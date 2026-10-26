@@ -33,6 +33,7 @@ typedef enum {
 } mg_terminal_operation_t;
 
 #define MG_TERMINAL_CAP_STYLED_OUTPUT TERMINAL_CAP_STYLED_OUTPUT
+#define MG_TERMINAL_CAP_INTERACTIVE_OUTPUT TERMINAL_CAP_INTERACTIVE_OUTPUT
 
 typedef terminal_color_t mg_terminal_color_t;
 typedef terminal_style_role_t mg_terminal_style_role_t;

@@ -24,6 +24,7 @@ typedef struct fetch_http_headers {
     u64 content_length;
     bool chunked;
     const char *location;
+    const char *content_type;
 } fetch_http_headers_t;
 
 /* The decoder allocates a bounded 16 KiB header workspace. It never buffers

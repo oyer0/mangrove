@@ -25,10 +25,10 @@ int main(void)
     fetch_arguments_destroy(&arguments);
 
     char *long_options[] = {(char *)"fetch", (char *)"--quiet",
-        (char *)"--output=page.html", (char *)"--",
+        (char *)"--output=page.html", (char *)"--timings", (char *)"--",
         (char *)"-leading.example"};
-    assert(parse(5, long_options, &arguments, &bad) == FETCH_ARGUMENTS_OK);
-    assert(arguments.quiet && arguments.url_count == 1U);
+    assert(parse(6, long_options, &arguments, &bad) == FETCH_ARGUMENTS_OK);
+    assert(arguments.quiet && arguments.timings && arguments.url_count == 1U);
     assert(!strcmp(arguments.output_path, "page.html"));
     assert(!strcmp(arguments.urls[0], "-leading.example"));
     fetch_arguments_destroy(&arguments);
@@ -74,6 +74,10 @@ int main(void)
            FETCH_ARGUMENTS_UNKNOWN_OPTION);
     char *unexpected[] = {(char *)"fetch", (char *)"--quiet=yes"};
     assert(parse(2, unexpected, &arguments, &bad) ==
+           FETCH_ARGUMENTS_UNEXPECTED_VALUE);
+    char *timings_value[] = {(char *)"fetch", (char *)"--timings=true",
+                             (char *)"example.com"};
+    assert(parse(3, timings_value, &arguments, &bad) ==
            FETCH_ARGUMENTS_UNEXPECTED_VALUE);
     char *duplicate[] = {(char *)"fetch", (char *)"-oone",
                          (char *)"-otwo", (char *)"host"};

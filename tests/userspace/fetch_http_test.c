@@ -53,7 +53,8 @@ static fetch_http_event_t feed_fragmented(fetch_http_decoder_t *decoder,
 static void test_content_length_and_no_extra_read(void)
 {
     static const u8 response[] =
-        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhelloNEXT";
+        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n"
+        "Content-Type: text/plain; charset=utf-8\r\n\r\nhelloNEXT";
     test_sink_t sink = {0};
     fetch_http_decoder_t *decoder = fetch_http_decoder_create(sink_append,
                                                               &sink);
@@ -67,6 +68,8 @@ static void test_content_length_and_no_extra_read(void)
     const fetch_http_headers_t *headers = fetch_http_decoder_headers(decoder);
     assert(headers && headers->status == 200U && headers->has_content_length);
     assert(headers->content_length == 5U && !headers->chunked);
+    assert(headers->content_type &&
+           !strcmp(headers->content_type, "text/plain; charset=utf-8"));
     assert(fetch_http_decoder_feed(decoder, response + consumed,
                                    sizeof(response) - 1U - consumed,
                                    &consumed) == FETCH_HTTP_COMPLETE);
@@ -154,10 +157,11 @@ static void test_redirect_and_error_status_headers(void)
 
 static void test_large_streaming_body(void)
 {
-    const usize body_length = 192U * 1024U;
+    const usize body_length = 3U * 1024U * 1024U;
     char header[96];
     int header_length = snprintf(header, sizeof(header),
-        "HTTP/1.1 200 OK\r\nContent-Length: %u\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Length: %u\r\n"
+        "Content-Type: application/octet-stream\r\n\r\n",
         (unsigned)body_length);
     test_sink_t sink = {0};
     fetch_http_decoder_t *decoder = fetch_http_decoder_create(sink_append,
@@ -183,6 +187,9 @@ static void test_large_streaming_body(void)
         offset += amount;
     }
     assert(sink.length == body_length);
+    assert(fetch_http_decoder_headers(decoder)->content_type &&
+           !strcmp(fetch_http_decoder_headers(decoder)->content_type,
+                   "application/octet-stream"));
     for (usize offset = 0; offset < body_length; offset += sizeof(input))
         assert(sink.bytes[offset] == (u8)(offset / sizeof(input)));
     free(sink.bytes);

@@ -19,11 +19,18 @@ typedef struct fetch_transport {
 } fetch_transport_t;
 
 mg_result_t fetch_transport_prepare_tls(fetch_transport_state_t *state);
-mg_result_t fetch_transport_open(fetch_transport_state_t *state,
-                                 const fetch_url_t *url,
-                                 const mg_ipv4_addr_t *address,
-                                 u32 timeout_ms,
-                                 fetch_transport_t *transport);
+/* Open the TCP stream to a resolved IPv4 endpoint. For HTTPS, prepare the
+ * trust context before opening TCP and then call fetch_transport_start_tls(). */
+mg_result_t fetch_transport_connect_tcp(const fetch_url_t *url,
+                                       const mg_ipv4_addr_t *address,
+                                       u32 timeout_ms,
+                                       fetch_transport_t *transport);
+/* Upgrade an open stream to authenticated TLS 1.3. mgTLS consumes the stream
+ * on both success and failure. */
+mg_result_t fetch_transport_start_tls(fetch_transport_state_t *state,
+                                      const char *server_name,
+                                      u32 timeout_ms,
+                                      fetch_transport_t *transport);
 mg_result_t fetch_transport_send(fetch_transport_t *transport,
                                  const void *data, usize length,
                                  u32 timeout_ms);

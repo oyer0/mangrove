@@ -30,6 +30,9 @@ _Static_assert(TERMINAL_COLOR_COUNT == 16,
 
 /* Capabilities describe the current output target, not its implementation. */
 #define TERMINAL_CAP_STYLED_OUTPUT (1U << 0)
+/* Standard output is the interactive console, so carriage-return progress
+ * updates are visible in place instead of becoming redirected file bytes. */
+#define TERMINAL_CAP_INTERACTIVE_OUTPUT (1U << 1)
 
 typedef enum {
     TERMINAL_STYLE_DEFAULT = 0,

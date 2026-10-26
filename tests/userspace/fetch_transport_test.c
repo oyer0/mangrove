@@ -27,6 +27,7 @@ static unsigned int stream_close_calls;
 static unsigned int tls_init_calls;
 static unsigned int tls_context_calls;
 static unsigned int tls_connect_calls;
+static unsigned int tls_stream_connect_calls;
 static unsigned int tls_send_calls;
 static unsigned int tls_receive_calls;
 static unsigned int tls_close_calls;
@@ -53,7 +54,8 @@ static void reset(void)
     tls_receive_count = 5U;
     stream_connect_calls = stream_send_calls = stream_receive_calls = 0U;
     stream_close_calls = tls_init_calls = tls_context_calls = 0U;
-    tls_connect_calls = tls_send_calls = tls_receive_calls = 0U;
+    tls_connect_calls = tls_stream_connect_calls = 0U;
+    tls_send_calls = tls_receive_calls = 0U;
     tls_close_calls = tls_context_destroy_calls = tls_cleanup_calls = 0U;
     tls_connect_host = NULL;
     tls_connect_port = 0U;
@@ -62,7 +64,8 @@ static void reset(void)
 mg_result_t mg_stream_connect(const mg_net_endpoint_t *endpoint,
                               u32 timeout_ms, mg_handle_t *out_handle)
 {
-    assert(endpoint && endpoint->port == 80U && timeout_ms == 123U);
+    assert(endpoint && (endpoint->port == 80U || endpoint->port == 443U) &&
+           timeout_ms == 123U);
     ++stream_connect_calls;
     if (stream_connect_result == MG_OK) *out_handle = 42;
     return stream_connect_result;
@@ -125,6 +128,25 @@ mg_result_t mgtls_session_connect(mgtls_context_t *context,
     return tls_connect_result;
 }
 
+mg_result_t mgtls_session_connect_stream(mgtls_context_t *context,
+                                         const char *server_name,
+                                         mg_handle_t stream,
+                                         u32 timeout_ms,
+                                         mgtls_session_t **out_session)
+{
+    assert(context == (mgtls_context_t *)(uintptr_t)1U);
+    assert(stream == 42U && timeout_ms == 123U && out_session);
+    ++tls_stream_connect_calls;
+    tls_connect_host = server_name;
+    if (tls_connect_result == MG_OK)
+        *out_session = (mgtls_session_t *)(uintptr_t)2U;
+    else {
+        *out_session = NULL;
+        (void)mg_stream_close(stream); /* models mgTLS stream ownership */
+    }
+    return tls_connect_result;
+}
+
 mg_result_t mgtls_session_send(mgtls_session_t *session, const void *data,
                                usize length, u32 timeout_ms,
                                usize *out_transferred)
@@ -175,8 +197,8 @@ static void test_http_keeps_native_transport(void)
     mg_ipv4_addr_t address = {{192U, 0U, 2U, 1U}};
 
     reset();
-    assert(fetch_transport_open(&state, &url, &address, 123U,
-                                &transport) == MG_OK);
+    assert(fetch_transport_connect_tcp(&url, &address, 123U,
+                                       &transport) == MG_OK);
     assert(transport.open && !transport.secure && stream_connect_calls == 1U);
     assert(tls_init_calls == 0U && tls_connect_calls == 0U);
     assert(fetch_transport_send(&transport, "hello world!", 12U, 456U) == 3);
@@ -196,13 +218,14 @@ static void test_https_uses_authenticated_session_and_partial_io(void)
     usize received;
 
     reset();
+    mg_ipv4_addr_t address = {{203U, 0U, 113U, 4U}};
     assert(fetch_transport_prepare_tls(&state) == MG_OK);
-    assert(fetch_transport_open(&state, &url, NULL, 123U, &transport) == MG_OK);
+    assert(fetch_transport_connect_tcp(&url, &address, 123U, &transport) == MG_OK);
+    assert(fetch_transport_start_tls(&state, url.host, 123U, &transport) == MG_OK);
     assert(transport.open && transport.secure && tls_init_calls == 1U &&
-           tls_context_calls == 1U && tls_connect_calls == 1U);
-    assert(!stream_connect_calls);
-    assert(!strcmp(tls_connect_host, "secure.example") &&
-           tls_connect_port == 443U);
+           tls_context_calls == 1U && tls_stream_connect_calls == 1U);
+    assert(stream_connect_calls == 1U);
+    assert(!strcmp(tls_connect_host, "secure.example"));
     assert(fetch_transport_send(&transport, "hello world!", 12U, 456U) == 7);
     assert(fetch_transport_receive(&transport, &received, 32U, 789U) == 5);
     assert(tls_send_calls == 1U && tls_receive_calls == 1U);
@@ -221,36 +244,36 @@ static void test_security_failures_never_fall_back(void)
 
     reset();
     tls_context_result = MG_ERR_TIME_UNAVAILABLE;
-    assert(fetch_transport_open(&state, &url, NULL, 123U, &transport) ==
-           MG_ERR_TIME_UNAVAILABLE);
-    assert(!transport.open && !tls_connect_calls && !stream_connect_calls);
+    assert(fetch_transport_prepare_tls(&state) == MG_ERR_TIME_UNAVAILABLE);
+    assert(!transport.open && !tls_stream_connect_calls && !stream_connect_calls);
     assert(fetch_transport_state_cleanup(&state) == MG_OK);
     assert(tls_cleanup_calls == 1U);
 
     reset();
+    mg_ipv4_addr_t address = {{203U, 0U, 113U, 4U}};
+    assert(fetch_transport_prepare_tls(&state) == MG_OK);
+    assert(fetch_transport_connect_tcp(&url, &address, 123U, &transport) == MG_OK);
     tls_connect_result = MG_ERR_CERTIFICATE_INVALID;
-    assert(fetch_transport_open(&state, &url, NULL, 123U, &transport) ==
+    assert(fetch_transport_start_tls(&state, url.host, 123U, &transport) ==
            MG_ERR_CERTIFICATE_INVALID);
-    assert(!transport.open && tls_connect_calls == 1U &&
-           !stream_connect_calls);
+    assert(!transport.open && tls_stream_connect_calls == 1U &&
+           stream_connect_calls == 1U && stream_close_calls == 1U);
     assert(fetch_transport_state_cleanup(&state) == MG_OK);
     assert(tls_context_destroy_calls == 1U && tls_cleanup_calls == 1U);
 
     reset();
     tls_init_result = MG_ERR_ENTROPY_UNAVAILABLE;
-    assert(fetch_transport_open(&state, &url, NULL, 123U, &transport) ==
-           MG_ERR_ENTROPY_UNAVAILABLE);
+    assert(fetch_transport_prepare_tls(&state) == MG_ERR_ENTROPY_UNAVAILABLE);
     assert(!transport.open && tls_context_calls == 0U &&
-           tls_connect_calls == 0U && !stream_connect_calls);
+           tls_stream_connect_calls == 0U && !stream_connect_calls);
     assert(fetch_transport_state_cleanup(&state) == MG_OK);
     assert(tls_cleanup_calls == 0U);
 
     reset();
     tls_context_result = MG_ERR_TRUST_STORE_INVALID;
-    assert(fetch_transport_open(&state, &url, NULL, 123U, &transport) ==
-           MG_ERR_TRUST_STORE_INVALID);
+    assert(fetch_transport_prepare_tls(&state) == MG_ERR_TRUST_STORE_INVALID);
     assert(!transport.open && tls_init_calls == 1U &&
-           tls_context_calls == 1U && !tls_connect_calls &&
+           tls_context_calls == 1U && !tls_stream_connect_calls &&
            !stream_connect_calls);
     assert(fetch_transport_state_cleanup(&state) == MG_OK);
     assert(!tls_context_destroy_calls && tls_cleanup_calls == 1U);
@@ -264,7 +287,10 @@ static void test_interrupt_and_retryable_close(void)
                        .https = true};
 
     reset();
-    assert(fetch_transport_open(&state, &url, NULL, 123U, &transport) == MG_OK);
+    mg_ipv4_addr_t address = {{203U, 0U, 113U, 4U}};
+    assert(fetch_transport_prepare_tls(&state) == MG_OK);
+    assert(fetch_transport_connect_tcp(&url, &address, 123U, &transport) == MG_OK);
+    assert(fetch_transport_start_tls(&state, url.host, 123U, &transport) == MG_OK);
     tls_receive_result = MG_ERR_INTERRUPTED;
     assert(fetch_transport_receive(&transport, (void *)"", 32U, 789U) ==
            MG_ERR_INTERRUPTED);
@@ -279,7 +305,9 @@ static void test_interrupt_and_retryable_close(void)
     reset();
     state = (fetch_transport_state_t){0};
     transport = (fetch_transport_t){0};
-    assert(fetch_transport_open(&state, &url, NULL, 123U, &transport) == MG_OK);
+    assert(fetch_transport_prepare_tls(&state) == MG_OK);
+    assert(fetch_transport_connect_tcp(&url, &address, 123U, &transport) == MG_OK);
+    assert(fetch_transport_start_tls(&state, url.host, 123U, &transport) == MG_OK);
     tls_close_result = MG_ERR_INTERRUPTED;
     assert(fetch_transport_close(&transport) == MG_ERR_INTERRUPTED);
     assert(!transport.open);

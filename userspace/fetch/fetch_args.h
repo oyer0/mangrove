@@ -5,6 +5,7 @@
 
 typedef struct fetch_arguments {
     bool quiet;
+    bool timings;
     const char *output_path;
     const char *input_file;
     const char **urls;

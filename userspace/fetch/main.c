@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "fetch_args.h"
+#include "fetch_display.h"
 #include "fetch_transport.h"
 #include "fetch_url.h"
 #include "http_response.h"
@@ -22,21 +23,21 @@ typedef struct fetch_url_list {
 } fetch_url_list_t;
 
 typedef struct fetch_metrics {
-    u64 dns_ms, connect_ms, tls_setup_ms, first_byte_ms, receive_ms, write_ms;
+    u64 dns_ms, connect_ms, tls_context_ms, tls_handshake_ms;
+    u64 first_byte_ms, receive_ms, write_ms;
     u64 output_check_ms, file_setup_ms, connection_close_ms;
     u64 file_close_ms, publish_ms;
     u64 write_calls, write_max_ms;
     u64 total_ms;
+    u64 transfer_start_ms, transfer_ms;
     bool clock_available;
+    bool transfer_clock_available;
 } fetch_metrics_t;
 
 typedef struct fetch_sink_context {
     mg_handle_t file;
-    const char *host;
-    bool quiet;
-    bool progress_active;
+    fetch_display_t *display;
     bool progress_clock_ready;
-    bool failed;
     mg_result_t failure;
     u64 bytes;
     u64 last_progress_ms;
@@ -49,6 +50,14 @@ static bool monotonic_ms(u64 *out)
     if (!out || mg_clock_monotonic(&time) != MG_OK) return false;
     *out = time.milliseconds;
     return true;
+}
+
+static void stdout_write(void *context, const char *text, usize length)
+{
+    (void)context;
+    if (!text || !length) return;
+    (void)fwrite(text, 1U, length, stdout);
+    (void)fflush(stdout);
 }
 
 static u64 duration_ms(u64 start, u64 end)
@@ -363,34 +372,29 @@ static mg_result_t file_sink(void *opaque, const u8 *bytes, usize length)
     if (!context || (!bytes && length)) return MG_ERR_BAD_ARGUMENT;
     bool timed = monotonic_ms(&before);
     result = object_write_all(context->file, bytes, length);
+    if (context->metrics && context->metrics->write_calls != ~(u64)0)
+        context->metrics->write_calls++;
     if (timed && monotonic_ms(&after) && context->metrics) {
         u64 elapsed = duration_ms(before, after);
         add_duration(&context->metrics->write_ms, before, after);
-        if (context->metrics->write_calls != ~(u64)0)
-            context->metrics->write_calls++;
         if (elapsed > context->metrics->write_max_ms)
             context->metrics->write_max_ms = elapsed;
     }
     if (result < 0 || (usize)result != length) {
-        context->failed = true;
         context->failure = result < 0 ? result : MG_ERR_IO;
         return context->failure;
     }
     if ((u64)length > ~(u64)0 - context->bytes) {
-        context->failed = true;
         context->failure = MG_ERR_NO_SPACE;
         return context->failure;
     }
     context->bytes += (u64)length;
-    if (!context->quiet && context->progress_clock_ready &&
+    if (context->progress_clock_ready &&
         monotonic_ms(&after) &&
         after >= context->last_progress_ms &&
         after - context->last_progress_ms >= FETCH_PROGRESS_INTERVAL_MS) {
-        printf("\rReceiving %llu bytes from %s",
-               (unsigned long long)context->bytes, context->host);
-        (void)fflush(stdout);
+        fetch_display_progress(context->display, context->bytes, after);
         context->last_progress_ms = after;
-        context->progress_active = true;
     }
     return MG_OK;
 }
@@ -454,17 +458,8 @@ static mg_result_t publish_temp(const char *temporary, const char *destination,
     }
 }
 
-static u64 transfer_rate_kib(u64 bytes, u64 milliseconds)
-{
-    if (!milliseconds) return 0;
-    u64 whole = bytes / milliseconds;
-    u64 remainder = bytes % milliseconds;
-    if (whole > ~(u64)0 / 1000ULL) return ~(u64)0;
-    return (whole * 1000ULL + remainder * 1000ULL / milliseconds) / 1024ULL;
-}
-
 static int download_one(const fetch_url_t *initial, const char *explicit_output,
-                        bool quiet)
+                        bool quiet, bool timings, bool interactive_progress)
 {
     fetch_url_t current = {0};
     fetch_url_t visited[FETCH_MAX_REDIRECTS + 1U] = {{0}};
@@ -480,19 +475,24 @@ static int download_one(const fetch_url_t *initial, const char *explicit_output,
     bool uncertain_publish = false;
     mg_result_t failure = MG_OK;
     fetch_metrics_t metrics = {0};
+    fetch_display_t display;
     fetch_sink_context_t sink = {0};
     fetch_transport_state_t transport_state = {0};
     fetch_transport_t active_transport = {0};
     u64 total_start = 0;
     u64 total_end = 0;
+    bool timings_printed = false;
     u64 fs_start = 0;
     u64 fs_end = 0;
 
     metrics.clock_available = monotonic_ms(&total_start);
+    fetch_display_init(&display, quiet, interactive_progress, stdout_write,
+                       NULL);
     if (!fetch_url_clone(initial, &current)) {
         printf("fetch: not enough memory to prepare URL.\n");
         return 1;
     }
+    fetch_display_requested(&display, &current);
     if (explicit_output && monotonic_ms(&fs_start)) {
         bool absent = output_path_absent(explicit_output);
         if (monotonic_ms(&fs_end))
@@ -529,7 +529,7 @@ static int download_one(const fetch_url_t *initial, const char *explicit_output,
     file_created = true;
     file_opened = true;
     sink.file = file;
-    sink.quiet = quiet;
+    sink.display = &display;
     sink.metrics = &metrics;
 
     for (;;) {
@@ -564,24 +564,35 @@ static int download_one(const fetch_url_t *initial, const char *explicit_output,
             failure = MG_ERR_NO_MEMORY;
             goto done;
         }
-        sink.host = current.host;
-        sink.last_progress_ms = 0;
         sink.progress_clock_ready = false;
-
-        if (!current.https) {
+        if (current.https) {
             if (monotonic_ms(&phase_start)) {
-                if (!mg_ipv4_parse(current.host, &address))
-                    failure = mg_net_resolve_a(current.host, &address,
-                                               MG_NET_TIMEOUT_DEFAULT);
-                else
-                    failure = MG_OK;
+                failure = fetch_transport_prepare_tls(&transport_state);
                 if (monotonic_ms(&phase_end))
-                    add_duration(&metrics.dns_ms, phase_start, phase_end);
-            } else if (!mg_ipv4_parse(current.host, &address)) {
+                    add_duration(&metrics.tls_context_ms, phase_start,
+                                 phase_end);
+            } else {
+                failure = fetch_transport_prepare_tls(&transport_state);
+            }
+            if (failure < 0) {
+                printf("fetch: could not prepare TLS trust and crypto state for %s: %s.\n",
+                       current.host, error_string(failure));
+                goto done;
+            }
+        }
+
+        bool is_ip = mg_ipv4_parse(current.host, &address);
+        fetch_display_resolving(&display, current.host, is_ip);
+
+        if (!is_ip) {
+            if (monotonic_ms(&phase_start)) {
                 failure = mg_net_resolve_a(current.host, &address,
                                            MG_NET_TIMEOUT_DEFAULT);
+                if (monotonic_ms(&phase_end))
+                    add_duration(&metrics.dns_ms, phase_start, phase_end);
             } else {
-                failure = MG_OK;
+                failure = mg_net_resolve_a(current.host, &address,
+                                           MG_NET_TIMEOUT_DEFAULT);
             }
             if (failure < 0) {
                 printf("fetch: DNS lookup failed for %s: %s.\n", current.host,
@@ -589,38 +600,54 @@ static int download_one(const fetch_url_t *initial, const char *explicit_output,
                 goto done;
             }
         }
+        if (!is_ip) fetch_display_resolved(&display, current.host, &address);
         if (!build_request(&current, &request, &request_length)) {
             printf("fetch: could not prepare HTTP request for %s.\n",
                    current.host);
             failure = MG_ERR_NO_MEMORY;
             goto done;
         }
+        fetch_display_connecting(&display, current.host, current.port);
         if (monotonic_ms(&phase_start)) {
-            failure = fetch_transport_open(&transport_state, &current,
-                current.https ? NULL : &address, FETCH_CONNECT_TIMEOUT_MS,
+            failure = fetch_transport_connect_tcp(
+                &current, &address, FETCH_CONNECT_TIMEOUT_MS,
                 &active_transport);
-            if (monotonic_ms(&phase_end)) {
-                if (current.https)
-                    add_duration(&metrics.tls_setup_ms, phase_start, phase_end);
-                else
-                    add_duration(&metrics.connect_ms, phase_start, phase_end);
-            }
+            if (monotonic_ms(&phase_end))
+                add_duration(&metrics.connect_ms, phase_start, phase_end);
         } else {
-            failure = fetch_transport_open(&transport_state, &current,
-                current.https ? NULL : &address, FETCH_CONNECT_TIMEOUT_MS,
-                &active_transport);
+            failure = fetch_transport_connect_tcp(&current, &address,
+                FETCH_CONNECT_TIMEOUT_MS, &active_transport);
         }
         if (failure < 0) {
-            if (current.https)
-                printf("fetch: authenticated TLS 1.3 connection to %s:%u failed: %s.\n",
-                       current.host, (unsigned)current.port,
-                       error_string(failure));
-            else
-                printf("fetch: could not connect to %s:%u: %s.\n",
-                       current.host, (unsigned)current.port,
-                       error_string(failure));
+            printf("fetch: TCP connection to %s:%u failed: %s.\n",
+                   current.host, (unsigned)current.port,
+                   error_string(failure));
             free(request);
             goto done;
+        }
+        fetch_display_connected(&display, current.host, current.port,
+                                &address);
+        if (current.https) {
+            fetch_display_tls_starting(&display, current.host);
+            if (monotonic_ms(&phase_start)) {
+                failure = fetch_transport_start_tls(
+                    &transport_state, current.host, FETCH_CONNECT_TIMEOUT_MS,
+                    &active_transport);
+                if (monotonic_ms(&phase_end))
+                    add_duration(&metrics.tls_handshake_ms, phase_start,
+                                 phase_end);
+            } else {
+                failure = fetch_transport_start_tls(
+                    &transport_state, current.host, FETCH_CONNECT_TIMEOUT_MS,
+                    &active_transport);
+            }
+            if (failure < 0) {
+                printf("fetch: TLS 1.3 handshake/authentication for %s failed; no authenticated session was established: %s.\n",
+                       current.host, error_string(failure));
+                free(request);
+                goto done;
+            }
+            fetch_display_tls_verified(&display, current.host);
         }
         usize request_offset = 0;
         mg_result_t sent = MG_OK;
@@ -670,6 +697,7 @@ static int download_one(const fetch_url_t *initial, const char *explicit_output,
                 add_duration(&metrics.receive_ms, receive_start, receive_end);
             if (received > (mg_result_t)sizeof(receive_buffer)) {
                 failure = MG_ERR_IO;
+                fetch_display_finish_progress(&display);
                 printf("fetch: network returned an invalid receive length.\n");
                 break;
             }
@@ -698,6 +726,7 @@ static int download_one(const fetch_url_t *initial, const char *explicit_output,
                             failure = MG_ERR_PROTOCOL;
                             break;
                         }
+                        fetch_display_http_status(&display, headers->status);
                         if (redirect_status(headers->status)) {
                             if (!headers->location) {
                                 printf("fetch: HTTP status %u from %s has no Location header.\n",
@@ -729,6 +758,8 @@ static int download_one(const fetch_url_t *initial, const char *explicit_output,
                                 failure = MG_ERR_PROTOCOL;
                                 break;
                             }
+                            fetch_display_redirect(&display, headers->status,
+                                                  &next_url);
                             follow = true;
                             break;
                         }
@@ -738,6 +769,23 @@ static int download_one(const fetch_url_t *initial, const char *explicit_output,
                             failure = MG_ERR_PROTOCOL;
                             break;
                         }
+                        if (!explicit_output && !automatic_name &&
+                            !fetch_url_filename(&current, &automatic_name)) {
+                            printf("fetch: final URL has no safe output filename.\n");
+                            failure = MG_ERR_BAD_ARGUMENT;
+                            break;
+                        }
+                        fetch_display_response_details(&display, headers,
+                            explicit_output ? explicit_output : automatic_name);
+                        u64 body_start = 0;
+                        bool body_clock = monotonic_ms(&body_start);
+                        metrics.transfer_clock_available = body_clock;
+                        metrics.transfer_start_ms = body_start;
+                        sink.last_progress_ms = body_start;
+                        sink.progress_clock_ready = body_clock;
+                        fetch_display_body_start(&display,
+                            headers->has_content_length,
+                            headers->content_length, body_start);
                         if (fetch_http_decoder_complete(decoder)) {
                             response_complete = true;
                             break;
@@ -749,6 +797,7 @@ static int download_one(const fetch_url_t *initial, const char *explicit_output,
                         break;
                     }
                     if (event == FETCH_HTTP_MALFORMED) {
+                        fetch_display_finish_progress(&display);
                         printf("fetch: malformed or truncated HTTP response from %s.\n",
                                current.host);
                         failure = MG_ERR_PROTOCOL;
@@ -756,11 +805,13 @@ static int download_one(const fetch_url_t *initial, const char *explicit_output,
                     }
                     if (event == FETCH_HTTP_SINK_FAILED) {
                         failure = sink.failure;
+                        fetch_display_finish_progress(&display);
                         printf("fetch: writing temporary output failed: %s.\n",
                                error_string(failure));
                         break;
                     }
                     if (!consumed) {
+                        fetch_display_finish_progress(&display);
                         printf("fetch: HTTP response decoder made no progress.\n");
                         failure = MG_ERR_PROTOCOL;
                         break;
@@ -773,16 +824,19 @@ static int download_one(const fetch_url_t *initial, const char *explicit_output,
                 if (fetch_http_decoder_eof(decoder) == FETCH_HTTP_COMPLETE)
                     response_complete = true;
                 else {
+                    fetch_display_finish_progress(&display);
                     printf("fetch: connection closed before the HTTP response completed.\n");
                     failure = MG_ERR_PROTOCOL;
                 }
                 break;
             }
             failure = received < 0 ? received : MG_ERR_IO;
+            fetch_display_finish_progress(&display);
             printf("fetch: response receive from %s failed: %s.\n",
                    current.host, error_string(failure));
             break;
         }
+        fetch_display_finish_progress(&display);
         if (monotonic_ms(&phase_start)) {
             mg_result_t closed = fetch_transport_close(&active_transport);
             if (monotonic_ms(&phase_end))
@@ -809,6 +863,10 @@ static int download_one(const fetch_url_t *initial, const char *explicit_output,
             continue;
         }
         if (response_complete) {
+            u64 transfer_end = 0;
+            if (metrics.transfer_clock_available && monotonic_ms(&transfer_end))
+                metrics.transfer_ms = duration_ms(metrics.transfer_start_ms,
+                                                  transfer_end);
             complete = true;
             break;
         }
@@ -835,13 +893,15 @@ static int download_one(const fetch_url_t *initial, const char *explicit_output,
                          file_close_end);
         file_opened = false;
         if (closed < 0) {
+            fetch_display_finish_progress(&display);
             printf("fetch: could not close temporary output \"%s\": %s.\n",
                    temporary, error_string(closed));
             failure = closed;
             goto done;
         }
     }
-    if (!explicit_output && !fetch_url_filename(&current, &automatic_name)) {
+    if (!explicit_output && !automatic_name &&
+        !fetch_url_filename(&current, &automatic_name)) {
         printf("fetch: final URL has no safe output filename.\n");
         failure = MG_ERR_BAD_ARGUMENT;
         goto done;
@@ -859,41 +919,27 @@ static int download_one(const fetch_url_t *initial, const char *explicit_output,
     }
     if (failure == MG_ERR_UNCERTAIN) {
         uncertain_publish = true;
+        fetch_display_finish_progress(&display);
         printf("fetch: publishing \"%s\" had an uncertain result; inspect the output before retrying.\n",
                explicit_output ? explicit_output : automatic_name);
         goto done;
     }
     if (failure < 0) {
+        fetch_display_finish_progress(&display);
         printf("fetch: could not publish \"%s\": %s.\n",
                explicit_output ? explicit_output : automatic_name,
                error_string(failure));
         goto done;
     }
     file_created = false;
-    if (metrics.clock_available && monotonic_ms(&total_end))
-        metrics.total_ms = duration_ms(total_start, total_end);
-    if (!quiet) {
-        printf("Saved %s (%llu bytes, %llu KiB/s; DNS %llu ms, connect %llu ms, TLS setup %llu ms, first byte %llu ms, receive wait %llu ms, output check %llu ms, temp create/open %llu ms, write %llu ms (%llu calls, max %llu ms), connection close %llu ms, file close %llu ms, publish %llu ms)\n",
-               published, (unsigned long long)sink.bytes,
-               (unsigned long long)transfer_rate_kib(sink.bytes,
-                                                      metrics.total_ms),
-               (unsigned long long)metrics.dns_ms,
-               (unsigned long long)metrics.connect_ms,
-               (unsigned long long)metrics.tls_setup_ms,
-               (unsigned long long)metrics.first_byte_ms,
-               (unsigned long long)metrics.receive_ms,
-               (unsigned long long)metrics.output_check_ms,
-               (unsigned long long)metrics.file_setup_ms,
-               (unsigned long long)metrics.write_ms,
-               (unsigned long long)metrics.write_calls,
-               (unsigned long long)metrics.write_max_ms,
-               (unsigned long long)metrics.connection_close_ms,
-               (unsigned long long)metrics.file_close_ms,
-               (unsigned long long)metrics.publish_ms);
-    }
+    fetch_display_finish_progress(&display);
+    fetch_display_complete(&display, published, sink.bytes,
+                           metrics.transfer_ms,
+                           metrics.transfer_clock_available);
     failure = MG_OK;
 
 done:
+    fetch_display_finish_progress(&display);
     if (active_transport.open) {
         mg_result_t closed = fetch_transport_close(&active_transport);
         if (closed < 0) {
@@ -911,10 +957,6 @@ done:
             if (failure == MG_OK) failure = tls_cleanup;
         }
     }
-    if (sink.progress_active) {
-        putchar('\n');
-        sink.progress_active = false;
-    }
     if (file_opened) {
         mg_result_t closed = handle_close(file);
         file_opened = false;
@@ -927,6 +969,32 @@ done:
                    temporary, error_string(removed));
             if (failure == MG_OK) failure = removed;
         }
+    }
+    if (metrics.clock_available && monotonic_ms(&total_end))
+        metrics.total_ms = duration_ms(total_start, total_end);
+    if (timings && !timings_printed) {
+        fetch_display_timings_t report = {
+            .dns_ms = metrics.dns_ms,
+            .connect_ms = metrics.connect_ms,
+            .tls_context_ms = metrics.tls_context_ms,
+            .tls_handshake_ms = metrics.tls_handshake_ms,
+            .first_byte_ms = metrics.first_byte_ms,
+            .transfer_ms = metrics.transfer_ms,
+            .receive_ms = metrics.receive_ms,
+            .write_ms = metrics.write_ms,
+            .output_check_ms = metrics.output_check_ms,
+            .file_setup_ms = metrics.file_setup_ms,
+            .connection_close_ms = metrics.connection_close_ms,
+            .file_close_ms = metrics.file_close_ms,
+            .publish_ms = metrics.publish_ms,
+            .write_calls = metrics.write_calls,
+            .write_max_ms = metrics.write_max_ms,
+            .total_ms = metrics.total_ms,
+            .clock_available = metrics.clock_available,
+            .transfer_clock_available = metrics.transfer_clock_available,
+        };
+        fetch_display_timings(&display, &report);
+        timings_printed = true;
     }
     for (usize index = 0; index < visited_count; index++)
         fetch_url_destroy(&visited[index]);
@@ -944,6 +1012,7 @@ int main(int argc, char **argv)
     const char *bad_argument = NULL;
     fetch_arguments_result_t parsed;
     int status = 0;
+    bool interactive_progress = false;
 
     if (command_help_requested(argc, argv)) return command_print_help(argv[0]);
     parsed = fetch_arguments_parse(argc, argv, &arguments, &bad_argument);
@@ -988,7 +1057,7 @@ int main(int argc, char **argv)
     }
     if (!urls.count) {
         command_usage_error(argv[0],
-            "fetch [-q] [-o FILE] URL... | fetch [-q] [-o FILE] -i URLS_FILE",
+            "fetch [-q] [--timings] [-o FILE] URL... | fetch [-q] [--timings] [-o FILE] -i URLS_FILE",
             NULL);
         status = 1;
         goto done;
@@ -1004,9 +1073,19 @@ int main(int argc, char **argv)
         status = 1;
         goto done;
     }
+    if (!arguments.quiet) {
+        mg_terminal_capabilities_t capabilities = {0};
+        mg_terminal_size_t size = {0};
+        if (terminal_get_capabilities(&capabilities) == MG_OK &&
+            (capabilities.capabilities &
+             MG_TERMINAL_CAP_INTERACTIVE_OUTPUT) != 0U &&
+            terminal_get_size(&size) == MG_OK && size.columns >= 40U)
+            interactive_progress = true;
+    }
     for (usize index = 0; index < urls.count; index++)
         if (download_one(&urls.items[index], arguments.output_path,
-                         arguments.quiet)) status = 1;
+                         arguments.quiet, arguments.timings,
+                         interactive_progress)) status = 1;
 
 done:
     fetch_arguments_destroy(&arguments);

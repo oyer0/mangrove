@@ -2278,6 +2278,8 @@ void syscall_dispatch(void *raw_frame)
                 }
                 case MG_TERMINAL_OP_CAPABILITIES: {
                     mg_terminal_capabilities_t capabilities;
+                    process_t *process = process_current();
+                    kernel_object_t *output;
                     u32 capability_mask;
                     if (frame->rsi || !frame->rdx ||
                         !syscall_user_buffer_valid(
@@ -2288,6 +2290,15 @@ void syscall_dispatch(void *raw_frame)
                     }
                     capabilities.version = MG_TERMINAL_API_VERSION;
                     terminal_get_capability_mask(&capability_mask);
+                    output = process_handle_lookup_retain(
+                        process, PROCESS_INITIAL_CONSOLE_HANDLE,
+                        OBJECT_TYPE_INVALID, OBJECT_RIGHT_WRITE);
+                    if (output) {
+                        if (output->type == OBJECT_TYPE_CONSOLE)
+                            capability_mask |=
+                                TERMINAL_CAP_INTERACTIVE_OUTPUT;
+                        object_release(output);
+                    }
                     capabilities.capabilities = capability_mask;
                     memcpy((void *)(uintptr_t)frame->rdx, &capabilities,
                            sizeof(capabilities));

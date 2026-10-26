@@ -117,7 +117,10 @@ static bool parse_headers(fetch_http_decoder_t *decoder)
     usize position;
     usize location_start = 0;
     usize location_length = 0;
+    usize content_type_start = 0;
+    usize content_type_length = 0;
     bool have_location = false;
+    bool have_content_type = false;
     bool have_length = false;
     bool have_transfer_encoding = false;
     bool chunked = false;
@@ -177,6 +180,12 @@ static bool parse_headers(fetch_http_decoder_t *decoder)
             location_start = value_start;
             location_length = value_end - value_start;
             have_location = true;
+        } else if (ascii_equal_ci(decoder->header + position, "Content-Type",
+                                  colon - position)) {
+            if (have_content_type || value_start == value_end) return false;
+            content_type_start = value_start;
+            content_type_length = value_end - value_start;
+            have_content_type = true;
         }
         position = end + 2U;
     }
@@ -187,9 +196,15 @@ static bool parse_headers(fetch_http_decoder_t *decoder)
     decoder->headers.content_length = content_length;
     decoder->headers.chunked = chunked;
     decoder->headers.location = NULL;
+    decoder->headers.content_type = NULL;
     if (have_location) {
         decoder->header[location_start + location_length] = '\0';
         decoder->headers.location = (const char *)decoder->header + location_start;
+    }
+    if (have_content_type) {
+        decoder->header[content_type_start + content_type_length] = '\0';
+        decoder->headers.content_type =
+            (const char *)decoder->header + content_type_start;
     }
 
     if (status >= 100U && status < 200U && status != 101U) {

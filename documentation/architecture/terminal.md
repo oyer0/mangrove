@@ -71,6 +71,12 @@ These operations do not create separate terminals or pseudo-terminals.
 Ordinary system output is denied while another process owns the alternate
 screen.
 
+The versioned terminal capability query reports whether the current process's
+standard output is the interactive console. Applications may use that flag
+for in-place carriage-return progress; it is absent when standard output is a
+file, including inherited command redirection. This capability does not imply
+ANSI or VT support.
+
 Console byte and raw-event queues, their indices and counts, raw-mode owner,
 and waiter slots are protected by one IRQ-safe SMP spinlock. Queue overflow
 continues to drop new input. Readers register under the lock, release it before

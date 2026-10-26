@@ -329,10 +329,13 @@ def create_disk(folder, build, run, relative_launch=False,
         elif phase == 'fetch-https':
             script = (
                 network_wait +
-                '/bin/fetch -q -o /temp/fetch-http.html http://example.com/\n'
-                '/bin/fetch -q -o /temp/fetch-https.html https://example.com/\n'
+                '/bin/fetch --timings -o /temp/fetch-http.html http://example.com/ > /temp/fetch-http.log\n'
+                '/bin/fetch --timings -o /temp/fetch-https.html https://example.com/ > /temp/fetch-https.log\n'
+                '/bin/fetch --timings -o /temp/fetch-gnu.html https://www.gnu.org/ > /temp/fetch-gnu.log\n'
+                '/bin/fetch --timings -o /temp/fetch-letsencrypt.html https://letsencrypt.org/ > /temp/fetch-letsencrypt.log\n'
+                '/bin/fetch --timings -o /temp/fetch-gnu-progress.html https://www.gnu.org/\n'
                 'jump /temp\n'
-                '/bin/fetch 5x40.org\n'
+                '/bin/fetch --timings 5x40.org > /temp/fetch-redirect.log\n'
                 '/bin/say FETCHHTTPS1 complete > /temp/fetch-https.exit\n'
                 '/bin/shutdown\n').encode()
         else:
@@ -645,6 +648,12 @@ def boot(folder, disk, phase, args):
                     break
                 text = screen_text(part / 'screen.ppm')
                 (part / 'screen.txt').write_text(text)
+                if (phase == 'fetch-https' and
+                        not (part / 'fetch-progress.txt').exists() and
+                        re.search(r'\[\s*(?:[0-9]{1,3}%|\?)\]', text)):
+                    shutil.copyfile(part / 'screen.ppm',
+                                    part / 'fetch-progress.ppm')
+                    (part / 'fetch-progress.txt').write_text(text)
                 if '[FAIL] Required kernel bring-up phase failed' in text:
                     raise RuntimeError('guest kernel bring-up failed; see framebuffer evidence')
                 failed_startup = re.search(
@@ -1182,7 +1191,7 @@ def inspect_mgtls_tls(folder, disk, build, run):
 
 
 def inspect_fetch_https(folder, disk, build):
-    """Verify native fetch HTTP compatibility and authenticated HTTPS bytes."""
+    """Verify native downloads, normal lifecycle output, and TLS authentication."""
     with disk.open('rb') as source:
         source.seek(ROOT_OFFSET)
         image = source.read(PART_BYTES)
@@ -1197,6 +1206,7 @@ def inspect_fetch_https(folder, disk, build):
         raise ValueError('fetch HTTP/HTTPS guest workflow did not complete')
 
     files = {}
+    timing_lines = {}
     for scheme in ('http', 'https'):
         _, record = find(image, f'/temp/fetch-{scheme}.html')
         content = payload(image, record)
@@ -1205,11 +1215,80 @@ def inspect_fetch_https(folder, disk, build):
             raise ValueError(f'native fetch {scheme.upper()} body is invalid')
         files[scheme] = {'bytes': len(content),
                          'sha256': hashlib.sha256(content).hexdigest()}
+        _, log_record = find(image, f'/temp/fetch-{scheme}.log')
+        log = payload(image, log_record).decode('utf-8', errors='strict')
+        if ('Requested URL:' not in log or 'Resolved ' not in log or
+                'TCP connected to ' not in log or 'HTTP response: 200' not in log or
+                'Content-Type:' not in log or 'Destination: ' not in log or
+                'Download complete:' not in log):
+            raise ValueError(f'native fetch {scheme.upper()} lifecycle output is incomplete')
+        if '\r' in log:
+            raise ValueError(f'native fetch {scheme.upper()} wrote in-place progress to redirected output')
+        if 'Timing details (milliseconds):' not in log:
+            raise ValueError(f'native fetch {scheme.upper()} omitted requested timing details')
+        timing_lines[scheme] = [line.strip() for line in log.splitlines()
+                                if line.startswith('  ')]
+        if (not any('DNS ' in line and 'TCP connect ' in line for line in timing_lines[scheme]) or
+                not any('Response transfer ' in line for line in timing_lines[scheme]) or
+                not any('file writes ' in line and 'publish ' in line for line in timing_lines[scheme])):
+            raise ValueError(f'native fetch {scheme.upper()} timing stages are incomplete')
+        if scheme == 'https':
+            stages = ('TCP connected to ',
+                      'TLS 1.3 authenticated: certificate chain and hostname verified',
+                      'HTTP response: 200')
+            positions = [log.find(stage) for stage in stages]
+            if min(positions) < 0 or positions != sorted(positions):
+                raise ValueError('native HTTPS lifecycle output misorders TCP, authenticated TLS, and HTTP')
+        else:
+            if 'TLS 1.3 authenticated:' in log:
+                raise ValueError('plain HTTP output incorrectly claims TLS authentication')
+    for name, host, marker_text in (
+            ('gnu', 'www.gnu.org', 'GNU'),
+            ('letsencrypt', 'letsencrypt.org', "Let's Encrypt")):
+        _, record = find(image, f'/temp/fetch-{name}.html')
+        content = payload(image, record)
+        marker = marker_text.encode('ascii')
+        if len(content) < 1024 or marker.lower() not in content.lower():
+            raise ValueError(f'native fetch {host} HTTPS response did not match its content reference')
+        _, log_record = find(image, f'/temp/fetch-{name}.log')
+        log = payload(image, log_record).decode('utf-8', errors='strict')
+        if ('TLS 1.3 authenticated: certificate chain and hostname verified' not in log or
+                'HTTP response: 200' not in log or
+                f'Download complete: /temp/fetch-{name}.html' not in log or
+                '\r' in log):
+            raise ValueError(f'native fetch {host} HTTPS lifecycle output is incomplete')
+        timing_lines[name] = [line.strip() for line in log.splitlines()
+                              if line.startswith('  ')]
+        files[name] = {'bytes': len(content),
+                       'sha256': hashlib.sha256(content).hexdigest(),
+                       'content_reference': marker_text}
+    _, progress_record = find(image, '/temp/fetch-gnu-progress.html')
+    progress_content = payload(image, progress_record)
+    if (len(progress_content) < 1024 or
+            b'GNU' not in progress_content.upper()):
+        raise ValueError('native interactive progress download content is invalid')
+    progress_path = folder / 'fetch-https' / 'fetch-progress.txt'
+    if not progress_path.exists():
+        raise ValueError('native interactive console did not present an in-place progress update')
+    progress_text = progress_path.read_text()
+    if not re.search(r'\[\s*(?:[0-9]{1,3}%|\?)\]', progress_text):
+        raise ValueError('native progress framebuffer did not contain percentage or indeterminate byte progress')
     _, five_x40_file = find(image, '/temp/index.html')
     five_x40_content = payload(image, five_x40_file)
     if (not five_x40_content or b'<title>5x40.org</title>' not in
             five_x40_content or b'<h1>5x40.org</h1>' not in five_x40_content):
         raise ValueError('native fetch 5x40.org redirect body is invalid')
+    _, redirect_log_record = find(image, '/temp/fetch-redirect.log')
+    redirect_log = payload(image, redirect_log_record).decode(
+        'utf-8', errors='strict')
+    if ('Requested URL: http://5x40.org/' not in redirect_log or
+            'Redirect ' not in redirect_log or 'https://' not in redirect_log or
+            'TLS 1.3 authenticated:' not in redirect_log or
+            'Download complete: index.html' not in redirect_log or
+            'Timing details (milliseconds):' not in redirect_log):
+        raise ValueError('native fetch redirect lifecycle output is incomplete')
+    if '\r' in redirect_log:
+        raise ValueError('native redirect download wrote in-place progress to redirected output')
     _, temp_directory = find(image, '/temp')
     leftovers = [entry[4] for entry in image_tool.directory_entries(
         payload(image, temp_directory))
@@ -1219,6 +1298,13 @@ def inspect_fetch_https(folder, disk, build):
         raise ValueError('native fetch left temporary files after publication')
     return {'http_download': files['http'],
             'https_download': files['https'],
+            'additional_https_sites': {'gnu': files['gnu'],
+                                       'letsencrypt': files['letsencrypt']},
+            'normal_output': {'http': 'PASS', 'https': 'PASS',
+                              'interactive_in_place_progress': 'PASS',
+                              'redirect_and_upgrade': 'PASS',
+                              'redirected_output_has_no_carriage_returns': 'PASS'},
+            'representative_stage_timings': timing_lines,
             'http_to_https_redirect_download': {
                 'bytes': len(five_x40_content),
                 'sha256': hashlib.sha256(five_x40_content).hexdigest()},

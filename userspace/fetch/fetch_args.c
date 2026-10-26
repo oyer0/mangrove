@@ -8,6 +8,7 @@ static const cli_option_spec_t options[] = {
     {'o', "output", true},
     {'q', "quiet", false},
     {'i', "input-file", true},
+    {0, "timings", false},
 };
 
 void fetch_arguments_destroy(fetch_arguments_t *arguments)
@@ -84,6 +85,8 @@ fetch_arguments_result_t fetch_arguments_parse(int argc, char **argv,
                 return FETCH_ARGUMENTS_DUPLICATE_OPTION;
             }
             out->input_file = item.value;
+        } else if (item.option == &options[3]) {
+            out->timings = true;
         } else {
             *out_bad_argument = item.value;
             fetch_arguments_destroy(out);

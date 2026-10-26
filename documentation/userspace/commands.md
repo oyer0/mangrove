@@ -175,25 +175,38 @@ the first available name by appending `.1`, `.2`, and so on. Multiple URL
 operands are processed sequentially. `-i FILE` / `--input-file=FILE` reads
 one URL per line; blank lines and lines whose first nonspace character is `#`
 are ignored. The URL list is fully read and validated before downloads begin.
-`-q` / `--quiet` suppresses progress and success summaries but leaves errors
-visible. Standard grouped and attached option forms are supported, and `--`
-ends option parsing.
+`-q` / `--quiet` suppresses normal lifecycle messages, progress, and success
+summaries but leaves errors visible. Standard grouped and attached option forms
+are supported, and `--` ends option parsing.
 
 HTTP and HTTPS response bodies are streamed to a temporary file and published
 only after a complete response; failed transfers remove the incomplete
 temporary file where filesystem certainty permits. Content-Length, chunked
 transfer encoding, and connection-close-delimited bodies are supported.
 Redirects (301, 302, 303, 307, and 308) are followed with relative-location
-resolution, an eight-hop bound, and loop detection. Progress summaries report
-received bytes, approximate average KiB/s, and DNS, connection, TLS setup,
-first-byte, network receive-wait, output inspection, temporary-file creation/open,
-filesystem-write, connection-close, file-close, and publish timings when
-monotonic timing is available. For HTTPS, TLS setup includes DNS, TCP connect,
-and the TLS handshake. Write summaries include callback count and the longest
-write call.
-Receive-wait and write timings are measured separately. The receive timeout is
-an inactivity limit, so slow but progressing transfers can exceed it in total
-duration.
+resolution, an eight-hop bound, and loop detection.
+
+Normal output reports the requested URL, DNS resolution and the one IPv4
+address currently returned by Mangrove's resolver, TCP connection, HTTP status,
+redirects, response length and content type when present, destination name, and
+a concise completion summary. For HTTPS, TCP success is reported before TLS
+starts; the separate TLS 1.3 authenticated message appears only after mgTLS has
+accepted the certificate chain, trusted certificate time, and hostname. Failed
+TLS setup never reports authentication success. When the interactive terminal
+capability is present, transfers taking longer than the update cadence show an
+in-place byte/percentage and speed line. Known lengths show a percentage;
+unknown lengths remain indeterminate. Redirected output receives no carriage
+return progress bytes.
+
+`--timings` adds monotonic DNS, TCP, TLS context, TLS handshake/authentication,
+first-byte, response-transfer, receive-wait, file-write, temporary-file,
+close, publication, and total measurements. Receive-wait and file-write costs
+are separate; write timings include call count and maximum write duration.
+DNS resolution, TCP connection, and TLS handshake have separate bounded waits
+so a slow DNS response does not consume the TCP or TLS phase budget. HTTPS DNS
+and TCP are measured separately from the TLS handshake. The receive timeout is an
+inactivity limit, so a slow but progressing transfer can exceed it in total
+duration. If the monotonic clock is unavailable, timing values are not claimed.
 
 Current network drivers and protocol limits are described in
 [network architecture](../network/architecture.md). A command's presence does

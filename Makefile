@@ -221,6 +221,7 @@ PING         := $(PING_DIR)/ping.elf
 RESOLVE      := $(RESOLVE_DIR)/resolve.elf
 FETCH        := $(FETCH_DIR)/fetch.elf
 FETCH_TRANSPORT := $(FETCH_DIR)/fetch_transport.o
+FETCH_DISPLAY := $(FETCH_DIR)/fetch_display.o
 NETINFO      := $(NETINFO_DIR)/netinfo.elf
 NETCFG       := $(NETCFG_DIR)/netcfg.elf
 POWER        := $(POWER_DIR)/power.elf
@@ -1171,6 +1172,11 @@ test-fetch: test-fetch-http test-fetch-args test-fetch-transport
 		-idirafter libc/include tests/userspace/fetch_url_test.c \
 		userspace/fetch/fetch_url.c -o /tmp/mangrove-fetch-url-test
 	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-fetch-url-test
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
+		-fsanitize=address,undefined -Iinclude -Iuserspace/fetch \
+		-idirafter libc/include tests/userspace/fetch_display_test.c \
+		userspace/fetch/fetch_display.c -o /tmp/mangrove-fetch-display-test
+	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-fetch-display-test
 
 .PHONY: test-fetch-args
 test-fetch-args:
@@ -2589,6 +2595,7 @@ $(RESOLVE): $(RESOLVE_DIR)/main.o $(HELP_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LI
 $(FETCH_DIR)/main.o: userspace/fetch/main.c userspace/fetch/fetch_args.h \
                     userspace/fetch/fetch_url.h \
                     userspace/fetch/fetch_transport.h \
+                    userspace/fetch/fetch_display.h \
                     userspace/fetch/http_response.h \
                     userspace/common/help.h $(USER_LIBC)
 	@mkdir -p $(dir $@)
@@ -2602,6 +2609,12 @@ $(FETCH_DIR)/http_response.o: userspace/fetch/http_response.c userspace/fetch/ht
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -Iuserspace/fetch -c $< -o $@
 
+$(FETCH_DISPLAY): userspace/fetch/fetch_display.c \
+		userspace/fetch/fetch_display.h userspace/fetch/fetch_url.h \
+		userspace/fetch/http_response.h $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -Iuserspace/fetch -c $< -o $@
+
 $(FETCH_TRANSPORT): userspace/fetch/fetch_transport.c \
 		userspace/fetch/fetch_transport.h userspace/fetch/fetch_url.h \
 		libc/include/mg/tls.h $(USER_MGTLS) $(USER_LIBC)
@@ -2612,12 +2625,13 @@ $(FETCH_DIR)/fetch_args.o: userspace/fetch/fetch_args.c userspace/fetch/fetch_ar
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -Iuserspace/fetch -Iuserspace/common -c $< -o $@
 
-$(FETCH): $(FETCH_DIR)/main.o $(FETCH_DIR)/fetch_args.o $(FETCH_DIR)/fetch_url.o $(FETCH_DIR)/http_response.o $(FETCH_TRANSPORT) $(CLI_OPTIONS_OBJ) $(HELP_OBJ) $(USER_CRT) $(USER_MGTLS) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+$(FETCH): $(FETCH_DIR)/main.o $(FETCH_DIR)/fetch_args.o $(FETCH_DIR)/fetch_url.o $(FETCH_DIR)/http_response.o $(FETCH_TRANSPORT) $(FETCH_DISPLAY) $(CLI_OPTIONS_OBJ) $(HELP_OBJ) $(USER_CRT) $(USER_MGTLS) $(USER_LIBC) $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
 		$(USER_CRT) $(FETCH_DIR)/main.o $(FETCH_DIR)/fetch_args.o \
 		$(FETCH_DIR)/fetch_url.o $(CLI_OPTIONS_OBJ) \
-		$(FETCH_DIR)/http_response.o $(FETCH_TRANSPORT) $(USER_MGTLS) \
+		$(FETCH_DIR)/http_response.o $(FETCH_TRANSPORT) $(FETCH_DISPLAY) \
+		$(USER_MGTLS) \
 		$(HELP_OBJ) $(USER_LIBC)
 
 

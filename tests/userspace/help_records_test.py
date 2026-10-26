@@ -9,7 +9,7 @@ HELP_DIR = ROOT / "share" / "help"
 SECTIONS = {"usage", "option", "keybinding", "command", "note"}
 OPTION_FLAGS = {
     "del": {"-h", "-r"},
-    "fetch": {"-h", "-o", "-q", "-i"},
+    "fetch": {"-h", "-o", "-q", "-i", "--timings"},
     "history": {"-h", "-c", "-d", "-a", "-n", "-r", "-w"},
     "list": {"-h", "-l", "-t", "--tree"},
     "lsdsk": {"-h", "-v"},
@@ -100,6 +100,7 @@ def main():
     require(records, "fetch", "option", "--quiet")
     require(records, "fetch", "option", "--input-file=FILE")
     require(records, "fetch", "note", "HTTPS")
+    require(records, "fetch", "option", "--timings")
 
     for name in ("copy", "move"):
         assert option_flags(records[name]) == {"-h"}

@@ -22,41 +22,51 @@ mg_result_t fetch_transport_prepare_tls(fetch_transport_state_t *state)
     return result;
 }
 
-mg_result_t fetch_transport_open(fetch_transport_state_t *state,
-                                 const fetch_url_t *url,
-                                 const mg_ipv4_addr_t *address,
-                                 u32 timeout_ms,
-                                 fetch_transport_t *transport)
+mg_result_t fetch_transport_connect_tcp(const fetch_url_t *url,
+                                       const mg_ipv4_addr_t *address,
+                                       u32 timeout_ms,
+                                       fetch_transport_t *transport)
 {
-    mg_result_t result;
-
-    if (!state || !url || !transport || transport->open ||
-        (!url->https && !address))
+    if (!url || !address || !transport || transport->open)
         return MG_ERR_BAD_ARGUMENT;
     *transport = (fetch_transport_t){0};
-    if (url->https) {
-        result = fetch_transport_prepare_tls(state);
-        if (result != MG_OK) return result;
-        result = mgtls_session_connect(state->tls_context, url->host,
-                                       url->port, timeout_ms,
-                                       &transport->tls_session);
-        if (result != MG_OK) {
-            transport->tls_session = NULL;
-            return result;
-        }
-        if (!transport->tls_session) return MG_ERR_PROTOCOL;
-        transport->secure = true;
-        transport->open = true;
-        return MG_OK;
-    }
-
     mg_net_endpoint_t endpoint = {
         .address = *address,
         .port = url->port,
         .reserved = 0,
     };
-    result = mg_stream_connect(&endpoint, timeout_ms, &transport->stream);
+    mg_result_t result = mg_stream_connect(&endpoint, timeout_ms,
+                                           &transport->stream);
     if (result != MG_OK) return result;
+    transport->open = true;
+    return MG_OK;
+}
+
+mg_result_t fetch_transport_start_tls(fetch_transport_state_t *state,
+                                      const char *server_name,
+                                      u32 timeout_ms,
+                                      fetch_transport_t *transport)
+{
+    mg_result_t result;
+    mg_handle_t stream;
+
+    if (!state || !server_name || !transport || !transport->open ||
+        transport->secure || !transport->stream)
+        return MG_ERR_BAD_ARGUMENT;
+    result = fetch_transport_prepare_tls(state);
+    if (result != MG_OK) return result;
+    stream = transport->stream;
+    transport->stream = 0;
+    transport->open = false;
+    result = mgtls_session_connect_stream(state->tls_context, server_name,
+                                          stream, timeout_ms,
+                                          &transport->tls_session);
+    if (result != MG_OK) {
+        transport->tls_session = NULL;
+        return result;
+    }
+    if (!transport->tls_session) return MG_ERR_PROTOCOL;
+    transport->secure = true;
     transport->open = true;
     return MG_OK;
 }
