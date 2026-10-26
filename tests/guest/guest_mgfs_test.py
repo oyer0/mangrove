@@ -176,11 +176,43 @@ def install_qemu_network_config(image):
     image_tool.refresh_metadata_checksums(image, view)
 
 
+def phase_launch_command(phase, executable):
+    """Return the executable launched by the generated phase script."""
+    if phase in ('shutdown-history', 'reboot-history'):
+        return '/bin/shoot /temp/shutdown-history.shoot'
+    if phase == 'ca-store-reboot':
+        return '/bin/shoot /temp/ca-store-reboot.shoot'
+    if phase == 'reboot-verify':
+        return '/bin/shoot /temp/reboot-verify.shoot'
+    if phase == 'arguments':
+        return '/bin/argvtest'
+    if phase == 'random':
+        return '/bin/randomtest'
+    if phase == 'ca-store-verify':
+        return '/bin/castoretest'
+    if phase == 'mgtls':
+        return '/bin/mgtlstest'
+    if phase == 'time':
+        return f'{executable} time'
+    if phase == 'shoot-v1':
+        return '/bin/shoot /temp/shoot-v1-script.shoot'
+    if phase == 'network':
+        return f'{executable} network'
+    if phase == 'network-ping':
+        return '/bin/shoot /temp/network-ping.shoot'
+    if phase == 'math':
+        return f'{executable} math'
+    if phase == 'stdio':
+        return f'{executable} stdio'
+    return f'{executable} {"verify" if phase == "negative" else phase}'
+
+
 def create_disk(folder, build, run, relative_launch=False,
                 network_receive_smoke=False, shoot_v1=False,
                 power_history_smoke=False, arguments_smoke=False,
                 network_ping_smoke=False, manual_login=False,
-                random_smoke=False, ca_store_smoke=False):
+                random_smoke=False, ca_store_smoke=False,
+                mgtls_smoke=False):
     log = folder / 'image.log'
     root = folder / 'initial-root.img'
     command([build / 'mkmgfs', '--blocks', '16384', '--uuid',
@@ -206,7 +238,10 @@ def create_disk(folder, build, run, relative_launch=False,
     if ca_store_smoke:
         install(image, 2, 'castoretest',
                 (build / 'castoretest/castoretest.elf').read_bytes())
-    if not power_history_smoke and not arguments_smoke and not random_smoke and not ca_store_smoke:
+    if mgtls_smoke:
+        install(image, 2, 'mgtlstest',
+                (build / 'mgtlstest/mgtlstest.elf').read_bytes())
+    if not power_history_smoke and not arguments_smoke and not random_smoke and not ca_store_smoke and not mgtls_smoke:
         install(image, 2, 'fstest', (build / 'fstest/fstest.elf').read_bytes())
     if shoot_v1:
         install(image, 6, 'shoot-v1-script.shoot',
@@ -222,6 +257,8 @@ def create_disk(folder, build, run, relative_launch=False,
         phases = ('random',)
     if ca_store_smoke:
         phases = ('ca-store-reboot', 'ca-store-verify')
+    if mgtls_smoke:
+        phases = ('mgtls',)
     if network_ping_smoke:
         phases = ('network-ping',)
     if network_receive_smoke and not power_history_smoke:
@@ -231,32 +268,9 @@ def create_disk(folder, build, run, relative_launch=False,
     for phase in phases:
         prefix = "cd /temp\n" if relative_launch else ""
         executable = "./fstest-relative" if relative_launch else "/bin/fstest"
-        if phase in ('shutdown-history','reboot-history'):
-            launch_command = '/bin/shoot /temp/shutdown-history.shoot'
-        elif phase == 'ca-store-reboot':
-            launch_command = '/bin/shoot /temp/ca-store-reboot.shoot'
-        elif phase == 'reboot-verify':
-            launch_command = '/bin/shoot /temp/reboot-verify.shoot'
-        elif phase == 'arguments':
-            launch_command = '/bin/argvtest'
-        elif phase == 'random':
-            launch_command = '/bin/randomtest'
-        elif phase == 'ca-store-verify':
-            launch_command = '/bin/castoretest'
-        elif phase == 'time':
-            launch_command = f'{executable} time'
-        elif phase == 'shoot-v1':
-            launch_command = '/bin/shoot /temp/shoot-v1-script.shoot'
-        elif phase == 'network':
-            launch_command = f'{executable} network'
-        elif phase == 'network-ping':
-            launch_command = '/bin/shoot /temp/network-ping.shoot'
-        elif phase == 'math':
-            launch_command = f'{executable} math'
-        elif phase == 'stdio':
-            launch_command = f'{executable} stdio {run}'
-        else:
-            launch_command = f'{executable} {"verify" if phase == "negative" else phase} {run}'
+        launch_command = phase_launch_command(phase, executable)
+        if phase in ('stdio', 'create', 'verify', 'negative'):
+            launch_command += f' {run}'
         network_commands = ''
         if network_receive_smoke and phase == 'network':
             network_commands = '/bin/netinfo interfaces > /temp/interfaces.log\n'
@@ -1078,6 +1092,30 @@ def inspect_ca_store(folder, disk, build, phase, run):
             'disk_sha256': digest(disk)}
 
 
+def inspect_mgtls(folder, disk, build, run):
+    """Validate native mgTLS entropy wiring and upstream crypto vectors."""
+    with disk.open('rb') as source:
+        source.seek(ROOT_OFFSET)
+        image = source.read(PART_BYTES)
+    root = folder / 'mgtls-root.img'
+    root.write_bytes(image)
+    check_image(build, root, folder / 'mgtls-checker.log')
+    _, program = find(image, '/bin/mgtlstest')
+    if payload(image, program) != (build / 'mgtlstest/mgtlstest.elf').read_bytes():
+        raise ValueError('guest mgTLS binary differs from built source')
+    _, log_record = find(image, '/temp/mgtls.log')
+    transcript = payload(image, log_record).decode('ascii', errors='strict')
+    (folder / 'mgtls-guest.log').write_text(transcript)
+    if transcript != 'MGTLSGUEST PASS entropy sha256 aes-gcm x25519\n':
+        raise ValueError('native mgTLS test did not complete: ' + repr(transcript))
+    _, completion = find(image, '/temp/mgtls.exit')
+    if payload(image, completion) != f'child-exit-0-mgtls-{run}\n'.encode('ascii'):
+        raise ValueError('native mgTLS process completion marker is missing')
+    return {'entropy_source': 'Mangrove mg_random_bytes',
+            'vectors': ['SHA-256', 'AES-128-GCM', 'X25519'],
+            'checker': 'PASS', 'disk_sha256': digest(disk)}
+
+
 def validate_time_transcript(transcript, run, host_start, host_end,
                             virtual_clock_bound, network_receive_smoke=False):
     network_start_lines = re.findall(r'(?m)^NET1 begin$', transcript)
@@ -1506,6 +1544,8 @@ def main():
                         help='qualify native secure random status and large requests')
     parser.add_argument('--ca-store-smoke', action='store_true',
                         help='qualify native CA store read-only access across reboot')
+    parser.add_argument('--mgtls-smoke', action='store_true',
+                        help='qualify native mgTLS entropy adapter and crypto known-answer tests')
     parser.add_argument('--shoot-v1', action='store_true',
                         help='run only tests/userspace/shoot_v1.shoot as a native Ring 3 script')
     parser.add_argument('--power-history-smoke', action='store_true',
@@ -1542,6 +1582,12 @@ def main():
             args.network_receive_smoke or args.relative_launch or
             args.negative_control or args.repetitions != 1 or args.cpus != 2):
         parser.error('--ca-store-smoke is a focused two-CPU, two-boot workflow')
+    if args.mgtls_smoke and (args.arguments_smoke or args.random_smoke or
+            args.ca_store_smoke or args.shoot_v1 or args.power_history_smoke or
+            args.network_ping_smoke or args.network_receive_smoke or
+            args.relative_launch or args.negative_control or
+            args.repetitions != 1 or args.cpus != 2):
+        parser.error('--mgtls-smoke is a focused two-CPU, one-boot workflow')
     if args.shoot_v1 and (args.network_receive_smoke or args.relative_launch or
                           args.negative_control or args.power_history_smoke):
         parser.error('--shoot-v1 is a focused standalone guest workflow')
@@ -1559,6 +1605,7 @@ def main():
               'shoot_v1':args.shoot_v1, 'arguments_smoke':args.arguments_smoke,
               'random_smoke':args.random_smoke,
               'ca_store_smoke':args.ca_store_smoke,
+              'mgtls_smoke':args.mgtls_smoke,
               'network_ping_smoke':args.network_ping_smoke,
               'power_history_smoke':args.power_history_smoke,
               'runs':[]}
@@ -1575,7 +1622,8 @@ def main():
                              args.power_history_smoke, args.arguments_smoke,
                              args.network_ping_smoke,
                              random_smoke=args.random_smoke,
-                             ca_store_smoke=args.ca_store_smoke)
+                             ca_store_smoke=args.ca_store_smoke,
+                             mgtls_smoke=args.mgtls_smoke)
             result['initial_sha256']=digest(disk)
             if args.arguments_smoke:
                 phases = ('arguments',)
@@ -1583,6 +1631,8 @@ def main():
                 phases = ('random',)
             elif args.ca_store_smoke:
                 phases = ('ca-store-reboot', 'ca-store-verify')
+            elif args.mgtls_smoke:
+                phases = ('mgtls',)
             elif args.shoot_v1:
                 phases = ('shoot-v1',)
             elif args.power_history_smoke:
@@ -1606,6 +1656,9 @@ def main():
                 elif phase in ('ca-store-reboot', 'ca-store-verify'):
                     result[phase] = inspect_ca_store(folder, disk,
                                                      args.build_dir, phase, run)
+                elif phase == 'mgtls':
+                    result[phase] = inspect_mgtls(folder, disk, args.build_dir,
+                                                  run)
                 elif phase == 'stdio':
                     result[phase] = inspect_stdio(folder,disk,args.build_dir,run)
                 elif phase == 'time':
@@ -1637,7 +1690,7 @@ def main():
                     raise RuntimeError(phase_error)
             if (not args.shoot_v1 and not args.power_history_smoke and
                     not args.arguments_smoke and not args.random_smoke and
-                    not args.ca_store_smoke and
+                    not args.ca_store_smoke and not args.mgtls_smoke and
                     not args.network_ping_smoke and
                     result['create']['identifier'] !=
                     result['verify']['identifier']):

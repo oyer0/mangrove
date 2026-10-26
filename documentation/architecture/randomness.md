@@ -74,10 +74,12 @@ informal checks that do not replace formal validation. Mangrove does not
 currently claim production cryptographic assurance for this implementation
 or its hardware entropy sources.
 
-The interface is intended to supply randomness to future security protocols.
-A TLS client must propagate failures and fail the operation if randomness is
-unavailable. The future `mgtls` project is postponed; no TLS behavior is
-provided here.
+The interface supplies randomness to Mangrove's new [mgTLS
+foundation](../security/mgtls.md). Its custom wolfCrypt random callback
+propagates entropy failures and clears any partially written request before
+returning. The library currently exposes initialization and random-byte
+foundation APIs only; no TLS handshake or application TLS behavior is
+available yet.
 
 References:
 

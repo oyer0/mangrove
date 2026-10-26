@@ -14,6 +14,10 @@ sys.dont_write_bytecode = True
 import guest_mgfs_test as guest
 
 run='0123456789abcdef'
+assert guest.phase_launch_command('mgtls', '/bin/fstest') == '/bin/mgtlstest'
+assert guest.phase_launch_command('random', '/bin/fstest') == '/bin/randomtest'
+assert guest.phase_launch_command('arguments', '/bin/fstest') == '/bin/argvtest'
+assert guest.phase_launch_command('verify', '/bin/fstest') == '/bin/fstest verify'
 for phase,count in [('create',57),('verify',46)]:
     rows=guest.expected_operations(phase,run,221)
     assert len(rows)==count

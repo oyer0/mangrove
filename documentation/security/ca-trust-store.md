@@ -65,11 +65,13 @@ checks. Untrusted, unavailable, or invalid realtime remains a failure state;
 monotonic uptime is not a wall clock. See [kernel timekeeping](../kernel/timekeeping.md)
 and the [loam time API](../architecture/c-runtime.md).
 
-The kernel provides neither TLS parsing nor certificate policy. A future
-userspace TLS client must read this store, reject missing, empty, malformed,
-or inaccessible trust data, check the server hostname, validate the complete
-chain and certificate time interval, and fail closed on any error. No mgTLS or
-HTTPS client is implemented by this foundation.
+The kernel provides neither TLS parsing nor certificate policy. The current
+[mgTLS foundation](mgtls.md) builds wolfSSL's client and X.509 implementation,
+but does not load this store or perform a TLS handshake. A future userspace
+TLS client must reject missing, empty, malformed, or inaccessible trust data,
+check the server hostname, validate the complete chain and certificate time
+interval using trusted realtime, and fail closed on any error. No HTTPS client
+is implemented.
 
 The packaged snapshot is functional input for future integration, not an
 independent cryptographic assurance or a claim of production TLS readiness.

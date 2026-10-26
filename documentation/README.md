@@ -50,6 +50,9 @@ procedures. Source code is authoritative for implementation details.
   accounts, sessions, privileges, and PASS.
 - [System CA root store](security/ca-trust-store.md): packaged Mozilla-derived
   root bundle, provenance, permissions, update process, and TLS trust boundary.
+- [mgTLS foundation](security/mgtls.md): wolfSSL 5.9.4 provenance, native
+  platform integration, enabled TLS 1.3/crypto build profile, and current
+  security boundaries.
 - [Network architecture](network/architecture.md): kernel networking,
   networkd policy, configuration, and client interfaces.
 - [DHCP lifecycle](network/dhcp-lease.md): lease ownership and timers.

@@ -19,6 +19,25 @@ exercise TLS certificate parsing, chain or hostname validation, source
 authentication, or real hardware time/RTC behavior. See the [CA trust-store
 contract](../security/ca-trust-store.md).
 
+## mgTLS foundation
+
+`make test-mgtls` runs wolfCrypt SHA-256, AES-GCM, and X25519 known-answer
+checks under ASan/UBSan, exercises the Mangrove random-byte adapter including
+partial-output clearing on entropy failure, and compiles a native TLS 1.3
+client API probe. It verifies that the static archive contains the TLS 1.3
+client method and omits the TLS 1.2 client method. Leak detection is disabled
+because LeakSanitizer does not initialize reliably in this host environment.
+
+`make test-guest-mgtls` builds a source-matched disposable Q35/OVMF guest with
+two vCPUs (KVM by default on Linux, TCG on other supported hosts), runs the
+test-only native crypto program against
+`mg_random_bytes()`, and checks the stopped MGFS image independently. This
+qualifies the selected operations and entropy wiring in that virtual machine;
+it is not a cryptographic certification or a TLS handshake test. Neither
+target establishes certificate-chain or hostname validation, transport
+callbacks, physical-hardware entropy quality, or production HTTPS readiness.
+See the [mgTLS foundation contract](../security/mgtls.md).
+
 `make test-x86-cache` (also included in `test-vmm`) executes the production
 PAT/MTRR policy with adapters for privileged instructions. ASan/UBSan cover
 actual PAT selectors, loader 4 KiB/huge-page use of the reserved slot, AP

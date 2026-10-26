@@ -149,6 +149,7 @@ FONT_CONVERTER := tools/convert_unscii_hex.py
 FONT_ASSET   := kernel/assets/font.psf
 FSTEST_DIR   := $(BUILD_DIR)/fstest
 CASTORETEST_DIR := $(BUILD_DIR)/castoretest
+MGTLS_TEST_DIR := $(BUILD_DIR)/mgtlstest
 NETTEST_DIR  := $(BUILD_DIR)/nettest
 PING_DIR     := $(BUILD_DIR)/ping
 RESOLVE_DIR  := $(BUILD_DIR)/resolve
@@ -213,6 +214,7 @@ VERSION      := $(VERSION_DIR)/version.elf
 WHERE        := $(WHERE_DIR)/where.elf
 FSTEST       := $(FSTEST_DIR)/fstest.elf
 CASTORETEST  := $(CASTORETEST_DIR)/castoretest.elf
+MGTLS_TEST   := $(MGTLS_TEST_DIR)/mgtlstest.elf
 NETTEST      := $(NETTEST_DIR)/nettest.elf
 PING         := $(PING_DIR)/ping.elf
 RESOLVE      := $(RESOLVE_DIR)/resolve.elf
@@ -231,7 +233,29 @@ TEXT_PAGER_OBJ := $(BUILD_DIR)/userspace/text_pager.o
 STORAGE_SNAPSHOT_OBJ := $(BUILD_DIR)/userspace/storage_snapshot.o
 USER_LIBC    := $(USER_LIBC_DIR)/libc.a
 USER_LIBM    := $(BUILD_DIR)/userspace/libm.a
+USER_MGTLS   := $(BUILD_DIR)/userspace/libmgtls.a
 USER_CRT     := $(BUILD_DIR)/userspace/crt0.o
+
+MGTLS_UPSTREAM := libmgtls/upstream/wolfssl-5.9.4
+MGTLS_SSL_SOURCES := internal.c wolfio.c keys.c ssl.c tls.c tls13.c
+MGTLS_CRYPT_SOURCES := aes.c asn.c chacha.c chacha20_poly1305.c coding.c \
+	curve25519.c ecc.c ed25519.c error.c hmac.c memory.c poly1305.c random.c \
+	rsa.c sha256.c sha512.c signature.c tfm.c wc_encrypt.c wolfmath.c \
+	fe_operations.c ge_operations.c hash.c kdf.c wc_port.c sp_int.c \
+	pwdbased.c
+MGTLS_UPSTREAM_SOURCES := $(addprefix $(MGTLS_UPSTREAM)/src/,$(MGTLS_SSL_SOURCES)) \
+	$(addprefix $(MGTLS_UPSTREAM)/wolfcrypt/src/,$(MGTLS_CRYPT_SOURCES))
+MGTLS_LOCAL_SOURCES := libmgtls/src/mgtls.c
+MGTLS_SOURCES := $(MGTLS_UPSTREAM_SOURCES) $(MGTLS_LOCAL_SOURCES)
+MGTLS_OBJECTS := $(patsubst $(MGTLS_UPSTREAM)/%.c,$(BUILD_DIR)/mgtls/upstream/%.o,$(filter $(MGTLS_UPSTREAM)/%.c,$(MGTLS_SOURCES))) \
+	$(BUILD_DIR)/mgtls/mgtls.o
+MGTLS_HEADERS := libmgtls/include/user_settings.h \
+	$(MGTLS_UPSTREAM)/MG_IMPORT.json \
+	$(wildcard $(MGTLS_UPSTREAM)/wolfssl/*.h) \
+	$(wildcard $(MGTLS_UPSTREAM)/wolfssl/wolfcrypt/*.h) \
+	$(wildcard $(MGTLS_UPSTREAM)/wolfssl/wolfcrypt/port/*.h)
+MGTLS_CFLAGS = $(USER_CFLAGS) -DWOLFSSL_USER_SETTINGS \
+	-Ilibmgtls/include -I$(MGTLS_UPSTREAM)
 
 DEPFLAGS     := -MMD -MP
 
@@ -533,6 +557,14 @@ HOST_LIBM_CFLAGS := -std=gnu17 -O1 -g -fno-builtin -fno-strict-aliasing \
                     -fsanitize=address,undefined -fno-sanitize-recover=all \
                     -Ilibc/include -Iinclude
 HOST_AR ?= ar
+HOST_MGTLS_TEST := $(BUILD_DIR)/tests/mgtls/mgtls-host-sanitized
+HOST_MGTLS_CFLAGS := -std=gnu17 -O1 -g -fno-builtin -fno-omit-frame-pointer \
+                     -ffunction-sections -fdata-sections \
+                     -fsanitize=address,undefined -fno-sanitize-recover=all \
+                     -DWOLFSSL_USER_SETTINGS -Ilibc/include -Iinclude \
+                     -Ilibmgtls/include -I$(MGTLS_UPSTREAM)
+HOST_MGTLS_CRYPTO_SOURCES := $(addprefix $(MGTLS_UPSTREAM)/wolfcrypt/src/, \
+	aes.c memory.c random.c sha256.c curve25519.c fe_operations.c)
 
 # Object Mappings
 BOOT_OBJS := $(patsubst boot/src/%.c,$(BUILD_DIR)/boot/%.o,$(BOOT_C_SRCS))
@@ -605,7 +637,55 @@ test-all:
 test-mts:
 	python3 tests/guest/mts_test.py
 
-binaries: $(EFI) $(PITH) $(USER_LIBM) $(SPROUT) $(SPROUT_CMD) $(SESSIOND) $(LOGIND) $(LOGD) $(NETWORKD) $(DEVICED) $(VOLUMED) $(CLIPD) $(MOUNT) $(UNMOUNT) $(EJECT) $(LSPCI) $(LSUSB) $(LSDISK) $(DISKUTIL) $(CREW) $(ABOUT) $(VIEW) $(INFO) $(MEM) $(TIME) $(TMON) $(LOGV) $(SHOOT) $(CLEAR) $(COPY) $(LIST) $(LOCATE) $(MOVE) $(MKDIR) $(PLANT) $(TYPE) $(WAIT) $(REED) $(DEL) $(SAY) $(SHUTDOWN) $(REBOOT) $(UPTIME) $(DATE) $(VERSION) $(WHERE) $(PING) $(RESOLVE) $(FETCH) $(NETINFO) $(NETCFG) $(POWER) $(IDENTITY) $(USER_CMD)
+.PHONY: test-mgtls
+test-mgtls: $(USER_MGTLS)
+	@mkdir -p $(dir $(HOST_MGTLS_TEST))
+	$(HOST_CC) $(HOST_MGTLS_CFLAGS) tests/security/mgtls_crypto_test.c \
+		libmgtls/src/mgtls.c $(HOST_MGTLS_CRYPTO_SOURCES) \
+		-Wl,--gc-sections -o $(HOST_MGTLS_TEST)
+	ASAN_OPTIONS=detect_leaks=0 $(HOST_MGTLS_TEST)
+	$(CC) $(MGTLS_CFLAGS) -c tests/security/mgtls_tls13_api_compile.c \
+		-o $(BUILD_DIR)/mgtls/tls13-api-probe.o
+	nm $(USER_MGTLS) | grep -q 'wolfTLSv1_3_client_method'
+	! nm $(USER_MGTLS) | grep -q 'wolfTLSv1_2_client_method'
+
+binaries: $(EFI) $(PITH) $(USER_LIBM) $(USER_MGTLS) $(SPROUT) $(SPROUT_CMD) $(SESSIOND) $(LOGIND) $(LOGD) $(NETWORKD) $(DEVICED) $(VOLUMED) $(CLIPD) $(MOUNT) $(UNMOUNT) $(EJECT) $(LSPCI) $(LSUSB) $(LSDISK) $(DISKUTIL) $(CREW) $(ABOUT) $(VIEW) $(INFO) $(MEM) $(TIME) $(TMON) $(LOGV) $(SHOOT) $(CLEAR) $(COPY) $(LIST) $(LOCATE) $(MOVE) $(MKDIR) $(PLANT) $(TYPE) $(WAIT) $(REED) $(DEL) $(SAY) $(SHUTDOWN) $(REBOOT) $(UPTIME) $(DATE) $(VERSION) $(WHERE) $(PING) $(RESOLVE) $(FETCH) $(NETINFO) $(NETCFG) $(POWER) $(IDENTITY) $(USER_CMD)
+
+.PHONY: mgtls
+mgtls: $(USER_MGTLS)
+
+$(BUILD_DIR)/mgtls/upstream/%.o: $(MGTLS_UPSTREAM)/%.c $(MGTLS_HEADERS)
+	@mkdir -p $(dir $@)
+	$(CC) $(MGTLS_CFLAGS) -c $< -o $@
+
+# Mangrove is not a Unix target. Suppress wolfSSL's optional POSIX descriptor
+# helper block in this generic port unit; the SINGLE_THREADED mutex primitives
+# and wolfCrypt lifecycle code above that block remain compiled.
+$(BUILD_DIR)/mgtls/upstream/wolfcrypt/src/wc_port.o: $(MGTLS_UPSTREAM)/wolfcrypt/src/wc_port.c $(MGTLS_HEADERS)
+	@mkdir -p $(dir $@)
+	$(CC) $(MGTLS_CFLAGS) -U__unix__ -U__unix -c $< -o $@
+
+$(BUILD_DIR)/mgtls/mgtls.o: libmgtls/src/mgtls.c libc/include/mg/tls.h \
+		libc/include/mg/random.h libmgtls/include/mgtls_platform.h $(MGTLS_HEADERS)
+	@mkdir -p $(dir $@)
+	$(CC) $(MGTLS_CFLAGS) -c $< -o $@
+
+$(USER_MGTLS): $(MGTLS_OBJECTS)
+	@mkdir -p $(dir $@)
+	rm -f $@
+	$(AR) rcs $@ $^
+
+.PHONY: mgtlstest
+mgtlstest: $(MGTLS_TEST)
+
+$(MGTLS_TEST_DIR)/main.o: userspace/mgtlstest/main.c $(USER_LIBC) $(USER_MGTLS)
+	@mkdir -p $(dir $@)
+	$(CC) $(MGTLS_CFLAGS) -c $< -o $@
+
+$(MGTLS_TEST): $(MGTLS_TEST_DIR)/main.o $(USER_CRT) $(USER_MGTLS) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+	@mkdir -p $(dir $@)
+	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
+		$(USER_CRT) $(MGTLS_TEST_DIR)/main.o $(USER_MGTLS) $(USER_LIBC)
 
 shoot: $(SHOOT)
 
@@ -759,6 +839,15 @@ test-time:
 .PHONY: test-ca-store
 test-ca-store: $(MKMGFS) $(BUILD_DIR)/mgfsck
 	python3 tests/userspace/ca_store_test.py "$(MKMGFS)" "$(BUILD_DIR)/mgfsck"
+
+.PHONY: test-guest-mgtls
+GUEST_MGTLS_BUILD ?= /tmp/mangrove-mgtls-build
+GUEST_MGTLS_OUTPUT ?=
+GUEST_MGTLS_ACCEL ?= $(NATIVE_GUEST_ACCEL)
+test-guest-mgtls:
+	$(QEMU_ACCEL_PREFLIGHT) "$(GUEST_MGTLS_ACCEL)"
+	$(MAKE) -B -j4 BUILD_DIR="$(GUEST_MGTLS_BUILD)" RTC_UTC_TRUST=1 binaries mgtlstest mkmgfs mgfsck
+	python3 tests/guest/guest_mgfs_test.py --build-dir "$(GUEST_MGTLS_BUILD)" $(if $(GUEST_MGTLS_OUTPUT),--output "$(GUEST_MGTLS_OUTPUT)") --accel "$(GUEST_MGTLS_ACCEL)" --cpus 2 --mgtls-smoke
 
 test-terminal:
 	python3 tests/terminal/framebuffer_rect_test.py "$(HOST_CC)"
@@ -1795,7 +1884,7 @@ USER_C_OBJS := $(SPROUT_DIR)/sprout.o \
                $(TEXT_PAGER_OBJ) \
                $(BUILD_DIR)/userspace/secret_input.o \
                $(SHOOT_OBJS)
-USER_DEPS := $(USER_C_OBJS:.o=.d)
+USER_DEPS := $(USER_C_OBJS:.o=.d) $(MGTLS_OBJECTS:.o=.d)
 
 $(SPROUT_DIR)/sprout.o: userspace/sprout/main.c \
                               libc/include/mg/service.h \
