@@ -927,6 +927,10 @@ static void test_tokenizer_expansion_and_invalid_input(shell_state_t *state)
     assert(parse_test_command(state, "say word//comment", &command) ==
            SHELL_PARSE_OK);
     assert(command.argument_count == 1U &&
+           !strcmp(command.arguments[0], "word//comment"));
+    assert(parse_test_command(state, "say word //comment", &command) ==
+           SHELL_PARSE_OK);
+    assert(command.argument_count == 1U &&
            !strcmp(command.arguments[0], "word"));
     assert(parse_test_command(state, "say \"left\\right\"",
                                &command) == SHELL_PARSE_OK);
@@ -1482,6 +1486,27 @@ static void test_external_argv_redirection_and_failure(shell_state_t *state)
     assert(spawn_count == 1U && last_argc == 2U);
     assert(!strcmp(last_argv[0], "/bin/reed"));
     assert(!strcmp(last_argv[1], "hello world!"));
+
+    /* HTTP scheme slashes must remain part of the exact argv handed to the
+       native fetch executable, rather than being consumed as a comment. */
+    reset_observations();
+    assert(shell_execute_line(state,
+        "fetch http://example.com", NULL, 0, false));
+    assert(spawn_count == 1U && last_argc == 2U);
+    assert(!strcmp(last_argv[0], "/bin/fetch"));
+    assert(!strcmp(last_argv[1], "http://example.com"));
+
+    reset_observations();
+    assert(shell_execute_line(state,
+        "fetch http://example.com/files/page.txt", NULL, 0, false));
+    assert(spawn_count == 1U && last_argc == 2U);
+    assert(!strcmp(last_argv[1], "http://example.com/files/page.txt"));
+
+    reset_observations();
+    assert(shell_execute_line(state,
+        "fetch http://example.com // trailing comment", NULL, 0, false));
+    assert(spawn_count == 1U && last_argc == 2U);
+    assert(!strcmp(last_argv[1], "http://example.com"));
 
     reset_observations();
     assert(shell_execute_line(state,

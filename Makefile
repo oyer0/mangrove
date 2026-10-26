@@ -550,7 +550,7 @@ DEPS := $(BOOT_OBJS:.o=.d) $(ALL_KERNEL_OBJS:.o=.d)
 .PHONY: all help make fresh run fresh-run usb clean test exfat-upcase \
         binaries font sprout sessiond logind logd networkd deviced volumed clipd mount unmount eject lspci lsusb lsdsk diskutil crew about view info mem time tmon logv hello shoot clear copy list locate move mkdir plant type wait reed del say shutdown reboot uptime date version where fstest nettest ping resolve fetch netinfo netcfg power identity user \
         image fresh-image usb-image run-usb mkmgfs mgfsck test-time test-terminal test-mgfs-version test-mgfs-reconcile test-reed test-math \
-        check-image-deps check-usb-deps check-qemu-deps qemu-warning dev-image fresh-dev-image flash-image test-launch test-password test-vmm test-heap test-history test-copy test-move test-del test-mfqs test-sync test-spinlock-context test-storage test-dev-tools test-unicode test-shoot test-shoot-help test-pager test-view test-info test-help test-list test-cli-options test-startup-presentation test-power-presentation test-rtc-build-policy
+        check-image-deps check-usb-deps check-qemu-deps qemu-warning dev-image fresh-dev-image flash-image test-launch test-password test-vmm test-heap test-history test-copy test-move test-del test-mfqs test-sync test-spinlock-context test-storage test-dev-tools test-unicode test-shoot test-shoot-help test-pager test-view test-info test-help test-list test-cli-options test-fetch test-startup-presentation test-power-presentation test-rtc-build-policy
 
 # Everyday targets
 all: image
@@ -896,6 +896,7 @@ test-shoot:
 		/tmp/mangrove-shoot-language-test.o \
 		/tmp/mangrove-shoot-script-test.o userspace/shoot/shell.c \
 		userspace/shoot/builtin.c userspace/common/path.c \
+		userspace/common/cli_options.c \
 		libc/src/utf8.c \
 		/tmp/mangrove-shoot-glob-test.o /tmp/mangrove-shoot-del-test.o \
 		-Wl,--gc-sections -o /tmp/mangrove-shoot-language-test
@@ -955,7 +956,7 @@ $(BUILD_DIR)/tests/e1000-tx-concurrency-test: \
 		-idirafter libc/include $< -Wl,--gc-sections -o $@
 
 .PHONY: test-net
-test-net: test-e1000
+test-net: test-fetch test-e1000
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
 		-fsanitize=address,undefined -ffunction-sections -fdata-sections \
 		-Iinclude -Iuserspace/common -idirafter libc/include tests/network/ping_destination_test.c \
@@ -985,6 +986,14 @@ test-net: test-e1000
 		tests/network/net_user_table_test.c -Wl,--gc-sections \
 		-o /tmp/mangrove-net-user-table-test
 	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-net-user-table-test
+
+.PHONY: test-fetch
+test-fetch:
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
+		-fsanitize=address,undefined -Iinclude -Iuserspace/fetch \
+		-idirafter libc/include tests/userspace/fetch_url_test.c \
+		userspace/fetch/fetch_url.c -o /tmp/mangrove-fetch-url-test
+	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-fetch-url-test
 
 .PHONY: test-libc
 test-libc: test-unicode test-libc-link test-math

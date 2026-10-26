@@ -6,8 +6,10 @@ parsing. Outside quotes, backslash escapes the next character, including a
 space, quote, dollar sign, or comment marker. A final unquoted backslash is a
 syntax error. Backslashes inside single or double quotes are ordinary text.
 `$name` expands a shell variable outside single quotes unless the dollar sign
-is escaped; an unset variable expands to an empty string. An unquoted `//`
-starts a comment; inside quotes or when escaped it is ordinary text.
+is escaped; an unset variable expands to an empty string. An unquoted `//` at
+a word boundary starts a comment; inside a word, quotes, or an escape it is
+ordinary text. This allows URL arguments such as `http://example.com` without
+quoting.
 
 Quoted and unquoted pieces can form one word. Empty quoted words are allowed.
 The parser rejects unterminated quotes, a dangling escape, excess arguments,

@@ -268,8 +268,7 @@ static bool parse_word(const shell_state_t *state, const char **cursor,
                 continue;
             }
             if (value == ' ' || value == '\t' || value == '>' ||
-                (stop_operators && operator_at(source)) ||
-                (value == '/' && source[1] == '/')) break;
+                (stop_operators && operator_at(source))) break;
             if (value == '$') {
                 if (!append_variable(state, &source, command, true,
                                      track_glob))

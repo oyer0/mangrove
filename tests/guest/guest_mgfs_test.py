@@ -263,6 +263,8 @@ def create_disk(folder, build, run, relative_launch=False,
                 '/bin/netinfo routes > /temp/routes.log\n'
                 '/bin/netinfo neighbors > /temp/neighbors.log\n'
                 '/bin/resolve example.com > /temp/dns.log\n'
+                'jump /temp\n'
+                '/bin/fetch http://example.com > /temp/fetch.log\n'
                 '/bin/say PING1 complete\n').encode()
         else:
             script = (prefix + network_wait +
@@ -1092,6 +1094,15 @@ def inspect_network_ping(folder, disk, build):
     for name in ('ping', 'interfaces', 'routes', 'neighbors', 'dns'):
         _, item = find(image, f'/temp/{name}.log')
         evidence[name] = payload(image, item).decode('ascii', errors='strict')
+    _, fetch_log = find(image, '/temp/fetch.log')
+    evidence['fetch'] = payload(image, fetch_log).decode('ascii', errors='strict')
+    if evidence['fetch'] != 'Saved index.html\n':
+        raise ValueError('native pathless HTTP fetch did not save index.html')
+    _, fetched_file = find(image, '/temp/index.html')
+    fetched_body = payload(image, fetched_file)
+    if not fetched_body:
+        raise ValueError('native HTTP fetch produced an empty file')
+    evidence['fetch_bytes'] = len(fetched_body)
     _, repeat = find(image, '/temp/repeat.log')
     evidence['repeat'] = payload(image, repeat).decode('ascii', errors='strict')
     evidence.update(validate_network_ping_outputs(

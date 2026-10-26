@@ -66,9 +66,12 @@ fetch_url_parse_result_t fetch_parse_url(const char *text, fetch_url_t *url)
     if (*cursor != '/') return FETCH_URL_PARSE_INVALID;
     used = 0;
     while (*cursor) {
-        if (!append(url->path, sizeof(url->path), &used, *cursor++)) {
+        u8 character = (u8)*cursor;
+        if (character <= 0x20U || character == 0x7fU ||
+            !append(url->path, sizeof(url->path), &used, *cursor)) {
             return FETCH_URL_PARSE_INVALID;
         }
+        cursor++;
     }
     return used ? result : FETCH_URL_PARSE_INVALID;
 }

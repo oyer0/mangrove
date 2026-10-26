@@ -155,6 +155,11 @@ interval; a lost reply therefore does not stretch the next request's cadence.
 Ctrl+C interrupts an echo or interval wait, prints transmitted/received counts,
 and returns control to Shoot.
 
+`fetch` accepts lowercase `http://` URLs only; HTTPS remains unsupported. A
+URL without a path requests `/` and saves the response as `index.html`. An
+explicit path saves under its final path component. Raw spaces and control
+characters in the URL are rejected.
+
 Current network drivers and protocol limits are described in
 [network architecture](../network/architecture.md). A command's presence does
 not imply support for every device or network configuration.

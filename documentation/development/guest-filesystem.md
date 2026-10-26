@@ -59,12 +59,14 @@ python3 tests/guest/guest_mgfs_test.py --build-dir build/network-guest \
 ```
 
 The workflow waits for DHCP, pings `10.0.2.2` four times, runs the production
-16-request ICMP object-lifecycle check, and records interface, route,
-neighbor, and DNS state. The runner stops QEMU after the
-visible completion marker and independently checks the stopped MGFS image. It
-requires all echo replies, successful repeated object creation/close, and the
-learned gateway neighbor. This qualifies that exact QEMU user-network setup,
-not external ICMP service or physical hardware.
+16-request ICMP object-lifecycle check, records interface, route, neighbor,
+and DNS state, then runs `fetch http://example.com` from Shoot and verifies
+that the downloaded `index.html` is present in the stopped image. The runner
+stops QEMU after the visible completion marker and independently checks the
+stopped MGFS image. It requires all gateway echo replies, a successful fetch,
+successful repeated object creation/close, and the learned gateway neighbor.
+This qualifies that exact QEMU user-network setup, not external ICMP service or
+physical hardware.
 
 ## Executed path and evidence
 
