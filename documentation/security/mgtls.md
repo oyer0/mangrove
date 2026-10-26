@@ -104,6 +104,10 @@ Include `<mg/tls.h>` (also available through `<mangrove.h>`):
 - `mgtls_session_connect()` owns a TCP stream after it is opened and returns
   only after authenticated handshake completion. A monotonic deadline covers
   DNS, TCP connect, and TLS handshake; the default is five seconds.
+- `mgtls_session_connect_stream()` authenticates TLS over an already connected
+  stream using the same DNS/IP identity checks. The stream transfers to the
+  call and is consumed on both success and failure; a successful session owns
+  it until `mgtls_session_close()`. Its deadline covers the TLS handshake.
 - `mgtls_session_send()` and `mgtls_session_receive()` report exact transferred
   plaintext counts. A successful call may be partial. A failed write poisons
   the session because wolfSSL requires retrying a pending write with the same
