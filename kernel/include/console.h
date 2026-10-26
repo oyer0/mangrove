@@ -19,6 +19,9 @@ void console_input_key_event_flags(u32 keycode, u32 modifiers,
  * raw queue packet, so stale repeats must be discarded at that boundary. */
 void console_discard_key_repeats(u32 keycode);
 bool console_raw_input_active(void);
+/* Ctrl+C goes to the session shell's line editor or interrupts its foreground
+ * child, depending on who currently owns raw input. */
+bool console_control_c(void);
 bool console_set_raw_input(bool enabled, struct kernel_thread *owner);
 /* Normal-screen line editors receive cooked type-ahead before raw events. */
 bool console_set_raw_input_with_cooked_bytes(bool enabled,

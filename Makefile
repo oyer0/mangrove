@@ -2766,6 +2766,10 @@ test-process-arguments:
 test-process-handles:
 	python3 tests/kernel/process_handles_test.py "$(HOST_CC)"
 
+.PHONY: test-process-interrupt
+test-process-interrupt:
+	python3 tests/kernel/process_interrupt_test.py "$(HOST_CC)"
+
 # Explicit test payload; never installed in a normal development image.
 argvtest: $(BUILD_DIR)/argvtest/argvtest.elf
 $(BUILD_DIR)/argvtest/argvtest.o: tests/userspace/process_arguments_guest.c $(USER_LIBC)
@@ -2787,3 +2791,4 @@ test-guest-arguments:
 
 test-sync: test-process-arguments
 test-sync: test-process-handles
+test-sync: test-process-interrupt

@@ -2532,11 +2532,20 @@ void syscall_dispatch(void *raw_frame)
             return;
         }
         case SYSCALL_SLEEP_MS: {
+            process_t *process = process_current();
             bool slept;
 
+            if (process_take_interrupt(process)) {
+                syscall_fail(frame, MG_ERR_INTERRUPTED);
+                return;
+            }
             scheduler_syscall_enter();
             slept = scheduler_sleep(frame->rdi);
             scheduler_syscall_leave();
+            if (process_take_interrupt(process)) {
+                syscall_fail(frame, MG_ERR_INTERRUPTED);
+                return;
+            }
             if (!slept) {
                 syscall_fail(frame, MG_ERR_BUSY);
                 return;

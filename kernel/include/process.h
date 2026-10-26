@@ -75,6 +75,9 @@ struct process {
     u32 service_id;
     bool shutdown_requested;
     bool shutdown_wake_sent;
+    /* One-shot cooperative terminal interrupt, delivered by an interruptible
+     * operation in this process. */
+    volatile bool interrupt_requested;
     bool output_redirected;
     process_handle_t redirected_output_saved_handle;
     /* One-shot PASS authorization for the immediately following storage
@@ -174,6 +177,8 @@ u64 process_handle_pid(process_t *process, process_handle_t handle);
 mg_session_id_t process_session_id(const process_t *process);
 bool process_is_session_shell(const process_t *process);
 bool process_shutdown_requested(const process_t *process);
+bool process_take_interrupt(process_t *process);
+bool process_interrupt_foreground_session(void);
 bool process_shutdown_pending(void);
 int process_shutdown_quiesce(process_t *requester);
 void process_shutdown_abort(void);

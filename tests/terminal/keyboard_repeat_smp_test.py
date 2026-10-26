@@ -34,10 +34,12 @@ static _Atomic u64 output_count;
 static _Atomic bool raw_mode;
 static terminal_key_event_t raw_events[32];
 static _Atomic u64 raw_event_count;
+static _Atomic u64 control_c_calls;
 u8 inb(u16 port) { (void)port; return 0; }
 void outb(u16 port, u8 value) { (void)port; (void)value; }
 u64 timer_uptime_ms(void) { return atomic_load_explicit(&fake_time, memory_order_relaxed); }
 bool console_raw_input_active(void) { return atomic_load(&raw_mode); }
+bool console_control_c(void) { atomic_fetch_add(&control_c_calls, 1); return true; }
 void console_input(char c) {
     pthread_mutex_lock(&output_lock);
     u64 index = atomic_load_explicit(&output_count, memory_order_relaxed);
@@ -99,6 +101,7 @@ int main(void) {
     usb_keyboard_handler(1, 11, 0x04, key_q, 1);
     usb_keyboard_handler(1, 11, 0, no_keys, 0);
     assert(atomic_load(&output_count) == 2);
+    assert(atomic_load(&control_c_calls) == 1U);
 
     atomic_store(&raw_mode, true);
     atomic_store(&raw_event_count, 0);
@@ -106,11 +109,10 @@ int main(void) {
     const u8 key_left[1] = {0x50};
     usb_keyboard_handler(2, 22, 0x04, key_left, 1);
     usb_keyboard_handler(2, 22, 0, no_keys, 0);
-    assert(atomic_load(&raw_event_count) == 2);
-    assert(raw_events[0].keycode == 0x06 && raw_events[0].modifiers == 0x01 &&
-           raw_events[0].codepoint == 'c');
-    assert(raw_events[1].keycode == 0x50 && raw_events[1].modifiers == 0x04 &&
-           raw_events[1].codepoint == 0);
+    assert(atomic_load(&control_c_calls) == 2U);
+    assert(atomic_load(&raw_event_count) == 1U);
+    assert(raw_events[0].keycode == 0x50 && raw_events[0].modifiers == 0x04 &&
+           raw_events[0].codepoint == 0);
     atomic_store(&raw_mode, false);
 
     /* Rapid deliberate taps of the same key remain two distinct ordinary

@@ -4,6 +4,7 @@
 #include <net/ipv4.h>
 #include <net/udp.h>
 #include <scheduler.h>
+#include <process.h>
 #include <timer.h>
 
 #define DNS_PORT 53U
@@ -120,6 +121,11 @@ bool dns_resolve_a(net_device_t *device, const char *hostname,
         start = timer_ticks();
         while (timer_ticks() - start < DNS_WAIT_TICKS &&
                __atomic_load_n(&state.event, __ATOMIC_ACQUIRE) == 0) {
+            if (process_take_interrupt(process_current())) {
+                status = DNS_STATUS_INTERRUPTED;
+                if (status_out) *status_out = status;
+                return false;
+            }
             if (!net_device_instance_current(device, state.device_generation))
                 return false;
             /* DNS can run beneath a syscall, whose entry path masks IF. */

@@ -35,6 +35,13 @@ selection mode. Modifier combinations that have no binding are ignored rather
 than inserted as printable text. Cooked byte readers, including login input,
 retain their existing input path.
 
+While Shoot waits for a foreground command, Ctrl+C requests cooperative
+interruption of that command and returns to the prompt after its cleanup. This
+is not POSIX signal or process-group support; blocking console, IPC, network,
+and sleep operations are interruptible, while CPU-only work must reach an
+interruptible operation. See the
+[process interruption contract](../architecture/processes-and-syscalls.md#foreground-interruption).
+
 `exit` leaves the current login session; `logout` is its no-status spelling.
 Ctrl+D at an empty prompt has the same end-of-input effect. Ctrl+D on a
 nonempty command still deletes the scalar under the cursor. When a session

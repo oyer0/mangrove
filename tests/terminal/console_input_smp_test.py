@@ -59,6 +59,18 @@ bool process_shutdown_requested(const process_t *process) {
     return process && __atomic_load_n(&process->shutdown_requested,
                                       __ATOMIC_ACQUIRE);
 }
+static unsigned foreground_interrupt_calls;
+bool process_is_session_shell(const process_t *process) {
+    return process && process->session_shell;
+}
+bool process_take_interrupt(process_t *process) {
+    return process && __atomic_exchange_n(&process->interrupt_requested,
+                                           false, __ATOMIC_ACQ_REL);
+}
+bool process_interrupt_foreground_session(void) {
+    foreground_interrupt_calls++;
+    return true;
+}
 u64 timer_uptime_ms(void) { return atomic_load(&repeat_test_time); }
 u8 inb(u16 port) { (void)port; return 0; }
 void outb(u16 port, u8 value) { (void)port; (void)value; }
@@ -329,6 +341,50 @@ int main(void) {
     current = &shutdown_thread;
     assert(console_read_bytes_checked(&recovered, 1) == MG_ERR_SHUTDOWN);
     assert(console_read_key_event(0, &event) == MG_ERR_SHUTDOWN);
+    process_t interrupted_process = {0};
+    kernel_thread_t interrupted_thread = {
+        .state = THREAD_STATE_RUNNING, .process = &interrupted_process
+    };
+    interrupted_process.interrupt_requested = true;
+    current = &interrupted_thread;
+    assert(console_read_bytes_checked(&recovered, 1) == MG_ERR_INTERRUPTED);
+    assert(!interrupted_process.interrupt_requested);
+    current = &main_thread;
+
+    /* The production HID path routes Ctrl+C to Shoot's raw line editor, but
+       interrupts the foreground application when another process owns raw
+       input. In cooked mode it invokes the same foreground interruption
+       mechanism and never inserts a printable c byte. */
+    process_t shell_process = {.session_shell = true};
+    main_thread.process = &shell_process;
+    assert(console_set_raw_input(true, &main_thread));
+    const u8 key_c[1] = {0x06};
+    usb_keyboard_handler(3, 33, 1, key_c, 1);
+    assert(foreground_interrupt_calls == 0U);
+    assert(console_read_key_event(0, &event) == MG_OK);
+    assert(event.keycode == 0x06 && event.modifiers == 1U &&
+           event.codepoint == 'c');
+    usb_keyboard_handler(3, 33, 0, no_keys, 0);
+
+    process_t foreground_process = {0};
+    kernel_thread_t foreground_thread = {
+        .state = THREAD_STATE_RUNNING, .process = &foreground_process
+    };
+    assert(console_set_raw_input(false, NULL));
+    assert(console_set_raw_input(true, &foreground_thread));
+    usb_keyboard_handler(3, 33, 1, key_c, 1);
+    assert(foreground_interrupt_calls == 1U);
+    current = &foreground_thread;
+    assert(console_read_key_event(0, &event) == MG_ERR_WOULD_BLOCK);
+    current = &main_thread;
+    usb_keyboard_handler(3, 33, 0, no_keys, 0);
+    assert(console_set_raw_input(false, NULL));
+
+    usb_keyboard_handler(3, 33, 1, key_c, 1);
+    assert(foreground_interrupt_calls == 2U);
+    usb_keyboard_handler(3, 33, 0, no_keys, 0);
+    console_input('Q');
+    assert(console_read_bytes_checked(&recovered, 1) == 1 && recovered == 'Q');
     current = &main_thread;
 
     pthread_cond_destroy(&main_thread.condition);
@@ -371,9 +427,12 @@ bool scheduler_wake_waiter(kernel_thread_t *);
 ''')
     (temp / 'process.h').write_text(r'''#pragma once
 #include <types.h>
-typedef struct process { bool shutdown_requested; } process_t;
+typedef struct process { bool shutdown_requested, session_shell; volatile bool interrupt_requested; } process_t;
 process_t *process_current(void);
 bool process_shutdown_requested(const process_t *process);
+bool process_is_session_shell(const process_t *process);
+bool process_take_interrupt(process_t *process);
+bool process_interrupt_foreground_session(void);
 ''')
     (temp / 'spinlock.h').write_text(r'''#pragma once
 #include <pthread.h>

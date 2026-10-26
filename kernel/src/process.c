@@ -957,6 +957,68 @@ bool process_is_session_shell(const process_t *process)
     return process && process->session_shell;
 }
 
+bool process_take_interrupt(process_t *process)
+{
+    return process && __atomic_exchange_n(&process->interrupt_requested,
+                                           false, __ATOMIC_ACQ_REL);
+}
+
+bool process_interrupt_foreground_session(void)
+{
+    process_t *shell = NULL;
+    process_t *target = NULL;
+    kernel_thread_t *thread = NULL;
+    usize process_count = 0;
+    u64 flags = spin_lock_irqsave(&process_registry_lock);
+
+    for (process_t *process = all_processes; process;
+         process = process->next_all) {
+        process_count++;
+        if (process->state != PROCESS_STATE_ACTIVE ||
+            !process->session_shell || !process->waiting_child ||
+            process->waiting_child->state != PROCESS_STATE_ACTIVE)
+            continue;
+        /* The console has one active login session. If that invariant is ever
+         * extended to multiple simultaneous sessions, keyboard ownership
+         * must identify the session instead of guessing here. */
+        if (shell) {
+            spin_unlock_irqrestore(&process_registry_lock, flags);
+            return false;
+        }
+        shell = process;
+    }
+
+    if (shell) {
+        process_t *current = shell;
+        for (usize depth = 0; depth < process_count; depth++) {
+            process_t *child = current->waiting_child;
+            if (!child) break;
+            if (child->parent != current ||
+                child->session_id != shell->session_id ||
+                child->state != PROCESS_STATE_ACTIVE) {
+                current = NULL;
+                break;
+            }
+            current = child;
+        }
+        if (current && current != shell && current->main_thread &&
+            object_reference(&current->object)) {
+            target = current;
+            thread = current->main_thread;
+            __atomic_store_n(&target->interrupt_requested, true,
+                             __ATOMIC_RELEASE);
+        }
+    }
+    spin_unlock_irqrestore(&process_registry_lock, flags);
+    if (!target) return false;
+
+    /* A blocked operation observes the one-shot request after this wake. A
+     * running process will observe it at its next interruptible operation. */
+    (void)scheduler_wake_waiter(thread);
+    object_release(&target->object);
+    return true;
+}
+
 bool process_shutdown_requested(const process_t *process)
 {
     return process && __atomic_load_n(&process->shutdown_requested,

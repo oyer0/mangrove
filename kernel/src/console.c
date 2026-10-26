@@ -234,6 +234,31 @@ bool console_raw_input_active(void)
     return active;
 }
 
+bool console_control_c(void)
+{
+    kernel_thread_t *waiter = NULL;
+    u64 saved_flags = spin_lock_irqsave(&input_lock);
+
+    if (raw_input_enabled && raw_input_owner &&
+        raw_input_owner->process &&
+        process_is_session_shell(raw_input_owner->process)) {
+        /* Shoot's raw line editor owns Ctrl+C at its prompt: deliver the key
+         * identity so it cancels the unfinished line without ending the
+         * login session. */
+        if (raw_input_count < CONSOLE_RAW_QUEUE_SIZE) {
+            console_queue_key_event(0x06U, 0x01U, 'c', 0);
+            waiter = raw_input_waiter;
+            raw_input_waiter = NULL;
+        }
+        spin_unlock_irqrestore(&input_lock, saved_flags);
+        if (waiter) (void)scheduler_wake_waiter(waiter);
+        return true;
+    }
+
+    spin_unlock_irqrestore(&input_lock, saved_flags);
+    return process_interrupt_foreground_session();
+}
+
 static bool console_set_raw_input_mode(bool enabled,
                                        struct kernel_thread *owner,
                                        bool preserve_text,
@@ -319,6 +344,8 @@ i64 console_read_key_event(u32 timeout_ms, terminal_key_event_t *event)
     for (;;) {
         if (process_shutdown_requested(process_current()))
             return MG_ERR_SHUTDOWN;
+        if (process_take_interrupt(process_current()))
+            return MG_ERR_INTERRUPTED;
         u64 saved_flags = spin_lock_irqsave(&input_lock);
 
         if (!raw_input_enabled || raw_input_owner != self) {
@@ -403,6 +430,8 @@ i64 console_read_bytes_checked(void *buffer, u64 length)
     for (;;) {
         if (process_shutdown_requested(process_current()))
             return MG_ERR_SHUTDOWN;
+        if (process_take_interrupt(process_current()))
+            return MG_ERR_INTERRUPTED;
         u64 saved_flags = spin_lock_irqsave(&input_lock);
 
         if (raw_input_enabled) {

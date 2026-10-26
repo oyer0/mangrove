@@ -42,6 +42,22 @@ session whose backend disappears stays visible in ENDING state if a member is
 busy; an authorized replacement backend can retry ending the same session ID.
 There is no forced cancellation of a syscall that remains blocked indefinitely.
 
+## Foreground interruption
+
+Ctrl+C is a cooperative foreground-process interruption, not a POSIX signal.
+At a Shoot prompt, the line editor receives Ctrl+C as a key event and discards
+the unfinished command line. While Shoot waits for a foreground child, the
+kernel follows that session's authenticated parent/waiting-child chain and
+sets a one-shot interrupt request on the deepest active child, then wakes its
+main thread. Console reads, IPC waits, networking waits, and millisecond sleeps
+observe the request and return `MG_ERR_INTERRUPTED`; interrupted network
+operations retire any submitted request before returning. A program doing
+nonblocking or CPU-only work observes the request only when it next enters an
+interruptible operation. The request never terminates Shoot or another
+session, and no live syscall frame is forcibly discarded. Applications must
+handle interruption at their own cleanup boundary; Reed uses its ordinary
+save/discard/cancel prompt before leaving a modified buffer.
+
 Publishing `PROCESS_STATE_TERMINATED` starts exit cleanup; it does not authorize
 collection. Cleanup can still own a running, ready, or blocked kernel frame.
 Wait, poll, session retirement, and shutdown require

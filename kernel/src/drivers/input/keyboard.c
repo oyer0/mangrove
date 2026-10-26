@@ -556,6 +556,11 @@ void usb_keyboard_handler(u8 slot_id, u64 device_generation,
                 sync_leds = true;
                 continue;
             }
+            if (key == 0x06U && is_control && !is_shift && !is_alt &&
+                !(modifier_mask & 0x88U)) {
+                (void)console_control_c();
+                continue;
+            }
             editor_action_t action = key_to_editor_action(
                 key, is_control, is_shift, is_alt);
 

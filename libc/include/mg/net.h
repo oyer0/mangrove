@@ -61,6 +61,9 @@ typedef struct {
 
 typedef struct {
     mg_ipv4_addr_t source;
+    /* Zero until an echo request is submitted. On timeout or interruption,
+     * a nonzero value still identifies the transmitted request. Sequence
+     * zero is reserved so callers can report sent packets accurately. */
     u16 sequence;
     u16 reply_length;
     u64 rtt_ms;

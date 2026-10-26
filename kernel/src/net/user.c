@@ -11,6 +11,7 @@
 #include <net/udp.h>
 #include <net/user.h>
 #include <scheduler.h>
+#include <process.h>
 #include <spinlock.h>
 #include <timer.h>
 #include <string.h>
@@ -46,6 +47,10 @@ static net_ipv4_t kernel_ip(mg_ipv4_addr_t address) { net_ipv4_t r; for (u32 i=0
 static mg_ipv4_addr_t user_ip(net_ipv4_t address) { mg_ipv4_addr_t r; for (u32 i=0;i<4;i++) r.octet[i]=address.octet[i]; return r; }
 static u64 timeout_ms(u32 value) { return value == ~(u32)0 ? NET_USER_DEFAULT_TIMEOUT_MS : value; }
 static void wait_tick(void) { (void)scheduler_sleep(1); }
+static bool interrupt_pending(void)
+{
+    return process_take_interrupt(process_current());
+}
 
 static void clear_runtime_configuration(void)
 {
@@ -355,6 +360,7 @@ i64 net_user_resolve_a(const char *name, mg_ipv4_addr_t *address, u32 timeout)
 {
     net_ipv4_t result; dns_status_t status; bool resolved;
     if(!name||!address||!net_primary_device())return MG_ERR_NETWORK_UNAVAILABLE;
+    if (interrupt_pending()) return MG_ERR_INTERRUPTED;
     /* The current resolver has one wire transaction slot.  Keep that limit
      * explicit at the object boundary instead of allowing two processes to
      * overwrite the transaction ID/state. */
@@ -365,6 +371,7 @@ i64 net_user_resolve_a(const char *name, mg_ipv4_addr_t *address, u32 timeout)
     }
     resolved=dns_resolve_a(net_primary_device(),name,&result,&status);
     __atomic_store_n(&resolver_active, false, __ATOMIC_RELEASE);
+    if (status == DNS_STATUS_INTERRUPTED) return MG_ERR_INTERRUPTED;
     if(!resolved)return status==DNS_STATUS_TIMEOUT?MG_ERR_TIMEOUT:MG_ERR_NOT_FOUND;
     *address=user_ip(result); return MG_OK;
 }
@@ -378,7 +385,9 @@ i64 net_user_icmp_echo(kernel_object_t *object,const mg_ipv4_addr_t *destination
     net_device_t *device;
     icmp_echo_request_result_t request;
 
-    if(!i||object->type!=OBJECT_TYPE_NETWORK_ICMP||!destination||!result||(!payload&&length)||length>NET_USER_ICMP_MAX||!net_primary_device())return MG_ERR_BAD_ARGUMENT;
+    if(!i||object->type!=OBJECT_TYPE_NETWORK_ICMP||!destination||!result||(!payload&&length)||length>NET_USER_ICMP_MAX)return MG_ERR_BAD_ARGUMENT;
+    result->sequence = 0;
+    if (!net_primary_device()) return MG_ERR_BAD_ARGUMENT;
     if (__atomic_exchange_n(&icmp_echo_active, true, __ATOMIC_ACQ_REL))
         return MG_ERR_BUSY;
     device = net_primary_device();
@@ -387,9 +396,14 @@ i64 net_user_icmp_echo(kernel_object_t *object,const mg_ipv4_addr_t *destination
         return MG_ERR_NETWORK_UNAVAILABLE;
     }
     generation = device->generation;
+    if (interrupt_pending()) {
+        __atomic_store_n(&icmp_echo_active, false, __ATOMIC_RELEASE);
+        return MG_ERR_INTERRUPTED;
+    }
     start = timer_uptime_ms();
     duration = timeout_ms(timeout);
     i->next_sequence++;
+    if (!i->next_sequence) i->next_sequence++;
 
     /* The first IPv4 transmission to a next hop may only submit an ARP
      * request. Keep that distinct from a failed device/route submission and
@@ -400,7 +414,12 @@ i64 net_user_icmp_echo(kernel_object_t *object,const mg_ipv4_addr_t *destination
         request = icmp_echo_request(device, kernel_ip(*destination),
                                     i->identifier, i->next_sequence,
                                     payload, length);
-        if (request == ICMP_ECHO_REQUEST_SUBMITTED) break;
+        if (request == ICMP_ECHO_REQUEST_SUBMITTED) {
+            /* Publish the sequence only once an ICMP packet reached the
+             * transmit path. It remains available on timeout/interruption. */
+            result->sequence = i->next_sequence;
+            break;
+        }
         if (request != ICMP_ECHO_REQUEST_NEIGHBOR_PENDING) {
             __atomic_store_n(&icmp_echo_active, false, __ATOMIC_RELEASE);
             return MG_ERR_NETWORK_UNAVAILABLE;
@@ -410,6 +429,10 @@ i64 net_user_icmp_echo(kernel_object_t *object,const mg_ipv4_addr_t *destination
             return MG_ERR_WOULD_BLOCK;
         }
         while (!ipv4_neighbor_resolved(kernel_ip(*destination))) {
+            if (interrupt_pending()) {
+                __atomic_store_n(&icmp_echo_active, false, __ATOMIC_RELEASE);
+                return MG_ERR_INTERRUPTED;
+            }
             if (!net_device_instance_current(device, generation)) {
                 __atomic_store_n(&icmp_echo_active, false, __ATOMIC_RELEASE);
                 return MG_ERR_NETWORK_UNAVAILABLE;
@@ -430,6 +453,11 @@ i64 net_user_icmp_echo(kernel_object_t *object,const mg_ipv4_addr_t *destination
         }
     }
     while(timer_uptime_ms()-start<duration) {
+        if (interrupt_pending()) {
+            icmp_echo_cancel(i->identifier, i->next_sequence);
+            __atomic_store_n(&icmp_echo_active, false, __ATOMIC_RELEASE);
+            return MG_ERR_INTERRUPTED;
+        }
         if (!net_device_instance_current(device, generation)) {
             icmp_echo_cancel(i->identifier, i->next_sequence);
             __atomic_store_n(&icmp_echo_active, false, __ATOMIC_RELEASE);
@@ -466,6 +494,7 @@ i64 net_user_datagram_receive(kernel_object_t *object,void *data,usize capacity,
     u64 start=timer_uptime_ms();
     if(!d||object->type!=OBJECT_TYPE_NETWORK_DATAGRAM||!data||!result)return MG_ERR_BAD_ARGUMENT;
     for (;;) {
+        if (interrupt_pending()) return MG_ERR_INTERRUPTED;
         u64 flags = spin_lock_irqsave(&datagram_lock);
         if (d->count) {
             u32 head = d->head;

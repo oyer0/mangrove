@@ -1975,6 +1975,13 @@ static bool quit_action(reed_editor_t *editor)
     return false;
 }
 
+static void handle_input_interrupt(reed_editor_t *editor)
+{
+    /* Treat Ctrl+C as a request to leave the foreground editor, but keep the
+     * established save/discard/cancel protection for modified documents. */
+    if (editor) (void)quit_action(editor);
+}
+
 static const char *open_error_text(mg_result_t result)
 {
     switch (result) {
@@ -2834,6 +2841,10 @@ int reed_run(const char *pathname)
         }
         result = terminal_read_key_event(MG_TERMINAL_WAIT_FOREVER, &event);
         if (result != MG_OK) {
+            if (result == MG_ERR_INTERRUPTED) {
+                handle_input_interrupt(editor);
+                continue;
+            }
             exit_status = 1;
             break;
         }

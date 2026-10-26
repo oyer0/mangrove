@@ -11,7 +11,8 @@ typedef enum {
     DNS_STATUS_SERVFAIL,
     DNS_STATUS_NO_ANSWER,
     DNS_STATUS_INVALID,
-    DNS_STATUS_UNCONFIGURED
+    DNS_STATUS_UNCONFIGURED,
+    DNS_STATUS_INTERRUPTED
 } dns_status_t;
 
 void dns_init(void);

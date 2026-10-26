@@ -633,6 +633,7 @@ const char *error_string(mg_result_t error)
         case MG_ERR_NO_SPACE: return "filesystem has no space";
         case MG_ERR_NAME_TOO_LONG: return "filename exceeds native interface capacity";
         case MG_ERR_SHUTDOWN: return "system shutdown requested";
+        case MG_ERR_INTERRUPTED: return "interrupted";
         default: return "unknown error";
     }
 }

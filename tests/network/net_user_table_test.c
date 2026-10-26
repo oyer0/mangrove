@@ -6,6 +6,7 @@
 #include <mg/net.h>
 #include <net/icmp.h>
 #include <net/net.h>
+#include <process.h>
 
 #include <spinlock.h>
 #include "../../kernel/src/net/user.c"
@@ -31,6 +32,17 @@ static u16 echo_pending_identifier;
 static u16 echo_pending_sequence;
 static unsigned echo_ipv4_submissions;
 static unsigned echo_cancel_calls;
+static bool interrupt_requested;
+static bool interrupt_on_sleep;
+
+process_t *process_current(void) { return NULL; }
+bool process_take_interrupt(process_t *process)
+{
+    (void)process;
+    bool pending = interrupt_requested;
+    interrupt_requested = false;
+    return pending;
+}
 
 u64 spin_lock_irqsave(spinlock_t *lock)
 {
@@ -73,6 +85,7 @@ bool scheduler_sleep(u64 ticks)
     echo_sleep_calls++;
     if (resolve_neighbor_on_sleep) echo_neighbor_available = true;
     if (invalidate_device_on_sleep) echo_device.generation++;
+    if (interrupt_on_sleep) interrupt_requested = true;
     return true;
 }
 
@@ -219,6 +232,7 @@ int main(void)
     assert(pthread_mutex_unlock(&echo_mutex) == 0);
     assert(pthread_join(echo_thread, NULL) == 0);
     assert(echo.status == MG_ERR_TIMEOUT);
+    assert(echo.result.sequence != 0U);
     assert(!__atomic_load_n(&icmp_echo_active, __ATOMIC_ACQUIRE));
     /* A submitted request that times out must retire its global wire slot.
        Otherwise every later ICMP request is rejected before IPv4 submission. */
@@ -226,6 +240,7 @@ int main(void)
     assert(net_user_icmp_echo(&competing.object.object,
                               &competing.destination, "y", 1, 0,
                               &competing.result) == MG_ERR_TIMEOUT);
+    assert(competing.result.sequence != 0U);
     assert(__atomic_load_n(&echo_requests, __ATOMIC_RELAXED) == 2U);
     assert(echo_cancel_calls == 2U && !echo_wire_pending);
     assert(echo_ipv4_submissions == 2U);
@@ -267,6 +282,7 @@ int main(void)
     assert(net_user_icmp_echo(&competing.object.object,
                               &competing.destination, "y", 1, 2,
                               &competing.result) == MG_ERR_TIMEOUT);
+    assert(competing.result.sequence == 0U);
     assert(echo_requests == 1U && echo_sleep_calls == 2U);
     assert(!__atomic_load_n(&icmp_echo_active, __ATOMIC_ACQUIRE));
 
@@ -281,6 +297,7 @@ int main(void)
     assert(net_user_icmp_echo(&competing.object.object,
                               &competing.destination, "y", 1, 100,
                               &competing.result) == MG_ERR_NETWORK_UNAVAILABLE);
+    assert(competing.result.sequence == 0U);
     assert(echo_requests == 1U && echo_sleep_calls == 1U);
     assert(!__atomic_load_n(&icmp_echo_active, __ATOMIC_ACQUIRE));
 
@@ -299,6 +316,7 @@ int main(void)
     assert(net_user_icmp_echo(&competing.object.object,
                               &competing.destination, "y", 1, 100,
                               &competing.result) == MG_ERR_NETWORK_UNAVAILABLE);
+    assert(competing.result.sequence != 0U);
     assert(echo_requests == 1U && echo_ipv4_submissions == 1U);
     assert(echo_cancel_calls == cancels_before_device_change + 1U);
     assert(!echo_wire_pending);
@@ -314,6 +332,7 @@ int main(void)
                               &competing.destination, "y", 1, 100,
                               &competing.result) ==
            MG_ERR_NETWORK_UNAVAILABLE);
+    assert(competing.result.sequence == 0U);
     assert(echo_requests == 1U);
     assert(!__atomic_load_n(&icmp_echo_active, __ATOMIC_ACQUIRE));
     assert(net_user_icmp_echo(&competing.object.object,
@@ -321,6 +340,37 @@ int main(void)
                               &competing.result) == MG_OK);
     assert(echo_requests == 2U);
     assert(!__atomic_load_n(&icmp_echo_active, __ATOMIC_ACQUIRE));
+
+    /* Ctrl+C observed while waiting for an echo cancels only that request and
+       releases the shared admission slot for the next ping. */
+    echo_requests = 0;
+    echo_cancel_calls = 0;
+    echo_neighbor_available = true;
+    echo_reply_immediate = false;
+    interrupt_on_sleep = true;
+    interrupt_requested = false;
+    echo_wire_pending = false;
+    echo_sleep_calls = 0;
+    atomic_store_explicit(&echo_clock, 100, memory_order_relaxed);
+    assert(net_user_icmp_echo(&competing.object.object,
+                              &competing.destination, "y", 1, 100,
+                              &competing.result) == MG_ERR_INTERRUPTED);
+    assert(echo_requests == 1U && echo_cancel_calls == 1U);
+    assert(competing.result.sequence != 0U);
+    assert(!echo_wire_pending &&
+           !__atomic_load_n(&icmp_echo_active, __ATOMIC_ACQUIRE));
+    interrupt_on_sleep = false;
+
+    /* An interrupt already pending at syscall entry prevents submission and
+       leaves sequence zero for accurate transmitted-packet accounting. */
+    echo_requests = 0;
+    echo_wire_pending = false;
+    interrupt_requested = true;
+    assert(net_user_icmp_echo(&competing.object.object,
+                              &competing.destination, "y", 1, 100,
+                              &competing.result) == MG_ERR_INTERRUPTED);
+    assert(echo_requests == 0U && competing.result.sequence == 0U);
+    interrupt_requested = false;
     puts("native network object admission and port ownership tests passed");
     return 0;
 }

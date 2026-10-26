@@ -630,6 +630,16 @@ int main(void)
     assert(reed_buffer_is_modified(&editor.buffer));
     destroy_editor(&editor);
 
+    /* A foreground interrupt follows Reed's existing quit protection. A
+       cancelled prompt leaves both the process and unsaved edit active. */
+    init_editor(&editor);
+    assert(reed_buffer_insert(&editor.buffer, 0, "keep", 4));
+    prompt_text = "c";
+    prompt_offset = 0;
+    handle_input_interrupt(&editor);
+    assert(editor.running && reed_buffer_is_modified(&editor.buffer));
+    destroy_editor(&editor);
+
     /* A stale /sq cannot quit. A later explicit Save As can bind a new
      * handle even when the conflicting file cannot be snapshotted. */
     init_editor(&editor);

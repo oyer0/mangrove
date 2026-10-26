@@ -45,3 +45,5 @@
 /* A blocking operation was interrupted to let this process exit cleanly
  * during an orderly system shutdown or reboot. */
 #define MG_ERR_SHUTDOWN          (-38)
+/* A foreground operation was cancelled by the terminal's Ctrl+C request. */
+#define MG_ERR_INTERRUPTED       (-39)
