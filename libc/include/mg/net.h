@@ -200,8 +200,19 @@ mg_result_t mg_datagram_close(mg_handle_t handle);
 
 mg_result_t mg_stream_connect(const mg_net_endpoint_t *remote, u32 timeout_ms,
                               mg_handle_t *handle);
+/* Stream send returns the number of bytes accepted by the kernel transport,
+ * not proof that the peer application received them. A positive result may
+ * be shorter than requested; callers must advance by that count and retry
+ * the remainder. Accepted unacknowledged bytes remain owned and retransmitted
+ * by TCP. A zero timeout makes connect/receive nonblocking; send may accept
+ * immediately available data and otherwise return a partial count or
+ * MG_ERR_WOULD_BLOCK. UINT32_MAX selects the bounded native default. */
 mg_result_t mg_stream_send(mg_handle_t handle, const void *data, usize length,
                            u32 timeout_ms);
 mg_result_t mg_stream_receive(mg_handle_t handle, void *data, usize capacity,
                               u32 timeout_ms);
+/* Close consumes the stream handle even when graceful FIN completion times
+ * out or is interrupted; such a failure aborts the transport. A concurrent
+ * close while send/receive is active returns MG_ERR_BUSY and keeps the handle
+ * valid so the caller can retry. */
 mg_result_t mg_stream_close(mg_handle_t handle);

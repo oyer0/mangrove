@@ -556,30 +556,51 @@ static void syscall_network(process_t *process, syscall_frame_t *frame)
                                                          request.buffer_length, request.timeout_ms,
                                                          (mg_datagram_result_t *)request.result); return;
         case MG_NET_OP_STREAM_SEND:
-            object = process_handle_lookup(process, request.handle, OBJECT_TYPE_NETWORK_STREAM,
-                                           OBJECT_RIGHT_WRITE);
+            object = process_handle_lookup_retain(
+                process, request.handle, OBJECT_TYPE_NETWORK_STREAM,
+                OBJECT_RIGHT_WRITE);
             if (!object || (!request.buffer && request.buffer_length) ||
                 !syscall_user_buffer_valid(request.buffer, request.buffer_length)) {
+                if (object) object_release(object);
                 syscall_fail(frame, !object ? MG_ERR_INVALID_HANDLE : MG_ERR_BAD_ARGUMENT); return;
             }
-            frame->rax = (u64)net_user_stream_send(object, request.buffer,
-                                                    request.buffer_length, request.timeout_ms); return;
+            result = net_user_stream_send(object, request.buffer,
+                                          request.buffer_length,
+                                          request.timeout_ms);
+            object_release(object);
+            frame->rax = (u64)result;
+            return;
         case MG_NET_OP_STREAM_RECEIVE:
-            object = process_handle_lookup(process, request.handle, OBJECT_TYPE_NETWORK_STREAM,
-                                           OBJECT_RIGHT_READ);
+            object = process_handle_lookup_retain(
+                process, request.handle, OBJECT_TYPE_NETWORK_STREAM,
+                OBJECT_RIGHT_READ);
             if (!object || !request.buffer || !request.buffer_length ||
                 !syscall_user_buffer_valid(request.buffer, request.buffer_length)) {
+                if (object) object_release(object);
                 syscall_fail(frame, !object ? MG_ERR_INVALID_HANDLE : MG_ERR_BAD_ARGUMENT); return;
             }
-            frame->rax = (u64)net_user_stream_receive(object, (void *)request.buffer,
-                                                       request.buffer_length, request.timeout_ms); return;
+            result = net_user_stream_receive(object, (void *)request.buffer,
+                                             request.buffer_length,
+                                             request.timeout_ms);
+            object_release(object);
+            frame->rax = (u64)result;
+            return;
         case MG_NET_OP_STREAM_CLOSE:
-            object = process_handle_lookup(process, request.handle, OBJECT_TYPE_NETWORK_STREAM,
-                                           OBJECT_RIGHT_WRITE);
+            object = process_handle_lookup_retain(
+                process, request.handle, OBJECT_TYPE_NETWORK_STREAM,
+                OBJECT_RIGHT_WRITE);
             if (!object) { syscall_fail(frame, MG_ERR_INVALID_HANDLE); return; }
             result = net_user_stream_close(object);
-            if (result == MG_OK) (void)process_handle_close(process, request.handle);
-            frame->rax = (u64)result; return;
+            /* A close request consumes the stream handle even when graceful
+             * FIN processing times out or is interrupted. The stream helper
+             * aborts the transport on those paths before returning. A busy
+             * result leaves the handle available for a later close attempt. */
+            if (result != MG_ERR_BUSY &&
+                !process_handle_close(process, request.handle) && result == MG_OK)
+                result = MG_ERR_INVALID_HANDLE;
+            object_release(object);
+            frame->rax = (u64)result;
+            return;
         case MG_NET_OP_ICMP_CLOSE:
             object = process_handle_lookup(process, request.handle, OBJECT_TYPE_NETWORK_ICMP,
                                            OBJECT_RIGHT_WRITE);

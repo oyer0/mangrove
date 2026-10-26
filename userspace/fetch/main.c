@@ -609,11 +609,22 @@ static int download_one(const fetch_url_t *initial, const char *explicit_output,
             free(request);
             goto done;
         }
-        mg_result_t sent = mg_stream_send(stream, request, request_length,
-                                          FETCH_CONNECT_TIMEOUT_MS);
+        usize request_offset = 0;
+        mg_result_t sent = MG_OK;
+        while (request_offset < request_length) {
+            usize remaining = request_length - request_offset;
+            sent = mg_stream_send(stream, request + request_offset, remaining,
+                                  FETCH_CONNECT_TIMEOUT_MS);
+            if (sent < 0) break;
+            if (sent == 0 || (u64)sent > remaining) {
+                sent = MG_ERR_IO;
+                break;
+            }
+            request_offset += (usize)sent;
+        }
         free(request);
         request = NULL;
-        if (sent < 0 || (usize)sent != request_length) {
+        if (request_offset != request_length) {
             failure = sent < 0 ? sent : MG_ERR_IO;
             printf("fetch: request send to %s failed: %s.\n", current.host,
                    error_string(failure));

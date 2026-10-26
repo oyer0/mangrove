@@ -3,6 +3,20 @@
 #include <mangrove.h>
 #include <string.h>
 
+static bool stream_send_all(mg_handle_t handle, const void *data, usize length,
+                            u32 timeout_ms)
+{
+    const u8 *bytes = data;
+    usize offset = 0;
+    while (offset < length) {
+        mg_result_t sent = mg_stream_send(handle, bytes + offset,
+                                          length - offset, timeout_ms);
+        if (sent <= 0 || (u64)sent > length - offset) return false;
+        offset += (usize)sent;
+    }
+    return true;
+}
+
 int main(void)
 {
     mg_ipv4_addr_t answer;
@@ -29,7 +43,7 @@ int main(void)
     if (result < 0) { printf("nettest: ICMP failed: %s\n", error_string(result)); return 1; }
     result = mg_stream_connect(&echo, 5000, &handle);
     if (result < 0) { printf("nettest: TCP connect failed: %s\n", error_string(result)); return 1; }
-    if (mg_stream_send(handle, hello, sizeof(hello) - 1, 5000) < 0 ||
+    if (!stream_send_all(handle, hello, sizeof(hello) - 1, 5000) ||
         mg_stream_receive(handle, received, sizeof(hello) - 1, 5000) != sizeof(hello) - 1) {
         (void)mg_stream_close(handle); printf("nettest: TCP exchange failed\n"); return 1;
     }

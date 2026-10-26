@@ -3,10 +3,12 @@
 #include <net/http.h>
 #include <net/net.h>
 #include <net/tcp.h>
+#include <stddef.h>
 #include <timer.h>
 
 #define HTTP_REQUEST_MAX 2048U
 #define HTTP_WAIT_TICKS 15000U
+#define HTTP_TCP_TIMEOUT_MS 5000U
 
 static bool http_ipv4_literal(const char *text, net_ipv4_t *address)
 {
@@ -104,31 +106,57 @@ bool http_get(net_device_t *device, const char *url,
         if (result_out) *result_out = result;
         return false;
     }
-    if (!tcp_connect(device, address, parsed.port, &connection, &tcp_status)) {
+    if (!tcp_connect(device, address, parsed.port, HTTP_TCP_TIMEOUT_MS,
+                     NULL, NULL, &connection, &tcp_status)) {
         result = tcp_status == TCP_STATUS_TIMEOUT ? HTTP_STATUS_TIMEOUT : HTTP_STATUS_TCP_FAILURE;
         if (result_out) *result_out = result;
         return false;
     }
     http_parser_init(&parser, response);
-    if (!tcp_send(connection, request, request_length, &tcp_status)) {
-        (void)tcp_close(connection, &tcp_status);
+    usize request_sent = 0;
+    while (request_sent < request_length) {
+        usize sent = tcp_send(connection, request + request_sent,
+                              request_length - request_sent,
+                              HTTP_TCP_TIMEOUT_MS, NULL, NULL, &tcp_status);
+        if (sent > request_length - request_sent) sent = 0;
+        request_sent += sent;
+        if (!sent || (tcp_status != TCP_STATUS_SUCCESS &&
+                      request_sent < request_length)) break;
+    }
+    if (request_sent != request_length || tcp_status != TCP_STATUS_SUCCESS) {
+        (void)tcp_close(connection, HTTP_TCP_TIMEOUT_MS, NULL, NULL,
+                        &tcp_status);
         result = HTTP_STATUS_TCP_FAILURE;
         if (result_out) *result_out = result;
         return false;
     }
     start = timer_ticks();
     while (!http_parser_complete(&parser) && timer_ticks() - start < HTTP_WAIT_TICKS) {
-        usize count = tcp_receive_bytes(connection, receive, sizeof(receive));
+        usize count = tcp_receive_bytes(connection, receive, sizeof(receive),
+                                        &tcp_status);
         if (count && !http_parser_feed(&parser, receive, count)) {
-            (void)tcp_close(connection, &tcp_status);
+            (void)tcp_close(connection, HTTP_TCP_TIMEOUT_MS, NULL, NULL,
+                            &tcp_status);
             result = parser.response->body_length >= HTTP_BODY_MAX ?
                      HTTP_STATUS_TOO_LARGE : HTTP_STATUS_MALFORMED;
             if (result_out) *result_out = result;
             return false;
         }
-        if (!count && tcp_connection_state(connection) == TCP_STATE_CLOSE_WAIT) {
+        tcp_state_t state = tcp_connection_state(connection);
+        if (!count && tcp_status != TCP_STATUS_SUCCESS &&
+            !(tcp_status == TCP_STATUS_CLOSED &&
+              state == TCP_STATE_CLOSE_WAIT)) {
+            (void)tcp_close(connection, HTTP_TCP_TIMEOUT_MS, NULL, NULL,
+                            &tcp_status);
+            result = tcp_status == TCP_STATUS_TIMEOUT ? HTTP_STATUS_TIMEOUT :
+                                                        HTTP_STATUS_TCP_FAILURE;
+            if (result_out) *result_out = result;
+            return false;
+        }
+        if (!count && state == TCP_STATE_CLOSE_WAIT) {
             if (!http_parser_finish(&parser)) {
-                (void)tcp_close(connection, &tcp_status);
+                (void)tcp_close(connection, HTTP_TCP_TIMEOUT_MS, NULL, NULL,
+                                &tcp_status);
                 result = HTTP_STATUS_MALFORMED;
                 if (result_out) *result_out = result;
                 return false;
@@ -137,12 +165,14 @@ bool http_get(net_device_t *device, const char *url,
         if (!http_parser_complete(&parser)) __asm__ volatile("hlt");
     }
     if (!http_parser_complete(&parser)) {
-        (void)tcp_close(connection, &tcp_status);
+        (void)tcp_close(connection, HTTP_TCP_TIMEOUT_MS, NULL, NULL,
+                        &tcp_status);
         result = HTTP_STATUS_TIMEOUT;
         if (result_out) *result_out = result;
         return false;
     }
-    (void)tcp_close(connection, &tcp_status);
+    (void)tcp_close(connection, HTTP_TCP_TIMEOUT_MS, NULL, NULL,
+                    &tcp_status);
     result = HTTP_STATUS_SUCCESS;
     if (result_out) *result_out = result;
     return true;

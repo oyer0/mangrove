@@ -31,7 +31,13 @@ typedef struct {
     u32 head, tail, count;
     net_datagram_packet_t packets[NET_USER_DATAGRAM_QUEUE];
 } net_datagram_object_t;
-typedef struct { kernel_object_t object; tcp_connection_t *connection; } net_stream_object_t;
+typedef struct {
+    kernel_object_t object;
+    spinlock_t lock;
+    tcp_connection_t *connection;
+    u32 active_operations;
+    bool closing;
+} net_stream_object_t;
 
 static bool icmp_object_active;
 static bool icmp_echo_active;
@@ -50,6 +56,28 @@ static void wait_tick(void) { (void)scheduler_sleep(1); }
 static bool interrupt_pending(void)
 {
     return process_take_interrupt(process_current());
+}
+
+static bool stream_interrupted(void *context)
+{
+    (void)context;
+    return interrupt_pending();
+}
+
+static i64 stream_status_error(tcp_status_t status)
+{
+    switch (status) {
+    case TCP_STATUS_TIMEOUT: return MG_ERR_TIMEOUT;
+    case TCP_STATUS_RESET: return MG_ERR_CONNECTION_RESET;
+    case TCP_STATUS_CLOSED: return MG_ERR_CONNECTION_CLOSED;
+    case TCP_STATUS_BUSY: return MG_ERR_BUSY;
+    case TCP_STATUS_INTERRUPTED: return MG_ERR_INTERRUPTED;
+    case TCP_STATUS_DEVICE_GONE: return MG_ERR_DEVICE_GONE;
+    case TCP_STATUS_WOULD_BLOCK: return MG_ERR_WOULD_BLOCK;
+    case TCP_STATUS_UNREACHABLE: return MG_ERR_NETWORK_UNAVAILABLE;
+    case TCP_STATUS_BUFFER_FULL: return MG_ERR_BUFFER_TOO_SMALL;
+    default: return MG_ERR_CONNECTION_CLOSED;
+    }
 }
 
 static void clear_runtime_configuration(void)
@@ -221,6 +249,28 @@ static void stream_destroy(kernel_object_t *object)
     kfree(s);
 }
 
+static bool stream_operation_begin(net_stream_object_t *stream,
+                                   tcp_connection_t **connection_out)
+{
+    u64 flags = spin_lock_irqsave(&stream->lock);
+    if (stream->closing || !stream->connection ||
+        stream->active_operations == ~(u32)0) {
+        spin_unlock_irqrestore(&stream->lock, flags);
+        return false;
+    }
+    stream->active_operations++;
+    *connection_out = stream->connection;
+    spin_unlock_irqrestore(&stream->lock, flags);
+    return true;
+}
+
+static void stream_operation_end(net_stream_object_t *stream)
+{
+    u64 flags = spin_lock_irqsave(&stream->lock);
+    if (stream->active_operations) stream->active_operations--;
+    spin_unlock_irqrestore(&stream->lock, flags);
+}
+
 kernel_object_t *net_user_icmp_create(void)
 {
     net_icmp_object_t *i;
@@ -296,17 +346,19 @@ kernel_object_t *net_user_datagram_create(u16 port, i64 *error_out)
 kernel_object_t *net_user_stream_connect(const mg_net_endpoint_t *remote, u32 timeout, i64 *error_out)
 {
     net_stream_object_t *s; tcp_connection_t *connection; tcp_status_t status;
-    (void)timeout;
     if(error_out)*error_out=MG_ERR_NETWORK_UNAVAILABLE;
     if(!remote || !remote->port || !net_primary_device() || !net_network_configured()) return 0;
-    if(!tcp_connect(net_primary_device(), kernel_ip(remote->address), remote->port, &connection, &status)) {
-        if (error_out) *error_out = status == TCP_STATUS_TIMEOUT ? MG_ERR_TIMEOUT :
-            status == TCP_STATUS_BUSY ? MG_ERR_BUSY :
-            status == TCP_STATUS_RESET ? MG_ERR_CONNECTION_RESET : MG_ERR_CONNECTION_CLOSED;
+    if(!tcp_connect(net_primary_device(), kernel_ip(remote->address), remote->port,
+                    timeout_ms(timeout), stream_interrupted, NULL,
+                    &connection, &status)) {
+        if (error_out) *error_out = stream_status_error(status);
         return 0;
     }
-    s=(net_stream_object_t *)kmalloc(sizeof(*s)); if(!s) { (void)tcp_close(connection,&status); if(error_out)*error_out=MG_ERR_NO_MEMORY; return 0; }
-    *s=(net_stream_object_t){0}; s->connection=connection; object_init(&s->object,OBJECT_TYPE_NETWORK_STREAM,stream_destroy);
+    s=(net_stream_object_t *)kmalloc(sizeof(*s)); if(!s) { tcp_abort(connection); if(error_out)*error_out=MG_ERR_NO_MEMORY; return 0; }
+    *s=(net_stream_object_t){0};
+    spinlock_init(&s->lock);
+    s->connection=connection;
+    object_init(&s->object,OBJECT_TYPE_NETWORK_STREAM,stream_destroy);
     if (error_out)
         *error_out = MG_OK;
     return &s->object;
@@ -523,31 +575,88 @@ i64 net_user_datagram_receive(kernel_object_t *object,void *data,usize capacity,
 
 i64 net_user_stream_send(kernel_object_t *object,const void *data,usize length,u32 timeout)
 {
-    net_stream_object_t *s=(net_stream_object_t *)object; tcp_status_t status; (void)timeout;
+    net_stream_object_t *s=(net_stream_object_t *)object; tcp_status_t status;
+    tcp_connection_t *connection;
     if(!s||object->type!=OBJECT_TYPE_NETWORK_STREAM||(!data&&length))return MG_ERR_BAD_ARGUMENT;
-    if (!tcp_send(s->connection, data, length, &status))
-        return status == TCP_STATUS_TIMEOUT ? MG_ERR_TIMEOUT :
-            MG_ERR_CONNECTION_CLOSED;
-    return (i64)length;
+    if (!stream_operation_begin(s, &connection)) return MG_ERR_CONNECTION_CLOSED;
+    usize accepted = tcp_send(connection, data, length, timeout_ms(timeout),
+                              stream_interrupted, NULL, &status);
+    stream_operation_end(s);
+    if (accepted) return (i64)accepted;
+    return status == TCP_STATUS_SUCCESS ? 0 : stream_status_error(status);
 }
 
 i64 net_user_stream_receive(kernel_object_t *object,void *data,usize capacity,u32 timeout)
 {
-    net_stream_object_t *s=(net_stream_object_t *)object; u64 start=timer_uptime_ms(); usize received;
+    net_stream_object_t *s=(net_stream_object_t *)object;
+    tcp_connection_t *connection;
+    u64 start = timer_uptime_ms();
+    u64 duration = timeout_ms(timeout);
+    i64 result;
     if(!s||object->type!=OBJECT_TYPE_NETWORK_STREAM||!data||!capacity)return MG_ERR_BAD_ARGUMENT;
-    while((received=tcp_receive_bytes(s->connection,data,capacity))==0) { tcp_state_t state=tcp_connection_state(s->connection); if(state==TCP_STATE_CLOSE_WAIT||state==TCP_STATE_CLOSED)return MG_ERR_CONNECTION_CLOSED; if(timeout==0||timer_uptime_ms()-start>=timeout_ms(timeout))return MG_ERR_TIMEOUT; wait_tick(); } return (i64)received;
+    if (!stream_operation_begin(s, &connection)) return MG_ERR_CONNECTION_CLOSED;
+    for (;;) {
+        if (interrupt_pending()) {
+            result = MG_ERR_INTERRUPTED;
+            break;
+        }
+        tcp_status_t status;
+        usize received = tcp_receive_bytes(connection, data, capacity,
+                                           &status);
+        if (received) {
+            result = (i64)received;
+            break;
+        }
+        if (status != TCP_STATUS_SUCCESS) {
+            result = stream_status_error(status);
+            break;
+        }
+        if (timeout == 0) {
+            result = MG_ERR_WOULD_BLOCK;
+            break;
+        }
+        if (timer_uptime_ms() - start >= duration) {
+            result = MG_ERR_TIMEOUT;
+            break;
+        }
+        wait_tick();
+    }
+    stream_operation_end(s);
+    return result;
 }
 
 i64 net_user_stream_close(kernel_object_t *object)
 {
-    net_stream_object_t *s=(net_stream_object_t *)object; tcp_status_t status;
+    net_stream_object_t *s=(net_stream_object_t *)object;
+    tcp_connection_t *connection;
+    tcp_status_t status;
     if(!s||object->type!=OBJECT_TYPE_NETWORK_STREAM)return MG_ERR_BAD_ARGUMENT;
-    if(!s->connection)return MG_OK;
+    u64 flags = spin_lock_irqsave(&s->lock);
+    if (!s->connection) {
+        spin_unlock_irqrestore(&s->lock, flags);
+        return MG_OK;
+    }
+    if (s->closing || s->active_operations) {
+        spin_unlock_irqrestore(&s->lock, flags);
+        return MG_ERR_BUSY;
+    }
+    s->closing = true;
+    connection = s->connection;
+    spin_unlock_irqrestore(&s->lock, flags);
     /* Closing a handle is definitive even if a peer never completes the
      * handshake.  Release the singleton before the handle is destroyed so a
      * failed close cannot turn the one-stream limit into a permanent leak. */
-    if (!tcp_close(s->connection,&status)) tcp_abort(s->connection);
-    s->connection=0;
+    if (!tcp_close(connection, NET_USER_DEFAULT_TIMEOUT_MS,
+                   stream_interrupted, NULL, &status)) {
+        tcp_abort(connection);
+        flags = spin_lock_irqsave(&s->lock);
+        s->connection = 0;
+        spin_unlock_irqrestore(&s->lock, flags);
+        return stream_status_error(status);
+    }
+    flags = spin_lock_irqsave(&s->lock);
+    s->connection = 0;
+    spin_unlock_irqrestore(&s->lock, flags);
     return MG_OK;
 }
 

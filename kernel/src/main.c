@@ -704,16 +704,17 @@ void kernel_debug_runtime_tests(void)
             u64 tcp_start;
             bool equal = true;
 
-            if (tcp_connect(network_device, *net_gateway_ipv4(), 12345,
-                            &tcp_connection, &tcp_status) &&
+            if (tcp_connect(network_device, *net_gateway_ipv4(), 12345, 5000U,
+                            NULL, NULL, &tcp_connection, &tcp_status) &&
                 tcp_send(tcp_connection, tcp_echo_payload,
-                         sizeof(tcp_echo_payload) - 1U, &tcp_status)) {
+                         sizeof(tcp_echo_payload) - 1U, 5000U, NULL, NULL,
+                         &tcp_status) == sizeof(tcp_echo_payload) - 1U) {
                 tcp_start = timer_ticks();
                 while (timer_ticks() - tcp_start < 5000U &&
                        received_length < sizeof(received)) {
                     received_length += tcp_receive_bytes(
                         tcp_connection, received + received_length,
-                        sizeof(received) - received_length);
+                        sizeof(received) - received_length, &tcp_status);
                     if (received_length < sizeof(received))
                         __asm__ volatile("hlt");
                 }
@@ -722,7 +723,8 @@ void kernel_debug_runtime_tests(void)
                         received[i] != tcp_echo_payload[i])
                         equal = false;
                 }
-                if (equal && tcp_close(tcp_connection, &tcp_status))
+                if (equal && tcp_close(tcp_connection, 5000U, NULL, NULL,
+                                       &tcp_status))
                     kprint("[OK] TCP echo validation passed\n");
                 else
                     kprint("[WARN] TCP echo validation failed\n");

@@ -550,7 +550,7 @@ DEPS := $(BOOT_OBJS:.o=.d) $(ALL_KERNEL_OBJS:.o=.d)
 .PHONY: all help make fresh run fresh-run usb clean test exfat-upcase \
         binaries font sprout sessiond logind logd networkd deviced volumed clipd mount unmount eject lspci lsusb lsdsk diskutil crew about view info mem time tmon logv hello shoot clear copy list locate move mkdir plant type wait reed del say shutdown reboot uptime date version where fstest nettest ping resolve fetch netinfo netcfg power identity user \
         image fresh-image usb-image run-usb mkmgfs mgfsck test-time test-terminal test-mgfs-version test-mgfs-reconcile test-reed test-math \
-        check-image-deps check-usb-deps check-qemu-deps qemu-warning dev-image fresh-dev-image flash-image test-launch test-password test-vmm test-heap test-history test-copy test-move test-del test-mfqs test-sync test-spinlock-context test-storage test-dev-tools test-unicode test-shoot test-shoot-help test-pager test-view test-info test-help test-list test-cli-options test-fetch test-startup-presentation test-power-presentation test-rtc-build-policy
+        check-image-deps check-usb-deps check-qemu-deps qemu-warning dev-image fresh-dev-image flash-image test-launch test-password test-vmm test-heap test-history test-copy test-move test-del test-mfqs test-sync test-spinlock-context test-storage test-dev-tools test-unicode test-shoot test-shoot-help test-pager test-view test-info test-help test-list test-cli-options test-fetch test-tcp test-startup-presentation test-power-presentation test-rtc-build-policy
 
 # Everyday targets
 all: image
@@ -955,8 +955,18 @@ $(BUILD_DIR)/tests/e1000-tx-concurrency-test: \
 		-Ikernel/include -Ikernel/include/pci -Iinclude \
 		-idirafter libc/include $< -Wl,--gc-sections -o $@
 
+.PHONY: test-tcp
+test-tcp:
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
+		-fsanitize=address,undefined -ffunction-sections -fdata-sections \
+		-Ikernel/include -Iinclude -idirafter libc/include \
+		tests/network/tcp_stream_test.c kernel/src/net/tcp.c \
+		kernel/src/net/tcp_wire.c -Wl,--gc-sections \
+		-o /tmp/mangrove-tcp-stream-test
+	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-tcp-stream-test
+
 .PHONY: test-net
-test-net: test-fetch test-e1000
+test-net: test-fetch test-e1000 test-tcp
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
 		-fsanitize=address,undefined -ffunction-sections -fdata-sections \
 		-Iinclude -Iuserspace/common -idirafter libc/include tests/network/ping_destination_test.c \

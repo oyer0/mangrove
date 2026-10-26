@@ -34,6 +34,24 @@ static unsigned echo_ipv4_submissions;
 static unsigned echo_cancel_calls;
 static bool interrupt_requested;
 static bool interrupt_on_sleep;
+static bool stream_network_ready = true;
+static bool stream_allocation_failure;
+static bool stream_connect_should_succeed = true;
+static bool stream_connect_interrupt;
+static bool stream_close_should_succeed = true;
+static bool attempt_stream_close_during_send;
+static i64 stream_close_during_send_result;
+static kernel_object_t *stream_test_object;
+static u64 stream_connect_timeout;
+static u64 stream_send_timeout;
+static u64 stream_close_timeout;
+static usize stream_send_result;
+static tcp_status_t stream_send_status = TCP_STATUS_SUCCESS;
+static usize stream_receive_result;
+static tcp_status_t stream_receive_status = TCP_STATUS_SUCCESS;
+static u32 stream_abort_count;
+static u8 stream_object_storage[128];
+static u8 stream_connection_storage[sizeof(void *)];
 
 process_t *process_current(void) { return NULL; }
 bool process_take_interrupt(process_t *process)
@@ -44,11 +62,105 @@ bool process_take_interrupt(process_t *process)
     return pending;
 }
 
+bool net_network_configured(void) { return stream_network_ready; }
+
+void *kmalloc(usize size)
+{
+    assert(size <= sizeof(stream_object_storage));
+    if (stream_allocation_failure) return NULL;
+    return stream_object_storage;
+}
+void kfree(void *pointer) { assert(pointer == stream_object_storage); }
+
+void object_init(kernel_object_t *object, kernel_object_type_t type,
+                 void (*destroy)(kernel_object_t *))
+{
+    *object = (kernel_object_t){.type = type, .ref_count = 1,
+                                .destroy = destroy};
+}
+
+bool tcp_connect(net_device_t *device, net_ipv4_t remote, u16 remote_port,
+                 u64 timeout_ms, tcp_interrupt_check_t interrupted,
+                 void *interrupt_context, tcp_connection_t **connection_out,
+                 tcp_status_t *status_out)
+{
+    (void)remote;
+    assert(device == &echo_device && remote_port != 0U);
+    stream_connect_timeout = timeout_ms;
+    if (stream_connect_interrupt && interrupted &&
+        interrupted(interrupt_context)) {
+        *status_out = TCP_STATUS_INTERRUPTED;
+        return false;
+    }
+    if (!stream_connect_should_succeed) {
+        *status_out = TCP_STATUS_TIMEOUT;
+        return false;
+    }
+    *connection_out = (tcp_connection_t *)stream_connection_storage;
+    *status_out = TCP_STATUS_SUCCESS;
+    return true;
+}
+
+usize tcp_send(tcp_connection_t *connection, const void *data, usize length,
+               u64 timeout_ms, tcp_interrupt_check_t interrupted,
+               void *interrupt_context, tcp_status_t *status_out)
+{
+    assert(connection == (tcp_connection_t *)stream_connection_storage);
+    assert(data != NULL || length == 0U);
+    stream_send_timeout = timeout_ms;
+    if (attempt_stream_close_during_send) {
+        attempt_stream_close_during_send = false;
+        stream_close_during_send_result =
+            net_user_stream_close(stream_test_object);
+    }
+    if (interrupted && interrupted(interrupt_context)) {
+        *status_out = TCP_STATUS_INTERRUPTED;
+        return 0;
+    }
+    *status_out = stream_send_status;
+    return stream_send_result < length ? stream_send_result : length;
+}
+
+usize tcp_receive_bytes(tcp_connection_t *connection, void *output,
+                        usize capacity, tcp_status_t *status_out)
+{
+    assert(connection == (tcp_connection_t *)stream_connection_storage);
+    assert(output != NULL && capacity != 0U);
+    *status_out = stream_receive_status;
+    return stream_receive_result < capacity ? stream_receive_result : capacity;
+}
+
+bool tcp_close(tcp_connection_t *connection, u64 timeout_ms,
+               tcp_interrupt_check_t interrupted, void *interrupt_context,
+               tcp_status_t *status_out)
+{
+    assert(connection == (tcp_connection_t *)stream_connection_storage);
+    stream_close_timeout = timeout_ms;
+    if (interrupted && interrupted(interrupt_context)) {
+        *status_out = TCP_STATUS_INTERRUPTED;
+        return false;
+    }
+    *status_out = stream_close_should_succeed ? TCP_STATUS_SUCCESS :
+                                               TCP_STATUS_TIMEOUT;
+    return stream_close_should_succeed;
+}
+
+void tcp_abort(tcp_connection_t *connection)
+{
+    assert(connection == (tcp_connection_t *)stream_connection_storage);
+    stream_abort_count++;
+}
+
 u64 spin_lock_irqsave(spinlock_t *lock)
 {
     (void)lock;
     assert(pthread_mutex_lock(&table_mutex) == 0);
     return 0;
+}
+
+void spinlock_init(spinlock_t *lock)
+{
+    lock->value = 0;
 }
 
 void spin_unlock_irqrestore(spinlock_t *lock, u64 flags)
@@ -371,6 +483,80 @@ int main(void)
                               &competing.result) == MG_ERR_INTERRUPTED);
     assert(echo_requests == 0U && competing.result.sequence == 0U);
     interrupt_requested = false;
+
+    /* TCP stream wrappers forward their deadlines, expose positive partial
+       writes, preserve transport errors, and use the process interrupt. */
+    mg_net_endpoint_t endpoint = {
+        .address = {{10, 0, 2, 2}}, .port = 80U
+    };
+    u8 stream_received[8];
+    stream_network_ready = true;
+    stream_connect_should_succeed = true;
+    stream_connect_interrupt = false;
+    stream_allocation_failure = false;
+    kernel_object_t *stream_object = net_user_stream_connect(&endpoint, 37U,
+                                                              &competing.status);
+    assert(stream_object && competing.status == MG_OK);
+    stream_test_object = stream_object;
+    assert(stream_connect_timeout == 37U);
+    stream_send_result = 2U;
+    stream_send_status = TCP_STATUS_TIMEOUT;
+    attempt_stream_close_during_send = true;
+    assert(net_user_stream_send(stream_object, "hello", 5U, 41U) == 2);
+    assert(stream_close_during_send_result == MG_ERR_BUSY);
+    assert(stream_send_timeout == 41U);
+    stream_send_result = 0U;
+    interrupt_requested = true;
+    assert(net_user_stream_send(stream_object, "x", 1U, 9U) == MG_ERR_INTERRUPTED);
+    interrupt_requested = false;
+
+    stream_receive_result = 3U;
+    stream_receive_status = TCP_STATUS_SUCCESS;
+    assert(net_user_stream_receive(stream_object, stream_received,
+                                   sizeof(stream_received),
+                                   19U) == 3);
+    stream_receive_result = 0U;
+    stream_receive_status = TCP_STATUS_RESET;
+    assert(net_user_stream_receive(stream_object, stream_received,
+                                   sizeof(stream_received),
+                                   19U) == MG_ERR_CONNECTION_RESET);
+    stream_receive_status = TCP_STATUS_SUCCESS;
+    assert(net_user_stream_receive(stream_object, stream_received,
+                                   sizeof(stream_received),
+                                   0U) == MG_ERR_WOULD_BLOCK);
+    interrupt_on_sleep = true;
+    interrupt_requested = false;
+    assert(net_user_stream_receive(stream_object, stream_received,
+                                   sizeof(stream_received),
+                                   10U) == MG_ERR_INTERRUPTED);
+    interrupt_on_sleep = false;
+    interrupt_requested = false;
+
+    stream_close_should_succeed = false;
+    assert(net_user_stream_close(stream_object) == MG_ERR_TIMEOUT);
+    assert(stream_close_timeout == NET_USER_DEFAULT_TIMEOUT_MS);
+    assert(stream_abort_count == 1U);
+
+    stream_close_should_succeed = true;
+    stream_object = net_user_stream_connect(&endpoint, ~(u32)0,
+                                           &competing.status);
+    assert(stream_object && competing.status == MG_OK);
+    assert(stream_connect_timeout == NET_USER_DEFAULT_TIMEOUT_MS);
+    assert(net_user_stream_close(stream_object) == MG_OK);
+    assert(stream_abort_count == 1U);
+
+    stream_allocation_failure = true;
+    assert(net_user_stream_connect(&endpoint, 10U, &competing.status) == NULL);
+    assert(competing.status == MG_ERR_NO_MEMORY && stream_abort_count == 2U);
+    stream_allocation_failure = false;
+
+    stream_connect_interrupt = true;
+    interrupt_requested = true;
+    assert(net_user_stream_connect(&endpoint, 10U, &competing.status) == NULL);
+    assert(competing.status == MG_ERR_INTERRUPTED);
+    assert(!interrupt_requested);
+    stream_connect_interrupt = false;
+
     puts("native network object admission and port ownership tests passed");
     return 0;
 }

@@ -66,11 +66,58 @@ the receive interrupt publishes entries while process-context route checks
 and neighbor queries read them. Cache locks are released before Ethernet
 transmission or any wait.
 
-The current TCP implementation remains a single connection. Its connection
-state is shared between process operations and the receive interrupt path; it
-does not have a complete synchronization protocol for concurrent TCP
-syscalls on multiple CPUs. Avoid treating the current TCP singleton as a
-multi-caller interface.
+The TCP core currently supports one active connection. Its state is protected
+by an IRQ-saving lock shared by process operations and the receive path;
+packet transmission happens from a connection snapshot after releasing that
+lock. A second connection attempt returns `MG_ERR_BUSY`. A failed or reset
+connection remains reserved until its stream owner closes or destroys it, so a
+stale object cannot alias a later connection.
+
+The native stream contract is:
+
+- `mg_stream_connect` uses the supplied monotonic timeout. A zero timeout is
+  an immediate `MG_ERR_WOULD_BLOCK`; `UINT32_MAX` uses the bounded 5-second
+  default. Timeout, Ctrl+C interruption, reset, and device-generation loss are
+  reported distinctly. Failed or interrupted handshakes release the reserved
+  connection before returning.
+- `mg_stream_send` returns a positive byte count for bytes accepted into the
+  kernel's bounded TCP retransmission state. It does not assert that the peer
+  application consumed the bytes. A return may be shorter than requested;
+  callers advance by that count and retry only the remainder. TCP retains the
+  last accepted segment until acknowledgment or connection failure, and waits
+  for its acknowledgment before accepting a following segment. If a deadline
+  or interrupt occurs after earlier segments were accepted, the positive
+  partial count takes precedence. If that interrupt follows accepted progress,
+  the connection records the interruption so a following operation returns
+  `MG_ERR_INTERRUPTED` rather than continuing the cancelled write. A later
+  operation observes a persistent transport failure if retries ultimately
+  expire. Zero-timeout sends accept immediately available data and otherwise
+  return a partial count or `MG_ERR_WOULD_BLOCK`.
+- `mg_stream_receive` returns any currently buffered bytes, including a
+  partial read. With no data it waits only until its monotonic deadline and
+  responds to foreground process interruption. A zero-timeout read returns
+  `MG_ERR_WOULD_BLOCK`; buffered bytes are delivered before a peer-close or
+  reset status is reported.
+- `mg_stream_close` is a bounded graceful FIN exchange. Timeout or
+  interruption aborts the connection, and the close request consumes its
+  native handle even when it returns that error. Process teardown aborts
+  immediately without waiting for the peer.
+
+Blocking stream syscalls retain their kernel object for the operation's
+lifetime. A close attempted concurrently with an active send or receive
+returns `MG_ERR_BUSY` and leaves the handle available for retry. This keeps
+stream storage alive across cross-CPU handle closure and prevents close from
+releasing the singleton while an operation still references it.
+
+The retransmission state holds one segment up to the 1,460-byte MSS; the
+receive queue holds 4,096 bytes and the advertised receive window tracks its
+remaining free space. The implementation handles cumulative and partial ACKs,
+retransmission, duplicate-data rejection, FIN/RST, deadlines, and window
+updates. It does not implement window scaling, selective acknowledgments,
+congestion control, or multiple concurrent connections; these remain TCP
+interoperability and throughput limitations. Device removal during active
+network traffic remains unsupported because the NIC lifecycle does not yet
+provide a hardware-operation quiescence guarantee.
 
 The PCI network lifecycle worker can unregister and tear down a NIC while
 process-side sends run on another online CPU. The registry and driver paths do
