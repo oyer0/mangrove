@@ -34,6 +34,27 @@ typedef struct PACKED {
     u32 reserved;
 } mg_unix_time_t;
 
+/* Realtime quality is independent of monotonic clock availability. An
+ * untrusted state means the deployment did not establish that its RTC uses
+ * UTC. Unavailable means a trusted source could not be sampled. Invalid means
+ * a stable source sample or subsequent realtime calculation failed checks. */
+typedef enum mg_realtime_state {
+    MG_REALTIME_UNTRUSTED = 0,
+    MG_REALTIME_UNAVAILABLE = 1,
+    MG_REALTIME_INVALID = 2,
+    MG_REALTIME_TRUSTED = 3,
+} mg_realtime_state_t;
+
+/* One coherent status/sample result. `time` and `resolution_ns` are zero
+ * unless state is MG_REALTIME_TRUSTED. A one-second resolution is reported as
+ * 1000000000 nanoseconds. */
+typedef struct PACKED {
+    u32 state;
+    mg_mangrove_time_t time;
+    u32 resolution_ns;
+    u32 reserved;
+} mg_realtime_info_t;
+
 typedef struct PACKED {
     i32 year;
     u8 month;
@@ -49,6 +70,9 @@ typedef struct PACKED {
  * is available. Current CMOS-backed realtime has whole-second resolution. */
 mg_result_t mg_clock_monotonic(mg_monotonic_time_t *out);
 mg_result_t mg_clock_realtime(mg_mangrove_time_t *out);
+/* Returns MG_OK when the status query itself succeeds, including when the
+ * result state is untrusted, unavailable, or invalid. */
+mg_result_t mg_clock_realtime_info(mg_realtime_info_t *out);
 /* CPU ticks accumulated for the calling process since process creation. */
 mg_result_t mg_clock_process_cpu(mg_process_cpu_time_t *out);
 /* Stable identifier for the current kernel boot, used to group records. */
@@ -62,3 +86,8 @@ mg_result_t mangrove_time_to_unix(const mg_mangrove_time_t *time,
                                   mg_unix_time_t *out);
 mg_result_t unix_time_to_mangrove(const mg_unix_time_t *time,
                                   mg_mangrove_time_t *out);
+/* Compare normalized Unix timestamps. Output is -1, 0, or 1. Nanosecond
+ * fields must be canonical; output is unchanged on failure. */
+mg_result_t mg_unix_time_compare(const mg_unix_time_t *left,
+                                 const mg_unix_time_t *right,
+                                 i32 *out_comparison);

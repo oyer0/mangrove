@@ -1869,14 +1869,15 @@ not establish guest, hardware, power-loss or post-reboot recovery guarantees.
 
 `make test-time` runs known-value epoch/calendar tests, the production C time
 library against host C-locale references under ASan/UBSan, CMOS sample-decoder
-fixtures, and the production clock state under concurrent readers. It covers
-RTC trust/unavailability, invalid calendars, whole-second progression and
-arithmetic boundaries. Host lock operations, uptime, entropy and CMOS register
-sampling are controlled dependencies; this does not qualify physical RTC
-hardware or clock accuracy. The `fstest time` phase in
-[`make test-guest-mgfs`](guest-filesystem.md) checks the native C API against
-the actual trusted QEMU clock, process CPU accounting, monotonic elapsed time
-and persisted guest transcript.
+fixtures, the production clock state under concurrent readers, and the status
+query ABI fixture. It covers untrusted, unavailable, invalid, and trusted
+states, invalid calendars, whole-second progression, Unix timestamp ordering,
+and arithmetic boundaries. Host lock operations, uptime, entropy and CMOS
+register sampling are controlled dependencies; this does not qualify physical
+RTC hardware or clock accuracy. The `fstest time` phase in
+[`make test-guest-mgfs`](guest-filesystem.md) checks the status syscall against
+the strict API and actual trusted QEMU clock, process CPU accounting,
+monotonic elapsed time and persisted guest transcript.
 
 `make test-guest-shutdown` is a bounded two-vCPU power-lifecycle check. It
 requests ACPI shutdown and reboot while an interactive Shoot process is

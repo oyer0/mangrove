@@ -2558,6 +2558,24 @@ void syscall_dispatch(void *raw_frame)
             frame->rax = MG_OK;
             return;
         }
+        case SYSCALL_CLOCK_REALTIME_INFO: {
+            mg_realtime_info_t value;
+            mg_realtime_info_t *user_value =
+                (mg_realtime_info_t *)(uintptr_t)frame->rdi;
+
+            if (!user_value || !syscall_user_buffer_valid(user_value,
+                                                            sizeof(value))) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            if (!timekeeping_realtime_info(&value)) {
+                syscall_fail(frame, MG_ERR_TIME_UNAVAILABLE);
+                return;
+            }
+            memcpy(user_value, &value, sizeof(value));
+            frame->rax = MG_OK;
+            return;
+        }
         case SYSCALL_CLOCK_BOOT_ID:
             frame->rax = timekeeping_boot_id();
             return;

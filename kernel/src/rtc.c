@@ -79,14 +79,14 @@ static bool rtc_samples_equal(const rtc_register_sample_t *left,
         left->century_valid == right->century_valid;
 }
 
-bool rtc_read_calendar(rtc_calendar_t *out)
+rtc_calendar_result_t rtc_read_calendar_status(rtc_calendar_t *out)
 {
     u8 saved_index;
     u8 century_register = 0;
     bool century_valid;
 
     if (!out)
-        return false;
+        return RTC_CALENDAR_INVALID;
 
     saved_index = inb(CMOS_INDEX_PORT);
     century_valid = acpi_fadt_has_rtc_century(&century_register);
@@ -108,12 +108,17 @@ bool rtc_read_calendar(rtc_calendar_t *out)
                    first.century_valid, valid);
 #endif
             outb(CMOS_INDEX_PORT, saved_index);
-            return valid;
+            return valid ? RTC_CALENDAR_VALID : RTC_CALENDAR_INVALID;
         }
     }
 #if defined(RTC_DEBUG)
     kprint("[RTC] no stable validated sample\n");
 #endif
     outb(CMOS_INDEX_PORT, saved_index);
-    return false;
+    return RTC_CALENDAR_UNAVAILABLE;
+}
+
+bool rtc_read_calendar(rtc_calendar_t *out)
+{
+    return rtc_read_calendar_status(out) == RTC_CALENDAR_VALID;
 }

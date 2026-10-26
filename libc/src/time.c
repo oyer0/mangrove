@@ -18,6 +18,13 @@ mg_result_t mg_clock_realtime(mg_mangrove_time_t *out)
     return (mg_result_t)mg_syscall(62, (unsigned long)out, 0, 0);
 }
 
+mg_result_t mg_clock_realtime_info(mg_realtime_info_t *out)
+{
+    if (!out)
+        return MG_ERR_BAD_ARGUMENT;
+    return (mg_result_t)mg_syscall(102, (unsigned long)out, 0, 0);
+}
+
 mg_result_t mg_clock_process_cpu(mg_process_cpu_time_t *out)
 {
     if (!out)

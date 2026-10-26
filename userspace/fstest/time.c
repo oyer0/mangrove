@@ -166,6 +166,7 @@ int fstest_time_phase(bool network_smoke)
 {
     mg_mangrove_time_t native;
     mg_mangrove_time_t later_native;
+    mg_realtime_info_t realtime_info;
     mg_unix_time_t unix_value;
     mg_monotonic_time_t mono_before, mono_after;
     struct timespec now;
@@ -176,7 +177,12 @@ int fstest_time_phase(bool network_smoke)
     u64 sleep_elapsed, wall_elapsed_ms, wall_elapsed;
     network_smoke_result_t network = {0};
 
-    if (mg_clock_realtime(&native) != MG_OK ||
+    if (mg_clock_realtime_info(&realtime_info) != MG_OK ||
+        realtime_info.state != MG_REALTIME_TRUSTED ||
+        realtime_info.resolution_ns != MG_TIME_NANOSECONDS_PER_SEC ||
+        mg_clock_realtime(&native) != MG_OK ||
+        native.seconds != realtime_info.time.seconds ||
+        native.nanoseconds != realtime_info.time.nanoseconds ||
         mangrove_time_to_unix(&native, &unix_value) != MG_OK)
         return 43;
     value = time(NULL);

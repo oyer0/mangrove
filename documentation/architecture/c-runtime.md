@@ -123,6 +123,13 @@ not manufacture subsecond precision or prove clock accuracy. The monotonic clock
 supports elapsed durations. A separate syscall returns scheduler-accounted CPU
 ticks for the calling process; this is the source for C `clock()`, not uptime.
 There is no clock setting, timezone, DST database or synchronization service.
+Security-sensitive users can query `mg_clock_realtime_info` to distinguish an
+untrusted deployment, unavailable RTC, invalid sample, and trusted sample.
+Its timestamp is usable only in the trusted state; monotonic time is never a
+wall-clock substitute. The generic `mg_unix_time_compare` helper compares
+normalized second/nanosecond timestamps for certificate validity boundaries,
+but certificate parsing, chain validation, and hostname matching remain
+userspace TLS responsibilities.
 
 `libc/src/time_convert.c` supplies proleptic Gregorian conversions, including
 negative dates, leap-year rules and range checks. It rejects leap-second input

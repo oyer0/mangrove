@@ -41,6 +41,20 @@ No device I/O occurs under that lock. Realtime rejects backwards monotonic
 observations and arithmetic overflow. The interface leaves room for future
 sources and correction without conflating wall-clock time with monotonic time.
 
+`mg_clock_realtime_info()` is the explicit quality interface for security
+consumers. One syscall returns a coherent `mg_realtime_info_t` with one of
+four states: `MG_REALTIME_UNTRUSTED` (the build/deployment did not assert an
+UTC RTC convention and CMOS is not read), `MG_REALTIME_UNAVAILABLE` (UTC was
+trusted but no stable RTC sample was available), `MG_REALTIME_INVALID` (a
+stable sample failed calendar validation, conversion failed, or a later
+monotonic/arithmetic check failed), or `MG_REALTIME_TRUSTED`. A timestamp and
+resolution are populated only in the trusted state; the other fields are zero.
+The status call itself returns `MG_OK` when the query succeeds, so callers can
+distinguish a clock-quality result from a syscall failure. Existing
+`mg_clock_realtime()` remains strict and returns
+`MG_ERR_TIME_UNAVAILABLE` for every non-trusted state. It does not expose an
+untrusted calendar.
+
 `mg_clock_realtime()` returns the native Mangrove timestamp. The explicit
 `mangrove_time_to_unix()` and `unix_time_to_mangrove()` helpers exist only for
 interoperability; they do not change the kernel's native clock representation.
@@ -51,6 +65,14 @@ leaves `time_t` encoding implementation-defined; Mangrove selects signed
 leap-second counting. The C library's calendar conversion supports the range
 representable by its signed 32-bit `struct tm.tm_year`; values outside that
 range fail with `EOVERFLOW`.
+
+`mg_unix_time_compare()` compares normalized signed Unix seconds and
+nanoseconds without conversion to a narrower scalar. A TLS implementation can
+convert the trusted kernel sample to Unix time and apply X.509's inclusive
+validity rule (`notBefore <= now <= notAfter`) using this comparison. The
+clock API does not parse certificates, validate certificate chains, or decide
+hostname policy; those remain userspace TLS responsibilities. A monotonic
+timestamp or elapsed uptime must never substitute for trusted wall time.
 
 The native `<time.h>` provides `time`, `difftime`, `gmtime`, `mktime`,
 `asctime`, `ctime`, `strftime`, and `timespec_get(TIME_UTC)`. Reentrant `_r`
@@ -74,10 +96,11 @@ the value cannot fit. This accounting is tick-resolution process runtime, not
 wall time, uptime, or sub-tick CPU measurement. The monotonic `mg_clock_*`
 clock remains the source for elapsed durations.
 
-The native clock syscalls are 61 (monotonic milliseconds), 62 (validated
-Mangrove-epoch realtime), 63 (boot identifier), and 94 (current-process CPU
-ticks). Their fixed-width request/result structures are in `include/mg/time.h`;
-libc converts only at the public C wall-time boundary.
+The native clock syscalls are 61 (monotonic milliseconds), 62 (strict
+validated Mangrove-epoch realtime), 63 (boot identifier), 94 (current-process
+CPU ticks), and 102 (realtime status plus timestamp). Their fixed-width
+request/result structures are in `include/mg/time.h`; libc converts only at
+the public C wall-time boundary.
 
 Filesystem timestamps retain their format-specific meanings. exFAT mutations
 convert the native UTC calendar directly and write a valid zero UTC offset;

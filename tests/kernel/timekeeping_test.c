@@ -43,6 +43,10 @@ int main(void)
     mg_mangrove_time_t native = {0, 0, 0};
     mg_unix_time_t unix_time = {17, 23, 31};
     mg_mangrove_time_t round_trip = {19, 29, 37};
+    mg_unix_time_t before = {1798761599LL, 999999999U, 0};
+    mg_unix_time_t now = {1798761600LL, 0, 0};
+    mg_unix_time_t after = {1798761600LL, 1, 0};
+    i32 comparison = 77;
     if (check_time(1970, 1, 1, 0, 0, 0, -946684800LL) ||
         check_time(1999, 12, 31, 23, 59, 59, -1LL) ||
         check_time(2000, 1, 1, 0, 0, 0, 0LL) ||
@@ -65,6 +69,26 @@ int main(void)
         round_trip.seconds != 0 || round_trip.nanoseconds != 0 ||
         round_trip.reserved != 0)
         return 2;
+
+    /* X.509 validity endpoints are inclusive. The shared timestamp helper
+     * compares seconds and fractional boundaries without a lossy cast. */
+    if (mg_unix_time_compare(&before, &now, &comparison) != MG_OK ||
+        comparison >= 0 ||
+        mg_unix_time_compare(&now, &now, &comparison) != MG_OK ||
+        comparison != 0 ||
+        mg_unix_time_compare(&after, &now, &comparison) != MG_OK ||
+        comparison <= 0)
+        return 5;
+    mg_unix_time_t invalid_fraction = {0, MG_TIME_NANOSECONDS_PER_SEC, 0};
+    comparison = 77;
+    if (mg_unix_time_compare(&invalid_fraction, &now, &comparison) !=
+            MG_ERR_BAD_ARGUMENT || comparison != 77)
+        return 6;
+    mg_unix_time_t minimum = {-0x7fffffffffffffffLL - 1, 0, 0};
+    mg_unix_time_t maximum = {0x7fffffffffffffffLL, 999999999U, 0};
+    if (mg_unix_time_compare(&minimum, &maximum, &comparison) != MG_OK ||
+        comparison >= 0)
+        return 7;
 
     native.seconds = 0x7fffffffffffffffLL - UNIX_EPOCH_OFFSET + 1;
     unix_time = (mg_unix_time_t){17, 23, 31};

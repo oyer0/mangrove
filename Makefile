@@ -725,6 +725,10 @@ test-time:
 		-Ilibc/include -Iinclude tests/kernel/timekeeping_test.c \
 		libc/src/time_convert.c -o /tmp/mangrove-timekeeping-test
 	/tmp/mangrove-timekeeping-test
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
+		-Ilibc/include -Iinclude tests/userspace/time_status_api_test.c \
+		-o /tmp/mangrove-time-status-api-test
+	/tmp/mangrove-time-status-api-test
 	python3 tests/userspace/time_libc_test.py "$(HOST_CC)"
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
 		-Ikernel/include -Iinclude tests/kernel/rtc_decode_test.c \

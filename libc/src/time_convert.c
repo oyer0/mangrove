@@ -161,3 +161,26 @@ mg_result_t unix_time_to_mangrove(const mg_unix_time_t *time,
     *out = converted;
     return MG_OK;
 }
+
+mg_result_t mg_unix_time_compare(const mg_unix_time_t *left,
+                                 const mg_unix_time_t *right,
+                                 i32 *out_comparison)
+{
+    i32 comparison;
+    if (!left || !right || !out_comparison ||
+        left->nanoseconds >= MG_TIME_NANOSECONDS_PER_SEC ||
+        right->nanoseconds >= MG_TIME_NANOSECONDS_PER_SEC)
+        return MG_ERR_BAD_ARGUMENT;
+    if (left->seconds < right->seconds)
+        comparison = -1;
+    else if (left->seconds > right->seconds)
+        comparison = 1;
+    else if (left->nanoseconds < right->nanoseconds)
+        comparison = -1;
+    else if (left->nanoseconds > right->nanoseconds)
+        comparison = 1;
+    else
+        comparison = 0;
+    *out_comparison = comparison;
+    return MG_OK;
+}

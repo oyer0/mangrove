@@ -110,6 +110,7 @@ enum syscall_number {
     SYSCALL_DIRECTORY_READ_BATCH_EX = 99,
     SYSCALL_RANDOM_STATUS = 100,
     SYSCALL_RANDOM_BYTES = 101,
+    SYSCALL_CLOCK_REALTIME_INFO = 102,
 };
 
 /* Initialize the native syscall MSRs for the CPU executing this function. */

@@ -24,6 +24,12 @@ typedef struct PACKED {
     bool century_valid;
 } rtc_register_sample_t;
 
+typedef enum rtc_calendar_result {
+    RTC_CALENDAR_UNAVAILABLE = 0,
+    RTC_CALENDAR_INVALID = 1,
+    RTC_CALENDAR_VALID = 2,
+} rtc_calendar_result_t;
+
 /* Pure decoding/validation helper, also used by host-side deterministic
  * tests.  The input is a complete stable CMOS sample. */
 bool rtc_decode_sample(const rtc_register_sample_t *sample,
@@ -33,3 +39,6 @@ bool rtc_decode_sample(const rtc_register_sample_t *sample,
  * CMOS does not identify a timezone; UTC trust belongs to timekeeping.
  * This operation is bounded and never enables RTC periodic interrupts. */
 bool rtc_read_calendar(rtc_calendar_t *out);
+/* Distinguishes a stable but malformed calendar from a missing/unstable RTC
+ * sample. The legacy bool interface remains available to existing callers. */
+rtc_calendar_result_t rtc_read_calendar_status(rtc_calendar_t *out);

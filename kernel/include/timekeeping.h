@@ -15,6 +15,9 @@ typedef struct {
 /* Coherent validated UTC time and source resolution. Output is unchanged on
  * failure. Resolution describes precision, not accuracy or synchronization. */
 bool timekeeping_realtime_sample(timekeeping_realtime_sample_t *out);
+/* Writes a coherent public status and timestamp; time fields are zero unless
+ * status is MG_REALTIME_TRUSTED. */
+bool timekeeping_realtime_info(mg_realtime_info_t *out);
 u64 timekeeping_monotonic_ms(void);
 bool timekeeping_realtime(mg_mangrove_time_t *out);
 bool timekeeping_realtime_available(void);
