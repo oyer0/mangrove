@@ -1,1 +1,2 @@
 *.inc linguist-language=C
+libmgtls/upstream/wolfssl-5.9.4/** linguist-vendored
