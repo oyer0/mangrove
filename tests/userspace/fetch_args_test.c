@@ -16,7 +16,7 @@ int main(void)
 {
     fetch_arguments_t arguments;
     const char *bad = NULL;
-    char *grouped[] = {(char *)"fetch", (char *)"-qOpage.html",
+    char *grouped[] = {(char *)"fetch", (char *)"-qopage.html",
                        (char *)"example.com"};
     assert(parse(3, grouped, &arguments, &bad) == FETCH_ARGUMENTS_OK);
     assert(arguments.quiet && !strcmp(arguments.output_path, "page.html"));
@@ -25,7 +25,7 @@ int main(void)
     fetch_arguments_destroy(&arguments);
 
     char *long_options[] = {(char *)"fetch", (char *)"--quiet",
-        (char *)"--output-document=page.html", (char *)"--",
+        (char *)"--output=page.html", (char *)"--",
         (char *)"-leading.example"};
     assert(parse(5, long_options, &arguments, &bad) == FETCH_ARGUMENTS_OK);
     assert(arguments.quiet && arguments.url_count == 1U);
@@ -39,7 +39,7 @@ int main(void)
            arguments.url_count == 0U);
     fetch_arguments_destroy(&arguments);
 
-    char *output_separated[] = {(char *)"fetch", (char *)"-O",
+    char *output_separated[] = {(char *)"fetch", (char *)"-o",
         (char *)"page.html", (char *)"example.com"};
     assert(parse(4, output_separated, &arguments, &bad) == FETCH_ARGUMENTS_OK);
     assert(!strcmp(arguments.output_path, "page.html") &&
@@ -47,7 +47,7 @@ int main(void)
     fetch_arguments_destroy(&arguments);
 
     char *output_long_separated[] = {(char *)"fetch",
-        (char *)"--output-document", (char *)"page.html",
+        (char *)"--output", (char *)"page.html",
         (char *)"example.com"};
     assert(parse(4, output_long_separated, &arguments, &bad) ==
            FETCH_ARGUMENTS_OK);
@@ -65,21 +65,21 @@ int main(void)
     assert(arguments.quiet && arguments.url_count == 2U);
     fetch_arguments_destroy(&arguments);
 
-    char *missing[] = {(char *)"fetch", (char *)"-O"};
+    char *missing[] = {(char *)"fetch", (char *)"-o"};
     assert(parse(2, missing, &arguments, &bad) ==
            FETCH_ARGUMENTS_MISSING_VALUE);
-    assert(bad && !strcmp(bad, "-O"));
+    assert(bad && !strcmp(bad, "-o"));
     char *unknown[] = {(char *)"fetch", (char *)"--overwrite"};
     assert(parse(2, unknown, &arguments, &bad) ==
            FETCH_ARGUMENTS_UNKNOWN_OPTION);
     char *unexpected[] = {(char *)"fetch", (char *)"--quiet=yes"};
     assert(parse(2, unexpected, &arguments, &bad) ==
            FETCH_ARGUMENTS_UNEXPECTED_VALUE);
-    char *duplicate[] = {(char *)"fetch", (char *)"-Oone",
-                         (char *)"-Otwo", (char *)"host"};
+    char *duplicate[] = {(char *)"fetch", (char *)"-oone",
+                         (char *)"-otwo", (char *)"host"};
     assert(parse(4, duplicate, &arguments, &bad) ==
            FETCH_ARGUMENTS_DUPLICATE_OPTION);
-    char *ambiguous[] = {(char *)"fetch", (char *)"-O", (char *)"out",
+    char *ambiguous[] = {(char *)"fetch", (char *)"-o", (char *)"out",
                          (char *)"-i", (char *)"urls.txt"};
     assert(parse(5, ambiguous, &arguments, &bad) == FETCH_ARGUMENTS_OK);
     fetch_arguments_destroy(&arguments);

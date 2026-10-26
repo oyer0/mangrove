@@ -3,7 +3,7 @@ category=network
 description=download HTTP resources without overwriting existing files
 usage=fetch [OPTIONS] URL...
 usage=fetch [OPTIONS] --input-file=FILE
-option=-O FILE, --output-document=FILE    write one URL to FILE; it must not exist
+option=-o FILE, --output=FILE    write one URL to FILE; it must not exist
 option=-q, --quiet    suppress progress and success output
 option=-i FILE, --input-file=FILE    read one URL per line from FILE
 option=-h, --help    show this quick help

@@ -5,7 +5,7 @@
 #include <string.h>
 
 static const cli_option_spec_t options[] = {
-    {'O', "output-document", true},
+    {'o', "output", true},
     {'q', "quiet", false},
     {'i', "input-file", true},
 };

@@ -9,7 +9,7 @@ HELP_DIR = ROOT / "share" / "help"
 SECTIONS = {"usage", "option", "keybinding", "command", "note"}
 OPTION_FLAGS = {
     "del": {"-h", "-r"},
-    "fetch": {"-h", "-O", "-q", "-i"},
+    "fetch": {"-h", "-o", "-q", "-i"},
     "history": {"-h", "-c", "-d", "-a", "-n", "-r", "-w"},
     "list": {"-h", "-l", "-t", "--tree"},
     "lsdsk": {"-h", "-v"},
@@ -96,7 +96,7 @@ def main():
 
     assert records["fetch"]["usage"] == [
         "fetch [OPTIONS] URL...", "fetch [OPTIONS] --input-file=FILE"]
-    require(records, "fetch", "option", "--output-document=FILE")
+    require(records, "fetch", "option", "--output=FILE")
     require(records, "fetch", "option", "--quiet")
     require(records, "fetch", "option", "--input-file=FILE")
     require(records, "fetch", "note", "HTTPS")

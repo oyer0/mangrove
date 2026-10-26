@@ -162,8 +162,8 @@ without a path requests `/` and saves the response as `index.html`. An
 explicit path saves under its final path component. Raw spaces and control
 characters in a URL are rejected.
 
-`-O FILE` / `--output-document=FILE` selects an output path for exactly one
-URL. Existing files are never overwritten. Without `-O`, a collision selects
+`-o FILE` / `--output=FILE` selects an output path for exactly one
+URL. Existing files are never overwritten. Without `-o`, a collision selects
 the first available name by appending `.1`, `.2`, and so on. Multiple URL
 operands are processed sequentially. `-i FILE` / `--input-file=FILE` reads
 one URL per line; blank lines and lines whose first nonspace character is `#`

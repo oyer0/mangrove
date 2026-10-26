@@ -270,10 +270,10 @@ def create_disk(folder, build, run, relative_launch=False,
                 '/bin/say http://example.com > /temp/fetch-urls.txt\n'
                 '/bin/say http://example.com >> /temp/fetch-urls.txt\n'
                 '/bin/fetch --quiet --input-file=/temp/fetch-urls.txt\n'
-                '/bin/fetch -q --output-document=/temp/fetch-explicit.html example.com\n'
+                '/bin/fetch -q --output=/temp/fetch-explicit.html example.com\n'
                 '/bin/say protected > /temp/fetch-protected.html\n'
                 '/bin/say PING1 complete\n'
-                '/bin/fetch -q -O /temp/fetch-protected.html example.com\n').encode()
+                '/bin/fetch -q -o /temp/fetch-protected.html example.com\n').encode()
         else:
             script = (prefix + network_wait +
                       f'{launch_command} > /temp/{phase}.log\n' +
@@ -1133,7 +1133,7 @@ def inspect_network_ping(folder, disk, build):
             raise ValueError('automatic fetch collision output differs')
     _, explicit_file = find(image, '/temp/fetch-explicit.html')
     if payload(image, explicit_file) != fetched_body:
-        raise ValueError('fetch --output-document saved different bytes')
+        raise ValueError('fetch --output saved different bytes')
     _, protected_file = find(image, '/temp/fetch-protected.html')
     if payload(image, protected_file) != b'protected\n':
         raise ValueError('fetch overwrote an existing explicit output')

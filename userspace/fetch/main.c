@@ -933,13 +933,13 @@ int main(int argc, char **argv)
     }
     if (!urls.count) {
         command_usage_error(argv[0],
-            "fetch [-q] [-O FILE] URL... | fetch [-q] [-O FILE] -i URLS_FILE",
+            "fetch [-q] [-o FILE] URL... | fetch [-q] [-o FILE] -i URLS_FILE",
             NULL);
         status = 1;
         goto done;
     }
     if (arguments.output_path && urls.count != 1U) {
-        printf("fetch: -O/--output-document requires exactly one URL.\n");
+        printf("fetch: -o/--output requires exactly one URL.\n");
         status = 1;
         goto done;
     }
