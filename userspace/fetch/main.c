@@ -43,7 +43,7 @@ typedef struct fetch_sink_context {
     u64 bytes;
     u64 last_progress_ms;
     fetch_metrics_t *metrics;
-    fetch_sink_buffer_t buffer;
+    fetch_sink_buffer_t *buffer;
 } fetch_sink_context_t;
 
 static bool monotonic_ms(u64 *out)
@@ -400,7 +400,7 @@ static mg_result_t file_sink(void *opaque, const u8 *bytes, usize length)
         context->failure = MG_ERR_NO_SPACE;
         return context->failure;
     }
-    result = fetch_sink_buffer_append(&context->buffer, bytes, length);
+    result = fetch_sink_buffer_append(context->buffer, bytes, length);
     if (result != MG_OK) {
         context->failure = result;
         return result;
@@ -548,7 +548,6 @@ static int download_one(const fetch_url_t *initial, const char *explicit_output,
     sink.file = file;
     sink.display = &display;
     sink.metrics = &metrics;
-    fetch_sink_buffer_init(&sink.buffer, file_sink_write, &sink);
 
     for (;;) {
         mg_ipv4_addr_t address;
@@ -804,6 +803,18 @@ static int download_one(const fetch_url_t *initial, const char *explicit_output,
                         fetch_display_body_start(&display,
                             headers->has_content_length,
                             headers->content_length, body_start);
+                        if (!fetch_http_decoder_complete(decoder) &&
+                            !sink.buffer) {
+                            sink.buffer = (fetch_sink_buffer_t *)malloc(
+                                sizeof(*sink.buffer));
+                            if (!sink.buffer) {
+                                printf("fetch: not enough memory to buffer response output.\n");
+                                failure = MG_ERR_NO_MEMORY;
+                                break;
+                            }
+                            fetch_sink_buffer_init(sink.buffer,
+                                                   file_sink_write, &sink);
+                        }
                         if (fetch_http_decoder_complete(decoder)) {
                             response_complete = true;
                             break;
@@ -881,12 +892,16 @@ static int download_one(const fetch_url_t *initial, const char *explicit_output,
             continue;
         }
         if (response_complete) {
-            failure = fetch_sink_buffer_flush(&sink.buffer);
-            if (failure != MG_OK) {
-                sink.failure = failure;
-                printf("fetch: writing temporary output failed: %s.\n",
-                       error_string(failure));
-                goto done;
+            if (sink.buffer) {
+                failure = fetch_sink_buffer_flush(sink.buffer);
+                if (failure != MG_OK) {
+                    sink.failure = failure;
+                    printf("fetch: writing temporary output failed: %s.\n",
+                           error_string(failure));
+                    goto done;
+                }
+                free(sink.buffer);
+                sink.buffer = NULL;
             }
             u64 transfer_end = 0;
             if (metrics.transfer_clock_available && monotonic_ms(&transfer_end))
@@ -1027,6 +1042,7 @@ done:
     free(temporary);
     free(automatic_name);
     free(published);
+    free(sink.buffer);
     return failure < 0 ? 1 : 0;
 }
 

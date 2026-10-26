@@ -8,10 +8,9 @@ void fetch_sink_buffer_init(fetch_sink_buffer_t *buffer,
                             void *write_context)
 {
     if (!buffer) return;
-    *buffer = (fetch_sink_buffer_t){
-        .write = write,
-        .write_context = write_context,
-    };
+    buffer->write = write;
+    buffer->write_context = write_context;
+    buffer->length = 0U;
 }
 
 mg_result_t fetch_sink_buffer_flush(fetch_sink_buffer_t *buffer)

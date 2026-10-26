@@ -4,7 +4,7 @@
 #include <mg/error.h>
 #include <mg/types.h>
 
-#define FETCH_SINK_BUFFER_CAPACITY 4096U
+#define FETCH_SINK_BUFFER_CAPACITY 32768U
 
 typedef mg_result_t (*fetch_sink_buffer_write_fn)(void *context,
                                                   const u8 *bytes,

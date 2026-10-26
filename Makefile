@@ -1181,6 +1181,10 @@ test-fetch: test-fetch-http test-fetch-args test-fetch-transport test-fetch-sink
 
 .PHONY: test-fetch-sink
 test-fetch-sink:
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -Wframe-larger-than=8192 \
+		-Iinclude -Iuserspace/fetch -idirafter libc/include \
+		-c userspace/fetch/fetch_sink_buffer.c \
+		-o /tmp/mangrove-fetch-sink-stack.o
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
 		-fsanitize=address,undefined -Iinclude -Iuserspace/fetch \
 		-idirafter libc/include tests/userspace/fetch_sink_buffer_test.c \
