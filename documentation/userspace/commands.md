@@ -192,17 +192,27 @@ not limit the total response size.
 Redirects (301, 302, 303, 307, and 308) are followed with relative-location
 resolution, an eight-hop bound, and loop detection.
 
-Normal output reports the requested URL, DNS resolution and the one IPv4
-address currently returned by Mangrove's resolver, TCP connection, HTTP status,
-redirects, response length and content type when present, destination name, and
-a concise completion summary. For HTTPS, TCP success is reported before TLS
-starts; the separate TLS 1.3 authenticated message appears only after mgTLS has
-accepted the certificate chain, trusted certificate time, and hostname. Failed
-TLS setup never reports authentication success. When the interactive terminal
-capability is present, transfers taking longer than the update cadence show an
-in-place byte/percentage and speed line. Known lengths show a percentage;
-unknown lengths remain indeterminate. Redirected output receives no carriage
-return progress bytes.
+Normal output reports the requested URL, DNS lookup and its returned IPv4
+address, TCP connection, TLS 1.3 authentication when used, HTTP status and
+redirects, response length and content type when present, destination, and a
+completion summary. Lifecycle lines use `DNS:`, `TCP:`, `TLS 1.3:`, and `HTTP:`
+labels. The successful TCP line includes the peer address; there is no separate
+pre-connection line. TLS authentication appears only after mgTLS has accepted
+the certificate chain, trusted certificate time, and hostname. Failed TLS
+setup never reports authentication success. When the interactive terminal
+capability is present and a progress line fits the current terminal width,
+transfers taking longer than the update cadence show an in-place byte/percentage
+and speed line. Known lengths show a percentage; unknown lengths remain
+indeterminate. Narrow terminals skip progress lines that would wrap. Redirected
+output receives no carriage-return progress bytes.
+
+The completion line's `response transfer phase` duration is unchanged from the
+response-transfer measurement in `--timings`: it starts after final response
+headers are parsed and ends after the response completes, the connection is
+closed, and pending response bytes are flushed to the temporary output. It
+includes network receive waits and temporary-file writes, but excludes closing
+the temporary file and publishing its final name. The download-complete line
+appears after publication; the duration does not measure time-to-publication.
 
 `--timings` adds monotonic DNS, TCP, TLS context, TLS handshake/authentication,
 first-byte, response-transfer, receive-wait, file-write, temporary-file,

@@ -476,7 +476,8 @@ static mg_result_t publish_temp(const char *temporary, const char *destination,
 }
 
 static int download_one(const fetch_url_t *initial, const char *explicit_output,
-                        bool quiet, bool timings, bool interactive_progress)
+                        bool quiet, bool timings, bool interactive_progress,
+                        u32 terminal_columns)
 {
     fetch_url_t current = {0};
     fetch_url_t visited[FETCH_MAX_REDIRECTS + 1U] = {{0}};
@@ -503,8 +504,8 @@ static int download_one(const fetch_url_t *initial, const char *explicit_output,
     u64 fs_end = 0;
 
     metrics.clock_available = monotonic_ms(&total_start);
-    fetch_display_init(&display, quiet, interactive_progress, stdout_write,
-                       NULL);
+    fetch_display_init(&display, quiet, interactive_progress,
+                       terminal_columns, stdout_write, NULL);
     if (!fetch_url_clone(initial, &current)) {
         printf("fetch: not enough memory to prepare URL.\n");
         return 1;
@@ -624,7 +625,6 @@ static int download_one(const fetch_url_t *initial, const char *explicit_output,
             failure = MG_ERR_NO_MEMORY;
             goto done;
         }
-        fetch_display_connecting(&display, current.host, current.port);
         if (monotonic_ms(&phase_start)) {
             failure = fetch_transport_connect_tcp(
                 &current, &address, FETCH_CONNECT_TIMEOUT_MS,
@@ -664,7 +664,7 @@ static int download_one(const fetch_url_t *initial, const char *explicit_output,
                 free(request);
                 goto done;
             }
-            fetch_display_tls_verified(&display, current.host);
+            fetch_display_tls_verified(&display);
         }
         usize request_offset = 0;
         mg_result_t sent = MG_OK;
@@ -743,9 +743,10 @@ static int download_one(const fetch_url_t *initial, const char *explicit_output,
                             failure = MG_ERR_PROTOCOL;
                             break;
                         }
-                        fetch_display_http_status(&display, headers->status);
                         if (redirect_status(headers->status)) {
                             if (!headers->location) {
+                                fetch_display_http_status(&display,
+                                                          headers->status);
                                 printf("fetch: HTTP status %u from %s has no Location header.\n",
                                        headers->status, current.host);
                                 failure = MG_ERR_PROTOCOL;
@@ -761,6 +762,8 @@ static int download_one(const fetch_url_t *initial, const char *explicit_output,
                                 fetch_url_resolve_redirect(&current,
                                     headers->location, &next_url);
                             if (redirected != FETCH_URL_PARSE_OK) {
+                                fetch_display_http_status(&display,
+                                                          headers->status);
                                 printf("fetch: invalid redirect from %s%s.\n",
                                        current.host, current.path);
                                 failure = redirected == FETCH_URL_PARSE_NO_MEMORY
@@ -769,6 +772,8 @@ static int download_one(const fetch_url_t *initial, const char *explicit_output,
                             }
                             if (!fetch_url_redirect_allowed(&current,
                                                             &next_url)) {
+                                fetch_display_http_status(&display,
+                                                          headers->status);
                                 printf("fetch: refusing HTTPS-to-HTTP redirect downgrade to %s%s.\n",
                                        next_url.host, next_url.path);
                                 fetch_url_destroy(&next_url);
@@ -780,6 +785,7 @@ static int download_one(const fetch_url_t *initial, const char *explicit_output,
                             follow = true;
                             break;
                         }
+                        fetch_display_http_status(&display, headers->status);
                         if (headers->status < 200U || headers->status >= 300U) {
                             printf("fetch: HTTP request to %s failed with status %u.\n",
                                    current.host, headers->status);
@@ -1054,6 +1060,7 @@ int main(int argc, char **argv)
     fetch_arguments_result_t parsed;
     int status = 0;
     bool interactive_progress = false;
+    u32 interactive_columns = 0U;
 
     if (command_help_requested(argc, argv)) return command_print_help(argv[0]);
     parsed = fetch_arguments_parse(argc, argv, &arguments, &bad_argument);
@@ -1120,13 +1127,16 @@ int main(int argc, char **argv)
         if (terminal_get_capabilities(&capabilities) == MG_OK &&
             (capabilities.capabilities &
              MG_TERMINAL_CAP_INTERACTIVE_OUTPUT) != 0U &&
-            terminal_get_size(&size) == MG_OK && size.columns >= 40U)
+            terminal_get_size(&size) == MG_OK && size.columns >= 40U) {
             interactive_progress = true;
+            interactive_columns = size.columns;
+        }
     }
     for (usize index = 0; index < urls.count; index++)
         if (download_one(&urls.items[index], arguments.output_path,
                          arguments.quiet, arguments.timings,
-                         interactive_progress)) status = 1;
+                         interactive_progress, interactive_columns))
+            status = 1;
 
 done:
     fetch_arguments_destroy(&arguments);

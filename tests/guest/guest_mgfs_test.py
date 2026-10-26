@@ -1217,9 +1217,9 @@ def inspect_fetch_https(folder, disk, build):
                          'sha256': hashlib.sha256(content).hexdigest()}
         _, log_record = find(image, f'/temp/fetch-{scheme}.log')
         log = payload(image, log_record).decode('utf-8', errors='strict')
-        if ('Requested URL:' not in log or 'Resolved ' not in log or
-                'TCP connected to ' not in log or 'HTTP response: 200' not in log or
-                'Content-Type:' not in log or 'Destination: ' not in log or
+        if ('Requested URL:' not in log or 'DNS: ' not in log or
+                'TCP: connected to ' not in log or 'HTTP: status 200' not in log or
+                'HTTP: Content-Type:' not in log or 'Destination: ' not in log or
                 'Download complete:' not in log):
             raise ValueError(f'native fetch {scheme.upper()} lifecycle output is incomplete')
         if '\r' in log:
@@ -1233,14 +1233,14 @@ def inspect_fetch_https(folder, disk, build):
                 not any('file writes ' in line and 'publish ' in line for line in timing_lines[scheme])):
             raise ValueError(f'native fetch {scheme.upper()} timing stages are incomplete')
         if scheme == 'https':
-            stages = ('TCP connected to ',
-                      'TLS 1.3 authenticated: certificate chain and hostname verified',
-                      'HTTP response: 200')
+            stages = ('TCP: connected to ',
+                      'TLS 1.3: authenticated (certificate chain and hostname verified)',
+                      'HTTP: status 200')
             positions = [log.find(stage) for stage in stages]
             if min(positions) < 0 or positions != sorted(positions):
                 raise ValueError('native HTTPS lifecycle output misorders TCP, authenticated TLS, and HTTP')
         else:
-            if 'TLS 1.3 authenticated:' in log:
+            if 'TLS 1.3: authenticated' in log:
                 raise ValueError('plain HTTP output incorrectly claims TLS authentication')
     for name, host, marker_text in (
             ('gnu', 'www.gnu.org', 'GNU'),
@@ -1252,8 +1252,8 @@ def inspect_fetch_https(folder, disk, build):
             raise ValueError(f'native fetch {host} HTTPS response did not match its content reference')
         _, log_record = find(image, f'/temp/fetch-{name}.log')
         log = payload(image, log_record).decode('utf-8', errors='strict')
-        if ('TLS 1.3 authenticated: certificate chain and hostname verified' not in log or
-                'HTTP response: 200' not in log or
+        if ('TLS 1.3: authenticated (certificate chain and hostname verified)' not in log or
+                'HTTP: status 200' not in log or
                 f'Download complete: /temp/fetch-{name}.html' not in log or
                 '\r' in log):
             raise ValueError(f'native fetch {host} HTTPS lifecycle output is incomplete')
@@ -1272,11 +1272,11 @@ def inspect_fetch_https(folder, disk, build):
         raise ValueError('native multi-megabyte coreutils HTTPS download differs from release reference')
     coreutils_log = (folder / 'fetch-https' / 'screen.txt').read_text()
     if ('Requested URL: https://ftp.gnu.org/gnu/coreutils/coreutils-9.12.tar.xz' not in coreutils_log or
-            'Resolved ftp.gnu.org to ' not in coreutils_log or
-            'TCP connected to ftp.gnu.org:443' not in coreutils_log or
-            'TLS 1.3 authenticated: certificate chain and hostname verified' not in coreutils_log or
-            'HTTP response: 200' not in coreutils_log or
-            'Content-Length: 6.3 MiB' not in coreutils_log or
+            'DNS: ftp.gnu.org -> ' not in coreutils_log or
+            'TCP: connected to ftp.gnu.org:443' not in coreutils_log or
+            'TLS 1.3: authenticated (certificate chain and hostname verified)' not in coreutils_log or
+            'HTTP: status 200' not in coreutils_log or
+            'HTTP: Content-Length: 6.3 MiB' not in coreutils_log or
             'Download complete: /temp/fetch-coreutils-9.12.tar.xz' not in coreutils_log or
             'Timing details (milliseconds):' not in coreutils_log):
         raise ValueError('native multi-megabyte HTTPS lifecycle output is incomplete')
@@ -1300,8 +1300,9 @@ def inspect_fetch_https(folder, disk, build):
     redirect_log = payload(image, redirect_log_record).decode(
         'utf-8', errors='strict')
     if ('Requested URL: http://5x40.org/' not in redirect_log or
-            'Redirect ' not in redirect_log or 'https://' not in redirect_log or
-            'TLS 1.3 authenticated:' not in redirect_log or
+            'HTTP: redirect ' not in redirect_log or
+            'https://' not in redirect_log or
+            'TLS 1.3: authenticated' not in redirect_log or
             'Download complete: index.html' not in redirect_log or
             'Timing details (milliseconds):' not in redirect_log):
         raise ValueError('native fetch redirect lifecycle output is incomplete')

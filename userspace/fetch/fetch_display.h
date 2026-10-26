@@ -15,6 +15,7 @@ typedef struct fetch_display {
     void *write_context;
     bool quiet;
     bool interactive_progress;
+    u32 terminal_columns;
     bool progress_active;
     bool progress_has_length;
     u64 progress_length;
@@ -45,7 +46,7 @@ typedef struct fetch_display_timings {
 } fetch_display_timings_t;
 
 void fetch_display_init(fetch_display_t *display, bool quiet,
-                        bool interactive_progress,
+                        bool interactive_progress, u32 terminal_columns,
                         fetch_display_write_fn write, void *write_context);
 void fetch_display_requested(fetch_display_t *display,
                              const fetch_url_t *url);
@@ -53,12 +54,10 @@ void fetch_display_resolving(fetch_display_t *display, const char *host,
                              bool address_literal);
 void fetch_display_resolved(fetch_display_t *display, const char *host,
                             const mg_ipv4_addr_t *address);
-void fetch_display_connecting(fetch_display_t *display, const char *host,
-                              u16 port);
 void fetch_display_connected(fetch_display_t *display, const char *host,
                              u16 port, const mg_ipv4_addr_t *address);
 void fetch_display_tls_starting(fetch_display_t *display, const char *host);
-void fetch_display_tls_verified(fetch_display_t *display, const char *host);
+void fetch_display_tls_verified(fetch_display_t *display);
 void fetch_display_http_status(fetch_display_t *display, u32 status);
 void fetch_display_redirect(fetch_display_t *display, u32 status,
                             const fetch_url_t *url);

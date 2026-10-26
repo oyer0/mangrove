@@ -124,7 +124,7 @@ static u32 percentage(u64 bytes, u64 total)
 }
 
 void fetch_display_init(fetch_display_t *display, bool quiet,
-                        bool interactive_progress,
+                        bool interactive_progress, u32 terminal_columns,
                         fetch_display_write_fn write, void *write_context)
 {
     if (!display) return;
@@ -133,6 +133,7 @@ void fetch_display_init(fetch_display_t *display, bool quiet,
         .write_context = write_context,
         .quiet = quiet,
         .interactive_progress = interactive_progress,
+        .terminal_columns = terminal_columns,
     };
 }
 
@@ -141,7 +142,8 @@ void fetch_display_requested(fetch_display_t *display,
 {
     if (!url || !url->host || !url->path) return;
     if (url->port == (url->https ? 443U : 80U))
-        emit_line(display, "Requested URL: %s://%s%s%s", url->https ? "https" : "http",
+        emit_line(display, "Requested URL: %s://%s%s%s",
+                  url->https ? "https" : "http",
                   url->host, url->path[0] == '/' ? "" : "/", url->path);
     else
         emit_line(display, "Requested URL: %s://%s:%u%s%s",
@@ -154,32 +156,25 @@ void fetch_display_resolving(fetch_display_t *display, const char *host,
                              bool address_literal)
 {
     if (address_literal)
-        emit_line(display, "Address: %s (IPv4 literal; DNS not needed)", host);
+        emit_line(display, "DNS: %s is an IPv4 literal; lookup skipped", host);
     else
-        emit_line(display, "Resolving %s...", host);
+        emit_line(display, "DNS: resolving %s...", host);
 }
 
 void fetch_display_resolved(fetch_display_t *display, const char *host,
                             const mg_ipv4_addr_t *address)
 {
     if (!address) return;
-    emit_line(display, "Resolved %s to %u.%u.%u.%u", host,
+    emit_line(display, "DNS: %s -> %u.%u.%u.%u", host,
               (unsigned)address->octet[0], (unsigned)address->octet[1],
               (unsigned)address->octet[2], (unsigned)address->octet[3]);
-}
-
-void fetch_display_connecting(fetch_display_t *display, const char *host,
-                              u16 port)
-{
-    emit_line(display, "Connecting TCP to %s:%u...", host,
-              (unsigned)port);
 }
 
 void fetch_display_connected(fetch_display_t *display, const char *host,
                              u16 port, const mg_ipv4_addr_t *address)
 {
     if (!address) return;
-    emit_line(display, "TCP connected to %s:%u (%u.%u.%u.%u)", host,
+    emit_line(display, "TCP: connected to %s:%u (%u.%u.%u.%u)", host,
               (unsigned)port, (unsigned)address->octet[0],
               (unsigned)address->octet[1], (unsigned)address->octet[2],
               (unsigned)address->octet[3]);
@@ -187,19 +182,17 @@ void fetch_display_connected(fetch_display_t *display, const char *host,
 
 void fetch_display_tls_starting(fetch_display_t *display, const char *host)
 {
-    emit_line(display, "Negotiating TLS 1.3 and verifying %s...", host);
+    emit_line(display, "TLS 1.3: verifying %s...", host);
 }
 
-void fetch_display_tls_verified(fetch_display_t *display, const char *host)
+void fetch_display_tls_verified(fetch_display_t *display)
 {
-    emit_line(display,
-              "TLS 1.3 authenticated: certificate chain and hostname verified for %s",
-              host);
+    emit_line(display, "TLS 1.3: authenticated (certificate chain and hostname verified)");
 }
 
 void fetch_display_http_status(fetch_display_t *display, u32 status)
 {
-    emit_line(display, "HTTP response: %u", (unsigned)status);
+    emit_line(display, "HTTP: status %u", (unsigned)status);
 }
 
 void fetch_display_redirect(fetch_display_t *display, u32 status,
@@ -207,11 +200,11 @@ void fetch_display_redirect(fetch_display_t *display, u32 status,
 {
     if (!url || !url->host || !url->path) return;
     if (url->port == (url->https ? 443U : 80U))
-        emit_line(display, "Redirect %u to %s://%s%s%s", (unsigned)status,
+        emit_line(display, "HTTP: redirect %u -> %s://%s%s%s", (unsigned)status,
                   url->https ? "https" : "http", url->host,
                   url->path[0] == '/' ? "" : "/", url->path);
     else
-        emit_line(display, "Redirect %u to %s://%s:%u%s%s",
+        emit_line(display, "HTTP: redirect %u -> %s://%s:%u%s%s",
                   (unsigned)status, url->https ? "https" : "http",
                   url->host, (unsigned)url->port,
                   url->path[0] == '/' ? "" : "/", url->path);
@@ -225,14 +218,14 @@ void fetch_display_response_details(fetch_display_t *display,
     if (!headers) return;
     if (headers->has_content_length) {
         format_quantity(size, sizeof(size), headers->content_length);
-        emit_line(display, "Content-Length: %s", size);
+        emit_line(display, "HTTP: Content-Length: %s", size);
     } else if (headers->chunked) {
-        emit_line(display, "Response size: not declared (chunked transfer)");
+        emit_line(display, "HTTP: response size unknown (chunked transfer)");
     } else {
-        emit_line(display, "Response size: not declared (connection-close delimited)");
+        emit_line(display, "HTTP: response size unknown (connection-close delimited)");
     }
     if (headers->content_type)
-        emit_line(display, "Content-Type: %s", headers->content_type);
+        emit_line(display, "HTTP: Content-Type: %s", headers->content_type);
     if (destination)
         emit_line(display, "Destination: %s", destination);
 }
@@ -254,6 +247,7 @@ void fetch_display_progress(fetch_display_t *display, u64 bytes,
     char amount[48], total[48], speed[48], line[192];
     int length;
     if (!display || display->quiet || !display->interactive_progress ||
+        display->terminal_columns < 40U ||
         now_ms < display->progress_last_time_ms ||
         now_ms - display->progress_last_time_ms < FETCH_PROGRESS_INTERVAL_MS)
         return;
@@ -271,7 +265,10 @@ void fetch_display_progress(fetch_display_t *display, u64 bytes,
         length = snprintf(line, sizeof(line), "[  ?] %s received  %s",
                           amount, speed);
     }
-    if (length < 0 || (usize)length >= sizeof(line)) return;
+    /* Leave the final column unused so the console cannot enter its pending
+     * autowrap state before the next in-place update or line termination. */
+    if (length < 0 || (usize)length >= sizeof(line) ||
+        (u32)length >= display->terminal_columns) return;
     emit(display, "\r", 1U);
     emit(display, line, (usize)length);
     if ((usize)length < display->progress_line_length) {
@@ -314,10 +311,12 @@ void fetch_display_complete(fetch_display_t *display, const char *filename,
                        (unsigned long long)elapsed_ms);
     if (bytes >= 1024U && elapsed_ms >= 100U) {
         format_rate(speed, sizeof(speed), transfer_rate(bytes, elapsed_ms));
-        emit_line(display, "Download complete: %s (%s saved in %s, %s)",
+        emit_line(display,
+                  "Download complete: %s (%s saved; response transfer phase %s, %s)",
                   filename ? filename : "output", amount, duration, speed);
     } else {
-        emit_line(display, "Download complete: %s (%s saved in %s)",
+        emit_line(display,
+                  "Download complete: %s (%s saved; response transfer phase %s)",
                   filename ? filename : "output", amount, duration);
     }
 }
