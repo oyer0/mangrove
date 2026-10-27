@@ -13,6 +13,10 @@ import populate_mgfs as populate
 import update_mgfs as update
 from mgfs_update_record_reconcile_test import image_layout, checker_ok
 
+# The formatter yields 21 Records per table block and one table block per
+# 320 image blocks; 3,840 blocks provide 252 slots for current IDs through 243.
+IMAGE_BLOCKS = 3840
+
 
 def payload(image, layout, identifier):
     offset = update.record_offset(image, layout['record_table_start'],identifier,layout['record_count'])
@@ -29,8 +33,25 @@ def main():
         binary.write_bytes(b'clipboard-image-fixture'*64)
         paths=[str(binary)]*len(populate.PAYLOAD_MANIFEST)
         data=[str(binary)]*len(populate.DATA_MANIFEST)
-        subprocess.run([str(mkmgfs),'--blocks','3600','--uuid',
+        subprocess.run([str(mkmgfs),'--blocks',str(IMAGE_BLOCKS),'--uuid',
             '11111111-2222-3333-4444-555555555555','--format-time-ns','1',str(image_path)],check=True,capture_output=True)
+        initial_image = bytearray(image_path.read_bytes())
+        layout = image_layout(initial_image)
+        required_record_id = max(
+            max(record_id for record_id, _, _ in populate.PAYLOAD_MANIFEST),
+            max(record_id for record_id, _, _ in populate.DATA_MANIFEST),
+            populate.HARDWARE_RECORD_ID,
+            populate.INFO_RECORD_ID,
+            populate.HELP_FIRST_RECORD_ID + len(populate.HELP_FILES) - 1,
+            max(populate.INFO_RECORD_IDS),
+            populate.CA_STORE_FIRST_FILE_RECORD_ID +
+            len(populate.CA_STORE_FILES) - 1)
+        if layout['record_count'] < required_record_id:
+            raise AssertionError(
+                f"clipboard fixture has {layout['record_count']} MGFS Record "
+                f"slots, but the current full payload manifest requires Record "
+                f"ID {required_record_id}; increase IMAGE_BLOCKS (currently "
+                f"{IMAGE_BLOCKS})")
         subprocess.run([sys.executable,str(ROOT/'tools/populate_mgfs.py'),str(image_path),*paths,*data],check=True,capture_output=True)
         checker_ok(mgfsck,image_path)
         image=bytearray(image_path.read_bytes());layout=image_layout(image)
