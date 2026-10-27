@@ -126,6 +126,11 @@ tests and their respective oracles.
 The existing `tests/guest/guest_mgfs_test.py` supplies shared isolated boot, QMP,
 framebuffer observation and native transcript primitives. Other runners reuse
 it rather than installing another boot or filesystem path.
+Its shared QMP client validates the greeting and capability negotiation,
+matches command responses by request ID while retaining interleaved events,
+and bounds each command with a monotonic deadline. Screenshot capture requires
+a running guest, removes any prior image, and validates a newly written PPM;
+protocol, state, and timeout failures fail the runner with the command name.
 The root-MGFS runner accepts `--cpus 1|2` (default 1); two vCPUs exercise AP
 startup and its per-CPU protection/descriptor setup, but do not constitute
 comprehensive SMP qualification. `--no-nic` omits the QEMU virtual NIC while

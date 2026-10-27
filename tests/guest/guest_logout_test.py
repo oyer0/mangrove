@@ -85,7 +85,7 @@ def boot_logout(folder, disk, args):
             def capture(label=None):
                 if current_ppm.exists():
                     current_ppm.unlink()
-                qmp.call('screendump', {'filename': str(current_ppm)})
+                qmp.screendump(current_ppm)
                 text = mgfs.screen_text(current_ppm)
                 if label:
                     save_capture(label, text)

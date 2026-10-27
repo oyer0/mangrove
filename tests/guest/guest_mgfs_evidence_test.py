@@ -200,6 +200,10 @@ class QMP:
     def call(self,name,args=None):
         if name=='query-status': return {'status':'running'}
         if name=='quit': self.process.returncode=0
+    def query_status(self): return 'running'
+    def screendump(self,path,status=None):
+        assert status in (None,'running')
+        Path(path).write_bytes(b'P6\n1 1\n255\n\x00\x00\x00')
     def drain_events(self): pass
     def close(self): pass
 

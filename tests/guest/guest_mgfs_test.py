@@ -12,7 +12,6 @@ import resource
 from pathlib import Path
 import secrets
 import shutil
-import select
 import stat
 import struct
 import subprocess
@@ -26,6 +25,7 @@ import artifact_lifecycle as artifacts
 ROOT = Path(__file__).resolve().parents[2]
 sys.dont_write_bytecode = True
 import qemu_accel
+from qmp_client import QMP, QMPError
 sys.path.insert(0, str(ROOT / 'tools'))
 import image_payloads as manifest
 import update_mgfs as image_tool
@@ -377,70 +377,6 @@ def create_disk(folder, build, run, relative_launch=False,
     return disk
 
 
-class QMP:
-    def __init__(self, process, reader=None, writer=None):
-        self.process = process
-        self.reader = reader if reader is not None else process.stdout
-        self.writer = writer if writer is not None else process.stdin
-        self.events = []
-        self.receive()
-        self.call('qmp_capabilities')
-
-    def receive(self):
-        line = bytearray()
-        deadline = time.monotonic() + 10
-        while not line.endswith(b'\n'):
-            remaining = deadline - time.monotonic()
-            if remaining <= 0 or not select.select([self.reader], [], [], remaining)[0]:
-                raise TimeoutError('QMP response timeout')
-            byte = self.reader.read(1)
-            if not byte: raise EOFError('QMP closed')
-            line.extend(byte)
-            if len(line) > 65536: raise ValueError('QMP response bound')
-        return json.loads(line)
-
-    def call(self, name, arguments=None):
-        request = {'execute': name}
-        if arguments is not None: request['arguments'] = arguments
-        self.writer.write(json.dumps(request).encode() + b'\n')
-        self.writer.flush()
-        while True:
-            reply = self.receive()
-            if 'event' in reply:
-                if len(self.events)>=1024: raise ValueError('QMP event bound')
-                self.events.append(reply)
-            if 'error' in reply: raise RuntimeError(reply)
-            if 'return' in reply: return reply['return']
-
-    def drain_events(self):
-        # Peer has stopped. Pipes kept open by the host do not produce EOF;
-        # drain only available bytes, with the same strict finite bound.
-        tail = bytearray()
-        while select.select([self.reader], [], [], 0)[0]:
-            chunk = os.read(self.reader.fileno(), 65537 - len(tail))
-            if not chunk: break
-            tail.extend(chunk)
-            if len(tail) > 65536: raise ValueError('QMP final output bound')
-        for line in tail.splitlines():
-            item = json.loads(line)
-            if 'event' in item:
-                if len(self.events) >= 1024: raise ValueError('QMP event bound')
-                self.events.append(item)
-
-    def close(self):
-        self.writer.close(); self.reader.close()
-
-    def wait_deleted(self, device):
-        deadline = time.monotonic() + 10
-        while not any(e.get('event') == 'DEVICE_DELETED' and
-                      e.get('data', {}).get('device') == device for e in self.events):
-            if time.monotonic() >= deadline: raise TimeoutError('USB deletion event missing')
-            event = self.receive()
-            if 'event' not in event: raise ValueError('unexpected QMP response during deletion')
-            if len(self.events) >= 1024: raise ValueError('QMP event bound')
-            self.events.append(event)
-
-
 def screen_text(path):
     """Exact ASCII glyph recognition for the existing 8x16 console, not OCR."""
     header, dimensions, maximum, pixels = path.read_bytes().split(b'\n', 3)
@@ -614,23 +550,28 @@ def boot(folder, disk, phase, args):
     expected_failure = phase == 'negative' or getattr(args, 'expected_child_failure', False)
     pipe_qmp = getattr(args, 'qmp_pipe', False)
     reader = writer = None
+    qmp_prefix = None
     if pipe_qmp:
-        prefix = part / 'qmp'
-        for suffix in ('.in', '.out'): os.mkfifo(str(prefix) + suffix, 0o600)
-        writer = os.fdopen(os.open(str(prefix)+'.in', os.O_RDWR | os.O_NONBLOCK), 'wb', buffering=0)
-        reader = os.fdopen(os.open(str(prefix)+'.out', os.O_RDWR | os.O_NONBLOCK), 'rb', buffering=0)
-        invocation[invocation.index('-qmp')+1] = 'pipe:' + str(prefix)
+        qmp_prefix = part / 'qmp'
+        for suffix in ('.in', '.out'):
+            os.mkfifo(str(qmp_prefix) + suffix, 0o600)
+        writer = os.fdopen(os.open(str(qmp_prefix)+'.in', os.O_RDWR | os.O_NONBLOCK), 'wb', buffering=0)
+        reader = os.fdopen(os.open(str(qmp_prefix)+'.out', os.O_RDWR | os.O_NONBLOCK), 'rb', buffering=0)
+        invocation[invocation.index('-qmp')+1] = 'pipe:' + str(qmp_prefix)
     control = getattr(args, 'lifetime_control', None)
     if control is not None: control.configure(invocation, part)
     (part / 'command.json').write_text(json.dumps(invocation, indent=2))
     with (part / 'qemu.log').open('wb') as log, (part / 'diagnostics.log').open('wb') as diagnostic:
-        process = subprocess.Popen(invocation, stdin=subprocess.DEVNULL if pipe_qmp else subprocess.PIPE,
-                                   stdout=diagnostic if pipe_qmp else subprocess.PIPE, stderr=log, bufsize=0)
+        process = None
         try:
+            process = subprocess.Popen(invocation, stdin=subprocess.DEVNULL if pipe_qmp else subprocess.PIPE,
+                                       stdout=diagnostic if pipe_qmp else subprocess.PIPE, stderr=log, bufsize=0)
             poll_interval=getattr(args,'guest_poll_interval',.5)
             if not .05 <= poll_interval <= 1:raise ValueError('guest poll interval bound')
             while process.poll() is None:
-                if time.monotonic() - started > args.timeout: raise TimeoutError('guest phase timeout')
+                if time.monotonic() - started > args.timeout:
+                    raise TimeoutError(
+                        f'guest phase {phase!r} timed out after {args.timeout:g}s')
                 for diagnostic in ('qemu.log','serial.log','diagnostics.log','debugcon.log'):
                     path=part/diagnostic
                     if path.exists() and path.stat().st_size>8*1024*1024:
@@ -644,22 +585,21 @@ def boot(folder, disk, phase, args):
                     try:
                         if qmp is None:
                             qmp = QMP(process, reader, writer)
-                        qmp.call('screendump', {'filename': str(part / 'screen.ppm')})
+                        qmp.screendump(part / 'screen.ppm')
                         (part / 'screen.txt').write_text(screen_text(part / 'screen.ppm'))
                     except (OSError, ValueError, RuntimeError, EOFError) as error:
                         (part / 'panic-capture-error.txt').write_text(str(error))
                     raise RuntimeError(failure)
                 if qmp is None:
                     qmp = QMP(process, reader, writer)
-                if qmp.call('query-status')['status'] == 'shutdown':
+                status = qmp.query_status()
+                if status == 'shutdown':
                     (part / 'blockstats.json').write_text(json.dumps(qmp.call('query-blockstats'),indent=2))
                     qmp.call('quit'); process.wait(timeout=10)
                     break
-                try:
-                    qmp.call('screendump', {'filename': str(part / 'screen.ppm')})
-                except (EOFError, BrokenPipeError):
-                    process.wait(timeout=10)
-                    break
+                if status != 'running':
+                    raise QMPError(f'guest was not ready for capture (QMP state: {status})')
+                qmp.screendump(part / 'screen.ppm', status=status)
                 text = screen_text(part / 'screen.ppm')
                 (part / 'screen.txt').write_text(text)
                 if (phase == 'fetch-https' and
@@ -779,19 +719,43 @@ def boot(folder, disk, phase, args):
         finally:
             if hotplug_run:
                 (part / 'hotplug-actions.json').write_text(json.dumps(hotplug_actions,indent=2))
-            if process.poll() is None:
+            if process is not None and process.poll() is None:
                 if qmp:
-                    try: qmp.call('quit')
-                    except (OSError, ValueError, EOFError): pass
-            artifacts.terminate_and_reap(process, timeout=10)
+                    try:
+                        qmp.call('quit')
+                    except QMPError as error:
+                        (part / 'qmp-quit-error.txt').write_text(str(error) + '\n')
+            if process is not None:
+                artifacts.terminate_and_reap(process, timeout=10)
             if qmp:
                 # The process is stopped: collect bounded final events, without
                 # waiting for a live QMP peer or trusting exit alone as success.
-                qmp.drain_events()
-                (part / 'events.json').write_text(json.dumps(qmp.events,indent=2))
-                qmp.close()
-            elif pipe_qmp:
-                reader.close(); writer.close()
+                cleanup_error = None
+                try:
+                    qmp.drain_events()
+                except QMPError as error:
+                    cleanup_error = error
+                    (part / 'qmp-drain-error.txt').write_text(str(error) + '\n')
+                finally:
+                    (part / 'events.json').write_text(json.dumps(qmp.events,indent=2))
+                    qmp.close()
+                if cleanup_error is not None and sys.exc_info()[0] is None:
+                    raise cleanup_error
+            else:
+                for stream in (reader, writer,
+                               process.stdout if process is not None else None,
+                               process.stdin if process is not None else None):
+                    if stream is not None:
+                        try:
+                            stream.close()
+                        except OSError:
+                            pass
+            if qmp_prefix is not None:
+                for suffix in ('.in', '.out'):
+                    try:
+                        Path(str(qmp_prefix) + suffix).unlink()
+                    except FileNotFoundError:
+                        pass
     if control is not None: control.finish(expected_failure, negative_exit)
     transition_event = None
     if not expected_failure and child_status == 0:

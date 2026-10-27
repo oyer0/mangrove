@@ -133,7 +133,7 @@ class ReedControl:
         for index in range(2):
             time.sleep(.10 if index == 0 else .15)
             path=part/f'reed-repeat-released-{index+1}.ppm'
-            qmp.call('screendump',{'filename':str(path)})
+            qmp.screendump(path)
             screen=guest.screen_text(path)
             if expected not in screen:
                 raise ValueError('Reed text changed during navigation repeat probe')
@@ -143,7 +143,7 @@ class ReedControl:
                 # a bounded number of times without sending additional input.
                 for _ in range(8):
                     time.sleep(.08)
-                    qmp.call('screendump',{'filename':str(path)})
+                    qmp.screendump(path)
                     column=reed_cursor_column(path,expected)
                     if column is not None:break
             released_columns.append(column)

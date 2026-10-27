@@ -98,7 +98,7 @@ def main():
             failure = guest.kernel_failure(work)
             if failure: raise RuntimeError(failure)
             path = work/'poll.ppm'
-            qmp.call('screendump',{'filename':str(path)})
+            qmp.screendump(path)
             return guest.screen_text(path)
         def wait(predicate, timeout=90 if args.large else 45):
             deadline=min(time.monotonic()+timeout,overall_deadline)

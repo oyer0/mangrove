@@ -1601,7 +1601,11 @@ test-help:
 	ASAN_OPTIONS=detect_leaks=0 $(BUILD_DIR)/tests/help-record-test share/help
 	python3 tests/userspace/help_records_test.py
 
-test-dev-tools:
+.PHONY: test-qmp-client
+test-qmp-client:
+	python3 tests/guest/qmp_client_test.py
+
+test-dev-tools: test-qmp-client
 	python3 tests/guest/artifact_lifecycle_test.py
 	python3 tests/guest/qemu_accel_test.py
 	python3 tests/guest/reed_input_diagnostic_test.py
@@ -2987,7 +2991,10 @@ test-guest-safe:
 # the separate stale-save conflict workflow.
 GUEST_REED_BUILD ?= $(abspath $(BUILD_DIR))/guest-reed-build
 GUEST_REED_ACCEL ?= $(NATIVE_GUEST_ACCEL)
-GUEST_REED_TIMEOUT ?= 300
+# The native Reed workflow includes MGFS preparation plus several hundred
+# state-verified USB keyboard actions and framebuffer captures. Keep its
+# per-guest deadline bounded while leaving measured headroom for slow hosts.
+GUEST_REED_TIMEOUT ?= 420
 .PHONY: test-guest-reed
 test-guest-reed:
 	$(QEMU_ACCEL_PREFLIGHT) "$(GUEST_REED_ACCEL)"

@@ -99,7 +99,8 @@ for step in ('retained-busy','offline-stale-read','offline-stale-write','offline
 qmp=object.__new__(guest.QMP)
 qmp.events=[{'event':'DEVICE_DELETED','data':{'path':'/child'}},
             {'event':'DEVICE_DELETED','data':{'device':'other'}}]
-def deadline():raise TimeoutError('controlled missing frontend event')
+qmp.timeout=1.0
+def deadline(_deadline,_operation):raise TimeoutError('controlled missing frontend event')
 qmp.receive=deadline
 try:qmp.wait_deleted('secondary-storage')
 except TimeoutError:pass
