@@ -18,13 +18,15 @@ current PCI NIC drivers. A low-priority lifecycle worker reconciles PCI and
 these drivers every 500 ms because the current machine profile has no portable
 PCI hotplug interrupt source.
 
-At boot, the legacy e1000 interrupt is routed through the IOAPIC to the BSP.
-Its receive helpers carry an explicit controller reference; they do not use a
-shared mutable current-controller pointer. The per-controller transmit descriptor
-queue is protected by an IRQ-saving spinlock because transmit callers may run
-on different CPUs and the completion interrupt shares its consumer state.
-These rules protect receive context selection and transmit-ring ownership;
-they do not establish a general device-operation lifetime for hot removal.
+Legacy e1000 interrupts and RTL8168 MSI-X are routed to the BSP, including
+devices initialized by the scheduler-backed lifecycle worker. E1000's shared
+vector uses a per-controller IRQ lifetime gate; RTL8168 uses the IRQ registry's
+per-vector gate. Teardown masks a present device's interrupt source and drains
+admitted handlers before releasing their rings. E1000 receive helpers carry an
+explicit controller reference; they do not use a shared mutable
+current-controller pointer. The per-controller transmit descriptor queue is
+protected by an IRQ-saving spinlock because transmit callers may run on
+different CPUs and the completion interrupt shares its consumer state.
 
 Network devices have boot-local instance generations. Datagram and ICMP work
 revalidates the exact device while waiting or transmitting, so removal cannot
@@ -119,15 +121,15 @@ interoperability and throughput limitations. Device removal during active
 network traffic remains unsupported because the NIC lifecycle does not yet
 provide a hardware-operation quiescence guarantee.
 
-The PCI network lifecycle worker can unregister and tear down a NIC while
-process-side sends run on another online CPU. The registry and driver paths do
-not hold a shared device-operation lifetime across that interval; local
-interrupt masking does not serialize another CPU. Device removal during active
-network traffic is therefore not safe or qualified. A removal event alone does
-not establish that in-flight sends or receive processing have quiesced.
-E1000 DMA rings and buffers also require hardware quiescence before their
-frames can be released. The current lifecycle path provides no such guarantee;
-active e1000 removal remains unsupported.
+The IRQ lifetime gates serialize interrupt callbacks with teardown, but the
+network-device registry and driver paths do not hold a shared device-operation
+lifetime across process-side sends running on another CPU. Active removal
+during network traffic therefore remains unsupported and unqualified. The
+current PCI lifecycle path detaches an e1000 only after its PCI function is no
+longer present; that path drains CPU-side IRQ access before releasing the
+controller's DMA buffers. A general live-device shutdown sequence, including
+quiescing in-flight transmit callers and stopping a still-present e1000's DMA
+engines, remains outside the current contract.
 
 ## `networkd` policy
 

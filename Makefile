@@ -1157,6 +1157,10 @@ test-pmm:
 test-preemption-accounting:
 	python3 tests/kernel/preemption_accounting_test.py "$(HOST_CC)"
 
+.PHONY: test-irq-lifecycle
+test-irq-lifecycle:
+	python3 tests/kernel/irq_lifecycle_test.py "$(HOST_CC)"
+
 .PHONY: test-idt
 test-idt:
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
@@ -1678,7 +1682,8 @@ test-ipc-capacity:
 		-o "$(BUILD_DIR)/tests/ipc_capacity_test"
 	ASAN_OPTIONS=detect_leaks=0 "$(BUILD_DIR)/tests/ipc_capacity_test"
 
-test-sync: test-spinlock-context test-ipc-capacity test-preemption-accounting
+test-sync: test-spinlock-context test-ipc-capacity test-preemption-accounting \
+		test-irq-lifecycle
 	python3 tests/filesystems/mgfs/mgfs_handoff_test.py "$(HOST_CC)"
 	python3 tests/filesystems/fat32/fat_handoff_test.py "$(HOST_CC)"
 	python3 tests/filesystems/vfs/vfs_location_test.py "$(HOST_CC)"

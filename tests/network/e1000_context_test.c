@@ -67,6 +67,8 @@ int main(void)
     controllers[1].mmio = mmio[1];
     controllers[1].rx_ring = rx_ring[1];
     controllers[1].rx_next = 0;
+    assert(irq_gate_open(&controllers[0].irq_gate));
+    assert(irq_gate_open(&controllers[1].irq_gate));
 
     /* A sentinel proves the nested helper does not acknowledge or recycle
      * controller 0's descriptor through controller 1's MMIO mapping. */
@@ -76,7 +78,7 @@ int main(void)
     rx_ring[0][0].length = NET_ETHERNET_HEADER_SIZE;
     rx_ring[0][0].status = E1000_RX_STATUS_DD | E1000_RX_STATUS_EOP;
 
-    e1000_service_irq(&controllers[0]);
+    e1000_irq_handler(NULL);
 
     assert(delivered_frames == 1U);
     assert(controllers[0].received_frames == 1U);
@@ -86,6 +88,8 @@ int main(void)
     assert(controllers[1].received_frames == 0U);
     assert(controllers[1].rx_next == 0U);
     assert(((volatile u32 *)mmio[1])[tail_reg] == 0xA5A5U);
+    e1000_irq_quiesce(&controllers[0]);
+    e1000_irq_quiesce(&controllers[1]);
 
     puts("e1000 receive keeps controller context across interleaving");
     return 0;

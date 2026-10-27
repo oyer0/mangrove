@@ -122,6 +122,16 @@ current CR3; shared high-half mappings and global translations make a local
 CR3 reload insufficient for that operation. A remote CPU acknowledges only
 after its invalidation is complete.
 
+Unregisterable IRQ callbacks enter per-vector atomic lifetime gates. Unregister
+closes admission and drains callbacks already in progress before it returns.
+Lifetime-long PIT, local timer, and TLB-shootdown handlers use permanent
+registration and bypass those gates, avoiding reference traffic on frequent
+interrupts. A driver masks its device source before unregistering or otherwise
+closing device-local callback admission; it must not hold a lock needed by the
+handler while waiting. Drivers that share a vector across devices also use a
+per-controller gate. These guarantees cover handler lifetime, not concurrent
+process-side device operations.
+
 ## Memory synchronization
 
 AP cache-policy admission precedes online publication. `x86_cache_init_ap()`

@@ -2,6 +2,7 @@
 #include <net/rtl8168.h>
 
 #include <address_layout.h>
+#include <cpu.h>
 #include <irq.h>
 #include <kprint.h>
 #include <lapic.h>
@@ -1109,7 +1110,7 @@ static void rtl8168_irq_handler(struct cpu_registers *registers)
 
 static bool rtl8168_prepare_msix(void)
 {
-    u8 apic_id;
+    cpu_local_t *bsp;
 
     if (!lapic_enabled() ||
         !pci_get_msix_info(controller.pci, &controller.msix) ||
@@ -1118,9 +1119,11 @@ static bool rtl8168_prepare_msix(void)
         return false;
     }
 
-    apic_id = lapic_current_id();
+    bsp = cpu_by_index(0);
+    if (!bsp || !bsp->bsp || !bsp->online)
+        return false;
     if (!pci_prepare_msix_vector(controller.pci, &controller.msix,
-                                 RTL8168_MSIX_ENTRY, apic_id,
+                                 RTL8168_MSIX_ENTRY, bsp->apic_id,
                                  RTL8168_IRQ_VECTOR)) {
         return false;
     }
@@ -1141,16 +1144,16 @@ static bool rtl8168_enable_interrupts(void)
                     RTL8168_INTERRUPT_RUNTIME_MASK);
     if (rtl8168_read16(RTL8168_REG_INTERRUPT_MASK) !=
         RTL8168_INTERRUPT_RUNTIME_MASK) {
-        controller.active = false;
         irq_unregister_vector(RTL8168_IRQ_VECTOR);
+        controller.active = false;
         controller.irq_registered = false;
         return false;
     }
     if (!pci_unmask_msix_vector(controller.pci, &controller.msix,
                                 RTL8168_MSIX_ENTRY)) {
-        controller.active = false;
         rtl8168_write16(RTL8168_REG_INTERRUPT_MASK, 0);
         irq_unregister_vector(RTL8168_IRQ_VECTOR);
+        controller.active = false;
         controller.irq_registered = false;
         return false;
     }
@@ -1179,7 +1182,6 @@ static void rtl8168_cleanup_failed_start(void)
 {
     bool safe_to_release;
 
-    controller.active = false;
     if (controller.mmio)
         rtl8168_write16(RTL8168_REG_INTERRUPT_MASK, 0);
     if (controller.msix_prepared) {
@@ -1191,6 +1193,7 @@ static void rtl8168_cleanup_failed_start(void)
         irq_unregister_vector(RTL8168_IRQ_VECTOR);
         controller.irq_registered = false;
     }
+    controller.active = false;
 
     safe_to_release = rtl8168_stop_dma();
     rtl8168_disable_bus_master();
@@ -1384,10 +1387,6 @@ rtl8168_init_result_t rtl8168_init(const char **reason)
 
 static void rtl8168_detach(bool hardware_present)
 {
-    controller.active = false;
-    controller.device.administrative_enabled = false;
-    if (controller.device.id)
-        (void)net_unregister_device(&controller.device);
     if (hardware_present && controller.mmio)
         rtl8168_write16(RTL8168_REG_INTERRUPT_MASK, 0);
     if (hardware_present && controller.msix_prepared) {
@@ -1398,6 +1397,10 @@ static void rtl8168_detach(bool hardware_present)
         irq_unregister_vector(RTL8168_IRQ_VECTOR);
         controller.irq_registered = false;
     }
+    controller.active = false;
+    controller.device.administrative_enabled = false;
+    if (controller.device.id)
+        (void)net_unregister_device(&controller.device);
     if (hardware_present)
         (void)rtl8168_stop_dma();
     controller.dma_started = false;

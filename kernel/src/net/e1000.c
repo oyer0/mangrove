@@ -4,6 +4,7 @@
 
 #include <acpi.h>
 #include <address_layout.h>
+#include <cpu.h>
 #include <ioapic.h>
 #include <irq.h>
 #include <kprint.h>
@@ -116,6 +117,7 @@ _Static_assert(E1000_TX_RING_COUNT * sizeof(e1000_tx_descriptor_t) <= PAGE_SIZE,
                "E1000 TX ring must fit one physical frame");
 
 typedef struct {
+    irq_gate_t irq_gate;
     pci_device_t pci_snapshot;
     const pci_device_t *pci;
     bool pci_valid;
@@ -162,6 +164,27 @@ static inline void e1000_compiler_barrier(void)
 static inline void e1000_pause(void)
 {
     __asm__ volatile("pause");
+}
+
+static void e1000_state_reset(e1000_state_t *state)
+{
+    if (!state) return;
+    /* The ISR may still probe the closed gate while walking the static
+     * controller array. Keep that word atomic and clear the rest only after
+     * any admitted per-controller service has drained. */
+    irq_gate_reset(&state->irq_gate);
+    memset((u8 *)state + sizeof(state->irq_gate), 0,
+           sizeof(*state) - sizeof(state->irq_gate));
+}
+
+static void e1000_irq_quiesce(e1000_state_t *state)
+{
+    if (!state) return;
+    if (irq_gate_begin_close(&state->irq_gate)) {
+        irq_gate_wait_drained(&state->irq_gate);
+    } else if (irq_gate_is_closing(&state->irq_gate)) {
+        irq_gate_wait_drained(&state->irq_gate);
+    }
 }
 
 static u64 e1000_irq_save(void)
@@ -457,7 +480,7 @@ static void e1000_service_irq(e1000_state_t *state)
 {
     u32 causes;
 
-    if (!state || !state->active || !state->mmio) return;
+    if (!state || !state->mmio) return;
 
     /* Reading ICR acknowledges device causes.  LAPIC EOI remains centralized
      * in the common APIC interrupt epilogue after this callback. */
@@ -478,11 +501,15 @@ static void e1000_service_irq(e1000_state_t *state)
 static void e1000_irq_handler(struct cpu_registers *regs)
 {
     (void)regs;
-    /* Probing suppresses IRQ service while controller slots are prepared.
-     * This is not a teardown-quiescence protocol. */
+    /* Probing suppresses service while controller slots are prepared; the
+     * per-controller gates independently protect teardown lifetimes. */
     if (__atomic_load_n(&e1000_probe_in_progress, __ATOMIC_ACQUIRE)) return;
-    for (u32 index = 0; index < E1000_MAX_CONTROLLERS; index++)
-        if (controllers[index].active) e1000_service_irq(&controllers[index]);
+    for (u32 index = 0; index < E1000_MAX_CONTROLLERS; index++) {
+        e1000_state_t *state = &controllers[index];
+        if (!irq_gate_enter(&state->irq_gate)) continue;
+        e1000_service_irq(state);
+        irq_gate_leave(&state->irq_gate);
+    }
 }
 
 static void e1000_send_boot_frame(e1000_state_t *state)
@@ -557,7 +584,7 @@ static bool e1000_probe_device(const pci_device_t *device)
     }
     if (!state || !pci_enable_memory_busmaster(device)) return false;
 
-    *state = (e1000_state_t){0};
+    e1000_state_reset(state);
     spinlock_init(&state->tx_lock);
     state->pci_snapshot = *device;
     state->pci = &state->pci_snapshot;
@@ -590,18 +617,20 @@ static bool e1000_probe_device(const pci_device_t *device)
             if (irq_register_vector(IRQ_VECTOR_E1000, e1000_irq_handler))
                 e1000_irq_registered = true;
         }
-        if (e1000_irq_registered &&
+        cpu_local_t *bsp = cpu_by_index(0);
+        if (bsp && bsp->bsp && bsp->online && e1000_irq_registered &&
             ioapic_route_gsi(acpi_irq_to_gsi(state->irq),
                              IRQ_VECTOR_E1000,
-                             lapic_current_id(),
+                             bsp->apic_id,
                              acpi_irq_flags(state->irq)))
             state->irq_enabled = true;
     }
 
     (void)e1000_read(state, E1000_REG_ICR);
+    state->active = true;
+    if (!irq_gate_open(&state->irq_gate)) goto fail;
     e1000_write(state, E1000_REG_IMS, E1000_INT_RXT0 | E1000_INT_RXDMT0 |
                 E1000_INT_TXDW | E1000_INT_LSC);
-    state->active = true;
     e1000_send_boot_frame(state);
     KERNEL_BOOT_DEBUG_LOG(
         "[OK] Ethernet controller active: e1000 %02x:%02x:%02x:%02x:%02x:%02x\n",
@@ -611,9 +640,10 @@ static bool e1000_probe_device(const pci_device_t *device)
 
 fail:
     if (state->mmio) e1000_write(state, E1000_REG_IMC, 0xFFFFFFFFU);
+    e1000_irq_quiesce(state);
     if (registered) (void)net_unregister_device(&state->device);
     e1000_release_buffers(state);
-    *state = (e1000_state_t){0};
+    e1000_state_reset(state);
     return false;
 }
 
@@ -622,13 +652,14 @@ static void e1000_detach(e1000_state_t *state, bool hardware_present)
     bool any_active = false;
 
     if (!state || !state->pci_valid) return;
+    if (hardware_present && state->mmio)
+        e1000_write(state, E1000_REG_IMC, 0xFFFFFFFFU);
+    e1000_irq_quiesce(state);
     state->active = false;
     state->device.administrative_enabled = false;
     (void)net_unregister_device(&state->device);
-    if (hardware_present && state->mmio)
-        e1000_write(state, E1000_REG_IMC, 0xFFFFFFFFU);
     e1000_release_buffers(state);
-    *state = (e1000_state_t){0};
+    e1000_state_reset(state);
     for (u32 index = 0; index < E1000_MAX_CONTROLLERS; index++)
         any_active |= controllers[index].active;
     if (!any_active && e1000_irq_registered) {

@@ -108,9 +108,9 @@ void input_trace_record(u32 kind, u32 key, u32 first, u32 second)
 
 void timer_init(void)
 {
-    (void)irq_register_vector(IRQ_VECTOR_PIT, timer_interrupt);
-    (void)irq_register_vector(IRQ_VECTOR_LAPIC_TIMER,
-                              timer_lapic_interrupt);
+    (void)irq_register_permanent_vector(IRQ_VECTOR_PIT, timer_interrupt);
+    (void)irq_register_permanent_vector(IRQ_VECTOR_LAPIC_TIMER,
+                                       timer_lapic_interrupt);
 }
 
 bool timer_monotonic_init(void)

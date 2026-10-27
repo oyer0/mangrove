@@ -1279,8 +1279,8 @@ void vmm_init(void) {
         __atomic_store_n(&vmm_shootdown_request.acknowledged[word], 0,
                          __ATOMIC_RELAXED);
     }
-    if (!irq_register_vector(IRQ_VECTOR_TLB_SHOOTDOWN,
-                             vmm_tlb_shootdown_handler))
+    if (!irq_register_permanent_vector(IRQ_VECTOR_TLB_SHOOTDOWN,
+                                       vmm_tlb_shootdown_handler))
         panic("vmm: failed to register TLB shootdown vector");
     active_pml4 = 0;
     kernel_pml4 = 0;
