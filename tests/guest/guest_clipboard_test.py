@@ -21,6 +21,7 @@ import guest_mgfs_test as guest
 import guest_secondary_test as secondary
 
 SOURCE = 'hello clipboard 🌱\nsecond line\n'.encode()
+SEARCH_SOURCE = b'needle first line\nmiddle line\nneedle second line\n'
 
 
 def png(ppm, destination):
@@ -72,6 +73,10 @@ def main():
         guest.install(image,2,'cliptest',(build/'cliptest/cliptest.elf').read_bytes())
         secondary.install(image,6,'clip-source.txt',source,owner=1000,permissions=3)
         secondary.install(image,6,'clip-target.txt',b'TARGET\n',owner=1000,permissions=3)
+        secondary.install(image,6,'search-next.txt',SEARCH_SOURCE,
+                          owner=1000,permissions=3)
+        secondary.install(image,6,'search-prev.txt',SEARCH_SOURCE,
+                          owner=1000,permissions=3)
         (work/'initial-root.img').write_bytes(image)
         guest.check_image(build,work/'initial-root.img',work/'prepared-check.log')
         with disk.open('r+b') as stream: stream.seek(guest.ROOT_OFFSET);stream.write(image)
@@ -100,16 +105,18 @@ def main():
             path = work/'poll.ppm'
             qmp.screendump(path)
             return guest.screen_text(path)
-        def wait(predicate, timeout=90 if args.large else 45):
+        def wait(predicate, description='framebuffer condition',
+                 timeout=90 if args.large else 45):
             deadline=min(time.monotonic()+timeout,overall_deadline)
             while time.monotonic()<deadline:
                 text=screen();(work/'poll.txt').write_text(text)
                 if predicate(text):return text
                 time.sleep(.05)
-            raise TimeoutError('framebuffer condition not observed')
+            raise TimeoutError(description + ' not observed')
         prompt='developer ~:'
         def at_prompt(text): return text.rstrip().splitlines()[-1:]==[prompt]
         def key(code):
+            code = {'?':'shift-slash','\b':'backspace'}.get(code, code)
             result=qmp.call('human-monitor-command',{'command-line':f'sendkey {code} 30'})
             if result:raise RuntimeError(result)
             report['actions'].append(code)
@@ -126,12 +133,13 @@ def main():
                 wait(lambda t:t.rstrip().splitlines()[-1:]==[expected])
                 key({'/':'slash',' ':'spc','.':'dot','-':'minus','>':'shift-dot'}.get(char,char))
             key('ret')
-            if complete:wait(at_prompt,180)
+            if complete:wait(at_prompt,timeout=180,
+                             description='Shoot prompt after command')
         def editor_command(text):
             key('slash')
             for char in text:key(char)
             key('ret')
-        wait(at_prompt,90)
+        wait(at_prompt,timeout=90,description='initial Shoot prompt')
         command('/bin/cliptest suite > /temp/cliptest.log')
         capture('suite-returned',at_prompt)
         command('reed /temp/clip-source.txt',False)
@@ -164,6 +172,63 @@ def main():
             wait(lambda t:'NORMAL' in t and '/temp/clip-target.txt' in t);key('g')
         capture('target-reopened',lambda t:'hello clipboard' in t and 'NORMAL' in t)
         editor_command('q');wait(at_prompt)
+
+        def open_search_file(name):
+            command('reed /temp/' + name,False)
+            return wait(lambda t:'NORMAL' in t and name in t)
+
+        def enter_search(query, edit_query=False):
+            key('?')
+            wait(lambda t:'Find:' in t,'incremental search prompt')
+            for character in query:
+                key(character)
+            wait(lambda t:'Find: ' + query in t,'search query displayed')
+            if edit_query:
+                key('backspace')
+                wait(lambda t:'Find: needl' in t,'edited search query')
+                key('e')
+                wait(lambda t:'Find: needle' in t,'corrected search query')
+            key('ret')
+            return wait(lambda t:'SEARCH' in t and 'Find:' not in t,
+                        'accepted query in Search mode')
+
+        open_search_file('search-next.txt')
+        enter_search('needlx',edit_query=True)
+        key('n')
+        key('n')
+        key('esc')
+        wait(lambda t:'NORMAL' in t and 'Find:' not in t,
+             'Escape exits Search mode')
+        key('i')
+        wait(lambda t:'INSERT' in t,'ordinary Insert input after Search')
+        key('shift-x')
+        wait(lambda t:'needleX second line' in t and 'INSERT' in t,
+             'ordinary text input after Search')
+        key('esc')
+        editor_command('s')
+        capture('search-next-saved',
+                lambda t:'Saved opened file.' in t and 'NORMAL' in t)
+        editor_command('q');wait(at_prompt)
+
+        open_search_file('search-prev.txt')
+        enter_search('needle')
+        key('n')
+        key('b')
+        key('b')
+        key('esc')
+        wait(lambda t:'NORMAL' in t and 'Find:' not in t,
+             'Search mode exits after reverse navigation')
+        key('i')
+        wait(lambda t:'INSERT' in t,'ordinary editing after reverse search')
+        key('shift-y')
+        wait(lambda t:'needleY first line' in t and 'INSERT' in t,
+             'ordinary editing at previous match')
+        key('esc')
+        editor_command('s')
+        capture('search-prev-saved',
+                lambda t:'Saved opened file.' in t and 'NORMAL' in t)
+        editor_command('q');wait(at_prompt)
+
         command('say clipboard-restored')
         capture('shoot-restored',lambda t:at_prompt(t) and 'clipboard-restored' in t)
         command('/bin/shutdown',False)
@@ -188,10 +253,24 @@ def main():
             # final-newline setting. The source may deliberately lack one.
             expected = source if name == 'source' or source.endswith(b'\n') else source + b'\n'
             if actual!=expected:raise ValueError(f'{name}: saved bytes differ from its final-newline contract')
+        expected_search = {
+            'search-next.txt': SEARCH_SOURCE.replace(
+                b'needle second',b'needleX second'),
+            'search-prev.txt': SEARCH_SOURCE.replace(
+                b'needle first',b'needleY first'),
+        }
+        for name, expected in expected_search.items():
+            actual = guest.payload(image,guest.find(image,'/temp/'+name)[1])
+            if actual != expected:
+                raise ValueError(f'Reed search navigation produced incorrect edit in {name}: '
+                                 f'{actual!r}')
         report.update(status='PASS',native_suite=result,source_bytes=len(source),
             saved_bytes=len(source) + (0 if source.endswith(b'\n') else 1),
             source_sha256=hashlib.sha256(source).hexdigest(),
             saved_sha256=hashlib.sha256(source if source.endswith(b'\n') else source+b'\n').hexdigest(),
+            reed_search='PASS: query edit, n/b navigation, boundaries, Escape and normal input',
+            search_files_sha256={name:hashlib.sha256(data).hexdigest()
+                                 for name,data in expected_search.items()},
             smp=guest.inspect_smp_boot(disk,2),independent_mgfs='PASS')
     except Exception as error:
         report['status']='FAIL';report['error']=str(error)
