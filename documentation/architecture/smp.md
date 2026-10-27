@@ -104,6 +104,12 @@ global scheduler timekeeping source and wakes sleeping threads; local LAPIC
 timer interrupts provide per-CPU preemption without multiplying wall-clock
 time by the CPU count.
 
+Timer preemption counters are diagnostic accounting shared across CPUs. Their
+increments and samples use relaxed atomic operations: these counters do not
+publish scheduler state or order other memory. Scheduler statistics other
+than the independently sampled timer-preemption count remain protected by the
+global scheduler lock.
+
 ## Interrupt policy
 
 External device interrupts remain routed to the BSP, including the current

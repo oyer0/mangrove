@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include <scheduler.h>
+#include <preemption_count.h>
 #include <cpu.h>
 #include <idt.h>
 #include <heap.h>
@@ -516,7 +517,20 @@ void scheduler_get_stats(scheduler_stats_t *stats)
 {
     if (stats) {
         u64 flags = spin_lock_irqsave(&scheduler_lock);
-        *stats = scheduler_stats;
+        stats->context_switches = scheduler_stats.context_switches;
+        stats->timer_preemptions = preemption_count_snapshot(
+            &scheduler_stats.timer_preemptions);
+        stats->voluntary_yields = scheduler_stats.voluntary_yields;
+        stats->blocks = scheduler_stats.blocks;
+        stats->wakeups = scheduler_stats.wakeups;
+        stats->sleeping_threads = scheduler_stats.sleeping_threads;
+        stats->blocked_threads = scheduler_stats.blocked_threads;
+        stats->peak_runnable_threads =
+            scheduler_stats.peak_runnable_threads;
+        stats->idle_runtime_ticks = scheduler_stats.idle_runtime_ticks;
+        for (u32 priority = 0; priority < 3U; priority++)
+            stats->dispatches[priority] =
+                scheduler_stats.dispatches[priority];
         spin_unlock_irqrestore(&scheduler_lock, flags);
     }
 }
@@ -560,7 +574,7 @@ void scheduler_dump(void)
     }
     kprint("\n  switches=%llu preemptions=%llu yields=%llu blocks=%llu wakes=%llu\n",
            scheduler_stats.context_switches,
-           scheduler_stats.timer_preemptions,
+           preemption_count_snapshot(&scheduler_stats.timer_preemptions),
            scheduler_stats.voluntary_yields,
            scheduler_stats.blocks,
            scheduler_stats.wakeups);
@@ -1862,7 +1876,7 @@ bool scheduler_prepare_preemption(struct cpu_registers *regs)
      * when this thread is selected again. */
     if (cpu_registers_has_privilege_stack(regs)) {
         preemption_pending = false;
-        scheduler_stats.timer_preemptions++;
+        preemption_count_increment(&scheduler_stats.timer_preemptions);
         (void)scheduler_reschedule();
         return false;
     }
@@ -1878,7 +1892,7 @@ bool scheduler_prepare_preemption(struct cpu_registers *regs)
     /* Keep the transition interrupt-free until the trampoline is running. */
     regs->rflags &= ~(1ULL << 9);
     regs->rip = (u64)(uintptr_t)&thread_interrupt_return_trampoline;
-    scheduler_stats.timer_preemptions++;
+    preemption_count_increment(&scheduler_stats.timer_preemptions);
     preemption_pending = false;
     return true;
 }

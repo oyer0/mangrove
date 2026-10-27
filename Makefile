@@ -1153,6 +1153,10 @@ test-pmm:
 		-o /tmp/mangrove-pmm-test
 	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-pmm-test
 
+.PHONY: test-preemption-accounting
+test-preemption-accounting:
+	python3 tests/kernel/preemption_accounting_test.py "$(HOST_CC)"
+
 .PHONY: test-idt
 test-idt:
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
@@ -1674,7 +1678,7 @@ test-ipc-capacity:
 		-o "$(BUILD_DIR)/tests/ipc_capacity_test"
 	ASAN_OPTIONS=detect_leaks=0 "$(BUILD_DIR)/tests/ipc_capacity_test"
 
-test-sync: test-spinlock-context test-ipc-capacity
+test-sync: test-spinlock-context test-ipc-capacity test-preemption-accounting
 	python3 tests/filesystems/mgfs/mgfs_handoff_test.py "$(HOST_CC)"
 	python3 tests/filesystems/fat32/fat_handoff_test.py "$(HOST_CC)"
 	python3 tests/filesystems/vfs/vfs_location_test.py "$(HOST_CC)"

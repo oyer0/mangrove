@@ -42,8 +42,8 @@ prelude = r"""
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdatomic.h>
-typedef uint64_t u64;
-typedef uint32_t u32;
+#include <types.h>
+#include <preemption_count.h>
 typedef struct { volatile u32 value; } spinlock_t;
 typedef struct cpu_local {
     volatile u32 spinlock_depth;
@@ -263,7 +263,9 @@ with tempfile.TemporaryDirectory(prefix="mangrove-spinlock-context-",
     executable = Path(temp) / "test"
     subprocess.run(
         [CC, "-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread",
-         "-fsanitize=address,undefined", str(source), "-o", str(executable)],
+         "-fsanitize=address,undefined", "-Ikernel/include", "-Iinclude",
+         str(source), "-o", str(executable)],
+        cwd=ROOT,
         check=True,
     )
     subprocess.run([str(executable)], check=True, timeout=30)

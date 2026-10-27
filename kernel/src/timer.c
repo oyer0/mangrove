@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include <timer.h>
+#include <preemption_count.h>
 #include <acpi.h>
 #include <irq.h>
 #include <drivers/input/keyboard.h>
@@ -27,7 +28,7 @@
 #define ACPI_ADDRESS_SPACE_SYSTEM_MEMORY  0U
 
 static u64 ticks = 0;
-static volatile u64 preemptions = 0;
+static u64 preemptions = 0;
 static volatile u8 *monotonic_hpet;
 static u64 monotonic_counter_mask;
 static u64 monotonic_period_fs;
@@ -253,7 +254,7 @@ void timer_interrupt(struct cpu_registers *regs)
     (void)scheduler_global_tick();
     if (!lapic_timer_active() && scheduler_timer_tick()) {
         /* Scheduling is deferred until irq_handler has sent EOI. */
-        preemptions++;
+        preemption_count_increment(&preemptions);
     }
 }
 
@@ -262,7 +263,7 @@ void timer_lapic_interrupt(struct cpu_registers *regs)
     (void)regs;
     if (scheduler_timer_tick()) {
         /* The common IRQ exit path performs deferred preemption after EOI. */
-        preemptions++;
+        preemption_count_increment(&preemptions);
     }
 }
 
@@ -278,7 +279,7 @@ u64 timer_uptime_ms(void)
 
 u64 timer_preemptions(void)
 {
-    return preemptions;
+    return preemption_count_snapshot(&preemptions);
 }
 
 void timer_sleep(u64 ms)
