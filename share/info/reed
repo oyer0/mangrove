@@ -1,173 +1,148 @@
-Reed text editor
-================
+NAME
 
-Start Reed with reed for an unnamed buffer or reed FILE to edit a file. A
-missing file is not created until a successful save. Use reed --help for
-quick invocation syntax. Reed is modal and uses the alternate screen while
-editing.
+reed - Edit UTF-8 text files
 
-Modes and navigation
---------------------
+SYNOPSIS
 
-Reed has Normal, Insert, Selection, Command, and Search modes. Positions and
-edits are UTF-8 scalar boundaries. The cursor is an insertion boundary.
+    reed [FILE]
+    reed --help
 
-Normal mode:
+DESCRIPTION
 
-  h / Left, l / Right       Move one scalar.
-  j / Down, k / Up          Move one visual row when wrapping, otherwise one
-                            logical line; retain the preferred cell column.
-  b / n                     Move to the final scalar of the previous or
-                            current/next word, respectively.
-  B / N                     Move to the beginning of the current/previous
-                            word, or skip to the next word beginning.
-  a / Home, e / End         Move to logical line start/end boundary.
-  A / E                     Move to line start/end and enter Insert mode.
-  g / Ctrl+Home, G / Ctrl+End
-                            Move to document start/end.
-  [ / ]                     Move to previous/next paragraph.
-  Page Up / Page Down       Move by a visible text viewport.
-  i                         Enter Insert mode at the cursor.
-  o / O                     Open a blank logical line below/above and enter
-                            Insert mode on it.
-  s / S / Alt+S             Start character selection, line selection, or
-                            select the whole document.
-  d / Backspace / Delete    Delete at cursor, before cursor, or at cursor.
-  u / Shift+U                Undo / redo.
-  c / x + motion            Copy / cut a motion range through clipd.
-  cc / xx                   Copy / cut the complete logical line.
-  v                         Paste at the cursor.
-  / / ?                     Open command / incremental search prompt.
+Reed is a modal text editor. With no file argument it opens an unnamed buffer.
+A missing file is created only when it is saved successfully. Editing uses the
+alternate screen; leaving Reed restores the terminal screen.
 
-Words are runs of ASCII letters, digits, underscore, and valid non-ASCII
-scalars. ASCII punctuation, whitespace, and line breaks separate words. b
-and n land on the last scalar of their target word. B and N move to word
-starts. Motions do not wrap at document boundaries. B from inside a word
-moves to its start; another B at that start continues to the previous word.
-N skips the word under the cursor and goes to the next word start.
+Normal mode navigates and edits the document. Insert mode enters text.
+Selection mode highlights text or complete lines for editing and clipboard
+operations. Command mode accepts file operations. Search mode keeps literal
+matches highlighted while navigating them.
 
-Paragraphs are runs of nonblank logical lines. Empty lines and lines containing
-only ASCII spaces, tabs, or carriage returns separate paragraphs. [ from
-inside a paragraph moves to its first line; from that line's beginning or a
-separator it moves to the previous nonblank paragraph. ] moves to the next
-nonblank paragraph. At document edges, motions stay in place. { and } are
-reserved and currently do nothing.
+OPTIONS
 
-Selection
----------
+    -h, --help — Show concise invocation help and exit.
 
-s starts character selection, S starts line selection, and Alt+S selects
-the document. Navigation extends from the original anchor. Pressing the active
-selection key cancels; pressing the other changes granularity while keeping
-the anchor and endpoint. Escape cancels at the current endpoint. Line selection
-includes complete logical lines and appropriate newline bytes without
-inventing a final newline. d deletes a selection as one undoable edit and
-returns to Normal mode. i does not enter Insert mode from selection.
+KEYBINDINGS
 
-The system clipboard is shared within your authenticated session. In selection,
-c copies, x cuts, and v replaces the selection. In Normal mode, c/x take one
-of b/B/n/N, a/e, g/G, [ or ] as a suffix; cc/xx use the complete logical line
-under the selection newline rule. Escape cancels a pending operator. Word-end
-ranges include the destination scalar even though edits use half-open ranges.
-Copy leaves the cursor fixed; successful selection operations return to Normal.
+Movement
 
-Cut publishes successfully before deleting. Paste downloads a complete item
-before one undoable replacement. Failure leaves text, selection and undo/redo
-unchanged. Empty text deletes a selection or does nothing without one. NUL
-bytes are rejected. Paste allocation/address failures preserve the document. No
-truncation occurs. Undo/redo, typing and ordinary deletion do not change the
-clipboard. Contents survive the source editor exiting; logout or restarting
-clipd loses them. There is no private yank register or clipboard history.
+    h — Move one character left (Normal).
+    Left — Move one character left (Normal and Insert).
+    j — Move down one visual row (Normal).
+    Down — Move down one visual row (Normal and Insert).
+    k — Move up one visual row (Normal).
+    Up — Move up one visual row (Normal and Insert).
+    l — Move one character right (Normal).
+    Right — Move one character right (Normal and Insert).
+    b — Move backward to the end of the previous word (Normal).
+    B — Move backward to the beginning of the current or previous word (Normal).
+    n — Move forward to the end of the current or next word (Normal).
+    N — Move forward to the beginning of the next word (Normal).
+    a — Move to the current logical line start (Normal).
+    Home — Move to the logical line start (Normal and Insert).
+    e — Move to the current logical line end (Normal).
+    End — Move to the logical line end (Normal and Insert).
+    A — Move to line start and enter Insert mode.
+    E — Move to line end and enter Insert mode.
+    g — Move to the document start (Normal).
+    Ctrl+Home — Move to the document start (Normal).
+    G — Move to the document end (Normal).
+    Ctrl+End — Move to the document end (Normal).
+    [ — Move to the previous paragraph (Normal).
+    ] — Move to the next paragraph (Normal).
+    Page Up — Move up one viewport (Normal).
+    Page Down — Move down one viewport (Normal).
 
-Insert, commands, and search
----------------------------
+Editing
 
-Insert mode accepts text, arrow navigation, Home/End, Backspace, Delete, and
-Enter for a newline. Shift+Arrow does not select. Escape returns to Normal
-mode. The o and O commands work in empty files, at the first or last line,
-and when the file has no trailing newline. Undo restores the previous line and
-final-newline state.
+    i — Enter Insert mode at the cursor (Normal).
+    o — Open a line below the current line (Normal).
+    O — Open a line above the current line (Normal).
+    Enter — Insert a newline (Insert).
+    Escape — Return to Normal mode (Insert).
+    d — Delete at the cursor (Normal).
+    Backspace — Delete before the cursor (Normal and Insert).
+    Delete — Delete at the cursor (Normal and Insert).
+    u — Undo (Normal).
+    U — Redo (Normal).
 
-/ opens Reed's command prompt. The command name ends at a space or tab and is
-case-insensitive, but must match exactly. Tab completes an unambiguous command
-name; it does not complete paths.
+Selection and clipboard
 
-  /s             Save the current file.
-  /q             Quit with unsaved-change protection.
-  /sq            Save, then quit only if saving succeeds.
-  /saveas PATH   Save as a new path; the destination must not exist.
-  /open PATH     Open another file.
-  /find TEXT     Find literal text forward, wrapping to the document start.
+    s — Start character selection (Normal); cancel or change to characters (Selection).
+    S — Start line selection (Normal); cancel or change to lines (Selection).
+    Alt+S — Select the whole document (Normal).
+    Escape — Cancel selection (Selection).
+    d — Delete the selected text (Selection).
+    c — Copy selected text (Selection).
+    x — Copy, then delete selected text (Selection).
+    v — Replace the selection with clipboard text (Selection).
+    c — Start a copy motion or whole-line operation (Normal).
+    x — Start a cut motion or whole-line operation (Normal).
+    v — Paste clipboard text at the cursor (Normal).
 
-Command errors appear in the status row. Failed or cancelled actions retain
-the buffer. Alt+S means Select All, not Save.
+Search
 
-? opens incremental literal search. All matches highlight while the query is
-edited, with Backspace/Delete editing the query. Escape cancels and returns to
-the original cursor. Enter selects the match nearest the original cursor
-(ties choose the later match), places the cursor after it, and enters Search
-mode. No match returns to Normal mode at the original cursor. In Search mode,
-n advances to the next match and b to the previous match. Search navigation
-uses the current cursor, does not wrap, and warns while leaving the cursor
-unchanged when no match exists. ? or Escape exits Search mode at the current
-cursor and clears highlights. Editing is unavailable until Search mode ends.
+    / — Open command entry (Normal).
+    ? — Open incremental search (Normal).
+    Backspace — Delete the previous query character (Search prompt).
+    Delete — Delete the query character at the cursor (Search prompt).
+    Enter — Move to the nearest match after accepting the query (Search prompt).
+    Escape — Cancel search and restore its starting cursor (Search prompt).
+    n — Move to the next match without wrapping (Search mode).
+    b — Move to the previous match without wrapping (Search mode).
+    ? — Exit Search mode at the current cursor.
+    Escape — Exit Search mode at the current cursor.
 
-Display and text limits
-----------------------
+Word motions treat ASCII letters, digits, underscore, and non-ASCII Unicode
+scalars as word characters; punctuation and whitespace separate words.
+Paragraphs are runs of nonblank logical lines separated by blank lines. In
+wrapped mode vertical movement follows visual rows; line and paragraph
+commands use logical lines.
 
-Soft wrapping is the default. Long logical lines occupy additional visual rows
-without adding newline bytes. j/k and arrows move by visual row when wrapping
-is enabled, while a/e, Home/End, and paragraph motions remain logical. Tabs
-expand to the configured cell stop but remain tab bytes in the file. Setting
-wrap = false disables wrapping and uses one shared horizontal offset for all
-lines; the status row and prompts remain stationary.
+CONFIGURATION
 
-Reed accepts valid UTF-8 text and rejects NUL or malformed UTF-8 in files. The
-cursor and renderer operate on Unicode scalar boundaries and count each scalar
-as one cell. Editing is not grapheme-aware and does not account for combining
-marks or wide-script display width. Search is literal, not regular-expression
-based. Paths are limited to 255 bytes; documents have no fixed 2 MiB ceiling.
-The editable text, saved baseline, layout, undo data and serialized save must
-fit available memory. Safe saving also requires kernel staging memory and
-filesystem space and ownership-proof resources. Failure preserves unsaved edits.
-Undo/redo retain up to 64 groups of changed bytes, with an 8 MiB retention
-target per stack; one larger atomic edit remains undoable when memory permits.
-Ordinary edits do not make full-document undo copies. Newline/layout changes,
-very long single-line edits and unsuccessful searches can take linear time.
-There is no out-of-core editing, swap or silent truncation.
+Reed reads `~/.config/reed/config` once at startup. The file is optional and
+is not created automatically. Built-in defaults are:
 
-Configuration
--------------
+    wrap=true
+    tab_width=4
 
-Reed reads its optional configuration at startup from:
+`wrap` accepts `true` or `false`. `tab_width` accepts an integer from 1 through
+16. Blank lines and whitespace around assignments are accepted. Lines may
+contain `#`, `;`, or `//` comments. Duplicate or unknown keys, invalid values,
+malformed input, or a read failure reject the complete file. Reed keeps both
+built-in defaults and displays the path and specific error in its status row;
+parse errors include a line number. The file is never rewritten. Settings are
+not reloaded during an editing session.
 
-    ~/.config/reed/config
+COMMANDS
 
-It does not create the directories or file and does not reload settings during
-an editing session. Missing configuration uses these defaults:
+    /s — Save the current file.
+    /q — Quit with unsaved-change protection.
+    /sq — Save and quit only after a successful save.
+    /saveas PATH — Save to a new path; an existing destination is not replaced.
+    /open PATH — Open another file after applying the save/discard prompt.
+    /find TEXT — Find literal text forward, wrapping to document start.
 
-    wrap = true
-    tab_width = 4
+Use Tab to complete a command name. Command names are case-insensitive and
+must otherwise match exactly. Failed commands leave the document open.
 
-To configure Reed, use jump to go to your home directory, create each
-missing parent directory with mkdir, then open the new file with Reed, enter
-the settings, and save with /s. For example:
+EXAMPLES
 
-    jump
-    mkdir .config
-    mkdir .config/reed
-    reed .config/reed/config
+    reed
+    reed notes.txt
 
-wrap accepts true or false. tab_width accepts an integer from 1 through
-16. Blank lines and whitespace around assignments are allowed. Lines may use
-#, ;, or // comments. Duplicate or unknown keys, malformed values, NUL,
-lines longer than 127 bytes, and files larger than 1023 bytes invalidate the
-whole file. Reed keeps its built-in defaults and displays a warning; it never
-partially applies invalid settings or rewrites the file.
+NOTES
 
-Reed has no separate history, state, or cache file. It saves only the path
-chosen by the user. Saving an existing file uses a conditional replacement
-against its opened generation; a stale save is rejected and offers cancel,
-Save As, or explicit overwrite after reading a complete new version. Save As
-never overwrites an existing destination. Runtime conflict handling does not
-promise crash atomicity or power-loss durability.
+Reed stores valid UTF-8 and rejects NUL or malformed UTF-8 when opening a
+file. Cursor movement and display are scalar-based; grapheme editing, wide
+character layout, and combining-mark layout are not supported. Saving an
+existing file checks that it has not changed since opening. A conflict must
+be resolved in Reed; Save As does not overwrite. Failed or uncertain saves
+leave edits in the buffer. Undo and redo retain grouped changes in memory and
+are limited by available process memory.
+
+SEE ALSO
+
+    info shoot
+    documentation/editor/README.md

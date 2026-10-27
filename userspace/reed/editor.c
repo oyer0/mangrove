@@ -152,6 +152,7 @@ typedef struct reed_editor {
     bool running;
     bool alternate_entered;
     bool raw_input;
+    bool config_warning;
     bool insert_transaction;
     bool insert_recorded;
     reed_selection_t selection;
@@ -297,6 +298,7 @@ static void set_status(reed_editor_t *editor, const char *text)
     usize length;
 
     if (!editor || !text) return;
+    editor->config_warning = false;
     length = strlen(text);
     if (length >= sizeof(editor->status)) length = sizeof(editor->status) - 1U;
     memcpy(editor->status, text, length);
@@ -2810,8 +2812,10 @@ int reed_run(const char *pathname)
     }
     result = reed_config_load(&editor->config, config_diagnostic,
                               sizeof(config_diagnostic));
-    if (result != MG_OK && config_diagnostic[0])
+    if (result != MG_OK && config_diagnostic[0]) {
         set_status(editor, config_diagnostic);
+        editor->config_warning = true;
+    }
     result = terminal_alternate_enter();
     if (result != MG_OK) {
         editor_destroy_frames(editor);
@@ -3249,19 +3253,24 @@ static void frame_build_status(reed_editor_t *editor, u32 row, u32 columns,
                            ? "LINE" : "CHAR");
         status_mode = selection_mode;
     }
-    status_length = snprintf(status, sizeof(status), "%s  %s%s  %llu:%llu%s",
-                             status_mode, path ? path : "[unnamed]",
-                             editor->save_uncertain ? " [?]" :
-                             editor->save_conflict ? " [!]" :
-                             (reed_buffer_is_modified(&editor->buffer)
-                                 ? " [+]" : ""),
-                             (unsigned long long)(reed_buffer_line_at(
-                                 &editor->buffer,
-                                 reed_buffer_cursor(&editor->buffer)) + 1U),
-                             (unsigned long long)(reed_buffer_line_column(
-                                 &editor->buffer,
-                                 reed_buffer_cursor(&editor->buffer)) + 1U),
-                             editor->status[0] ? "  " : "");
+    if (editor->config_warning) {
+        status_length = snprintf(status, sizeof(status), "%s",
+                                 editor->status);
+    } else {
+        status_length = snprintf(status, sizeof(status), "%s  %s%s  %llu:%llu%s",
+                                 status_mode, path ? path : "[unnamed]",
+                                 editor->save_uncertain ? " [?]" :
+                                 editor->save_conflict ? " [!]" :
+                                 (reed_buffer_is_modified(&editor->buffer)
+                                     ? " [+]" : ""),
+                                 (unsigned long long)(reed_buffer_line_at(
+                                     &editor->buffer,
+                                     reed_buffer_cursor(&editor->buffer)) + 1U),
+                                 (unsigned long long)(reed_buffer_line_column(
+                                     &editor->buffer,
+                                     reed_buffer_cursor(&editor->buffer)) + 1U),
+                                 editor->status[0] ? "  " : "");
+    }
     if (status_length < 0) status_length = 0;
     if ((usize)status_length > sizeof(status) - 1U)
         status_length = sizeof(status) - 1U;

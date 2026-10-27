@@ -254,6 +254,26 @@ static void reed_fixture_end(reed_editor_t *editor)
     assert(terminal_alternate_leave_process(EDITOR_TEST_PID));
     assert_pixels_match_cells();
 }
+static void test_reed_config_warning_visibility(void)
+{
+    static const char warning[] =
+        "~/.config/reed/config: line 2: tab_width must be 1..16; defaults used.";
+    reed_editor_t editor;
+    const u32 columns = 80U;
+    const u32 rows = 24U;
+
+    reed_fixture_start(&editor, "text", columns, rows);
+    set_status(&editor, warning);
+    editor.config_warning = true;
+    reed_present(&editor);
+    for (usize index = 0; index < sizeof(warning) - 1U; index++)
+        assert(screen_cell(rows - 1U, (u32)index)->codepoint ==
+               (u8)warning[index]);
+
+    set_status(&editor, "Editing resumed.");
+    assert(!editor.config_warning);
+    reed_fixture_end(&editor);
+}
 static void test_reed_work(void)
 {
     reed_editor_t editor;
@@ -383,6 +403,7 @@ static void test_reed_narrow_and_long_layout(void)
 int main(void)
 {
 #if defined(TEST_REED_RENDER)
+    test_reed_config_warning_visibility();
     test_reed_work();
     test_reed_clipboard_pixels();
     test_reed_narrow_and_long_layout();

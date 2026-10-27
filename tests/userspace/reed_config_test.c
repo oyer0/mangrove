@@ -15,6 +15,8 @@ static mg_result_t test_path_result;
 static char *test_contents;
 static usize test_contents_length;
 static usize test_contents_offset;
+static bool short_read;
+static mg_result_t close_result = MG_OK;
 static char observed_path[MG_PATH_MAX_BYTES + 1U];
 static int fail_realloc_after = -1;
 
@@ -32,6 +34,14 @@ void *__wrap_realloc(void *pointer, size_t size)
 bool result_is_error(mg_result_t result)
 {
     return result < 0;
+}
+
+const char *error_string(mg_result_t result)
+{
+    if (result == MG_ERR_ACCESS_DENIED) return "access denied";
+    if (result == MG_ERR_IO) return "I/O failure";
+    if (result == MG_ERR_NO_MEMORY) return "out of memory";
+    return "controlled filesystem error";
 }
 
 mg_result_t process_get_identity(mg_identity_t *identity)
@@ -72,6 +82,7 @@ mg_result_t object_read(mg_handle_t handle, void *buffer, usize length)
     usize copied;
 
     assert(handle == 7);
+    if (short_read) return MG_ERR_END_OF_FILE;
     if (test_contents_offset >= test_contents_length) return MG_ERR_END_OF_FILE;
     available = test_contents_length - test_contents_offset;
     copied = available < length ? available : length;
@@ -83,7 +94,7 @@ mg_result_t object_read(mg_handle_t handle, void *buffer, usize length)
 mg_result_t handle_close(mg_handle_t handle)
 {
     assert(handle == 7);
-    return MG_OK;
+    return close_result;
 }
 
 static void test_parser(void)
@@ -97,6 +108,12 @@ static void test_parser(void)
     const char unknown[] = "wrap = true\nindent_style = spaces\n";
     const char nul_value[] = {'w', 'r', 'a', 'p', ' ', '=', ' ', 't', 'r',
                               'u', 'e', '\0', 'x'};
+    const char *invalid_positions[] = {
+        "unknown=value\nwrap=false\n",
+        "wrap=false\nunknown=value\ntab_width=8\n",
+        "wrap=false\ntab_width=8\nunknown=value\n",
+    };
+    reed_config_t unchanged;
 
     reed_config_defaults(&config);
     assert(config.wrap && config.tab_width == 4U);
@@ -107,9 +124,10 @@ static void test_parser(void)
 
     config.wrap = true;
     config.tab_width = 3U;
+    unchanged = config;
     assert(!reed_config_parse(invalid, sizeof(invalid) - 1U, &config,
                               diagnostic, sizeof(diagnostic)));
-    assert(config.wrap && config.tab_width == 3U);
+    assert(memcmp(&config, &unchanged, sizeof(config)) == 0);
     assert(strstr(diagnostic, "line 2") != NULL);
     assert(!reed_config_parse(duplicate, sizeof(duplicate) - 1U, &config,
                               diagnostic, sizeof(diagnostic)));
@@ -120,6 +138,18 @@ static void test_parser(void)
     assert(!reed_config_parse(nul_value, sizeof(nul_value), &config,
                               diagnostic, sizeof(diagnostic)));
     assert(config.wrap && config.tab_width == 3U);
+    for (usize index = 0; index < sizeof(invalid_positions) /
+                                sizeof(invalid_positions[0]); index++) {
+        const char *invalid_text = invalid_positions[index];
+        config.wrap = false;
+        config.tab_width = 7U;
+        unchanged = config;
+        assert(!reed_config_parse(invalid_text, strlen(invalid_text),
+                                  &config, diagnostic, sizeof(diagnostic)));
+        assert(memcmp(&config, &unchanged, sizeof(config)) == 0);
+        assert(strstr(diagnostic, index == 0U ? "line 1" :
+                      index == 1U ? "line 2" : "line 3") != NULL);
+    }
 
     {
         const usize comment_length = 16384U;
@@ -164,12 +194,14 @@ static void set_contents(const char *text, usize length)
     test_contents = replacement;
     test_contents_length = length;
     test_contents_offset = 0;
+    short_read = false;
+    close_result = MG_OK;
 }
 
 static void test_load_and_fallback(void)
 {
     reed_config_t config = {false, 12U};
-    char diagnostic[128];
+    char diagnostic[512];
     const char valid[] = "wrap = false\ntab_width = 2\n";
     const char invalid[] = "wrap = false\ntab_width = 0\n";
     char *large;
@@ -188,8 +220,13 @@ static void test_load_and_fallback(void)
     assert(diagnostic[0] == '\0');
     assert(strcmp(observed_path, "/home/tester/.config/reed/config") == 0);
 
-    set_contents(valid, sizeof(valid) - 1U);
     test_path_result = MG_OK;
+    set_contents("", 0U);
+    assert(reed_config_load(&config, diagnostic, sizeof(diagnostic)) == MG_OK);
+    assert(config.wrap && config.tab_width == 4U);
+    assert(diagnostic[0] == '\0');
+
+    set_contents(valid, sizeof(valid) - 1U);
     assert(reed_config_load(&config, diagnostic, sizeof(diagnostic)) == MG_OK);
     assert(!config.wrap && config.tab_width == 2U);
 
@@ -197,7 +234,27 @@ static void test_load_and_fallback(void)
     assert(reed_config_load(&config, diagnostic, sizeof(diagnostic)) ==
            MG_ERR_BAD_ARGUMENT);
     assert(config.wrap && config.tab_width == 4U);
-    assert(diagnostic[0] != '\0');
+    assert(strstr(diagnostic, "~/.config/reed/config") != NULL);
+    assert(strstr(diagnostic, "line 2") != NULL);
+    assert(strstr(diagnostic, "defaults used") != NULL);
+
+    {
+        const char *invalid_positions[] = {
+            "unknown=value\nwrap=false\n",
+            "wrap=false\nunknown=value\ntab_width=8\n",
+            "wrap=false\ntab_width=8\nunknown=value\n",
+        };
+        for (usize index = 0; index < sizeof(invalid_positions) /
+                                    sizeof(invalid_positions[0]); index++) {
+            const char *contents = invalid_positions[index];
+            set_contents(contents, strlen(contents));
+            assert(reed_config_load(&config, diagnostic,
+                                    sizeof(diagnostic)) == MG_ERR_BAD_ARGUMENT);
+            assert(config.wrap && config.tab_width == 4U);
+            assert(strstr(diagnostic, index == 0U ? "line 1" :
+                          index == 1U ? "line 2" : "line 3") != NULL);
+        }
+    }
 
     large = (char *)malloc(large_length);
     assert(large);
@@ -210,6 +267,35 @@ static void test_load_and_fallback(void)
     free(large);
     assert(reed_config_load(&config, diagnostic, sizeof(diagnostic)) == MG_OK);
     assert(!config.wrap && config.tab_width == 4U);
+
+    short_read = true;
+    assert(reed_config_load(&config, diagnostic, sizeof(diagnostic)) ==
+           MG_ERR_IO);
+    assert(config.wrap && config.tab_width == 4U);
+    assert(strstr(diagnostic, "~/.config/reed/config") != NULL);
+    assert(strstr(diagnostic, "I/O failure") != NULL);
+    short_read = false;
+
+    test_path_result = MG_ERR_ACCESS_DENIED;
+    assert(reed_config_load(&config, diagnostic, sizeof(diagnostic)) ==
+           MG_ERR_ACCESS_DENIED);
+    assert(config.wrap && config.tab_width == 4U);
+    assert(strstr(diagnostic, "~/.config/reed/config") != NULL);
+    assert(strstr(diagnostic, "access denied") != NULL);
+    test_path_result = MG_OK;
+
+    short_read = true;
+    assert(reed_config_load(&config, diagnostic, sizeof(diagnostic)) ==
+           MG_ERR_IO);
+    assert(config.wrap && config.tab_width == 4U);
+    assert(strstr(diagnostic, "I/O failure") != NULL);
+    short_read = false;
+
+    close_result = MG_ERR_IO;
+    assert(reed_config_load(&config, diagnostic, sizeof(diagnostic)) ==
+           MG_ERR_IO);
+    assert(config.wrap && config.tab_width == 4U);
+    close_result = MG_OK;
 
     fail_realloc_after = 0;
     assert(reed_config_load(&config, diagnostic, sizeof(diagnostic)) ==

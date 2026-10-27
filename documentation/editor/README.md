@@ -170,7 +170,7 @@ When a logical line ends exactly at the right edge, its end insertion boundary
 is drawn on the final occupied cell, matching the terminal's pending-wrap
 cursor rule. The buffer cursor remains after the final scalar.
 
-Horizontal scrolling is available by setting `wrap = false`. It uses one
+Horizontal scrolling is available by setting `wrap=false`. It uses one
 document-wide horizontal offset: every logical line is clipped against the
 same left edge, including shorter neighboring lines. The status row and Reed's
 prompts remain fixed while the document viewport moves.
@@ -183,20 +183,24 @@ session. The file is optional; when absent, Reed uses soft wrapping and a tab
 width of four cells:
 
 ```ini
-wrap = true
-tab_width = 4
+wrap=true
+tab_width=4
 ```
 
-Blank lines and whitespace around keys and values are allowed. Lines may use
+The canonical spelling has no spaces around `=`; the parser also accepts
+optional whitespace around it. Blank lines and whitespace around keys and
+values are allowed. Lines may use
 `#`, `;`, or `//` comments. `wrap` accepts `true` or `false`; `tab_width` must
 be an integer from 1 through 16. Unknown or duplicate keys and malformed
 values reject the entire configuration; Reed keeps the built-in defaults and
-displays a status warning rather than applying partial settings. The parser
-has no fixed line or file-size ceiling; it reads the file into dynamically
-allocated memory and therefore remains subject to available process memory.
-It reads but never creates or rewrites the file. To configure Reed, create the
-parent directories and file yourself; configuration write policy is not part
-of this editor interface.
+displays a status warning rather than applying partial settings. Read and
+parse failures are reported separately; each warning identifies the path,
+includes the failing line when available, and leaves defaults active. The
+parser has no fixed line or file-size ceiling; it reads the file into
+dynamically allocated memory and therefore remains subject to available
+process memory. It reads but never creates or rewrites the file. To configure
+Reed, create the parent directories and file yourself; configuration write
+policy is not part of this editor interface.
 
 Documents have no fixed 2 MiB ceiling. Native pathnames allow up to 65,535
 UTF-8 bytes before NUL; each FAT32/exFAT component may use up to 765 UTF-8

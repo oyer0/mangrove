@@ -72,7 +72,7 @@ static bool config_error(char *diagnostic, usize capacity, usize line,
 {
     if (diagnostic && capacity)
         (void)snprintf(diagnostic, capacity,
-                       "Invalid Reed config at line %llu: %s",
+                       "line %llu: %s",
                        (unsigned long long)line, reason);
     return false;
 }
@@ -157,7 +157,7 @@ bool reed_config_parse(const char *text, usize length,
             if (!parse_tab_width(text, value, &candidate.tab_width))
                 return config_error(diagnostic, diagnostic_capacity,
                                     line_number,
-                                    "tab_width must be from 1 through 16.");
+                                    "tab_width must be 1..16.");
             saw_tab_width = true;
         } else if (key.begin != key.end) {
             return config_error(diagnostic, diagnostic_capacity,
@@ -238,6 +238,11 @@ static mg_result_t read_config(const char *path, char **out_data,
         }
         used += (usize)result;
     }
+    if ((u64)used != info.size) {
+        (void)handle_close(handle);
+        free(data);
+        return MG_ERR_IO;
+    }
     data[used] = '\0';
     result = handle_close(handle);
     if (result != MG_OK) {
@@ -253,6 +258,7 @@ mg_result_t reed_config_load(reed_config_t *config, char *diagnostic,
                              usize diagnostic_capacity)
 {
     reed_config_t candidate;
+    char parse_diagnostic[160];
     char *path = NULL;
     char *data = NULL;
     usize length = 0;
@@ -266,14 +272,14 @@ mg_result_t reed_config_load(reed_config_t *config, char *diagnostic,
     path = (char *)malloc(MG_PATH_MAX_BYTES + 1U);
     if (!path) {
         set_diagnostic(diagnostic, diagnostic_capacity,
-                       "Could not allocate Reed config path; using defaults.");
+                       "~/.config/reed/config: out of memory; defaults used.");
         return MG_ERR_NO_MEMORY;
     }
     result = app_directory_path(MG_APP_DIRECTORY_CONFIG, "reed", path,
                                 MG_PATH_MAX_BYTES + 1U);
     if (result_is_error(result)) {
         set_diagnostic(diagnostic, diagnostic_capacity,
-                       "Could not resolve Reed config path; using defaults.");
+                       "~/.config/reed/config: path unavailable; defaults used.");
         free(path);
         return result;
     }
@@ -281,23 +287,34 @@ mg_result_t reed_config_load(reed_config_t *config, char *diagnostic,
     if (base_length > MG_PATH_MAX_BYTES - suffix_length) {
         free(path);
         set_diagnostic(diagnostic, diagnostic_capacity,
-                       "Reed config path is too long; using defaults.");
+                       "~/.config/reed/config: path too long; defaults used.");
         return MG_ERR_NAME_TOO_LONG;
     }
     memcpy(path + base_length, "/config", suffix_length + 1U);
     result = read_config(path, &data, &length);
-    free(path);
-    if (result == MG_ERR_NOT_FOUND) return MG_OK;
+    if (result == MG_ERR_NOT_FOUND) {
+        free(path);
+        return MG_OK;
+    }
     if (result != MG_OK) {
-        set_diagnostic(diagnostic, diagnostic_capacity,
-                       "Could not read Reed config; using defaults.");
+        if (diagnostic && diagnostic_capacity)
+            (void)snprintf(diagnostic, diagnostic_capacity,
+                           "~/.config/reed/config: %s; defaults used.",
+                           error_string(result));
+        free(path);
         return result;
     }
-    if (!reed_config_parse(data, length, &candidate, diagnostic,
-                           diagnostic_capacity)) {
+    if (!reed_config_parse(data, length, &candidate, parse_diagnostic,
+                           sizeof(parse_diagnostic))) {
+        if (diagnostic && diagnostic_capacity)
+            (void)snprintf(diagnostic, diagnostic_capacity,
+                           "~/.config/reed/config: %s; defaults used.",
+                           parse_diagnostic);
+        free(path);
         free(data);
         return MG_ERR_BAD_ARGUMENT;
     }
+    free(path);
     *config = candidate;
     free(data);
     return MG_OK;
