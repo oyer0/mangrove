@@ -159,9 +159,13 @@ behavior are described in the [Shoot](../shell/README.md) and
 The output decoder uses Mangrove's strict UTF-8 codec and presents malformed
 prefixes as U+FFFD. An incomplete multibyte sequence is retained until later
 output supplies more bytes; there is no per-write decoder reset or end-of-input
-signal. The renderer uses one cell per code point and a font fallback glyph.
-It does not implement grapheme clusters, combining-mark placement, East Asian
-wide cells, shaping, or bidirectional layout.
+signal. The embedded regular UNSCII-16 subset is an 8x16 PSF2 font with 2,997
+Unicode mappings, including printable ASCII, selected accented Latin,
+combining marks, box drawing, and block elements. The renderer uses one cell
+per code point; a mapped combining mark is drawn as its own glyph and is not
+composed over a preceding character. It does not implement grapheme clusters,
+East Asian wide cells, shaping, or bidirectional layout. The bundled font has
+no U+FFFD or CJK U+4E00 glyph, so an unmapped CJK scalar uses the `?` fallback.
 
 The console recognizes carriage return (column zero), backspace (move left by
 one cell when possible, without erasing), and line feed (column zero on the

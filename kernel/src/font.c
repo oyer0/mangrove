@@ -4,6 +4,7 @@
 #include <mg/utf8.h>
 
 #define PSF2_HAS_UNICODE_TABLE 0x00000001U
+#define PSF2_SUPPORTED_VERSION 0U
 /* Regular UNSCII-16 supplies a few thousand bounded 8x16 mappings. */
 #define FONT_MAX_MAPPINGS 4096U
 #define FONT_REPLACEMENT_CODEPOINT 0xFFFDU
@@ -150,7 +151,8 @@ void font_init(BOOT_INFO *BootInfo)
         font_header->magic[3] != PSF2_MAGIC3)
         return;
 
-    if (font_header->headerfile < sizeof(psf2_header_t) ||
+    if (font_header->version != PSF2_SUPPORTED_VERSION ||
+        font_header->headerfile < sizeof(psf2_header_t) ||
         font_header->headerfile > font_asset_size ||
         font_header->numglyph == 0 || font_header->bytesperglyph == 0 ||
         font_header->width == 0 || font_header->height == 0)

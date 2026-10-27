@@ -596,7 +596,7 @@ DEPS := $(BOOT_OBJS:.o=.d) $(ALL_KERNEL_OBJS:.o=.d)
 .PHONY: all help make fresh run fresh-run usb clean test exfat-upcase \
         binaries font sprout sessiond logind logd networkd deviced volumed clipd mount unmount eject lspci lsusb lsdsk diskutil crew about view info mem time tmon logv hello shoot clear copy list locate move mkdir plant type wait reed del say shutdown reboot uptime date version where fstest nettest ping resolve fetch netinfo netcfg power identity user \
         image fresh-image usb-image run-usb mkmgfs mgfsck test-time test-terminal test-mgfs-version test-mgfs-reconcile test-reed test-math \
-        check-image-deps check-usb-deps check-qemu-deps qemu-warning dev-image fresh-dev-image flash-image test-launch test-password test-random test-vmm test-heap test-history test-copy test-move test-del test-mfqs test-sync test-spinlock-context test-storage test-dev-tools test-unicode test-shoot test-shoot-help test-pager test-view test-info test-help test-list test-cli-options test-fetch test-fetch-transport test-tcp test-startup-presentation test-power-presentation test-rtc-build-policy test-say
+        check-image-deps check-usb-deps check-qemu-deps qemu-warning dev-image fresh-dev-image flash-image test-launch test-password test-random test-vmm test-heap test-history test-copy test-move test-del test-mfqs test-sync test-spinlock-context test-storage test-dev-tools test-font test-unicode test-shoot test-shoot-help test-pager test-view test-info test-help test-list test-cli-options test-fetch test-fetch-transport test-tcp test-startup-presentation test-power-presentation test-rtc-build-policy test-say
 
 # Everyday targets
 all: image
@@ -619,7 +619,7 @@ help:
 	@echo "  Linux guest tests use KVM; select TCG explicitly with the target's *_ACCEL=tcg option"
 	@echo
 	@echo "Specialist targets: binaries image fresh-image usb-image mkmgfs mgfsck"
-	@echo "                    test-time test-terminal test-help test-guest-shutdown test-guest-logout test-guest-reed"
+	@echo "                    test-time test-terminal test-font test-help test-guest-shutdown test-guest-logout test-guest-reed"
 	@echo "                    test-random test-guest-random test-say and individual programs"
 
 make: image
@@ -955,6 +955,24 @@ test-say:
 		/tmp/mangrove-say-main-test.o tests/userspace/say_cli_test.c \
 		-Wl,--gc-sections -o /tmp/mangrove-say-test
 	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-say-test
+
+.PHONY: test-font
+test-font: $(FONT_ASSET) $(BUILD_DIR)/tests/terminal/font_asset_blob.o
+	python3 tests/terminal/font_asset_test.py \
+		--source "$(FONT_SOURCE)" --asset "$(FONT_ASSET)" \
+		--converter "$(FONT_CONVERTER)"
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
+		-fsanitize=address,undefined -I. -Ikernel/include -Iinclude \
+		-idirafter libc/include tests/terminal/font_render_test.c \
+		kernel/src/font.c libc/src/utf8.c \
+		$(BUILD_DIR)/tests/terminal/font_asset_blob.o \
+		-o /tmp/mangrove-font-render-test
+	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-font-render-test
+	@echo production UNSCII-16 font tests passed
+
+$(BUILD_DIR)/tests/terminal/font_asset_blob.o: tests/terminal/font_asset_blob.S $(FONT_ASSET)
+	@mkdir -p $(dir $@)
+	$(HOST_CC) -c $< -o $@
 
 .PHONY: test-unicode
 test-unicode:
