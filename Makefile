@@ -1331,6 +1331,7 @@ test-heap:
 .PHONY: test-slab test-slab-benchmark
 test-slab:
 	python3 tests/memory/slab_test.py "$(HOST_CC)"
+	python3 tests/guest/guest_slab_evidence_test.py
 
 SLAB_GUEST_BUILD ?= $(abspath $(BUILD_DIR))/slab-guest-build
 SLAB_GUEST_OUTPUT ?=

@@ -53,8 +53,49 @@ PUBLIC_SMP = re.compile(
     r'cpumask=([0-9a-fA-F]+) cross=(\d+) overlap=(\d+)$', re.M)
 CONCURRENCY = re.compile(
     r'^SLAB_GUEST_CONCURRENCY pass=(\d+) cpu_cache=(\d+) queued=(\d+) '
-    r'created=(\d+) cpumask=([0-9a-fA-F]+) cross=(\d+) '
-    r'worker_failed=(\d+) terminated=(\d+)$', re.M)
+    r'created=(\d+) worker_mask=([0-9a-fA-F]+) '
+    r'allocator_mask=([0-9a-fA-F]+) allocations=(\d+) arrived=(\d+) '
+    r'first_allocations=(\d+) cross=(\d+) worker_failed=(\d+) '
+    r'terminated=(\d+) rendezvous_timeout=(\d+)$', re.M)
+
+
+def check_concurrency_records(text, cpus):
+    records = CONCURRENCY.findall(text)
+    if len(records) != 2:
+        raise ValueError('guest log lacks both shared/cache concurrency witnesses')
+    concurrency = []
+    for record in records:
+        (passed, cpu_cache, queued, created, worker_mask, allocator_mask,
+         allocations, arrived, first_allocations, cross, worker_failed,
+         terminated, rendezvous_timeout) = record
+        passed, cpu_cache, queued, created, allocations, arrived, \
+            first_allocations, cross, worker_failed, terminated, \
+            rendezvous_timeout = map(int, (
+                passed, cpu_cache, queued, created, allocations, arrived,
+                first_allocations, cross, worker_failed, terminated,
+                rendezvous_timeout))
+        worker_mask = int(worker_mask, 16)
+        allocator_mask = int(allocator_mask, 16)
+        if (passed != 1 or cpu_cache not in (0, 1) or queued != 4 or
+                created != 4 or allocations != 4 * 48 or arrived != 4 or
+                first_allocations != 4 or worker_failed or
+                not terminated or rendezvous_timeout):
+            raise ValueError('allocator worker rendezvous or work is incomplete')
+        if cpus >= 2 and ((worker_mask & 3) != 3 or
+                          (allocator_mask & 3) != 3):
+            raise ValueError('two-vCPU workload lacks worker and allocator participation')
+        concurrency.append({
+            'cpu_cache': bool(cpu_cache), 'queued': queued,
+            'created': created, 'worker_cpu_mask': worker_mask,
+            'allocator_cpu_mask': allocator_mask,
+            'successful_allocations': allocations,
+            'arrived_workers': arrived,
+            'first_allocations': first_allocations,
+            'cross_cpu_frees': cross,
+        })
+    if [item['cpu_cache'] for item in concurrency] != [False, True]:
+        raise ValueError('guest concurrency phases are out of order')
+    return concurrency
 
 
 def check_boot_log(text, cpus, deep_validation=0, hybrid_routing=False,
@@ -81,7 +122,6 @@ def check_boot_log(text, cpus, deep_validation=0, hybrid_routing=False,
         raise ValueError('guest boot log lacks IRQ-disabled reclaim evidence')
     public_records = PUBLIC_HYBRID.findall(text)
     public_smp_records = PUBLIC_SMP.findall(text)
-    concurrency_records = CONCURRENCY.findall(text)
     backing_reclaims = SLAB_BACKING_RECLAIM.findall(text)
     owned_reclaims = VMM_OWNED_RECLAIM.findall(text)
     heap_reclaims = HEAP_RECLAIM.findall(text)
@@ -91,27 +131,7 @@ def check_boot_log(text, cpus, deep_validation=0, hybrid_routing=False,
         raise ValueError('guest log lacks the owned-frame VMM regression witness')
     if len(heap_reclaims) != 1:
         raise ValueError('guest log lacks indexed-heap physical reclamation evidence')
-    if len(concurrency_records) != 2:
-        raise ValueError('guest log lacks both shared/cache concurrency witnesses')
-    concurrency = []
-    for record in concurrency_records:
-        passed, cpu_cache, queued, created, cpu_mask, cross, worker_failed, \
-            terminated = record
-        passed, cpu_cache, queued, created, cross, worker_failed, terminated = \
-            map(int, (passed, cpu_cache, queued, created, cross,
-                      worker_failed, terminated))
-        cpu_mask = int(cpu_mask, 16)
-        if (passed != 1 or cpu_cache not in (0, 1) or queued != 4 or
-                created != 4 or worker_failed or not terminated or
-                (cpus >= 2 and (cpu_mask & 3) != 3)):
-            raise ValueError('shared/cache allocator concurrency witness is invalid')
-        concurrency.append({
-            'cpu_cache': bool(cpu_cache), 'queued': queued,
-            'created': created, 'cpu_mask': cpu_mask,
-            'cross_cpu_frees': cross,
-        })
-    if [item['cpu_cache'] for item in concurrency] != [False, True]:
-        raise ValueError('guest concurrency phases are out of order')
+    concurrency = check_concurrency_records(text, cpus)
     reclaim_pass, reclaim_online, backing_frame, shootdown_ack, other_cr3 = \
         backing_reclaims[0]
     reclaim_pass, reclaim_online = map(int, (reclaim_pass, reclaim_online))
@@ -798,7 +818,8 @@ def check_source_identity(report):
                 'kernel/src/slab_guest_test.c',
                 'kernel/src/slab_guest_benchmark.c',
                 'tests/guest/guest_slab_test.py',
-                'tests/guest/guest_slab_benchmark_evidence_test.py')
+                'tests/guest/guest_slab_benchmark_evidence_test.py',
+                'tests/guest/guest_slab_evidence_test.py')
     hashes = report.get('source_hashes', {})
     for path in required:
         if not re.fullmatch(r'[0-9a-f]{64}', hashes.get(path, '')):
@@ -928,7 +949,8 @@ def main():
                                  'kernel/src/slab_guest_test.c',
                                  'kernel/src/slab_guest_benchmark.c',
                                  'tests/guest/guest_slab_test.py',
-                                 'tests/guest/guest_slab_benchmark_evidence_test.py')},
+                'tests/guest/guest_slab_benchmark_evidence_test.py',
+                'tests/guest/guest_slab_evidence_test.py')},
             'target_compiler': subprocess.run(
                 ['gcc', '--version'], text=True, capture_output=True,
                 check=True).stdout.splitlines()[0],

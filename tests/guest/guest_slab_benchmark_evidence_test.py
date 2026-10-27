@@ -279,13 +279,15 @@ def main():
     good_identity = {
         'source_revision': 'a' * 40,
         'source_hashes': {path: 'b' * 64 for path in (
-            'Makefile', 'include/kprint.h', 'kernel/include/slab.h',
-            'kernel/src/heap.c',
+            'Makefile', 'include/kprint.h', 'kernel/include/heap.h',
+            'kernel/include/pmm.h', 'kernel/include/slab.h',
+            'kernel/include/vmm.h', 'kernel/src/heap.c',
             'kernel/src/slab.c',
             'kernel/src/slab_guest_test.c',
             'kernel/src/slab_guest_benchmark.c',
             'tests/guest/guest_slab_test.py',
-            'tests/guest/guest_slab_benchmark_evidence_test.py')},
+            'tests/guest/guest_slab_benchmark_evidence_test.py',
+            'tests/guest/guest_slab_evidence_test.py')},
         'kernel_sha256': 'c' * 64,
         'target_compiler': 'gcc 15.2',
         'target_configuration': {

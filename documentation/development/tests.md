@@ -312,7 +312,9 @@ and IRQ-safe locks are host adapters for slab lifecycle tests;
 `test-heap` separately exercises production page-extent allocation and release,
 including overflow, undersized-release rejection, failed growth, and handle
 consumption. These tests do not use a toy slab implementation and do not
-establish Pith SMP correctness. The heap fixture also exercises
+establish Pith SMP correctness. `test-slab` also runs positive and negative
+controls for the native slab guest's two-CPU concurrency evidence parser. The
+heap fixture also exercises
 page-aligned extent backing through growth and PMM failure, then verifies that
 releasing the extent returns capacity to ordinary heap use. It also checks
 that extent-owned blocks cannot be released through the raw heap interface,
@@ -586,8 +588,9 @@ allocator behavior in Pith.
 
 `test-slab-guest` forces a separate kernel with `SLAB_CORE_GUEST_TEST=1`,
 `SLAB_CORE_DIAGNOSTICS=1`, and `VMM_KERNEL_RANGE_GUEST_TEST=1`, then runs a
-focused native MGFS boot under QEMU TCG with one and two vCPUs and the normal
-e1000 NIC. A test-only kernel hook, called after SMP startup, exercises all
+focused native MGFS boot under Q35/OVMF with one and two vCPUs and the normal
+e1000 NIC. Linux defaults to KVM; TCG is selected explicitly. A test-only
+kernel hook, called after SMP startup, exercises all
 shared and per-CPU classes, payload-preserving local reuse, concurrent cache
 allocation/free churn, cross-CPU frees, cache draining, bounded
 `slab_reclaim_bounded()` calls during concurrent frees, page retirement, and
@@ -597,8 +600,16 @@ the shootdown before PMM returns the same physical frame for reuse. The runner
 also exercises a reclaim pass with local interrupts disabled and verifies the
 saved IF state remains disabled through the return. It requires reclaim
 progress and, on two vCPUs, reclaim activity on both CPUs overlapping
-allocator operations. Its negative controls reject missing slab,
-bounded-reclaim, IRQ-disabled-reclaim, or PMM/VMM frame-reuse evidence. A
+allocator operations. The concurrency workers rendezvous before allocator
+work, hold after their first successful allocation until all workers have
+allocated once, and report worker-entry and allocator-completion CPU masks
+separately. The two-vCPU witness requires both masks to include CPUs 0 and 1,
+all 192 allocations per phase, all four rendezvous arrivals, and no barrier
+timeout. This removes dependence on cache-mode timing while still requiring
+both CPUs to execute allocator work. The runner's negative controls reject
+missing allocator CPU participation, incomplete worker work, or a timed-out
+rendezvous, as well as missing slab, bounded-reclaim, IRQ-disabled-reclaim,
+or PMM/VMM frame-reuse evidence. A
 complete `slab_cpu_drain_all()` still requires allocator users to be
 quiescent; the runtime reclaim API reports partial progress and never claims a
 global drain. The guest runner independently checks the diagnostic kernel's

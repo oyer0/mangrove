@@ -9,6 +9,7 @@
 #include <scheduler.h>
 #include <slab.h>
 #include <string.h>
+#include <timer.h>
 #include <vmm.h>
 
 #ifndef SLAB_DEEP_VALIDATION
@@ -19,6 +20,7 @@
 #define SLAB_GUEST_OBJECTS 48U
 #define SLAB_GUEST_CLASS_OBJECTS 251U
 #define SLAB_GUEST_RECLAIM_EVERY 4U
+#define SLAB_GUEST_WORKER_TIMEOUT_MS 10000ULL
 
 static void *slab_guest_class_objects[SLAB_GUEST_CLASS_OBJECTS];
 static void *slab_guest_worker_objects[SLAB_GUEST_WORKERS]
@@ -31,6 +33,11 @@ static volatile u32 slab_guest_worker_cpu_mask;
 static volatile u32 slab_guest_cross_cpu_frees;
 static volatile u32 slab_guest_worker_expected;
 static volatile u32 slab_guest_barrier_armed;
+static volatile u32 slab_guest_worker_first_allocated;
+static volatile u32 slab_guest_worker_alloc_done;
+static volatile u32 slab_guest_allocator_cpu_mask;
+static volatile u32 slab_guest_allocator_successful;
+static volatile u32 slab_guest_barrier_failed;
 static volatile u32 slab_guest_worker_failed;
 static volatile u32 slab_guest_cleanup_own;
 static volatile u32 slab_guest_cpu_cache_mode;
@@ -168,6 +175,34 @@ static bool slab_guest_other_cpu_active(volatile u32 *records, u32 cpu)
     return false;
 }
 
+static bool slab_guest_wait_for_workers(volatile u32 *counter, u32 expected,
+                                        volatile u32 *cpu_mask,
+                                        bool require_two_cpus)
+{
+    u64 started = timer_uptime_ms();
+
+    for (;;) {
+        u32 completed = __atomic_load_n(counter, __ATOMIC_ACQUIRE);
+        u32 mask = cpu_mask
+            ? __atomic_load_n(cpu_mask, __ATOMIC_ACQUIRE) : 0U;
+        if (completed >= expected &&
+            (!require_two_cpus || (mask & 3U) == 3U ||
+             __atomic_load_n(&slab_guest_worker_failed,
+                             __ATOMIC_ACQUIRE)))
+            return true;
+        if (__atomic_load_n(&slab_guest_barrier_failed, __ATOMIC_ACQUIRE))
+            return false;
+        if (timer_uptime_ms() - started >= SLAB_GUEST_WORKER_TIMEOUT_MS) {
+            __atomic_store_n(&slab_guest_cleanup_own, 1U, __ATOMIC_RELEASE);
+            __atomic_store_n(&slab_guest_barrier_failed, 1U,
+                             __ATOMIC_RELEASE);
+            __atomic_store_n(&slab_guest_worker_failed, 1U, __ATOMIC_RELEASE);
+            return false;
+        }
+        __asm__ volatile("pause" ::: "memory");
+    }
+}
+
 static void slab_guest_reclaim_pass(void)
 {
     u32 cpu = cpu_current_index();
@@ -214,6 +249,8 @@ static void slab_guest_worker(void *argument)
 {
     u32 worker = (u32)(uintptr_t)argument;
     u32 cpu = cpu_current_index();
+    u32 expected;
+    bool require_two_cpus;
     if (worker >= SLAB_GUEST_WORKERS || cpu >= 32U) {
         __atomic_store_n(&slab_guest_worker_failed, 1U, __ATOMIC_RELEASE);
         __atomic_add_fetch(&slab_guest_worker_ready, 1U, __ATOMIC_RELEASE);
@@ -222,6 +259,32 @@ static void slab_guest_worker(void *argument)
     }
     __atomic_fetch_or(&slab_guest_worker_cpu_mask, 1U << cpu,
                       __ATOMIC_RELAXED);
+
+    __atomic_add_fetch(&slab_guest_worker_ready, 1U, __ATOMIC_RELEASE);
+    u64 armed_started = timer_uptime_ms();
+    while (!__atomic_load_n(&slab_guest_barrier_armed, __ATOMIC_ACQUIRE) &&
+           !__atomic_load_n(&slab_guest_barrier_failed, __ATOMIC_ACQUIRE)) {
+        if (timer_uptime_ms() - armed_started >=
+            SLAB_GUEST_WORKER_TIMEOUT_MS) {
+            __atomic_store_n(&slab_guest_cleanup_own, 1U, __ATOMIC_RELEASE);
+            __atomic_store_n(&slab_guest_barrier_failed, 1U,
+                             __ATOMIC_RELEASE);
+            __atomic_store_n(&slab_guest_worker_failed, 1U, __ATOMIC_RELEASE);
+            break;
+        }
+        __asm__ volatile("pause" ::: "memory");
+    }
+    expected = __atomic_load_n(&slab_guest_worker_expected,
+                               __ATOMIC_ACQUIRE);
+    require_two_cpus = expected == SLAB_GUEST_WORKERS &&
+        cpu_online_count() >= 2U;
+    if (__atomic_load_n(&slab_guest_barrier_failed, __ATOMIC_ACQUIRE) ||
+        !slab_guest_wait_for_workers(&slab_guest_worker_ready, expected,
+                                     &slab_guest_worker_cpu_mask,
+                                     require_two_cpus)) {
+        __atomic_add_fetch(&slab_guest_worker_done, 1U, __ATOMIC_RELEASE);
+        return;
+    }
 
     for (u32 index = 0; index < SLAB_GUEST_OBJECTS; index++) {
         bool cached_mode = __atomic_load_n(&slab_guest_cpu_cache_mode,
@@ -235,19 +298,31 @@ static void slab_guest_worker(void *argument)
         if (!object) {
             __atomic_store_n(&slab_guest_worker_failed, 1U,
                              __ATOMIC_RELEASE);
-            continue;
+        } else {
+            u32 allocation_cpu = cpu_current_index();
+            slab_guest_worker_objects[worker][index] = object;
+            slab_guest_allocation_cpu[worker][index] = allocation_cpu;
+            if (allocation_cpu < 32U)
+                __atomic_fetch_or(&slab_guest_allocator_cpu_mask,
+                                  1U << allocation_cpu, __ATOMIC_RELAXED);
+            __atomic_add_fetch(&slab_guest_allocator_successful, 1U,
+                               __ATOMIC_RELAXED);
+            memset(object, (int)(worker + 1U), 72U);
         }
-        slab_guest_worker_objects[worker][index] = object;
-        slab_guest_allocation_cpu[worker][index] = cpu_current_index();
-        memset(object, (int)(worker + 1U), 72U);
+        if (index == 0U) {
+            __atomic_add_fetch(&slab_guest_worker_first_allocated, 1U,
+                               __ATOMIC_RELEASE);
+            if (!slab_guest_wait_for_workers(
+                    &slab_guest_worker_first_allocated, expected,
+                    &slab_guest_allocator_cpu_mask, require_two_cpus))
+                break;
+        }
     }
 
-    __atomic_add_fetch(&slab_guest_worker_ready, 1U, __ATOMIC_RELEASE);
-    while (!__atomic_load_n(&slab_guest_barrier_armed, __ATOMIC_ACQUIRE) ||
-           __atomic_load_n(&slab_guest_worker_ready, __ATOMIC_ACQUIRE) <
-               __atomic_load_n(&slab_guest_worker_expected,
-                               __ATOMIC_ACQUIRE))
-        (void)scheduler_yield();
+    __atomic_add_fetch(&slab_guest_worker_alloc_done, 1U, __ATOMIC_RELEASE);
+    if (!slab_guest_wait_for_workers(&slab_guest_worker_alloc_done, expected,
+                                     NULL, false))
+        panic("slab guest: allocation completion rendezvous timed out");
 
     u32 owner = __atomic_load_n(&slab_guest_cleanup_own,
                                 __ATOMIC_ACQUIRE)
@@ -511,6 +586,11 @@ static bool slab_guest_test_concurrency(u32 online_count, bool cpu_cache)
     slab_guest_cross_cpu_frees = 0;
     slab_guest_worker_expected = 0;
     slab_guest_barrier_armed = 0;
+    slab_guest_worker_first_allocated = 0;
+    slab_guest_worker_alloc_done = 0;
+    slab_guest_allocator_cpu_mask = 0;
+    slab_guest_allocator_successful = 0;
+    slab_guest_barrier_failed = 0;
     slab_guest_worker_failed = 0;
     slab_guest_cleanup_own = 0;
     slab_guest_reclaim_cpu_mask = 0U;
@@ -566,16 +646,17 @@ static bool slab_guest_test_concurrency(u32 online_count, bool cpu_cache)
         __atomic_store_n(&slab_guest_barrier_armed, 1U, __ATOMIC_RELEASE);
     }
 
-    u64 spins = 0;
-    while (__atomic_load_n(&slab_guest_worker_done, __ATOMIC_ACQUIRE) < queued &&
-           spins < 100000000ULL) {
-        spins++;
+    u64 started = timer_uptime_ms();
+    while (__atomic_load_n(&slab_guest_worker_done, __ATOMIC_ACQUIRE) < queued) {
+        if (timer_uptime_ms() - started >= SLAB_GUEST_WORKER_TIMEOUT_MS)
+            panic("slab guest: worker completion timed out");
         (void)scheduler_yield();
     }
     if (__atomic_load_n(&slab_guest_worker_done, __ATOMIC_ACQUIRE) != queued)
         panic("slab guest: worker completion timed out");
     bool terminated = false;
-    for (spins = 0; spins < 100000000ULL; spins++) {
+    started = timer_uptime_ms();
+    for (;;) {
         bool all_terminated = true;
         for (u32 index = 0; index < created; index++) {
             if (index >= queued)
@@ -590,6 +671,8 @@ static bool slab_guest_test_concurrency(u32 online_count, bool cpu_cache)
             terminated = true;
             break;
         }
+        if (timer_uptime_ms() - started >= SLAB_GUEST_WORKER_TIMEOUT_MS)
+            break;
         (void)scheduler_yield();
     }
     bool passed = __atomic_load_n(&slab_guest_worker_done,
@@ -598,18 +681,28 @@ static bool slab_guest_test_concurrency(u32 online_count, bool cpu_cache)
         !__atomic_load_n(&slab_guest_worker_failed, __ATOMIC_ACQUIRE);
     u32 cpu_mask = __atomic_load_n(&slab_guest_worker_cpu_mask,
                                    __ATOMIC_ACQUIRE);
+    u32 allocator_cpu_mask = __atomic_load_n(&slab_guest_allocator_cpu_mask,
+                                              __ATOMIC_ACQUIRE);
+    u32 allocator_successful = __atomic_load_n(
+        &slab_guest_allocator_successful, __ATOMIC_ACQUIRE);
+    u32 first_allocated = __atomic_load_n(
+        &slab_guest_worker_first_allocated, __ATOMIC_ACQUIRE);
     u32 cross_frees = __atomic_load_n(&slab_guest_cross_cpu_frees,
                                       __ATOMIC_ACQUIRE);
     if (online_count >= 2U && queued == created) {
-        passed = passed && (cpu_mask & 3U) == 3U;
+        passed = passed && (cpu_mask & 3U) == 3U &&
+                 (allocator_cpu_mask & 3U) == 3U;
         /* Worker ownership and migration do not guarantee remote frees in
          * this phase. A separate probe below establishes cross-CPU freeing. */
     }
-    kprint("SLAB_GUEST_CONCURRENCY pass=%u cpu_cache=%u queued=%u created=%u cpumask=%x cross=%u worker_failed=%u terminated=%u\n",
+    kprint("SLAB_GUEST_CONCURRENCY pass=%u cpu_cache=%u queued=%u created=%u worker_mask=%x allocator_mask=%x allocations=%u arrived=%u first_allocations=%u cross=%u worker_failed=%u terminated=%u rendezvous_timeout=%u\n",
            passed ? 1U : 0U, cpu_cache ? 1U : 0U, queued, created,
-           cpu_mask, cross_frees,
+           cpu_mask, allocator_cpu_mask, allocator_successful,
+           __atomic_load_n(&slab_guest_worker_ready, __ATOMIC_ACQUIRE),
+           first_allocated, cross_frees,
            __atomic_load_n(&slab_guest_worker_failed, __ATOMIC_ACQUIRE),
-           terminated ? 1U : 0U);
+           terminated ? 1U : 0U,
+           __atomic_load_n(&slab_guest_barrier_failed, __ATOMIC_ACQUIRE));
     if (!terminated)
         panic("slab guest: completed worker did not terminate");
     for (u32 index = 0; index < queued; index++) {
