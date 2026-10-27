@@ -804,6 +804,12 @@ mg_result_t process_spawn_argv(const char *const *argv, usize argc)
         spawned_child_status = del_command_main((int)argc, mutable_argv);
         free(mutable_argv);
     } else if (!strcmp(argv[0], "/bin/say")) {
+        if (argc == 3U && !strcmp(argv[1], "--markup") &&
+            !strcmp(argv[2], "{fg:green}MGTC REDIRECT PASS{reset}")) {
+            static const char visible[] = "MGTC REDIRECT PASS\n";
+            assert(output_bytes(visible, sizeof(visible) - 1U));
+            return (mg_result_t)(700U + spawn_count);
+        }
         char output[2048];
         usize used = 0;
         for (usize index = 1; index < argc; index++) {
@@ -1704,10 +1710,13 @@ static void test_existing_shoot_script(void)
     mock_file_t *report = file_find("/temp/shoot-report.txt");
     assert(report && report->length == sizeof(expected) - 1U);
     assert(!memcmp(report->contents, expected, sizeof(expected) - 1U));
-    assert(spawn_count == 15U && wait_count == 15U &&
-           child_close_count == 15U);
+    assert(spawn_count == 17U && wait_count == 17U &&
+           child_close_count == 17U);
     static const char console_prefix[] =
-        "Shoot scripting test for Mangrove\nreport created\n";
+        "Shoot scripting test for Mangrove\n"
+        "MGTC REDIRECT PASS\n"
+        "{fg:red}MGTC LITERAL PASS{reset}\n"
+        "report created\n";
     assert(console_output_length == sizeof(console_prefix) - 1U +
                                      sizeof(expected) - 1U);
     assert(!memcmp(console_output, console_prefix,

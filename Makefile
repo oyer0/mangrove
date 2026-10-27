@@ -592,7 +592,7 @@ DEPS := $(BOOT_OBJS:.o=.d) $(ALL_KERNEL_OBJS:.o=.d)
 .PHONY: all help make fresh run fresh-run usb clean test exfat-upcase \
         binaries font sprout sessiond logind logd networkd deviced volumed clipd mount unmount eject lspci lsusb lsdsk diskutil crew about view info mem time tmon logv hello shoot clear copy list locate move mkdir plant type wait reed del say shutdown reboot uptime date version where fstest nettest ping resolve fetch netinfo netcfg power identity user \
         image fresh-image usb-image run-usb mkmgfs mgfsck test-time test-terminal test-mgfs-version test-mgfs-reconcile test-reed test-math \
-        check-image-deps check-usb-deps check-qemu-deps qemu-warning dev-image fresh-dev-image flash-image test-launch test-password test-random test-vmm test-heap test-history test-copy test-move test-del test-mfqs test-sync test-spinlock-context test-storage test-dev-tools test-unicode test-shoot test-shoot-help test-pager test-view test-info test-help test-list test-cli-options test-fetch test-fetch-transport test-tcp test-startup-presentation test-power-presentation test-rtc-build-policy
+        check-image-deps check-usb-deps check-qemu-deps qemu-warning dev-image fresh-dev-image flash-image test-launch test-password test-random test-vmm test-heap test-history test-copy test-move test-del test-mfqs test-sync test-spinlock-context test-storage test-dev-tools test-unicode test-shoot test-shoot-help test-pager test-view test-info test-help test-list test-cli-options test-fetch test-fetch-transport test-tcp test-startup-presentation test-power-presentation test-rtc-build-policy test-terminal-markup
 
 # Everyday targets
 all: image
@@ -896,6 +896,11 @@ test-terminal:
 		libc/src/line_editor.c libc/src/string.c -Wl,--gc-sections \
 		-o /tmp/mangrove-terminal-render-test
 	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-terminal-render-test
+	$(HOST_CC) -std=gnu17 -Wall -Wextra -Werror -fno-builtin \
+		-fsanitize=address,undefined -Iinclude -idirafter libc/include \
+		tests/terminal/terminal_markup_test.c libc/src/terminal_markup.c \
+		-o /tmp/mangrove-terminal-markup-test
+	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-terminal-markup-test
 	python3 tests/terminal/terminal_overlay_test.py "$(HOST_CC)"
 	python3 tests/terminal/terminal_write_owner_test.py "$(HOST_CC)"
 	python3 tests/terminal/console_input_smp_test.py "$(HOST_CC)"
@@ -912,7 +917,15 @@ test-terminal:
 		libc/src/utf8.c libc/src/string.c -Wl,--gc-sections \
 		-o /tmp/mangrove-line-editor-key-event-test
 	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-line-editor-key-event-test
-	@echo terminal renderer, UTF-8, overlay, input synchronization and ownership tests passed
+	@echo terminal renderer, MGTC, markup, UTF-8, overlay, input synchronization and ownership tests passed
+
+.PHONY: test-terminal-markup
+test-terminal-markup:
+	$(HOST_CC) -std=gnu17 -Wall -Wextra -Werror -fno-builtin \
+		-fsanitize=address,undefined -Iinclude -idirafter libc/include \
+		tests/terminal/terminal_markup_test.c libc/src/terminal_markup.c \
+		-o /tmp/mangrove-terminal-markup-test
+	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-terminal-markup-test
 
 .PHONY: test-unicode
 test-unicode:
@@ -1931,6 +1944,7 @@ USER_C_OBJS := $(SPROUT_DIR)/sprout.o \
                $(USER_LIBC_DIR)/string.o \
                $(USER_LIBC_DIR)/allocator.o \
                $(USER_LIBC_DIR)/clipboard.o \
+               $(USER_LIBC_DIR)/terminal_markup.o \
                $(USER_LIBC_DIR)/stdio.o \
                $(USER_LIBC_DIR)/native.o \
                $(USER_LIBC_DIR)/line_editor.o \
@@ -2435,7 +2449,8 @@ $(DEL): $(DEL_DIR)/main.o $(HELP_OBJ) $(CLI_OPTIONS_OBJ) $(COMMAND_PATH_OBJ) $(U
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
 		$(USER_CRT) $(DEL_DIR)/main.o $(HELP_OBJ) $(CLI_OPTIONS_OBJ) $(COMMAND_PATH_OBJ) $(USER_LIBC)
 
-$(SAY_DIR)/say.o: userspace/say/main.c userspace/common/help.h $(USER_LIBC)
+$(SAY_DIR)/say.o: userspace/say/main.c userspace/common/help.h \
+		libc/include/mg/terminal_markup.h $(USER_LIBC)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
@@ -2722,7 +2737,7 @@ $(USER_LIBC_DIR)/wchar.o: libc/src/wchar.c libc/include/wchar.h libc/include/std
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
-$(USER_LIBC): $(USER_LIBC_DIR)/syscall.o $(USER_LIBC_DIR)/syscall_c.o $(USER_LIBC_DIR)/random.o $(USER_LIBC_DIR)/string.o $(USER_LIBC_DIR)/strtok.o $(USER_LIBC_DIR)/utf8.o $(USER_LIBC_DIR)/wchar.o $(USER_LIBC_DIR)/allocator.o $(USER_LIBC_DIR)/clipboard.o $(USER_LIBC_DIR)/stdio.o $(USER_LIBC_DIR)/stdio_stream.o $(USER_LIBC_DIR)/floatconv.o $(USER_LIBC_DIR)/scanf.o $(USER_LIBC_DIR)/native.o $(USER_LIBC_DIR)/line_editor.o $(USER_LIBC_DIR)/net.o $(USER_LIBC_DIR)/time.o $(USER_LIBC_DIR)/time_convert.o $(USER_LIBC_DIR)/time_standard.o $(USER_LIBC_DIR)/log.o $(USER_LIBC_DIR)/ctype.o $(USER_LIBC_DIR)/errno.o $(USER_LIBC_DIR)/error.o $(USER_LIBC_DIR)/exit.o $(USER_LIBC_DIR)/stdlib.o $(USER_LIBC_DIR)/assert.o
+$(USER_LIBC): $(USER_LIBC_DIR)/syscall.o $(USER_LIBC_DIR)/syscall_c.o $(USER_LIBC_DIR)/random.o $(USER_LIBC_DIR)/string.o $(USER_LIBC_DIR)/strtok.o $(USER_LIBC_DIR)/utf8.o $(USER_LIBC_DIR)/wchar.o $(USER_LIBC_DIR)/allocator.o $(USER_LIBC_DIR)/clipboard.o $(USER_LIBC_DIR)/terminal_markup.o $(USER_LIBC_DIR)/stdio.o $(USER_LIBC_DIR)/stdio_stream.o $(USER_LIBC_DIR)/floatconv.o $(USER_LIBC_DIR)/scanf.o $(USER_LIBC_DIR)/native.o $(USER_LIBC_DIR)/line_editor.o $(USER_LIBC_DIR)/net.o $(USER_LIBC_DIR)/time.o $(USER_LIBC_DIR)/time_convert.o $(USER_LIBC_DIR)/time_standard.o $(USER_LIBC_DIR)/log.o $(USER_LIBC_DIR)/ctype.o $(USER_LIBC_DIR)/errno.o $(USER_LIBC_DIR)/error.o $(USER_LIBC_DIR)/exit.o $(USER_LIBC_DIR)/stdlib.o $(USER_LIBC_DIR)/assert.o
 	@mkdir -p $(dir $@)
 	$(AR) rcs $@ $^
 
@@ -2736,6 +2751,12 @@ $(USER_LIBC_DIR)/errno.o: libc/src/errno.c libc/include/errno.h
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
 $(USER_LIBC_DIR)/error.o: libc/src/error.c libc/include/errno.h libc/include/mg/error.h
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+$(USER_LIBC_DIR)/terminal_markup.o: libc/src/terminal_markup.c \
+		libc/include/mg/terminal_markup.h libc/include/mg/terminal.h \
+		include/terminal_control.h include/terminal_colors.h
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 

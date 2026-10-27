@@ -129,7 +129,7 @@ commands suitable for non-disposable media without careful target selection.
 | `power` | Show battery and AC status when available. |
 | `sprout status [SERVICE]` | Inspect service state. `start`, `stop`, `restart`, and supported `reload` operations require service-control authorization. |
 | `user` | List, show, create, remove, change role, or set account passwords, subject to identity privileges and PASS. |
-| `clear`, `say TEXT...` | Clear the visible terminal or print text. |
+| `clear`, `say TEXT...` | Clear the interactive terminal or print text literally. `say --markup TEXT...` explicitly interprets the canonical native terminal markup directives; when redirected, it writes visible text only. |
 | `shutdown`, `reboot` | Request an orderly system power-off or restart. They display `Shutting down...` or `Restarting...` before the request. Active applications and leaf services receive a bounded cleanup window; mounted filesystems are synchronized before the ACPI transition. A cleanup timeout or sync error cancels the request and reports failure. |
 
 ## Network

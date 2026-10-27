@@ -5,6 +5,8 @@ report = "/temp/shoot-report.txt"
 rounds = 3
 
 say "Shoot scripting test for $name"
+say --markup '{fg:green}MGTC REDIRECT PASS{reset}'
+say '{fg:red}MGTC LITERAL PASS{reset}'
 
 say "System report" > $report
 say "=============" >> $report

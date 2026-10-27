@@ -161,7 +161,8 @@ are one-byte values from `terminal_colors.h`; reset has no payload. Cursor
 position is two little-endian u32 values, row then column, both zero-based as
 in the structured API. Visibility is one byte (0 hidden, 1 shown). Clear is
 one byte: line (1), cursor to line end (2), or screen (3). Text is opaque to
-the protocol parser and follows the console's UTF-8 and C0 text behavior.
+the record parser and follows the console's UTF-8 and C0 text behavior;
+malformed UTF-8 is rendered with replacement characters.
 
 Each stream write is limited to 65,536 bytes and must contain only complete,
 well-formed records. The kernel copies and validates the complete batch,
@@ -172,7 +173,36 @@ authorization failure leaves terminal contents and stream style unchanged.
 Stream style starts at the default role and is local to the handle; `fg` and
 `bg` change one component, a semantic role sets both components, and reset
 restores default. Closing the handle discards that style. Separate writes
-from any process may interleave; a write is the atomicity boundary.
+from any process may interleave; a write is the atomicity boundary. A userland
+template larger than one batch is encoded fully before output and split only
+between records, but a later I/O error can follow already-applied earlier
+batches.
+
+The shared loam encoder in `mg/terminal_markup.h` accepts explicit markup
+templates using this canonical notation:
+
+| Directive | Effect |
+| --- | --- |
+| `{fg:NAME}`, `{bg:NAME}` | Set foreground or background to one of the 16 palette names (`black`, `red`, `green`, `yellow`, `blue`, `magenta`, `cyan`, `light-gray`, `dark-gray`, `bright-red`, `bright-green`, `bright-yellow`, `bright-blue`, `bright-magenta`, `bright-cyan`, `white`). |
+| `{style:ROLE}` | Apply `default`, `directory`, `error`, `warning`, `success`, or `heading`. |
+| `{reset}` | Restore the stream's default colors. |
+| `{at:ROW,COLUMN}` | Move to one-based coordinates; an out-of-range position fails its MGTC write batch before any records in that batch are applied. |
+| `{cursor:show}`, `{cursor:hide}` | Set cursor visibility. |
+| `{clear:line}`, `{clear:to-end}`, `{clear:screen}` | Clear the current line, from cursor to line end, or the screen. |
+| `{{`, `}}` | Emit a literal opening or closing brace. |
+
+Only these spellings are recognized. There are no RGB, bold, underline, or
+alias forms. A directive is limited to 128 source bytes; a longer candidate
+is emitted as literal text. Unknown, malformed, or incomplete directives
+remain literal. The parser validates a full directive before encoding it.
+Markup is never inferred from ordinary output: use
+`terminal_markup_write_template()` only for an explicit template. Display
+untrusted file, network, or log text with
+`console_write()` or a text record, never by inserting it into a template.
+When stdout is redirected or the control stream is unavailable, the encoder
+emits visible text only and omits recognized terminal operations. Ordinary
+stdout stays byte-oriented text, including literal braces and ESC sequences.
+`say` uses the encoder only when explicitly invoked with `--markup`.
 
 The loam line editor renders its prompt when an input line is prepared (and
 again when completion explicitly clears that line). Ordinary insertion and

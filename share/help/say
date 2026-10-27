@@ -1,5 +1,7 @@
 name=say
 category=system
-description=print text
-usage=say [text ...]
+description=print text, optionally interpreting native terminal markup
+usage=say [--markup] [text ...]
 option=-h, --help    show this help
+option=--markup     interpret canonical {operation} directives on the interactive terminal
+note=Without --markup, all text is printed literally; redirected markup output contains only visible text.

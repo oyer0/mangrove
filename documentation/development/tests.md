@@ -1,5 +1,20 @@
 # Focused test coverage
 
+## Native terminal controls and markup
+
+`make test-terminal-markup` runs the shared production markup encoder and
+Shoot `say` frontend under ASan/UBSan. It checks the canonical directive set,
+literal brace escaping, malformed directives, UTF-8 preservation, redirected
+text-only behavior, bounded MGTC batches, and explicit `say --markup` argument
+handling. `make test-terminal` includes this fixture and the production
+renderer fixture, which verifies MGTC batch validation, style isolation,
+terminal ownership, literal ESC text, cursor operations, and clearing.
+
+The disposable `guest_mgfs_test.py --shoot-v1` workflow also exercises
+interactive `say --markup` through the native console stream and checks the
+resulting framebuffer text and foreground color. The guest image is built
+under the selected build directory and independently checked after shutdown.
+
 ## System CA root-store packaging
 
 `make test-ca-store` validates the checked-in Mozilla-derived PEM snapshot and
