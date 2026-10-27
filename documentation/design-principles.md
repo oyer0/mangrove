@@ -98,6 +98,15 @@ use display limitations as a reason to corrupt, normalize, or silently discard
 text. Support levels and unsupported presentation or input behavior must be
 documented and tested at the layer that owns them.
 
+## Keyboard modifier conventions
+
+Unmodified keys perform their ordinary actions. Alt broadens the scope or
+granularity of an action while preserving its purpose, such as moving one
+character with Left and one word with Alt+Left. Ctrl invokes a distinct
+command or function, such as typing `L` versus clearing the terminal with
+Ctrl+L. These are guidelines, not rigid rules; preserve established bindings
+unless a specific inconsistency is reviewed separately.
+
 ## User control and extensibility
 
 Provide approachable defaults and clear feedback while respecting users'
