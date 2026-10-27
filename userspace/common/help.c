@@ -636,7 +636,11 @@ int command_print_help(const char *argv0)
     mg_result_t result = help_load_record(name, &record);
 
     if (result != MG_OK) {
-        printf("Help unavailable for %s.\n", name);
+        static const char prefix[] = "Help unavailable for ";
+        static const char suffix[] = ".\n";
+        (void)console_write_literal(prefix, sizeof(prefix) - 1U);
+        (void)console_write_literal(name, strlen(name));
+        (void)console_write_literal(suffix, sizeof(suffix) - 1U);
         return 1;
     }
     help_print_record(&record);
@@ -648,8 +652,24 @@ void command_usage_error(const char *argv0, const char *usage,
 {
     const char *name = command_name(argv0);
 
-    if (option) printf("Unknown option: %s\n", option);
-    else printf("Invalid arguments.\n");
-    printf("Usage: %s\nTry '%s --help' for more information.\n",
-           usage, name);
+    if (option) {
+        static const char prefix[] = "Unknown option: ";
+        (void)console_write_literal(prefix, sizeof(prefix) - 1U);
+        (void)console_write_literal(option, strlen(option));
+        (void)console_write_literal("\n", 1U);
+    } else {
+        static const char invalid[] = "Invalid arguments.\n";
+        (void)console_write_literal(invalid, sizeof(invalid) - 1U);
+    }
+    {
+        static const char usage_prefix[] = "Usage: ";
+        static const char help_prefix[] = "\nTry '";
+        static const char help_suffix[] =
+            " --help' for more information.\n";
+        (void)console_write_literal(usage_prefix, sizeof(usage_prefix) - 1U);
+        (void)console_write_literal(usage, strlen(usage));
+        (void)console_write_literal(help_prefix, sizeof(help_prefix) - 1U);
+        (void)console_write_literal(name, strlen(name));
+        (void)console_write_literal(help_suffix, sizeof(help_suffix) - 1U);
+    }
 }

@@ -7,7 +7,8 @@
 #include <stdio.h>
 #include <string.h>
 
-/* Tables are collected before output so every row uses one set of widths. */
+/* Tables are collected before output so every row uses one set of widths.
+ * Cells are data, not terminal-control streams, and render literally. */
 #define MG_TABLE_MAX_COLUMNS       8U
 #define MG_TABLE_MAX_ROWS          256U
 #define MG_TABLE_CELL_CAPACITY     256U
@@ -278,14 +279,13 @@ static bool table_render(const mg_table_t *table)
     if (!table_calculate_widths(table, widths, &column_count)) return false;
     if (console_begin_transaction() != MG_OK) return false;
     for (usize row_index = 0; row_index < table->row_count; row_index++) {
-        const mg_table_row_t *row = &table->rows[row_index];
         char output[MG_TABLE_ROW_CAPACITY];
         usize length = 0;
 
         if (!table_format_row(table, row_index, widths, column_count,
                               output, sizeof(output), &length) ||
             !table_output_append(output, &length, sizeof(output), "\n", 1U) ||
-            console_write(output, length) != (mg_result_t)length) {
+            console_write_literal(output, length) != (mg_result_t)length) {
             (void)console_end_transaction();
             return false;
         }

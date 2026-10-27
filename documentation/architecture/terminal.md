@@ -224,7 +224,8 @@ reset commands. `type` and `logv` use literal writes. `say` is literal by
 default; its explicit `-e`/`--escapes` option
 translates selected backslash escapes before writing. When output is
 redirected, emitted bytes go to the file unchanged and are not interpreted by
-the terminal.
+the terminal. Shared command tables treat cell values as literal data, even
+when a filename or process name contains an actual ESC byte.
 
 On the live normal screen, `ESC{cls}` retains the vacated visible rows in the
 same ring and advances the live origin by one viewport. It preserves the

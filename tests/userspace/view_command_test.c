@@ -16,6 +16,8 @@ static const char *read_path;
 static const char *pager_path;
 static char pager_text[32];
 static usize pager_length;
+static u8 literal_output[512];
+static usize literal_output_length;
 
 bool command_help_requested(int argc, char **argv)
 {
@@ -69,6 +71,15 @@ const char *error_string(mg_result_t error)
     return "test error";
 }
 
+mg_result_t console_write_literal(const void *buffer, usize length)
+{
+    if (length > sizeof(literal_output) - literal_output_length)
+        return MG_ERR_BUFFER_TOO_SMALL;
+    memcpy(literal_output + literal_output_length, buffer, length);
+    literal_output_length += length;
+    return (mg_result_t)length;
+}
+
 #define main view_program_main
 #include "../../userspace/view/main.c"
 #undef main
@@ -84,6 +95,8 @@ static void reset(void)
     pager_path = NULL;
     memset(pager_text, 0, sizeof(pager_text));
     pager_length = 0U;
+    memset(literal_output, 0, sizeof(literal_output));
+    literal_output_length = 0U;
 }
 
 static void test_usage_and_help(void)
@@ -115,9 +128,33 @@ static void test_read_only_pager_handoff_and_errors(void)
     file_result = MG_ERR_ACCESS_DENIED;
     assert(view_program_main(2, args) != 0 && !pager_called);
 
+    {
+        char *hostile[] = {"view", "\x1b{cls}", NULL};
+        static const char expected[] =
+            "view: \x1b{cls}: test error\n";
+
+        reset();
+        file_result = MG_ERR_ACCESS_DENIED;
+        assert(view_program_main(2, hostile) != 0 && !pager_called);
+        assert(literal_output_length == sizeof(expected) - 1U);
+        assert(memcmp(literal_output, expected, sizeof(expected) - 1U) == 0);
+    }
+
     reset();
     pager_result = MG_ERR_IO;
     assert(view_program_main(2, args) != 0 && pager_called);
+
+    {
+        char *hostile[] = {"view", "\x1b{at:1,1}", NULL};
+        static const char expected[] =
+            "view: could not display \x1b{at:1,1}: test error\n";
+
+        reset();
+        pager_result = MG_ERR_IO;
+        assert(view_program_main(2, hostile) != 0 && pager_called);
+        assert(literal_output_length == sizeof(expected) - 1U);
+        assert(memcmp(literal_output, expected, sizeof(expected) - 1U) == 0);
+    }
 }
 
 int main(void)

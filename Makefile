@@ -898,7 +898,7 @@ test-terminal-api:
 	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-terminal-stream-api-test
 
 .PHONY: test-terminal
-test-terminal: test-terminal-api
+test-terminal: test-terminal-api test-table-literal-output
 	python3 tests/terminal/framebuffer_rect_test.py "$(HOST_CC)"
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
 		-fsanitize=address,undefined -ffunction-sections -fdata-sections \
@@ -1608,6 +1608,16 @@ test-view:
 		-Wl,--gc-sections -o $(BUILD_DIR)/tests/view-command-test
 	ASAN_OPTIONS=detect_leaks=0 $(BUILD_DIR)/tests/view-command-test
 
+.PHONY: test-table-literal-output
+test-table-literal-output:
+	@mkdir -p $(BUILD_DIR)/tests
+	$(HOST_CC) -std=gnu17 -Wall -Wextra -Werror -fno-builtin \
+		-Wno-unused-function -fsanitize=address,undefined \
+		-Iinclude -idirafter libc/include \
+		tests/userspace/table_literal_output_test.c libc/src/utf8.c \
+		-o $(BUILD_DIR)/tests/table-literal-output-test
+	ASAN_OPTIONS=detect_leaks=0 $(BUILD_DIR)/tests/table-literal-output-test
+
 .PHONY: test-info
 test-info:
 	@mkdir -p $(BUILD_DIR)/tests
@@ -1627,6 +1637,12 @@ test-help:
 		libc/src/utf8.c -Wl,--gc-sections \
 		-o $(BUILD_DIR)/tests/help-record-test
 	ASAN_OPTIONS=detect_leaks=0 $(BUILD_DIR)/tests/help-record-test share/help
+	$(HOST_CC) -std=gnu17 -Wall -Wextra -Werror -fno-builtin \
+		-fsanitize=address,undefined -ffunction-sections -fdata-sections \
+		-I. -Iinclude -idirafter libc/include \
+		tests/userspace/help_literal_output_test.c -Wl,--gc-sections \
+		-o $(BUILD_DIR)/tests/help-literal-output-test
+	ASAN_OPTIONS=detect_leaks=0 $(BUILD_DIR)/tests/help-literal-output-test
 	python3 tests/userspace/help_records_test.py
 	python3 tests/userspace/info_manuals_test.py
 
