@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include <net/http.h>
+#include <string.h>
 
 enum {
     HTTP_PARSE_STATUS = 0,
@@ -226,8 +227,11 @@ bool http_parse_url(const char *url, http_url_t *parsed)
 void http_parser_init(http_parser_t *parser, http_response_t *response)
 {
     if (!parser || !response) return;
-    *parser = (http_parser_t){0};
-    *response = (http_response_t){0};
+    /* A compound-literal assignment materializes the 32 KiB response as a
+     * temporary on this caller's kernel stack. Clear the caller-owned objects
+     * directly instead. */
+    memset(parser, 0, sizeof(*parser));
+    memset(response, 0, sizeof(*response));
     parser->response = response;
     parser->state = HTTP_PARSE_STATUS;
 }

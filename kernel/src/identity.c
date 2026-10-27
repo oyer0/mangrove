@@ -1317,39 +1317,56 @@ static bool account_home_is_safe(const user_identity_t *identity)
 
 static int account_purge_directory(vfs_node_t *directory, u32 depth)
 {
-    vfs_dirent_t entries[64];
-    char names[64][256];
-    vfs_node_type_t types[64];
+    struct account_purge_snapshot {
+        char names[64][MG_DIRECTORY_NAME_CAPACITY];
+        vfs_node_type_t types[64];
+    } *snapshot;
+    vfs_dirent_t entry;
     u32 count = 0;
     u32 index = 0;
+    int result = MG_OK;
 
     if (!directory || directory->type != VFS_TYPE_DIRECTORY || depth >= 32U)
         return MG_ERR_BAD_ARGUMENT;
-    while (count < 64U && vfs_readdir_trusted(directory, index,
-                                               &entries[count])) {
-        strncpy(names[count], entries[count].name, sizeof(names[count]) - 1);
-        names[count][sizeof(names[count]) - 1] = '\0';
-        types[count] = entries[count].type;
+    snapshot = (struct account_purge_snapshot *)kmalloc(sizeof(*snapshot));
+    if (!snapshot)
+        return MG_ERR_NO_MEMORY;
+    while (count < 64U && vfs_readdir_trusted(directory, index, &entry)) {
+        strncpy(snapshot->names[count], entry.name,
+                sizeof(snapshot->names[count]) - 1U);
+        snapshot->names[count][sizeof(snapshot->names[count]) - 1U] = '\0';
+        snapshot->types[count] = entry.type;
         count++;
         index++;
     }
-    if (count == 64U) return MG_ERR_NO_MEMORY;
+    if (count == 64U) {
+        result = MG_ERR_NO_MEMORY;
+        goto done;
+    }
     for (u32 child_index = 0; child_index < count; child_index++) {
         vfs_node_t *child = NULL;
-        int result = vfs_finddir_trusted_checked(directory, names[child_index], &child);
-        if (result != VFS_OK) return account_vfs_error(result);
-        if (types[child_index] == VFS_TYPE_DIRECTORY) {
-            result = account_purge_directory(child, depth + 1U);
-            if (result == MG_OK)
-                result = account_vfs_error(
-                    vfs_rmdir_trusted(directory, names[child_index]));
-        } else {
-            result = account_vfs_error(
-                vfs_unlink_trusted(directory, names[child_index]));
+        int lookup = vfs_finddir_trusted_checked(
+            directory, snapshot->names[child_index], &child);
+        if (lookup != VFS_OK) {
+            result = account_vfs_error(lookup);
+            goto done;
         }
-        if (result != MG_OK) return result;
+        if (snapshot->types[child_index] == VFS_TYPE_DIRECTORY) {
+            result = account_purge_directory(child, depth + 1U);
+            if (result != MG_OK)
+                goto done;
+            result = account_vfs_error(vfs_rmdir_trusted(
+                directory, snapshot->names[child_index]));
+        } else {
+            result = account_vfs_error(vfs_unlink_trusted(
+                directory, snapshot->names[child_index]));
+        }
+        if (result != MG_OK)
+            goto done;
     }
-    return MG_OK;
+done:
+    kfree(snapshot);
+    return result;
 }
 
 static int account_purge_home(const user_identity_t *identity)
