@@ -1,0 +1,19 @@
+NAME
+
+time - Run a command and show elapsed execution time
+
+SYNOPSIS
+
+    time <command> [arguments...]
+
+DESCRIPTION
+
+Run a command and show elapsed execution time.
+
+OPTIONS
+
+    -h, --help — Show this help.
+
+SEE ALSO
+
+    documentation/userspace/commands.md

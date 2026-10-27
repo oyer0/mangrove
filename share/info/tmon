@@ -1,0 +1,23 @@
+NAME
+
+tmon - Live task and system monitor
+
+SYNOPSIS
+
+    tmon
+
+DESCRIPTION
+
+Live task and system monitor.
+
+OPTIONS
+
+    -h, --help — Show this help.
+
+KEYBINDINGS
+
+    q — Close the live monitor.
+
+SEE ALSO
+
+    documentation/userspace/commands.md

@@ -1,0 +1,19 @@
+NAME
+
+resolve - Resolve an IPv4 address
+
+SYNOPSIS
+
+    resolve <hostname>
+
+DESCRIPTION
+
+Resolve an IPv4 address.
+
+OPTIONS
+
+    -h, --help — Show this help.
+
+SEE ALSO
+
+    documentation/userspace/commands.md

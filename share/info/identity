@@ -1,0 +1,19 @@
+NAME
+
+identity - Show the current process identity
+
+SYNOPSIS
+
+    identity
+
+DESCRIPTION
+
+Show the current process identity.
+
+OPTIONS
+
+    -h, --help — Show this help.
+
+SEE ALSO
+
+    documentation/userspace/commands.md

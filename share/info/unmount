@@ -1,0 +1,19 @@
+NAME
+
+unmount - Flush and unmount a volume
+
+SYNOPSIS
+
+    unmount <device>
+
+DESCRIPTION
+
+Flush and unmount a volume.
+
+OPTIONS
+
+    -h, --help — Show this help.
+
+SEE ALSO
+
+    documentation/userspace/commands.md

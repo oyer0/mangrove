@@ -1,0 +1,25 @@
+NAME
+
+netcfg - Configure network state
+
+SYNOPSIS
+
+    netcfg <command>
+    netcfg renew
+    netcfg automatic [<interface>]
+    netcfg manual [<interface>] <address/prefix> <gateway> <dns>
+    netcfg enable <interface>
+    netcfg disable <interface>
+    netcfg reload
+
+DESCRIPTION
+
+Configure network state.
+
+OPTIONS
+
+    -h, --help — Show this help.
+
+SEE ALSO
+
+    documentation/userspace/commands.md

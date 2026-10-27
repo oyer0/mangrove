@@ -1609,6 +1609,7 @@ test-help:
 		-o $(BUILD_DIR)/tests/help-record-test
 	ASAN_OPTIONS=detect_leaks=0 $(BUILD_DIR)/tests/help-record-test share/help
 	python3 tests/userspace/help_records_test.py
+	python3 tests/userspace/info_manuals_test.py
 
 .PHONY: test-qmp-client
 test-qmp-client:

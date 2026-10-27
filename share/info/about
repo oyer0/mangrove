@@ -1,0 +1,19 @@
+NAME
+
+about - Show Mangrove system information
+
+SYNOPSIS
+
+    about
+
+DESCRIPTION
+
+Show Mangrove system information.
+
+OPTIONS
+
+    -h, --help — Show this help.
+
+SEE ALSO
+
+    documentation/userspace/commands.md

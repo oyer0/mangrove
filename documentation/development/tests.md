@@ -172,10 +172,12 @@ byte-stable. These updater tests run on disposable host images.
 `make test-help` runs the production quick-help parser and renderer against
 synthetic section combinations and every checked-in `/share/help` record under
 ASan/UBSan. It verifies optional-section omission, narrow-terminal wrapping,
-and legacy records containing only usage and options. It is a focused host
-fixture; it does not boot the packaged image. A source-record audit checks
-section classification, the declared option set for all 44 commands, and the
-interactive controls documented for the pager, Reed, TMon, and disk utility.
+and legacy records containing only usage and options. It also checks that all
+44 installed command records have a matching manual with ordered, nonempty
+headings, matching synopsis and option names, and separate Reed keybinding
+entries. It is a focused host fixture; it does not boot the packaged image.
+A source-record audit checks section classification, the declared option set
+for every command, and interactive controls.
 
 | Target | Production code exercised | Test boundary |
 | --- | --- | --- |

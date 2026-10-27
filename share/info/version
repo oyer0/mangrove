@@ -1,0 +1,19 @@
+NAME
+
+version - Show system version information
+
+SYNOPSIS
+
+    version
+
+DESCRIPTION
+
+Show system version information.
+
+OPTIONS
+
+    -h, --help — Show this help.
+
+SEE ALSO
+
+    documentation/userspace/commands.md

@@ -1,0 +1,23 @@
+NAME
+
+mkdir - Create a directory
+
+SYNOPSIS
+
+    mkdir <directory>...
+
+DESCRIPTION
+
+Create a directory.
+
+OPTIONS
+
+    -h, --help — Show this help.
+
+NOTES
+
+Use -- before a directory name beginning with a hyphen.
+
+SEE ALSO
+
+    documentation/userspace/commands.md

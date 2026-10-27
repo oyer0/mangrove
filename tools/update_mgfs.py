@@ -23,7 +23,7 @@ from populate_mgfs import (B, DEFAULT_ACCOUNT_DATABASE,
                            RECORD_CHILD_MUTATION_OWNER_RESTRICTED,
                            directory_entry, w64)
 from populate_mgfs import (HELP_FILES, HELP_INDEX_NAME, INFO_FILES,
-                           INFO_SOURCE_DIR, INFO_FIRST_RECORD_ID,
+                           INFO_SOURCE_DIR, INFO_RECORD_IDS,
                            build_help_index)
 from image_payloads import (BIN_PAYLOAD_NAMES, PAYLOAD_MANIFEST,
                             DATA_MANIFEST, DATA_RECORD_IDS,
@@ -148,7 +148,7 @@ RESERVED_SYSTEM_RECORD_IDS = frozenset(SYSTEM_RECORDS) | {
     LOGD_RECORD_ID,
     HARDWARE_RECORD_ID, INFO_RECORD_ID, *DATA_RECORD_IDS,
     *CA_STORE_RECORD_IDS,
-    *range(INFO_FIRST_RECORD_ID, INFO_FIRST_RECORD_ID + len(INFO_FILES)),
+    *INFO_RECORD_IDS,
 }
 
 # This order is the public payload argument order used by make_image.sh.

@@ -1,0 +1,19 @@
+NAME
+
+crew - Show processes in the current Shoot session
+
+SYNOPSIS
+
+    crew
+
+DESCRIPTION
+
+Show processes in the current Shoot session.
+
+OPTIONS
+
+    -h, --help — Show this help.
+
+SEE ALSO
+
+    documentation/userspace/commands.md

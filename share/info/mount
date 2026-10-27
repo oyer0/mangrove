@@ -1,0 +1,19 @@
+NAME
+
+mount - Mount a volume using Mangrove's automatic mountpoint policy
+
+SYNOPSIS
+
+    mount <device>
+
+DESCRIPTION
+
+Mount a volume using Mangrove's automatic mountpoint policy.
+
+OPTIONS
+
+    -h, --help — Show this help.
+
+SEE ALSO
+
+    documentation/userspace/commands.md

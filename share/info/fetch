@@ -1,0 +1,33 @@
+NAME
+
+fetch - Download HTTP or authenticated HTTPS resources without overwriting existing files
+
+SYNOPSIS
+
+    fetch [OPTIONS] URL...
+    fetch [OPTIONS] --input-file=FILE
+
+DESCRIPTION
+
+Download HTTP or authenticated HTTPS resources without overwriting existing files.
+
+OPTIONS
+
+    -o FILE, --output=FILE — Write one URL to FILE; it must not exist.
+    -q, --quiet — Suppress normal lifecycle, progress, and success output.
+    -i FILE, --input-file=FILE — Read one URL per line from FILE.
+    --timings — Show detailed DNS, TCP, TLS, transfer, and filesystem timings.
+    -h, --help — Show this quick help.
+
+NOTES
+
+URLs without a scheme use http://. HTTPS uses TLS 1.3 with the system CA store, trusted UTC, and hostname verification; there is no HTTP fallback.
+HTTP redirects may upgrade to HTTPS. HTTPS-to-HTTP redirects are rejected. Relative redirects, Content-Length, chunked, and connection-close responses are supported.
+Multiple URLs are downloaded sequentially; automatic names gain .1, .2, and later suffixes on collision.
+URL list files use one URL per line; blank lines and lines beginning with # are ignored. Explicit output files are never overwritten.
+Normal output reports the requested URL, one resolved IPv4 address, TCP connect, TLS authentication for HTTPS, HTTP response metadata, destination, and a completion summary.
+In-place progress is used only when standard output is the interactive console and is wide enough. Redirected output receives no carriage-return progress updates.
+
+SEE ALSO
+
+    documentation/userspace/commands.md

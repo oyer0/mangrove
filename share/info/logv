@@ -1,0 +1,21 @@
+NAME
+
+logv - Display system logs with boot-relative monotonic timestamps
+
+SYNOPSIS
+
+    logv
+    logv boot
+    logv <source>
+
+DESCRIPTION
+
+Display system logs with boot-relative monotonic timestamps.
+
+OPTIONS
+
+    -h, --help — Show this help.
+
+SEE ALSO
+
+    documentation/userspace/commands.md

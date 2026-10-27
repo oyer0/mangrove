@@ -1,0 +1,19 @@
+NAME
+
+reboot - Restart the system
+
+SYNOPSIS
+
+    reboot
+
+DESCRIPTION
+
+Restart the system.
+
+OPTIONS
+
+    -h, --help — Show this help.
+
+SEE ALSO
+
+    documentation/userspace/commands.md

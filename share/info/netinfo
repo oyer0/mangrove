@@ -1,0 +1,26 @@
+NAME
+
+netinfo - Inspect current network state
+
+SYNOPSIS
+
+    netinfo
+    netinfo status
+    netinfo status <interface>
+    netinfo interfaces
+    netinfo routes
+    netinfo neighbors
+    netinfo connections
+    netinfo dns
+
+DESCRIPTION
+
+Inspect current network state.
+
+OPTIONS
+
+    -h, --help — Show this help.
+
+SEE ALSO
+
+    documentation/userspace/commands.md

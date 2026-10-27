@@ -1,0 +1,19 @@
+NAME
+
+wait - Wait for a number of seconds
+
+SYNOPSIS
+
+    wait SECONDS
+
+DESCRIPTION
+
+Wait for a number of seconds.
+
+OPTIONS
+
+    -h, --help — Show this help.
+
+SEE ALSO
+
+    documentation/userspace/commands.md

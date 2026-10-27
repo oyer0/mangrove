@@ -1,0 +1,24 @@
+NAME
+
+sprout - Inspect and control system services
+
+SYNOPSIS
+
+    sprout status
+    sprout status <service>
+    sprout start <service>
+    sprout stop <service>
+    sprout restart <service>
+    sprout reload <service>
+
+DESCRIPTION
+
+Inspect and control system services.
+
+OPTIONS
+
+    -h, --help — Show this help.
+
+SEE ALSO
+
+    documentation/userspace/commands.md

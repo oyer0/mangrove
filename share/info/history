@@ -1,0 +1,25 @@
+NAME
+
+history - Manage command history
+
+SYNOPSIS
+
+    history [-c|-a|-n|-r|-w|-d N]
+
+DESCRIPTION
+
+Manage command history.
+
+OPTIONS
+
+    -c — Clear only current in-memory history.
+    -d N — Delete numbered entry N from memory.
+    -a — Append unsaved session commands.
+    -n — Import reliably new saved entries; warn on ambiguous changes.
+    -r — Import all saved entries, allowing duplicates.
+    -w — Replace saved history with current memory; resolve uncertain writes.
+    -h, --help — Show the built-in history help.
+
+SEE ALSO
+
+    documentation/userspace/commands.md

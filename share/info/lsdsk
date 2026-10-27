@@ -1,0 +1,21 @@
+NAME
+
+lsdsk - Show disks, filesystems, labels, and mountpoints
+
+SYNOPSIS
+
+    lsdsk
+    lsdsk -v
+
+DESCRIPTION
+
+Show disks, filesystems, labels, and mountpoints.
+
+OPTIONS
+
+    -h, --help — Show this help.
+    -v — Show whole-disk connection and model details.
+
+SEE ALSO
+
+    documentation/userspace/commands.md

@@ -1,0 +1,21 @@
+NAME
+
+lsusb - Show USB devices
+
+SYNOPSIS
+
+    lsusb
+    lsusb -v
+
+DESCRIPTION
+
+Show USB devices.
+
+OPTIONS
+
+    -h, --help — Show this help.
+    -v — Show detailed device information.
+
+SEE ALSO
+
+    documentation/userspace/commands.md

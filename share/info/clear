@@ -1,0 +1,23 @@
+NAME
+
+clear - Clear the visible terminal
+
+SYNOPSIS
+
+    clear
+
+DESCRIPTION
+
+Clear the visible terminal.
+
+OPTIONS
+
+    -h, --help — Show this help.
+
+NOTES
+
+Clears only interactive terminal output; redirected output is left unchanged.
+
+SEE ALSO
+
+    documentation/userspace/commands.md

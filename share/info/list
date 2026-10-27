@@ -1,0 +1,27 @@
+NAME
+
+list - List directory contents
+
+SYNOPSIS
+
+    list [-l|--long] [-t] [--tree DEPTH] [path...]
+
+DESCRIPTION
+
+List directory contents.
+
+OPTIONS
+
+    -l, --long — Show one entry per line with native metadata.
+    -t — Show a directory tree (maximum depth 16).
+    --tree DEPTH — Show a directory tree to the selected depth.
+    -h, --help — Show this help.
+
+NOTES
+
+Multiple operands are listed in operand order; failures do not skip later operands, and any failure produces a nonzero status.
+Use -- before a path beginning with a hyphen. The previous -t DEPTH spelling remains accepted.
+
+SEE ALSO
+
+    documentation/userspace/commands.md

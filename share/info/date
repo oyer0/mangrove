@@ -1,0 +1,19 @@
+NAME
+
+date - Show the current Mangrove UTC time
+
+SYNOPSIS
+
+    date
+
+DESCRIPTION
+
+Show the current Mangrove UTC time.
+
+OPTIONS
+
+    -h, --help — Show this help.
+
+SEE ALSO
+
+    documentation/userspace/commands.md

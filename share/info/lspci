@@ -1,0 +1,21 @@
+NAME
+
+lspci - Show PCI devices
+
+SYNOPSIS
+
+    lspci
+    lspci -v
+
+DESCRIPTION
+
+Show PCI devices.
+
+OPTIONS
+
+    -h, --help — Show this help.
+    -v — Show detailed device information.
+
+SEE ALSO
+
+    documentation/userspace/commands.md

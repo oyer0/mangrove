@@ -1,0 +1,19 @@
+NAME
+
+locate - Show how a command resolves
+
+SYNOPSIS
+
+    locate <name>
+
+DESCRIPTION
+
+Show how a command resolves.
+
+OPTIONS
+
+    -h, --help — Show this help.
+
+SEE ALSO
+
+    documentation/userspace/commands.md

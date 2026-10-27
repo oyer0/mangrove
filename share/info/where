@@ -1,0 +1,19 @@
+NAME
+
+where - Print the current directory
+
+SYNOPSIS
+
+    where
+
+DESCRIPTION
+
+Print the current directory.
+
+OPTIONS
+
+    -h, --help — Show this help.
+
+SEE ALSO
+
+    documentation/userspace/commands.md

@@ -1,0 +1,19 @@
+NAME
+
+mem - Show physical memory usage
+
+SYNOPSIS
+
+    mem
+
+DESCRIPTION
+
+Show physical memory usage.
+
+OPTIONS
+
+    -h, --help — Show this help.
+
+SEE ALSO
+
+    documentation/userspace/commands.md

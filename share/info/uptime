@@ -1,0 +1,19 @@
+NAME
+
+uptime - Show elapsed system uptime
+
+SYNOPSIS
+
+    uptime
+
+DESCRIPTION
+
+Show elapsed system uptime.
+
+OPTIONS
+
+    -h, --help — Show this help.
+
+SEE ALSO
+
+    documentation/userspace/commands.md

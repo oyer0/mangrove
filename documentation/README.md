@@ -16,6 +16,8 @@ procedures. Source code is authoritative for implementation details.
   current text limits.
 - [Native command reference](userspace/commands.md): installed commands,
   administrative utilities, services, and development-only programs.
+- [Command documentation style](development/command-documentation.md):
+  authoring conventions and structure for quick help and installed manuals.
 - [Application directories](userspace/application-directories.md): per-user
   settings, data, state, and cache path conventions.
 - [Read-only text pager](userspace/text-pager.md): shared full-screen wrapping,

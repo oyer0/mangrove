@@ -1,0 +1,19 @@
+NAME
+
+power - Show battery and AC status
+
+SYNOPSIS
+
+    power
+
+DESCRIPTION
+
+Show battery and AC status.
+
+OPTIONS
+
+    -h, --help — Show this help.
+
+SEE ALSO
+
+    documentation/userspace/commands.md

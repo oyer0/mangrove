@@ -114,7 +114,6 @@ def directory_entry(record_id, name):
 
 HELP_SOURCE_DIR = "share/help"
 INFO_SOURCE_DIR = "share/info"
-INFO_FILES = ("shoot", "reed")
 HELP_FILES = (
     "clear", "copy", "fetch", "identity", "locate", "list", "mkdir", "move",
     "netinfo", "netcfg", "ping", "plant", "power", "reboot", "type", "wait",
@@ -123,6 +122,8 @@ HELP_FILES = (
     "time", "tmon", "logv", "mount", "unmount", "eject", "diskutil", "date",
     "about", "history", "reed", "shoot", "view", "info",
 )
+INFO_FILES = ("shoot", "reed") + tuple(
+    name for name in HELP_FILES if name not in ("shoot", "reed"))
 HELP_INDEX_NAME = ".index"
 
 
@@ -164,6 +165,19 @@ INFO_FIRST_RECORD_ID = 220
 CA_STORE_RECORD_ID = 240
 CA_STORE_FIRST_FILE_RECORD_ID = 241
 CA_STORE_FILES = (CA_BUNDLE_NAME, CA_MANIFEST_NAME, CA_LICENSE_NAME)
+
+
+def _info_record_ids():
+    """Keep the original Reed/Shoot IDs and reserve the remaining free range."""
+    candidates = (INFO_FIRST_RECORD_ID, INFO_FIRST_RECORD_ID + 1) + \
+        tuple(range(INFO_FIRST_RECORD_ID + 2, CA_STORE_RECORD_ID)) + \
+        tuple(range(113, 150))
+    if len(candidates) < len(INFO_FILES):
+        raise RuntimeError("fixed MGFS Record range is too small for manuals")
+    return candidates[:len(INFO_FILES)]
+
+
+INFO_RECORD_IDS = _info_record_ids()
 SECURITY_RECORD_ID = 70
 SECURITY_CONFIG_RECORD_ID = 71
 CONF_RECORD_ID = 5
@@ -274,7 +288,7 @@ def main():
         max(record_id for record_id, _ in SYSTEM_FILES), max(DATA_RECORD_IDS),
         HARDWARE_RECORD_ID, INFO_RECORD_ID,
         HELP_FIRST_RECORD_ID + len(HELP_FILES) - 1,
-        INFO_FIRST_RECORD_ID + len(INFO_FILES) - 1,
+        max(INFO_RECORD_IDS),
         CA_STORE_FIRST_FILE_RECORD_ID + len(CA_STORE_FILES) - 1)
     if highest_record_id > record_count:
         raise SystemExit("populate_mgfs: image has insufficient record slots")
@@ -305,7 +319,7 @@ def main():
         for name in INFO_FILES
     }
     info_data = b"".join(
-        directory_entry(INFO_FIRST_RECORD_ID + index, name)
+        directory_entry(INFO_RECORD_IDS[index], name)
         for index, name in enumerate(INFO_FILES))
     conf_data = directory_entry(NETWORK_RECORD_ID, "network")
     core_data = (directory_entry(8, "sprout") +
@@ -431,7 +445,7 @@ def main():
 
     info_extents = {}
     for index, name in enumerate(INFO_FILES):
-        record_id = INFO_FIRST_RECORD_ID + index
+        record_id = INFO_RECORD_IDS[index]
         payload = info_payloads[name]
         block_count = math.ceil(len(payload) / B)
         for block_index in range(block_count):
@@ -487,8 +501,7 @@ def main():
                          CA_STORE_RECORD_ID) or \
                 HELP_FIRST_RECORD_ID <= record_id < \
                 HELP_FIRST_RECORD_ID + len(HELP_FILES) or \
-                INFO_FIRST_RECORD_ID <= record_id < \
-                INFO_FIRST_RECORD_ID + len(INFO_FILES) or \
+                record_id in INFO_RECORD_IDS or \
                 CA_STORE_FIRST_FILE_RECORD_ID <= record_id < \
                 CA_STORE_FIRST_FILE_RECORD_ID + len(CA_STORE_FILES):
             continue
@@ -547,7 +560,7 @@ def main():
     records.append(make_record(INFO_RECORD_ID, 2, len(info_data),
                                [(0, first_block + 14, 1, 2)]))
     for index, name in enumerate(INFO_FILES):
-        record_id = INFO_FIRST_RECORD_ID + index
+        record_id = INFO_RECORD_IDS[index]
         records.append(make_record(record_id, 1, len(info_payloads[name]),
                                    info_extents[record_id]))
     records.append(make_record(CA_STORE_RECORD_ID, 2, len(ca_store_data),
@@ -595,7 +608,7 @@ def main():
     highest_record_id = max(highest_record_id, SHARE_RECORD_ID, HELP_RECORD_ID,
                             HELP_INDEX_RECORD_ID,
                             HELP_FIRST_RECORD_ID + len(HELP_FILES) - 1,
-                            INFO_FIRST_RECORD_ID + len(INFO_FILES) - 1,
+                            max(INFO_RECORD_IDS),
                             CA_STORE_RECORD_ID,
                             CA_STORE_FIRST_FILE_RECORD_ID + len(CA_STORE_FILES) - 1,
                             VOL_RECORD_ID, SECURITY_RECORD_ID,

@@ -40,7 +40,9 @@ def main():
                         str(ROOT / "boot/src/mgfs.c"), "-o", str(boot_test)],
                        check=True)
         current = pathlib.Path(temp) / "current.img"
-        subprocess.run([str(mkmgfs), "--blocks", "3600", "--uuid",
+        # Leave enough Record IDs for the production CA trust-store entries
+        # and the full installed command-manual set.
+        subprocess.run([str(mkmgfs), "--blocks", "4000", "--uuid",
                         "11111111-2222-3333-4444-555555555555",
                         "--format-time-ns", "1", str(current)], check=True)
         original = current.read_bytes()

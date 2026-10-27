@@ -1,0 +1,23 @@
+NAME
+
+plant - Create an empty file
+
+SYNOPSIS
+
+    plant <name>...
+
+DESCRIPTION
+
+Create an empty file.
+
+OPTIONS
+
+    -h, --help — Show this help.
+
+NOTES
+
+Use -- before a file name beginning with a hyphen.
+
+SEE ALSO
+
+    documentation/userspace/commands.md

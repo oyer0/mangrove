@@ -1,0 +1,26 @@
+NAME
+
+ping - Send ICMP echo requests
+
+SYNOPSIS
+
+    ping [OPTIONS] HOST
+    ping [-c|--count COUNT] [-i|--interval SECONDS] HOST
+
+DESCRIPTION
+
+Send ICMP echo requests.
+
+OPTIONS
+
+    -c COUNT, --count COUNT — Send a selected number of requests (1-1000).
+    -i SECONDS, --interval SECONDS — Default 1 second; minimum 0.002 seconds.
+    -h, --help — Show this help.
+
+NOTES
+
+Use -- before a hostname beginning with a hyphen. Fractional intervals round up to a millisecond; with this single-request API, a shorter interval also bounds the echo timeout.
+
+SEE ALSO
+
+    documentation/userspace/commands.md

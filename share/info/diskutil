@@ -1,0 +1,38 @@
+NAME
+
+diskutil - Protected interactive disk inspection and management utility; storage authorization is required to enter
+
+SYNOPSIS
+
+    diskutil
+
+DESCRIPTION
+
+Protected interactive disk inspection and management utility; storage authorization is required to enter.
+
+OPTIONS
+
+    -h, --help — Show this help.
+
+COMMANDS
+
+    list — List whole disks or the selected disk's partitions.
+    select <disk> — Select a whole disk.
+    info — Show general or selected disk properties.
+    format <target> <fat32|mgfs|exfat> — Format a disk or partition.
+    label <target> <label> — Change a filesystem label.
+    initialize gpt — Create a fresh GPT.
+    create <size|rest> — Create a GPT partition.
+    delete <partN> — Delete a GPT partition.
+    back — Return to the disk list.
+    help — Show commands available in the current state.
+    exit — Leave diskutil.
+
+NOTES
+
+Destructive operations require storage authorization and exact typed confirmation.
+Mounted, read-only, system-managed, or changed targets are rejected; whole-disk formatting requires no partitions.
+
+SEE ALSO
+
+    documentation/userspace/commands.md

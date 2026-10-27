@@ -1,0 +1,27 @@
+NAME
+
+user - Manage user accounts
+
+SYNOPSIS
+
+    user
+    user list
+    user show <name>
+    user create <name>
+    user password [<name>]
+    user remove <name>
+    user remove [-p|--purge] <name>
+    user role <name> <regular|admin>
+
+DESCRIPTION
+
+Manage user accounts.
+
+OPTIONS
+
+    -p, --purge — Delete the user's home directory when removing.
+    -h, --help — Show this help.
+
+SEE ALSO
+
+    documentation/userspace/commands.md

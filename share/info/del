@@ -1,0 +1,27 @@
+NAME
+
+del - Remove files and directories
+
+SYNOPSIS
+
+    del [-r|--recursive] <file|directory>...
+
+DESCRIPTION
+
+Remove files and directories.
+
+OPTIONS
+
+    -r, --recursive — Remove a directory tree; without it only empty directories are removed.
+    -h, --help — Show this help.
+
+NOTES
+
+Targets run in order; failures do not stop later targets.
+Duplicates and targets already removed by an earlier recursive operand fail explicitly.
+When run from Shoot, unquoted pathname patterns expand before del starts; unmatched patterns stay literal and hidden names require an explicit leading dot.
+Use -- before a target beginning with a hyphen.
+
+SEE ALSO
+
+    documentation/userspace/commands.md

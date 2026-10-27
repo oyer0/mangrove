@@ -1,0 +1,59 @@
+NAME
+
+info - Read an installed command manual
+
+SYNOPSIS
+
+    info PROGRAM
+    info --help
+
+DESCRIPTION
+
+`info` opens one installed plain-text manual in the fullscreen pager. Manuals
+are stored under `/share/info/PROGRAM`. A manual's internal sections are
+read as part of that manual; `info` accepts one program name only.
+
+OPTIONS
+
+    -h, --help — Show concise invocation help and exit.
+
+KEYBINDINGS
+
+    j — Scroll down one visual row.
+    Down — Scroll down one visual row.
+    k — Scroll up one visual row.
+    Up — Scroll up one visual row.
+    Page Down — Scroll down one viewport.
+    Space — Scroll down one viewport.
+    Page Up — Scroll up one viewport.
+    g — Move to the beginning of the document.
+    Home — Move to the beginning of the document.
+    G — Move to the end of the document.
+    End — Move to the end of the document.
+    ? — Open incremental search.
+    n — Move to the next search match without wrapping.
+    b — Move to the previous search match without wrapping.
+    Escape — Exit search input or search mode; otherwise close the manual.
+    q — Close the manual.
+
+During search input, Enter accepts the query and selects the nearest match.
+Backspace and Delete edit the query. Escape cancels an unfinished query or
+leaves search mode at the current reading position. Search does not wrap at
+document boundaries.
+
+EXAMPLES
+
+    info reed
+    info shoot
+
+NOTES
+
+Quick command help is available with `PROGRAM -h` or `PROGRAM --help`; it is
+separate from this full manual. A missing manual is reported without creating
+or changing files. The pager uses scalar-based terminal-cell layout and does
+not implement grapheme-aware or complex-script rendering.
+
+SEE ALSO
+
+    view
+    documentation/userspace/text-pager.md

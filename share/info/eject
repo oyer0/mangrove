@@ -1,0 +1,19 @@
+NAME
+
+eject - Cleanly unmount and suppress a removable device
+
+SYNOPSIS
+
+    eject <device>
+
+DESCRIPTION
+
+Cleanly unmount and suppress a removable device.
+
+OPTIONS
+
+    -h, --help — Show this help.
+
+SEE ALSO
+
+    documentation/userspace/commands.md

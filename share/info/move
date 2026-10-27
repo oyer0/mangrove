@@ -1,0 +1,24 @@
+NAME
+
+move - Move or rename a file or directory
+
+SYNOPSIS
+
+    move <source>... <destination>
+
+DESCRIPTION
+
+Move or rename a file or directory.
+
+OPTIONS
+
+    -h, --help — Show this help.
+
+NOTES
+
+Multiple sources require an existing destination directory and keep their basenames.
+Use -- before a source or destination beginning with a hyphen.
+
+SEE ALSO
+
+    documentation/userspace/commands.md
