@@ -2,6 +2,7 @@
 #include <bootinfo.h>
 #include <gdt.h>
 #include <idt.h>
+#include <cpu.h>
 #include <pmm.h>
 #include <memory_types.h>
 #include <vmm.h>
@@ -58,6 +59,7 @@
 
 extern char __stack_top[];
 extern char __stack_bottom[];
+extern char __stack_guard_bottom[];
 extern char __kernel_text_virt_start[];
 extern char __kernel_text_virt_end[];
 extern char __kernel_rodata_virt_start[];
@@ -829,6 +831,9 @@ static bool early_bootstrap(BOOT_INFO *source_boot_info)
             (uintptr_t)__kernel_data_virt_end, PTE_READWRITE | PTE_NX) ||
         !map_kernel_image_range(k_pml4,
             (uintptr_t)__kernel_bss_virt_start,
+            (uintptr_t)__stack_guard_bottom, PTE_READWRITE | PTE_NX) ||
+        !map_kernel_image_range(k_pml4,
+            (uintptr_t)__stack_bottom,
             (uintptr_t)__kernel_bss_virt_end, PTE_READWRITE | PTE_NX)) {
         kprint("[BOOT] kernel image mapping failed\n");
         return false;
@@ -866,6 +871,7 @@ static bool early_bootstrap(BOOT_INFO *source_boot_info)
     pmm_enable_direct_map();
     k_pml4 = vmm_get_kernel_pml4();
     if (!vmm_direct_map_valid(k_pml4_phys) ||
+        vmm_kernel_mapping_present((void *)__stack_guard_bottom) ||
         vmm_kernel_mapping_present((void *)(uintptr_t)KERNEL_PHYS_BASE) ||
         !vmm_kernel_mapping_supervisor((void *)(uintptr_t)PHYS_MAP_BASE) ||
         !vmm_kernel_mapping_supervisor((void *)framebuffer_mmio) ||
@@ -876,6 +882,10 @@ static bool early_bootstrap(BOOT_INFO *source_boot_info)
 
     if (!heap_init()) {
         kprint("[BOOT] initial kernel heap mapping failed\n");
+        return false;
+    }
+    if (!gdt_install_guarded_ists(cpu_bootstrap_local())) {
+        kprint("[BOOT] guarded exception-stack allocation failed\n");
         return false;
     }
     framebuffer_enable_backbuffer();
@@ -896,9 +906,15 @@ static void start_pid1(void)
     __asm__ volatile("cli" ::: "memory");
     const char *creation_stage = NULL;
     int creation_status = VFS_OK;
+    /* Guarded kernel-stack mappings are published into every process root
+     * and require remote CPUs to acknowledge the VMM shootdown. Keep IF on
+     * while constructing the suspended child; other CPUs are idle until its
+     * resources are fully prepared. */
+    __asm__ volatile("sti" ::: "memory");
     process_t *ring3_process = process_create_with_failure(
         "sprout", NULL, thread_current(), &creation_stage,
         &creation_status);
+    __asm__ volatile("cli" ::: "memory");
     if (!ring3_process) {
         kprint("[FAIL] Ring 3 process creation failed at %s (status=%d)\n",
                creation_stage ? creation_stage : "unknown stage",
@@ -969,6 +985,7 @@ static void start_pid1(void)
     /* Create terminal workers while the kernel address space is active and
      * interrupts are enabled.  Their allocations may grow the heap, which
      * can require the cross-CPU mapping publication path. */
+    __asm__ volatile("sti" ::: "memory");
     (void)terminal_cursor_blink_start();
     (void)terminal_presentation_start();
     __asm__ volatile("cli" ::: "memory");

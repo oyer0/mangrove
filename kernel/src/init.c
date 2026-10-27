@@ -30,6 +30,7 @@
 #include <platform_power.h>
 #include <process.h>
 #include <scheduler.h>
+#include <kernel_stack.h>
 #include <timer.h>
 #include <net/udp.h>
 #include <vfs.h>
@@ -53,6 +54,10 @@
 #endif
 
 #include <stddef.h>
+
+#if defined(KERNEL_STACK_OVERFLOW_GUEST_TEST)
+#include <panic.h>
+#endif
 
 #ifdef PITH_DEBUG_BOOT_TESTS
 extern void kernel_debug_scheduler_tests(void);
@@ -662,12 +667,42 @@ static init_result_t init_accounts(const char **reason)
     return INIT_RESULT_OK;
 }
 
+#if defined(KERNEL_STACK_OVERFLOW_GUEST_TEST)
+static __attribute__((noinline)) void stack_overflow_recurse(u32 depth)
+{
+    volatile u8 frame[2048];
+    frame[0] = (u8)depth;
+    frame[1023] = (u8)(depth >> 8);
+    frame[2047] = (u8)(depth >> 16);
+    stack_overflow_recurse(depth + 1U);
+    __asm__ volatile("" : : "m"(frame) : "memory");
+}
+
+static void stack_overflow_thread(void *argument)
+{
+    (void)argument;
+    stack_overflow_recurse(0U);
+}
+#endif
+
 static init_result_t init_smp(const char **reason)
 {
     if (!smp_start()) {
         *reason = "application processors unavailable";
         return INIT_RESULT_UNAVAILABLE;
     }
+    kernel_stack_usage_report();
+#if defined(KERNEL_STACK_OVERFLOW_GUEST_TEST)
+    kprint("[STACK-TEST] deliberate guarded thread-stack overflow\n");
+    if (!thread_create("stack-overflow-test", stack_overflow_thread, NULL)) {
+        *reason = "could not create guarded-stack overflow test thread";
+        return INIT_RESULT_FAILED;
+    }
+    for (;;) {
+        if (!scheduler_yield())
+            panic("stack test: scheduler yield failed");
+    }
+#endif
 #ifdef KERNEL_HYBRID_ALLOCATOR
     if (!slab_init((void *)KERNEL_VMM_RANGE_BASE,
                    (usize)(KERNEL_VMM_RANGE_LIMIT -

@@ -35,6 +35,7 @@ struct cpu_registers {
 
 #define IDT_VECTOR_NMI 2U
 #define IDT_VECTOR_DOUBLE_FAULT 8U
+#define IDT_VECTOR_PAGE_FAULT 14U
 #define IDT_VECTOR_MACHINE_CHECK 18U
 
 static inline bool cpu_registers_has_privilege_stack(

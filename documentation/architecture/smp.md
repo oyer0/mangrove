@@ -37,12 +37,22 @@ its local scheduler timer.
 `cpu_local_t` is addressed through GS in kernel context. User-to-kernel
 transitions use `swapgs`; kernel-origin interrupts do not swap GS
 unconditionally. Every online CPU has its own GDT, TSS, kernel `rsp0`, and
-separate 8 KiB IST stacks for double fault, NMI, and machine check, plus its
-current thread and current page-table root. The shared IDT selects the
+separate guarded 8 KiB IST stacks for double fault, NMI, and machine check,
+plus its current thread and current page-table root. The shared IDT selects the
 corresponding IST entries. These exceptions currently fail-stop; the switched
 stack enables reliable fatal reporting, not recovery. The IDT is immutable and
 syscall MSRs are initialized for each CPU. AP startup checks NX support before
 loading the shared page-table root and leaves unsupported CPUs offline.
+
+The BSP initially points its TSS at three static early exception stacks;
+after permanent paging and heap setup, Pith installs guarded leases. The BSP
+prepares each AP's descriptor and guarded exception stacks before SIPI, so
+shared mappings can be published while the BSP can service TLB shootdowns.
+Each AP loads that prepared state and uses a guarded 48 KiB startup stack plus
+a distinct guarded 16 KiB idle stack; the startup mapping is released only
+after the idle thread confirms the handoff.
+See [memory layout](memory.md#kernel-stacks) for the full stack inventory,
+measurement limits, and early-boot exceptions.
 
 ## Scheduling
 

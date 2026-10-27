@@ -2,13 +2,14 @@
 #pragma once
 
 #include <types.h>
+#include <kernel_stack.h>
 
 /* The firmware-selected page is chosen at boot from conventional memory. */
 #define SMP_TRAMPOLINE_PAGE_SIZE       0x1000ULL
 #define SMP_TRAMPOLINE_MAILBOX_OFFSET  0x800U
 #define SMP_TRAMPOLINE_LOW_LIMIT       0x00100000ULL
 #define SMP_TRAMPOLINE_VGA_LIMIT       0x000A0000ULL
-#define SMP_AP_STACK_SIZE               (64U * 1024U)
+#define SMP_AP_STARTUP_STACK_SIZE       (48U * 1024U)
 #define SMP_AP_IDLE_STACK_SIZE          (16U * 1024U)
 
 typedef enum {
@@ -16,6 +17,7 @@ typedef enum {
     SMP_AP_MAILBOX_PREPARED,
     SMP_AP_MAILBOX_STARTED,
     SMP_AP_MAILBOX_ONLINE,
+    SMP_AP_MAILBOX_IDLE_RUNNING,
     SMP_AP_MAILBOX_FAILED,
 } smp_ap_mailbox_state_t;
 
@@ -37,3 +39,6 @@ _Static_assert(sizeof(smp_trampoline_mailbox_t) == 48,
 
 bool smp_start(void);
 void smp_ap_entry(u32 cpu_index);
+void smp_ap_idle_entered(u32 cpu_index);
+bool smp_ap_startup_stack_guard_fault(u32 cpu_index,
+                                      uintptr_t fault_address);

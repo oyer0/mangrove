@@ -8,6 +8,7 @@
 #include <heap.h>
 #include <kprint.h>
 #include <lapic.h>
+#include <panic.h>
 #include <pmm.h>
 #include <string.h>
 #include <timer.h>
@@ -21,7 +22,8 @@
 
 typedef struct {
     cpu_local_t *cpu;
-    void *stack_base;
+    kernel_stack_t startup_stack;
+    kernel_stack_t idle_stack;
     uintptr_t stack_top;
     volatile u32 state;
 } smp_ap_runtime_t;
@@ -55,7 +57,7 @@ static bool smp_ap_rejected_for_nx(const smp_ap_runtime_t *runtime)
             SMP_AP_MAILBOX_FAILED;
 }
 
-static bool smp_wait_for_online(smp_ap_runtime_t *runtime, u64 timeout_us)
+static bool smp_wait_for_idle(smp_ap_runtime_t *runtime, u64 timeout_us)
 {
     timer_monotonic_deadline_t deadline;
 
@@ -65,26 +67,26 @@ static bool smp_wait_for_online(smp_ap_runtime_t *runtime, u64 timeout_us)
     if (timer_monotonic_deadline_start(&deadline, timeout_us)) {
         while (!timer_monotonic_deadline_expired(&deadline)) {
             smp_ap_mailbox_state_t state = smp_load_state(&runtime->state);
-            if (state == SMP_AP_MAILBOX_ONLINE)
+            if (state == SMP_AP_MAILBOX_IDLE_RUNNING)
                 return true;
             if (state == SMP_AP_MAILBOX_FAILED ||
                 smp_ap_rejected_for_nx(runtime))
                 return false;
             cpu_relax();
         }
-        return smp_load_state(&runtime->state) == SMP_AP_MAILBOX_ONLINE;
+        return smp_load_state(&runtime->state) == SMP_AP_MAILBOX_IDLE_RUNNING;
     }
 
     for (u32 i = 0; i < SMP_FALLBACK_WAIT_SPINS; i++) {
         smp_ap_mailbox_state_t state = smp_load_state(&runtime->state);
-        if (state == SMP_AP_MAILBOX_ONLINE)
+        if (state == SMP_AP_MAILBOX_IDLE_RUNNING)
             return true;
         if (state == SMP_AP_MAILBOX_FAILED ||
             smp_ap_rejected_for_nx(runtime))
             return false;
         cpu_relax();
     }
-    return smp_load_state(&runtime->state) == SMP_AP_MAILBOX_ONLINE;
+    return smp_load_state(&runtime->state) == SMP_AP_MAILBOX_IDLE_RUNNING;
 }
 
 static void smp_mark_failed(cpu_local_t *cpu, smp_ap_runtime_t *runtime,
@@ -155,38 +157,73 @@ static bool smp_prepare_trampoline(void)
 
 static bool smp_prepare_ap(cpu_local_t *cpu, smp_ap_runtime_t *runtime)
 {
-    void *stack;
     gdt_cpu_state_t *descriptor;
-    uintptr_t stack_address;
 
     if (!cpu || !runtime || cpu->bsp || !cpu->present || cpu->online)
         return false;
     descriptor = (gdt_cpu_state_t *)kmalloc(sizeof(*descriptor));
-    stack = kmalloc(SMP_AP_STACK_SIZE);
-    if (!descriptor || !stack) {
-        if (descriptor)
-            kfree(descriptor);
-        if (stack)
-            kfree(stack);
+    if (!descriptor) {
         return false;
     }
-
     memset(descriptor, 0, sizeof(*descriptor));
-    memset(stack, 0, SMP_AP_STACK_SIZE);
-    stack_address = (uintptr_t)stack + SMP_AP_STACK_SIZE;
-    stack_address &= ~(uintptr_t)0xFULL;
-    if (stack_address < (uintptr_t)stack + 8U) {
+    if (!kernel_stack_allocate(&runtime->startup_stack,
+                               SMP_AP_STARTUP_STACK_SIZE,
+                               KERNEL_STACK_USAGE_AP_STARTUP) ||
+        !kernel_stack_allocate(&runtime->idle_stack,
+                               SMP_AP_IDLE_STACK_SIZE,
+                               KERNEL_STACK_USAGE_AP_IDLE)) {
+        if (runtime->startup_stack.active &&
+            !kernel_stack_release(&runtime->startup_stack))
+            panic("smp: startup stack allocation rollback failed");
+        if (runtime->idle_stack.active &&
+            !kernel_stack_release(&runtime->idle_stack))
+            panic("smp: idle stack allocation rollback failed");
         kfree(descriptor);
-        kfree(stack);
         return false;
     }
 
-    cpu->descriptor = descriptor;
     runtime->cpu = cpu;
-    runtime->stack_base = stack;
-    runtime->stack_top = stack_address;
+    runtime->stack_top = runtime->startup_stack.base +
+                         runtime->startup_stack.size;
+    if (!runtime->stack_top || (runtime->stack_top & 0xFULL)) {
+        if (!kernel_stack_release(&runtime->startup_stack) ||
+            !kernel_stack_release(&runtime->idle_stack))
+            panic("smp: invalid stack layout rollback failed");
+        kfree(descriptor);
+        return false;
+    }
+    if (!gdt_prepare_ap_state(descriptor, runtime->stack_top)) {
+        if (!kernel_stack_release(&runtime->startup_stack) ||
+            !kernel_stack_release(&runtime->idle_stack))
+            panic("smp: AP descriptor preparation rollback failed");
+        kfree(descriptor);
+        return false;
+    }
+    cpu->descriptor = descriptor;
+
     smp_store_state(&runtime->state, SMP_AP_MAILBOX_PREPARED);
     return true;
+}
+
+static void smp_release_unstarted_resources(cpu_local_t *cpu,
+                                            smp_ap_runtime_t *runtime)
+{
+    gdt_cpu_state_t *descriptor;
+
+    if (!cpu || !runtime)
+        return;
+    descriptor = cpu->descriptor;
+    cpu->descriptor = 0;
+    if (runtime->startup_stack.active &&
+        !kernel_stack_release(&runtime->startup_stack))
+        panic("smp: failed to release unused startup stack");
+    if (runtime->idle_stack.active &&
+        !kernel_stack_release(&runtime->idle_stack))
+        panic("smp: failed to release unused idle stack");
+    if (descriptor) {
+        gdt_release_unstarted_ap_state(descriptor);
+        kfree(descriptor);
+    }
 }
 
 static bool smp_start_one(cpu_local_t *cpu, u32 cpu_index)
@@ -206,21 +243,14 @@ static bool smp_start_one(cpu_local_t *cpu, u32 cpu_index)
     kernel_cr3 = vmm_get_kernel_pml4_phys();
     if (!kernel_cr3 || (kernel_cr3 & (SMP_TRAMPOLINE_PAGE_SIZE - 1ULL)) ||
         kernel_cr3 > 0xFFFFFFFFULL) {
-        gdt_cpu_state_t *descriptor = runtime->cpu->descriptor;
         smp_mark_failed(cpu, runtime, "kernel page table is not SIPI-accessible");
-        cpu->descriptor = 0;
-        kfree(runtime->stack_base);
-        kfree(descriptor);
-        runtime->stack_base = 0;
+        smp_release_unstarted_resources(cpu, runtime);
         return false;
     }
 
-    /* Keep the upper part of the AP startup allocation for the trampoline's
-     * C stack.  The lower part becomes the AP's permanent idle stack, so the
-     * startup context can be abandoned without a second allocation. */
-    if (!scheduler_prepare_idle_cpu(cpu, (uintptr_t)runtime->stack_base,
-                                    SMP_AP_IDLE_STACK_SIZE)) {
+    if (!scheduler_prepare_idle_cpu(cpu, &runtime->idle_stack)) {
         smp_mark_failed(cpu, runtime, "idle context allocation failed");
+        smp_release_unstarted_resources(cpu, runtime);
         return false;
     }
 
@@ -246,8 +276,14 @@ static bool smp_start_one(cpu_local_t *cpu, u32 cpu_index)
         smp_mark_failed(cpu, runtime, "first SIPI delivery timeout");
         return false;
     }
-    if (smp_wait_for_online(runtime, SMP_AP_START_TIMEOUT_US))
+    if (smp_wait_for_idle(runtime, SMP_AP_START_TIMEOUT_US)) {
+        if (runtime->startup_stack.active &&
+            !kernel_stack_release(&runtime->startup_stack)) {
+            KERNEL_BOOT_DEBUG_LOG(
+                "[SMP] AP startup stack retained after safe handoff check failed\n");
+        }
         return true;
+    }
 
     if (smp_ap_rejected_for_nx(runtime)) {
         smp_mark_failed(cpu, runtime, "AP lacks NX page support");
@@ -257,9 +293,14 @@ static bool smp_start_one(cpu_local_t *cpu, u32 cpu_index)
     KERNEL_BOOT_DEBUG_LOG("[SMP] APIC %u retrying SIPI\n",
                           (u32)cpu->apic_id);
     if (!lapic_send_startup_ipi(cpu->apic_id, trampoline_vector) ||
-        !smp_wait_for_online(runtime, SMP_AP_RETRY_TIMEOUT_US)) {
+        !smp_wait_for_idle(runtime, SMP_AP_RETRY_TIMEOUT_US)) {
         smp_mark_failed(cpu, runtime, "AP online timeout");
         return false;
+    }
+    if (runtime->startup_stack.active &&
+        !kernel_stack_release(&runtime->startup_stack)) {
+        KERNEL_BOOT_DEBUG_LOG(
+            "[SMP] AP startup stack retained after safe handoff check failed\n");
     }
     return true;
 }
@@ -341,6 +382,12 @@ void smp_ap_entry(u32 cpu_index)
         smp_store_state(&runtime->state, SMP_AP_MAILBOX_FAILED);
         for (;;) cpu_relax();
     }
+    {
+        uintptr_t stack_pointer;
+        __asm__ volatile("movq %%rsp, %0" : "=r"(stack_pointer));
+        kernel_stack_usage_sample(KERNEL_STACK_USAGE_AP_STARTUP,
+                                  runtime->stack_top, stack_pointer);
+    }
     if (trampoline_mailbox->cpu_index != cpu_index ||
         trampoline_mailbox->apic_id != cpu->apic_id ||
         trampoline_mailbox->cpu_local != (u64)(uintptr_t)cpu) {
@@ -348,24 +395,88 @@ void smp_ap_entry(u32 cpu_index)
         for (;;) cpu_relax();
     }
 
-    if (!gdt_init_cpu(cpu, runtime->stack_top) ||
-        !x86_cache_init_ap(cpu_index) ||
-        !lapic_init_cpu() || !lapic_timer_init_cpu() ||
-        lapic_current_id() != cpu->apic_id) {
+    /* VMM stack setup uses the AP's kernel root and CPU-local state before
+     * this processor is admitted to shared TLB-shootdown target sets. */
+    cpu->current_pml4 = vmm_get_kernel_pml4();
+    if (!cpu->current_pml4 || !cpu_activate_kernel_gs(cpu)) {
         smp_store_state(&runtime->state, SMP_AP_MAILBOX_FAILED);
         for (;;) cpu_relax();
     }
 
-    cpu->current_pml4 = vmm_get_kernel_pml4();
+    if (!gdt_init_cpu(cpu, runtime->stack_top)) {
+        KERNEL_BOOT_DEBUG_LOG("[SMP] AP cpu%u descriptor initialization failed\n",
+                              cpu_index);
+        smp_store_state(&runtime->state, SMP_AP_MAILBOX_FAILED);
+        for (;;) cpu_relax();
+    }
+    KERNEL_BOOT_DEBUG_LOG("[SMP] AP cpu%u descriptor state ready\n",
+                          cpu_index);
+    if (!x86_cache_init_ap(cpu_index)) {
+        KERNEL_BOOT_DEBUG_LOG("[SMP] AP cpu%u cache policy initialization failed\n",
+                              cpu_index);
+        smp_store_state(&runtime->state, SMP_AP_MAILBOX_FAILED);
+        for (;;) cpu_relax();
+    }
+    KERNEL_BOOT_DEBUG_LOG("[SMP] AP cpu%u cache policy ready\n", cpu_index);
+    if (!lapic_init_cpu()) {
+        KERNEL_BOOT_DEBUG_LOG("[SMP] AP cpu%u local APIC initialization failed\n",
+                              cpu_index);
+        smp_store_state(&runtime->state, SMP_AP_MAILBOX_FAILED);
+        for (;;) cpu_relax();
+    }
+    if (!lapic_timer_init_cpu()) {
+        KERNEL_BOOT_DEBUG_LOG("[SMP] AP cpu%u local timer initialization failed\n",
+                              cpu_index);
+        smp_store_state(&runtime->state, SMP_AP_MAILBOX_FAILED);
+        for (;;) cpu_relax();
+    }
+    if (lapic_current_id() != cpu->apic_id) {
+        KERNEL_BOOT_DEBUG_LOG("[SMP] AP cpu%u LAPIC identity mismatch\n",
+                              cpu_index);
+        smp_store_state(&runtime->state, SMP_AP_MAILBOX_FAILED);
+        for (;;) cpu_relax();
+    }
+
     cpu_mark_online(cpu);
     __atomic_thread_fence(__ATOMIC_RELEASE);
     smp_store_state(&runtime->state, SMP_AP_MAILBOX_ONLINE);
     KERNEL_BOOT_DEBUG_LOG("[SMP] APIC %u scheduler-ready (cpu%u)\n",
                           (u32)cpu->apic_id, cpu_index);
 
+    {
+        uintptr_t stack_pointer;
+        __asm__ volatile("movq %%rsp, %0" : "=r"(stack_pointer));
+        kernel_stack_usage_sample(KERNEL_STACK_USAGE_AP_STARTUP,
+                                  runtime->stack_top, stack_pointer);
+    }
+
     if (!scheduler_start_cpu()) {
         cpu_mark_offline(cpu);
         smp_store_state(&runtime->state, SMP_AP_MAILBOX_FAILED);
     }
     for (;;) cpu_relax();
+}
+
+void smp_ap_idle_entered(u32 cpu_index)
+{
+    smp_ap_runtime_t *runtime;
+
+    if (!cpu_index || cpu_index >= CPU_MAX_COUNT)
+        return;
+    runtime = &ap_runtime[cpu_index];
+    if (runtime->cpu && runtime->cpu->index == cpu_index &&
+        smp_load_state(&runtime->state) == SMP_AP_MAILBOX_ONLINE)
+        smp_store_state(&runtime->state, SMP_AP_MAILBOX_IDLE_RUNNING);
+}
+
+bool smp_ap_startup_stack_guard_fault(u32 cpu_index,
+                                      uintptr_t fault_address)
+{
+    smp_ap_runtime_t *runtime;
+
+    if (!cpu_index || cpu_index >= CPU_MAX_COUNT)
+        return false;
+    runtime = &ap_runtime[cpu_index];
+    return runtime->startup_stack.active &&
+        kernel_stack_guard_contains(&runtime->startup_stack, fault_address);
 }

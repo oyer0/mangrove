@@ -50,10 +50,12 @@ typedef enum {SCHEDULER_DISPATCH_REQUEUE, SCHEDULER_DISPATCH_BLOCK,
               SCHEDULER_DISPATCH_TERMINATE} scheduler_dispatch_action_t;
 #define THREAD_CPU_NONE ((u32)-1)
 #define scheduler_trace(...) ((void)0)
+typedef struct {bool active;} kernel_stack_t;
 typedef struct kernel_thread {
  unsigned state, running_cpu; bool queued, sleeping, entry_started;
  void *process; const char *name; void (*entry)(void *); void *entry_argument;
  uintptr_t saved_stack_pointer; u64 wakeup_tick; struct kernel_thread *next;
+ kernel_stack_t kernel_stack;
 } kernel_thread_t;
 typedef struct {
  unsigned index; bool bsp;
@@ -68,6 +70,21 @@ static unsigned active_cpu, scheduler_lock, migrations, handoffs;
 static u64 scheduler_tick_count;
 static bool interrupts_enabled, migrate_armed;
 static jmp_buf entry_return;
+extern char __stack_guard_bottom[], __stack_bottom[];
+__asm__(".pushsection .rodata\n"
+        ".globl __stack_guard_bottom\n"
+        "__stack_guard_bottom:\n"
+        ".space 4096\n"
+        ".globl __stack_bottom\n"
+        "__stack_bottom:\n"
+        ".space 1\n"
+        ".popsection\n");
+static unsigned stack_samples;
+static void kernel_stack_sample_rsp(kernel_stack_t *stack, uintptr_t rsp)
+{assert(stack && stack->active && rsp); stack_samples++;}
+static bool kernel_stack_guard_contains(const kernel_stack_t *stack,
+                                       uintptr_t address)
+{return stack && stack->active && address == 0xdeadU;}
 static void set_gs(void) {
 #ifdef __linux__
  assert(syscall(SYS_arch_prctl,ARCH_SET_GS,&cpus[active_cpu])==0);
@@ -128,6 +145,7 @@ static void reset(bool success) {
 static void entered(void *argument) {
  assert(argument==&caller && caller.entry_started && !other.entry_started);
  assert(other.state==THREAD_STATE_RUNNING && other.running_cpu==0);
+ assert(stack_samples==1);
  assert(!scheduler_lock && interrupts_enabled);
  longjmp(entry_return,1);
 }
@@ -146,11 +164,14 @@ int main(int argc,char **argv) {
   assert(scheduler_current_thread()==&caller);
   cpus[active_cpu].scheduler_current_thread=NULL;
   assert(scheduler_current_thread()==NULL);
+  assert(scheduler_current_stack_guard_fault(
+      (uintptr_t)__stack_guard_bottom + 1U));
 #else
   puts("GS snapshot runtime check requires Linux x86-64; target build checks ABI");
 #endif
  } else if(!strcmp(argv[1],"entry")) {
   reset(false);caller.entry=entered;caller.entry_argument=&caller;
+  caller.kernel_stack.active=true;
   other.entry=entered;other.entry_argument=&other;
   caller.name="caller";other.name="other";
   if(!setjmp(entry_return))thread_entry_trampoline();
@@ -178,7 +199,8 @@ with tempfile.TemporaryDirectory(prefix='mangrove-scheduler-current-') as tmp:
     path = Path(tmp) / 'test.c'
     path.write_text(prefix + function('scheduler_cpu_local') + macros + ''.join(function(name) for name in (
         'scheduler_prepare_dispatch_locked', 'scheduler_block', 'scheduler_terminate', 'scheduler_sleep',
-        'scheduler_current_thread', 'thread_entry_trampoline')) + suffix)
+        'scheduler_current_thread', 'scheduler_current_stack_guard_fault',
+        'thread_entry_trampoline')) + suffix)
     binary = Path(tmp) / 'test'
     subprocess.run(['cc', '-std=c11', '-Wall', '-Wextra', '-Werror', '-fsanitize=address,undefined', str(path), '-o', str(binary)], check=True)
     results = [subprocess.run([str(binary), case]).returncode

@@ -132,6 +132,64 @@ file, or with invalid ranges or alignment. Anonymous mappings are page-rounded
 and placed in the dedicated anonymous region. Syscalls validate every user
 buffer against the current user mappings before dereferencing it.
 
+## Kernel stacks
+
+Ordinary kernel threads keep the existing 64 KiB usable stack size. Their
+stacks are separate page-aligned leases in the kernel virtual-range area: one
+unmapped page below and above the usable pages, with PMM-owned backing mapped
+read/write and non-executable. The 64 KiB size is scheduler policy, not a
+physical-frame or allocator limit. The stack descriptor currently supports at
+most 16 usable pages; allocation failure is reported to the thread creator
+and partial mappings and frames are unwound. There is no automatic stack
+growth. On SMP, stack mapping and release require interrupts enabled and no
+caller-owned spinlock so shared kernel mappings can complete their synchronous
+TLB publication/teardown; thread destruction checks this before unlinking the
+thread. A guard fault is fatal to the kernel; it is classified from CR2 and
+the current stack owner, and the faulting context is not resumed. If the
+exception frame itself cannot be pushed on an exhausted stack, the fault
+escalates to the double-fault IST, where the original CR2 address is checked.
+
+The BSP image stack remains 64 KiB. The linker reserves an absent page below
+it in Pith's permanent kernel root. The UEFI loader's temporary bootstrap
+page tables may still map the image BSS guard page until Pith activates its
+own root; the assembly handoff switches from the loader's 16-page physical
+handoff stack to the image stack immediately. The handoff stack is owned and
+reserved by the loader, then is no longer used by Pith. The AP trampoline uses
+its own 4 KiB low-memory page as its real/protected-mode transition stack
+before loading the guarded long-mode startup stack. The trampoline cannot
+have a page guard while its executable code and mailbox occupy that same page.
+
+Each AP has distinct guarded stacks: 48 KiB for startup and 16 KiB for
+permanent idle execution. The 16 KiB idle size preserves the former lower
+portion of the AP allocation; it is a chosen size, not an architectural frame
+restriction. The startup lease is reclaimed only after the AP has switched to
+its idle context and published that transition. If startup becomes ambiguous,
+the resources are retained rather than risking a free while the AP may still
+use them.
+
+Each CPU's double-fault, NMI, and machine-check IST has an independent guarded
+8 KiB lease after heap initialization. The BSP begins on three static 8 KiB
+emergency stacks so early exceptions have a valid TSS target; guarded leases
+replace those TSS pointers only after all allocations succeed. Before SIPI,
+the BSP constructs each AP's descriptor and maps its IST stacks while it can
+publish shared mappings with interrupts enabled, even if earlier APs are
+online.
+The early BSP arrays remain image-backed and cannot themselves be guarded
+before the permanent root and heap exist. Page faults deliberately do not use
+an IST: user-exception termination saves the process context on its ordinary
+kernel stack.
+
+Build-time per-function frame estimates are available with
+`make kernel-stack-usage`; GCC emits `.su` data and a report lists the largest
+individual frames. These are not transitive call-chain bounds and do not
+include assembly, interrupt nesting, or runtime paths. An opt-in
+`KERNEL_STACK_DIAGNOSTICS=1` build samples RSP at context switches, AP startup,
+and exception entry, and scans canaries only after managed stacks are
+quiescent. This yields an observed high-water estimate, not proof that every
+byte was written or a bound for unexecuted paths. The diagnostic report is
+disabled in normal builds. User stacks remain the existing guarded 32 KiB
+allocations and are unchanged.
+
 ## Owned kernel virtual ranges
 
 `vmm_kernel_range_reserve()` leases page-aligned ranges from
@@ -984,8 +1042,9 @@ remaining allocations were freed, after which coalescing restored one usable
 block. Allocation sizes and lifetimes in these fixtures are selected stress
 patterns, not measured kernel allocation frequencies. Source inspection finds
 168 direct `kmalloc` call-site lines, 107 under storage, spanning process/thread,
-VFS, IPC, network/device objects, filesystem metadata arrays, 64 KiB thread/AP
-stacks, and storage buffers sized from filesystem clusters. This source survey
+VFS, IPC, network/device objects, filesystem metadata arrays, 64 KiB ordinary
+kernel-thread stacks, AP startup/idle stacks, and storage buffers sized from
+filesystem clusters. This source survey
 does not provide runtime size or lifetime frequencies.
 
 Growth timings are reported separately and are not used as a first-fit versus

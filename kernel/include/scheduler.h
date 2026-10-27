@@ -3,6 +3,7 @@
 
 #include <types.h>
 #include <fpu.h>
+#include <kernel_stack.h>
 
 #define THREAD_KERNEL_STACK_SIZE  (64U * 1024U)
 #define THREAD_TIME_SLICE_HIGH    3ULL
@@ -98,6 +99,7 @@ struct kernel_thread {
     uintptr_t kernel_stack_base;
     usize kernel_stack_size;
     bool stack_external;
+    kernel_stack_t kernel_stack;
     /* Internal scheduler-backed mutex wait linkage.  A thread belongs to at
      * most one mutex wait chain and this is never used as a scheduler list
      * link. */
@@ -122,6 +124,9 @@ bool scheduler_init(void);
 /* Migration-safe snapshot of the executing thread, without taking a lock. */
 kernel_thread_t *scheduler_current_thread(void);
 kernel_thread_t *thread_current(void);
+/* Used by the fatal page-fault path to classify a faulting kernel stack
+ * guard without taking the scheduler lock from exception context. */
+bool scheduler_current_stack_guard_fault(uintptr_t fault_address);
 /* Top of the current thread's kernel stack for syscall entry. */
 uintptr_t scheduler_kernel_stack_top(void);
 kernel_thread_t *scheduler_idle_thread(void);
@@ -174,7 +179,7 @@ void scheduler_get_stats(scheduler_stats_t *stats);
 void scheduler_dump(void);
 /* Prepare an AP-owned idle context before that AP is started. */
 bool scheduler_prepare_idle_cpu(struct cpu_local *cpu,
-                                uintptr_t stack_base, usize stack_size);
+                                kernel_stack_t *stack);
 /* Enter the current CPU's idle context.  A successful call does not return. */
 bool scheduler_start_cpu(void);
 bool scheduler_prepare_preemption(struct cpu_registers *regs);

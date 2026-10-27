@@ -6,6 +6,11 @@
 #include <lapic.h>
 #include <scheduler.h>
 #include <process.h>
+#include <cpu.h>
+#include <gdt.h>
+#include <kernel_stack.h>
+#include <kprint.h>
+#include <smp.h>
 
 static struct idt_entry idt[256];
 static struct idt_ptr   idt_pointer;
@@ -54,8 +59,65 @@ static const char *exception_messages[32] = {
 
 void exception_handler(struct cpu_registers *regs)
 {
+    kernel_stack_usage_kind_t stack_kind;
+    uintptr_t exception_stack_top;
+    uintptr_t stack_pointer;
+
     if (!regs) {
         panic_exception("Unknown CPU Exception", regs);
+    }
+
+    exception_stack_top = gdt_exception_stack_top(
+        cpu_current(), regs->vec_no, &stack_kind);
+    if (exception_stack_top) {
+        __asm__ volatile("movq %%rsp, %0" : "=r"(stack_pointer));
+        kernel_stack_usage_sample(stack_kind, exception_stack_top,
+                                  stack_pointer);
+    }
+
+    if (regs->vec_no == IDT_VECTOR_PAGE_FAULT ||
+        regs->vec_no == IDT_VECTOR_DOUBLE_FAULT) {
+        uintptr_t fault_address;
+        kernel_stack_usage_kind_t fault_stack_kind;
+
+        __asm__ volatile("movq %%cr2, %0" : "=r"(fault_address));
+        if ((regs->cs & 3U) == 0U) {
+            kernel_thread_t *thread = scheduler_current_thread();
+            if (thread && thread->kernel_stack.active)
+                kernel_stack_sample_rsp(&thread->kernel_stack,
+                                        (uintptr_t)regs->rsp);
+        }
+
+        if (scheduler_current_stack_guard_fault(fault_address)) {
+            kernel_thread_t *thread = scheduler_current_thread();
+            kprint("[STACK] kernel stack guard fault thread=%llu\n",
+                   thread ? thread->id : 0ULL);
+#if defined(KERNEL_STACK_DIAGNOSTICS)
+            kernel_stack_usage_report();
+#endif
+            panic("kernel stack guard page fault");
+        }
+
+        if (gdt_exception_stack_guard_fault(cpu_current(), fault_address,
+                                            &fault_stack_kind)) {
+            kprint("[STACK] exception stack guard fault cpu=%u kind=%u\n",
+                   cpu_current_index(), (u32)fault_stack_kind);
+#if defined(KERNEL_STACK_DIAGNOSTICS)
+            kernel_stack_usage_report();
+#endif
+            panic("kernel exception stack guard page fault");
+        }
+
+        if (regs->vec_no == IDT_VECTOR_PAGE_FAULT &&
+            smp_ap_startup_stack_guard_fault(cpu_current_index(),
+                                             fault_address)) {
+            kprint("[STACK] AP startup stack guard fault cpu=%u\n",
+                   cpu_current_index());
+#if defined(KERNEL_STACK_DIAGNOSTICS)
+            kernel_stack_usage_report();
+#endif
+            panic("AP startup stack guard page fault");
+        }
     }
 
     /* These vectors describe machine/controller conditions, not an

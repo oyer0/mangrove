@@ -47,7 +47,12 @@ SECTIONS
         *(.bss*)
         *(COMMON)
 
-        . = ALIGN(16);
+        /* Keep one absent page below the bootstrap stack in the permanent
+         * kernel root. The loader may map the image during handoff, but Pith
+         * deliberately omits this page when constructing its own root. */
+        . = ALIGN(4096);
+        __stack_guard_bottom = .;
+        . += 4096;
         __stack_bottom = .;
         . += 64K;
         __stack_top = .;

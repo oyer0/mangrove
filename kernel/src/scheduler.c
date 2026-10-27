@@ -4,12 +4,14 @@
 #include <cpu.h>
 #include <idt.h>
 #include <heap.h>
+#include <kernel_stack.h>
 #include <string.h>
 #include <kprint.h>
 #include <panic.h>
 #include <process.h>
 #include <vmm.h>
 #include <gdt.h>
+#include <smp.h>
 #include <timer.h>
 #include <terminal.h>
 #include <spinlock.h>
@@ -23,6 +25,7 @@
 
 extern char __stack_bottom[];
 extern char __stack_top[];
+extern char __stack_guard_bottom[];
 
 static kernel_thread_t bootstrap_thread;
 static u64 next_thread_id = 2;
@@ -161,6 +164,7 @@ static void scheduler_update_runnable_peak(void)
  */
 static void thread_entry_trampoline(void)
 {
+    uintptr_t stack_pointer;
     u64 flags = spin_lock_irqsave(&scheduler_lock);
     kernel_thread_t *thread = current_thread;
     cpu_local_t *cpu = scheduler_cpu_local();
@@ -173,6 +177,10 @@ static void thread_entry_trampoline(void)
         first_kernel_run = __atomic_add_fetch(&cpu->kernel_thread_runs, 1,
                                               __ATOMIC_RELAXED) == 1;
     spin_unlock_irqrestore(&scheduler_lock, flags);
+
+    __asm__ volatile("movq %%rsp, %0" : "=r"(stack_pointer));
+    if (thread && thread->kernel_stack.active)
+        kernel_stack_sample_rsp(&thread->kernel_stack, stack_pointer);
 
     if (first_kernel_run) {
         KERNEL_BOOT_DEBUG_LOG("[SCHED] kernel thread '%s' first ran on CPU %u\n",
@@ -195,6 +203,15 @@ static void thread_entry_trampoline(void)
 static void idle_thread_entry(void *argument)
 {
     (void)argument;
+    {
+        uintptr_t stack_pointer;
+        kernel_thread_t *thread = scheduler_current_thread();
+        __asm__ volatile("movq %%rsp, %0" : "=r"(stack_pointer));
+        if (thread && thread->kernel_stack.active)
+            kernel_stack_sample_rsp(&thread->kernel_stack, stack_pointer);
+        if (thread && !cpu_current()->bsp)
+            smp_ap_idle_entered(cpu_current_index());
+    }
     for (;;) {
         cpu_local_t *cpu = scheduler_cpu_local();
         if (cpu && cpu->bsp)
@@ -249,6 +266,7 @@ void scheduler_context_switch_saved(uintptr_t *outgoing_rsp_slot,
                                     uintptr_t incoming_rsp)
 {
     kernel_thread_t *outgoing = NULL;
+    uintptr_t stack_pointer;
     u64 flags;
 
     if (outgoing_rsp_slot) {
@@ -257,6 +275,15 @@ void scheduler_context_switch_saved(uintptr_t *outgoing_rsp_slot,
     }
     if (outgoing)
         fpu_state_save(&outgoing->fpu_state);
+    __asm__ volatile("movq %%rsp, %0" : "=r"(stack_pointer));
+    if (outgoing && outgoing->kernel_stack.active) {
+        kernel_stack_sample_rsp(&outgoing->kernel_stack, stack_pointer);
+    } else if (outgoing && outgoing->stack_external &&
+               outgoing->kernel_stack_size) {
+        kernel_stack_usage_sample(KERNEL_STACK_USAGE_BOOTSTRAP,
+            outgoing->kernel_stack_base + outgoing->kernel_stack_size,
+            stack_pointer);
+    }
     flags = spin_lock_irqsave(&scheduler_lock);
     if (outgoing) {
         outgoing->saved_context_valid = true;
@@ -884,13 +911,14 @@ bool scheduler_init(void)
 }
 
 bool scheduler_prepare_idle_cpu(struct cpu_local *cpu,
-                                uintptr_t stack_base, usize stack_size)
+                                kernel_stack_t *stack)
 {
     kernel_thread_t *idle;
     u64 flags;
 
     if (!cpu || !cpu->present || cpu->bsp || cpu->scheduler_idle_thread ||
-        !stack_base || stack_size < 8 * sizeof(u64)) {
+        !stack || !stack->active ||
+        stack->size < 8 * sizeof(u64)) {
         return false;
     }
 
@@ -904,9 +932,8 @@ bool scheduler_prepare_idle_cpu(struct cpu_local *cpu,
     idle->default_time_slice = thread_default_time_slice(
         THREAD_PRIORITY_BACKGROUND);
     idle->remaining_time_slice = idle->default_time_slice;
-    idle->kernel_stack_base = stack_base;
-    idle->kernel_stack_size = stack_size;
-    idle->stack_external = true;
+    idle->kernel_stack_base = stack->base;
+    idle->kernel_stack_size = stack->size;
     idle->entry = idle_thread_entry;
     strncpy(idle->name, "idle", sizeof(idle->name) - 1);
     idle->name[sizeof(idle->name) - 1] = '\0';
@@ -923,6 +950,8 @@ bool scheduler_prepare_idle_cpu(struct cpu_local *cpu,
         return false;
     }
     idle->id = next_thread_id++;
+    idle->kernel_stack = *stack;
+    memset(stack, 0, sizeof(*stack));
     cpu->scheduler_idle_thread = idle;
     spin_unlock_irqrestore(&scheduler_lock, flags);
     return true;
@@ -979,6 +1008,26 @@ kernel_thread_t *thread_current(void)
     return scheduler_current_thread();
 }
 
+bool scheduler_current_stack_guard_fault(uintptr_t fault_address)
+{
+    kernel_thread_t *thread;
+
+    /* The BSP can hit its linker-reserved guard before scheduler_init has
+     * published a current thread. Classify that fixed range independently
+     * so early boot overflows are still identified as stack faults. */
+    if (fault_address >= (uintptr_t)__stack_guard_bottom &&
+        fault_address < (uintptr_t)__stack_bottom)
+        return true;
+
+    thread = scheduler_current_thread();
+    if (!thread)
+        return false;
+    if (thread->kernel_stack.active &&
+        kernel_stack_guard_contains(&thread->kernel_stack, fault_address))
+        return true;
+    return false;
+}
+
 kernel_thread_t *scheduler_idle_thread(void)
 {
     return idle_thread;
@@ -1002,11 +1051,13 @@ kernel_thread_t *thread_create_with_priority(const char *name,
     }
 
     memset(thread, 0, sizeof(*thread));
-    thread->kernel_stack_base = (uintptr_t)kmalloc(THREAD_KERNEL_STACK_SIZE);
-    if (!thread->kernel_stack_base) {
+    if (!kernel_stack_allocate(&thread->kernel_stack,
+                               THREAD_KERNEL_STACK_SIZE,
+                               KERNEL_STACK_USAGE_THREAD)) {
         kfree(thread);
         return NULL;
     }
+    thread->kernel_stack_base = thread->kernel_stack.base;
 
     thread->running_cpu = THREAD_CPU_NONE;
     thread->state = THREAD_STATE_READY;
@@ -1021,7 +1072,8 @@ kernel_thread_t *thread_create_with_priority(const char *name,
     thread->name[sizeof(thread->name) - 1] = '\0';
 
     if (!thread_prepare_context(thread)) {
-        kfree((void *)thread->kernel_stack_base);
+        if (!kernel_stack_release(&thread->kernel_stack))
+            panic("scheduler: failed to release an unqueued thread stack");
         kfree(thread);
         return NULL;
     }
@@ -1029,14 +1081,16 @@ kernel_thread_t *thread_create_with_priority(const char *name,
     u64 flags = spin_lock_irqsave(&scheduler_lock);
     if (next_thread_id == 0) {
         spin_unlock_irqrestore(&scheduler_lock, flags);
-        kfree((void *)thread->kernel_stack_base);
+        if (!kernel_stack_release(&thread->kernel_stack))
+            panic("scheduler: failed to release an unqueued thread stack");
         kfree(thread);
         return NULL;
     }
     thread->id = next_thread_id++;
     if (!scheduler_enqueue_locked(thread)) {
         spin_unlock_irqrestore(&scheduler_lock, flags);
-        kfree((void *)thread->kernel_stack_base);
+        if (!kernel_stack_release(&thread->kernel_stack))
+            panic("scheduler: failed to release an unenqueued thread stack");
         kfree(thread);
         return NULL;
     }
@@ -1063,11 +1117,13 @@ kernel_thread_t *thread_create_suspended_with_priority(const char *name,
     }
 
     memset(thread, 0, sizeof(*thread));
-    thread->kernel_stack_base = (uintptr_t)kmalloc(THREAD_KERNEL_STACK_SIZE);
-    if (!thread->kernel_stack_base) {
+    if (!kernel_stack_allocate(&thread->kernel_stack,
+                               THREAD_KERNEL_STACK_SIZE,
+                               KERNEL_STACK_USAGE_THREAD)) {
         kfree(thread);
         return NULL;
     }
+    thread->kernel_stack_base = thread->kernel_stack.base;
 
     thread->running_cpu = THREAD_CPU_NONE;
     thread->state = THREAD_STATE_READY;
@@ -1082,7 +1138,8 @@ kernel_thread_t *thread_create_suspended_with_priority(const char *name,
     thread->name[sizeof(thread->name) - 1] = '\0';
 
     if (!thread_prepare_context(thread)) {
-        kfree((void *)thread->kernel_stack_base);
+        if (!kernel_stack_release(&thread->kernel_stack))
+            panic("scheduler: failed to release a suspended thread stack");
         kfree(thread);
         return NULL;
     }
@@ -1091,7 +1148,8 @@ kernel_thread_t *thread_create_suspended_with_priority(const char *name,
         u64 flags = spin_lock_irqsave(&scheduler_lock);
         if (next_thread_id == 0) {
             spin_unlock_irqrestore(&scheduler_lock, flags);
-            kfree((void *)thread->kernel_stack_base);
+            if (!kernel_stack_release(&thread->kernel_stack))
+                panic("scheduler: failed to release a suspended thread stack");
             kfree(thread);
             return NULL;
         }
@@ -1122,6 +1180,12 @@ bool thread_destroy(kernel_thread_t *thread)
     if (!thread)
         return false;
 
+    /* Do not unlink a thread if the VMM's synchronous SMP teardown cannot
+     * safely run in the caller's context. */
+    if (!thread->stack_external &&
+        !kernel_stack_release_context_valid())
+        return false;
+
     flags = spin_lock_irqsave(&scheduler_lock);
     if (thread == &bootstrap_thread || thread->sleeping ||
         thread->running_cpu != THREAD_CPU_NONE ||
@@ -1145,7 +1209,9 @@ bool thread_destroy(kernel_thread_t *thread)
     scheduler_remove_queued_locked(thread);
     spin_unlock_irqrestore(&scheduler_lock, flags);
     mutex_cancel_waiter(thread);
-    kfree((void *)thread->kernel_stack_base);
+    if (!thread->stack_external &&
+        !kernel_stack_release(&thread->kernel_stack))
+        panic("scheduler: thread stack could not be safely reclaimed");
     kfree(thread);
     return true;
 }

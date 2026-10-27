@@ -62,16 +62,18 @@ enum {PROCESS_STATE_ACTIVE, PROCESS_STATE_TERMINATED};
 #define THREAD_CPU_NONE ((u32)-1)
 typedef struct kernel_thread kernel_thread_t;
 typedef struct process process_t;
+typedef struct {bool active;} kernel_stack_t;
 struct process {int state; kernel_thread_t *main_thread; process_t *parent;};
 typedef struct {process_t *process;} kernel_object_t;
 static kernel_object_t target_object;
 struct kernel_thread {
  int state; u32 running_cpu, syscall_nesting;
  bool syscall_active, context_switch_pending, queued, sleeping;
- bool entry_started;
+ bool entry_started, stack_external;
  uintptr_t preempt_return_rip;
  u64 wakeup_tick; kernel_thread_t *next;
  void *waiting_mutex; uintptr_t kernel_stack_base;
+ kernel_stack_t kernel_stack;
  process_t *process;
 };
 typedef struct {kernel_thread_t *scheduler_idle_thread;} cpu_local_t;
@@ -87,6 +89,11 @@ static kernel_thread_t selected_thread;
 static u32 fixture_spinlock_depth;
 typedef enum {SCHEDULER_DISPATCH_TERMINATE} scheduler_dispatch_action_t;
 static u32 spinlock_depth_current(void) { return fixture_spinlock_depth; }
+static bool kernel_stack_release_context_valid(void)
+{return fixture_spinlock_depth == 0;}
+static bool kernel_stack_release(kernel_stack_t *stack)
+{assert(stack && stack->active && !fixture_spinlock_depth); stack->active=false; return true;}
+static void panic(const char *reason) {(void)reason; assert(!"unexpected kernel panic");}
 static u64 spin_lock_irqsave(u32 *lock) {assert(!*lock); *lock = 1; return 0;}
 static void spin_unlock_irqrestore(u32 *lock, u64 flags)
 {(void)flags; assert(*lock); *lock = 0;}
@@ -188,6 +195,16 @@ int main(void) {
         unmapped == 1);
  assert(!process_terminate_external(&target, 1));
  assert(exited==1 && closed_handles==1 && unmapped==1 && cancelled==1);
+
+ /* A fully retired ordinary kernel thread releases its guarded stack only
+  * after scheduler ownership is detached and the lock is no longer held. */
+ kernel_thread_t retired={.state=THREAD_STATE_TERMINATED,
+   .running_cpu=THREAD_CPU_NONE,.queued=true,
+   .kernel_stack={.active=true}};
+ fixture_spinlock_depth=1;
+ assert(!thread_destroy(&retired) && retired.kernel_stack.active && !freed);
+ fixture_spinlock_depth=0;
+ assert(thread_destroy(&retired) && !retired.kernel_stack.active && freed==1);
 
  /* SYSCALL_EXIT publishes process exit, then terminates its own thread.
   * The external guard must not reject this live syscall frame. */

@@ -36,11 +36,15 @@ pre = r'''
 typedef uint64_t u64; typedef unsigned u32; typedef unsigned thread_priority_t;
 enum {THREAD_PRIORITY_HIGH,THREAD_PRIORITY_NORMAL,THREAD_PRIORITY_BACKGROUND};
 enum {THREAD_STATE_READY,THREAD_STATE_RUNNING,THREAD_STATE_BLOCKED,THREAD_STATE_TERMINATED};
+enum {KERNEL_STACK_USAGE_BOOTSTRAP};
 #define THREAD_CPU_NONE ((u32)-1)
+typedef struct {bool active;} kernel_stack_t;
 typedef struct kernel_thread {
  struct kernel_thread *next; uintptr_t saved_stack_pointer;
  unsigned state,running_cpu,effective_priority,base_priority,last_selected_priority,ready_wait_ticks;
  bool queued,context_switch_pending,saved_context_valid,wakeup_boosted,last_selection_was_wakeup_boost;
+ bool stack_external; uintptr_t kernel_stack_base; size_t kernel_stack_size;
+ kernel_stack_t kernel_stack;
  unsigned fpu_state;
 } kernel_thread_t;
 typedef struct {kernel_thread_t *scheduler_idle_thread;} cpu_local_t;
@@ -49,6 +53,11 @@ typedef struct {kernel_thread_t *head;} thread_ready_queue_t;
 static thread_ready_queue_t ready_queues[3];
 static struct {unsigned dispatches[3];} scheduler_stats;
 static unsigned scheduler_lock, scheduler_context_switch_in_progress;
+static unsigned sampled_kernel_stacks;
+static void kernel_stack_sample_rsp(kernel_stack_t *stack, uintptr_t rsp)
+{assert(stack && stack->active && rsp); sampled_kernel_stacks++;}
+static void kernel_stack_usage_sample(unsigned kind, uintptr_t top, uintptr_t rsp)
+{assert(kind == KERNEL_STACK_USAGE_BOOTSTRAP && top && rsp); sampled_kernel_stacks++;}
 static u64 spin_lock_irqsave(unsigned *p){assert(!*p);*p=1;return 0;}
 static void spin_unlock_irqrestore(unsigned *p,u64 f){(void)f;assert(*p);*p=0;}
 static void panic(const char *s){puts(s);abort();}
@@ -64,10 +73,11 @@ static void scheduler_remove_queued_locked(kernel_thread_t *t){assert(ready_queu
 '''
 post = r'''
 int main(void){
- kernel_thread_t outgoing={.state=THREAD_STATE_READY,.running_cpu=0,.context_switch_pending=true,.saved_stack_pointer=0x1000};
+ kernel_thread_t outgoing={.state=THREAD_STATE_READY,.running_cpu=0,.context_switch_pending=true,.saved_stack_pointer=0x1000,.stack_external=true,.kernel_stack_base=0x4000,.kernel_stack_size=0x4000};
  kernel_thread_t incoming={.state=THREAD_STATE_RUNNING,.running_cpu=0,.saved_context_valid=true,.saved_stack_pointer=0x2000};
  current_thread=&incoming;scheduler_context_switch_in_progress=1;
  scheduler_context_switch_saved(&outgoing.saved_stack_pointer,incoming.saved_stack_pointer);
+ assert(sampled_kernel_stacks==1);
  /* CPU 1 tries selection before CPU 0 has left outgoing's stack. */
  assert(scheduler_select_next_locked()==NULL);
  assert(outgoing.running_cpu==0 && !outgoing.queued && outgoing.context_switch_pending);
@@ -89,6 +99,12 @@ int main(void){
   scheduler_context_switch_complete(&outgoing.saved_stack_pointer);
   assert(!outgoing.queued && outgoing.running_cpu==THREAD_CPU_NONE && !outgoing.context_switch_pending);
  }
+ kernel_thread_t guarded={.state=THREAD_STATE_READY,.running_cpu=0,
+   .saved_stack_pointer=0x3000,.kernel_stack={.active=true}};
+ incoming.saved_stack_pointer=0x3000;current_thread=&incoming;
+ scheduler_context_switch_saved(&guarded.saved_stack_pointer,
+                                incoming.saved_stack_pointer);
+ assert(sampled_kernel_stacks==2);
  puts("scheduler handoff: production publication/selection interleavings passed");
 }
 '''

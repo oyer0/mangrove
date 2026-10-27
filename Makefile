@@ -281,6 +281,18 @@ BOOT_LDFLAGS := --subsystem 10 --entry efi_main --enable-reloc-section --dynamic
 # x86-64 floating-point/SSE ABI without exposing that state to kernel C code.
 KERNEL_CFLAGS  := -std=gnu11 -ffreestanding -fno-asynchronous-unwind-tables -fno-stack-protector -fno-pic -fno-pie -mcmodel=kernel -Ikernel/include -Ikernel/include/usb -Ikernel/include/pci -Ikernel/include/storage -Iinclude -Ilibc/include -mno-red-zone -mno-sse -mno-sse2 -mno-mmx -msoft-float $(DEPFLAGS)
 KERNEL_ASFLAGS := -m64
+KERNEL_STACK_USAGE ?= 0
+KERNEL_STACK_DIAGNOSTICS ?= 0
+KERNEL_STACK_OVERFLOW_GUEST_TEST ?= 0
+ifeq ($(KERNEL_STACK_USAGE),1)
+KERNEL_CFLAGS += -fstack-usage
+endif
+ifeq ($(KERNEL_STACK_DIAGNOSTICS),1)
+KERNEL_CFLAGS += -DKERNEL_STACK_DIAGNOSTICS=1
+endif
+ifeq ($(KERNEL_STACK_OVERFLOW_GUEST_TEST),1)
+KERNEL_CFLAGS += -DKERNEL_STACK_OVERFLOW_GUEST_TEST=1
+endif
 INPUT_TRACE_DIAGNOSTICS ?= 0
 ifeq ($(INPUT_TRACE_DIAGNOSTICS),1)
 KERNEL_CFLAGS += -DINPUT_TRACE_DIAGNOSTICS=1
@@ -595,7 +607,7 @@ DEPS := $(BOOT_OBJS:.o=.d) $(ALL_KERNEL_OBJS:.o=.d)
 
 .PHONY: all help make fresh run fresh-run usb clean test exfat-upcase \
         binaries font sprout sessiond logind logd networkd deviced volumed clipd mount unmount eject lspci lsusb lsdsk diskutil crew about view info mem time tmon logv hello shoot clear copy list locate move mkdir plant type wait reed del say shutdown reboot uptime date version where fstest nettest ping resolve fetch netinfo netcfg power identity user \
-        image fresh-image usb-image run-usb mkmgfs mgfsck test-time test-terminal test-mgfs-version test-mgfs-reconcile test-reed test-math \
+        image fresh-image usb-image run-usb mkmgfs mgfsck test-time test-terminal test-mgfs-version test-mgfs-reconcile test-reed test-math test-kernel-stack test-http-wire kernel-stack-usage test-guest-kernel-stack \
         check-image-deps check-usb-deps check-qemu-deps qemu-warning dev-image fresh-dev-image flash-image test-launch test-password test-random test-vmm test-heap test-history test-copy test-move test-del test-mfqs test-sync test-spinlock-context test-storage test-dev-tools test-font test-unicode test-shoot test-shoot-help test-pager test-view test-info test-help test-list test-cli-options test-fetch test-fetch-transport test-tcp test-startup-presentation test-power-presentation test-rtc-build-policy test-say
 
 # Everyday targets
@@ -1163,11 +1175,43 @@ test-irq-lifecycle:
 
 .PHONY: test-idt
 test-idt:
+	@mkdir -p $(BUILD_DIR)/tests
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
 		-fsanitize=address,undefined -ffunction-sections -fdata-sections \
 		-Ikernel/include -Iinclude -idirafter libc/include \
-		tests/kernel/idt_ist_test.c -Wl,--gc-sections -o /tmp/mangrove-idt-ist-test
-	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-idt-ist-test
+		tests/kernel/idt_ist_test.c -Wl,--gc-sections \
+		-o $(BUILD_DIR)/tests/idt-ist-test
+	ASAN_OPTIONS=detect_leaks=0 $(BUILD_DIR)/tests/idt-ist-test
+
+.PHONY: test-kernel-stack test-http-wire
+test-kernel-stack: test-http-wire
+	@mkdir -p $(BUILD_DIR)/tests
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
+		-fsanitize=address,undefined -Ikernel/include -Iinclude \
+		-idirafter libc/include tests/kernel/kernel_stack_test.c \
+		-o $(BUILD_DIR)/tests/kernel-stack-test
+	ASAN_OPTIONS=detect_leaks=0 $(BUILD_DIR)/tests/kernel-stack-test
+
+test-http-wire:
+	@mkdir -p $(BUILD_DIR)/tests
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
+		-fsanitize=address,undefined -ffunction-sections -fdata-sections \
+		-Ikernel/include -Iinclude -idirafter libc/include \
+		tests/network/http_wire_init_test.c -Wl,--gc-sections \
+		-o $(BUILD_DIR)/tests/http-wire-init-test
+	ASAN_OPTIONS=detect_leaks=0 $(BUILD_DIR)/tests/http-wire-init-test
+
+KERNEL_STACK_USAGE_BUILD ?= $(abspath $(BUILD_DIR))/stack-usage
+.PHONY: kernel-stack-usage
+kernel-stack-usage:
+	$(MAKE) -B -j4 BUILD_DIR="$(KERNEL_STACK_USAGE_BUILD)" \
+		KERNEL_STACK_USAGE=1 \
+		"$(KERNEL_STACK_USAGE_BUILD)/Mangrove/pith.elf"
+	python3 tools/kernel_stack_usage_report.py \
+		"$(KERNEL_STACK_USAGE_BUILD)/kernel" \
+		"$(KERNEL_STACK_USAGE_BUILD)/libc"
+	python3 tests/kernel/kernel_stack_usage_test.py \
+		"$(KERNEL_STACK_USAGE_BUILD)/kernel"
 
 .PHONY: test-e1000
 test-e1000: $(BUILD_DIR)/tests/e1000-context-test \
@@ -2976,6 +3020,23 @@ test-guest-mgfs:
 	$(QEMU_ACCEL_PREFLIGHT) "$(GUEST_MGFS_ACCEL)"
 	$(MAKE) -B -j4 BUILD_DIR="$(GUEST_MGFS_BUILD)" RTC_UTC_TRUST=1 binaries fstest mkmgfs mgfsck
 	python3 tests/guest/guest_mgfs_test.py --build-dir "$(GUEST_MGFS_BUILD)" $(if $(GUEST_MGFS_OUTPUT),--output "$(GUEST_MGFS_OUTPUT)") --accel "$(GUEST_MGFS_ACCEL)" --repetitions 2 --negative-control
+
+# Build a diagnostic-only kernel that deliberately overflows one ordinary
+# guarded stack, then require the two-vCPU guest to fail-stop on the guard.
+GUEST_KERNEL_STACK_BUILD ?= $(abspath $(BUILD_DIR))/kernel-stack-overflow
+GUEST_KERNEL_STACK_OUTPUT ?=
+GUEST_KERNEL_STACK_ACCEL ?= $(NATIVE_GUEST_ACCEL)
+.PHONY: test-guest-kernel-stack
+test-guest-kernel-stack:
+	$(QEMU_ACCEL_PREFLIGHT) "$(GUEST_KERNEL_STACK_ACCEL)"
+	$(MAKE) -B -j4 BUILD_DIR="$(GUEST_KERNEL_STACK_BUILD)" RTC_UTC_TRUST=1 \
+		NETWORK_BOOT_DIAG=1 KERNEL_BOOT_DEBUG=1 KERNEL_STACK_DIAGNOSTICS=1 \
+		KERNEL_STACK_OVERFLOW_GUEST_TEST=1 \
+		binaries fstest mkmgfs mgfsck
+	python3 tests/guest/guest_kernel_stack_test.py \
+		--build-dir "$(GUEST_KERNEL_STACK_BUILD)" \
+		$(if $(GUEST_KERNEL_STACK_OUTPUT),--output "$(GUEST_KERNEL_STACK_OUTPUT)") \
+		--accel "$(GUEST_KERNEL_STACK_ACCEL)" --repetitions 2
 
 # Verify the system-managed Mozilla-derived CA store in a disposable image,
 # including read-only access and exact contents after a native reboot.
