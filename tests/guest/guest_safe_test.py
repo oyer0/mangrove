@@ -214,8 +214,6 @@ class ReedControl:
             self.shell_active=True
             self.shell_progress=time.monotonic()
             return
-        if time.monotonic()-self.shell_progress>25:
-            raise TimeoutError(f'Shoot interactive acceptance stalled at shell stage {self.shell_stage}')
         if self.shell_stage==0:
             if self.shell_type(qmp,part,text,'','/bin/say shot','shell-edited-command'):
                 self.shell_stage=1
@@ -303,6 +301,12 @@ class ReedControl:
                     self.shoot_stage=3;self.shell_stage=20
         if self.shell_stage>=20:return
     def observe(self,qmp,text,part,started):
+        if (self.reed_from_shoot and self.shell_active and
+                time.monotonic()-self.shell_progress>25):
+            raise TimeoutError(
+                'Reed guest workflow stopped making rendered progress at '
+                f'shell stage {self.shell_stage}, editor stage {self.stage}, '
+                f'filename probe stage {self.filename_probe_stage}')
         if self.receiver is not None:
             try:message,peer=self.receiver.recvfrom(129)
             except BlockingIOError:pass

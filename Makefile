@@ -1606,6 +1606,7 @@ test-qmp-client:
 	python3 tests/guest/qmp_client_test.py
 
 test-dev-tools: test-qmp-client
+	python3 tests/guest/guest_reed_watchdog_test.py
 	python3 tests/guest/artifact_lifecycle_test.py
 	python3 tests/guest/qemu_accel_test.py
 	python3 tests/guest/reed_input_diagnostic_test.py
@@ -2992,9 +2993,9 @@ test-guest-safe:
 GUEST_REED_BUILD ?= $(abspath $(BUILD_DIR))/guest-reed-build
 GUEST_REED_ACCEL ?= $(NATIVE_GUEST_ACCEL)
 # The native Reed workflow includes MGFS preparation plus several hundred
-# state-verified USB keyboard actions and framebuffer captures. Keep its
-# per-guest deadline bounded while leaving measured headroom for slow hosts.
-GUEST_REED_TIMEOUT ?= 420
+# state-verified USB keyboard actions and framebuffer captures. The controller
+# also has a per-stage no-progress watchdog for unexpected guest transitions.
+GUEST_REED_TIMEOUT ?= 300
 .PHONY: test-guest-reed
 test-guest-reed:
 	$(QEMU_ACCEL_PREFLIGHT) "$(GUEST_REED_ACCEL)"
