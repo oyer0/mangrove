@@ -292,12 +292,19 @@ static void language_error(const char *source, usize line_number,
 
 bool shell_state_init(shell_state_t *state)
 {
+    char config_diagnostic[512];
+
     if (!state) return false;
     memset(state, 0, sizeof(*state));
     if (result_is_error(command_getcwd_alloc(&state->cwd))) return false;
     shoot_config_defaults(&state->config);
-    if (!shoot_config_reload(&state->config))
-        console_write_string("Shoot: invalid configuration; using defaults.\n");
+    (void)shoot_config_reload(&state->config, config_diagnostic,
+                              sizeof(config_diagnostic));
+    if (config_diagnostic[0]) {
+        console_write_string("Shoot: ");
+        console_write_string(config_diagnostic);
+        console_write_string("\n");
+    }
     return true;
 }
 

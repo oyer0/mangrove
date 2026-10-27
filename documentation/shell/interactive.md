@@ -98,10 +98,32 @@ either file. The currently recognized keys are:
 | `history_ignore_space` | `true` | Do not record commands beginning with a space. |
 
 Values are written as `key=value`; booleans are `true` or `false`. Lines
-beginning with `//` are comments. Unknown keys are ignored. A malformed line
-or invalid value for a recognized key makes reload fail without replacing the
-previous settings. Run the `reload` built-in to apply a valid edited
-configuration.
+beginning with `//` are comments. Optional spaces and tabs around `=` are
+accepted, but generated configuration and examples use the canonical form
+without spaces. Duplicate or unknown keys, malformed assignments, invalid
+values, and read failures reject the complete file. Shoot keeps every setting
+at its built-in default instead of applying a valid prefix or preserving a
+previously loaded subset. It prints the path and, for parser errors, the line
+number; it continues to run. A missing optional file is normal. Run the
+`reload` built-in to read the current file again.
+
+```ini
+prompt_color=green
+completion_color=dark_gray
+completion_case_sensitive=true
+history_enabled=true
+history_limit=256
+history_persist=true
+history_ignore_duplicates=true
+history_ignore_space=true
+```
+
+The current file has no fixed small size limit; reading is dynamically
+allocated and remains subject to available process memory. A failed read,
+allocation, or close is reported and leaves defaults active. Shoot never
+rewrites an invalid file. During a legacy migration, a valid old file remains
+usable for the current run if an exclusive copy cannot be completed; the
+warning names both paths and the legacy file is preserved.
 
 History operations and the behavior when concurrent sessions change the saved
 file are specified in [command history](history.md).

@@ -361,9 +361,11 @@ void shoot_config_defaults(shoot_config_t *config)
     config->history_limit = 256U;
 }
 
-bool shoot_config_reload(shoot_config_t *config)
+bool shoot_config_reload(shoot_config_t *config, char *diagnostic,
+                         usize diagnostic_capacity)
 {
     (void)config;
+    if (diagnostic && diagnostic_capacity) diagnostic[0] = '\0';
     return true;
 }
 

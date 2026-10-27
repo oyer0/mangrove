@@ -1,217 +1,143 @@
-Shoot shell
-==========
+NAME
 
-Start an interactive shell with:
+shoot - Run the Mangrove interactive shell or a script
 
-    shoot
+SYNOPSIS
 
-Run a script and exit with its result:
+    shoot [SCRIPT]
+    shoot --help
 
-    shoot FILE.shoot
+DESCRIPTION
 
-Use shoot --help for the short invocation summary. help inside Shoot lists
-Shoot's built-in commands. Use a native command's -h or --help for its
-quick usage. This manual describes Shoot as an application; built-ins do not
-have separate manual pages.
+With no script argument, Shoot provides an interactive command prompt. With a
+script path, it runs the script and exits with its result. Shoot resolves
+installed commands from `/bin`; commands may also be started by executable
+path. `help` lists Shoot's built-in commands. Built-ins do not have separate
+manual pages.
 
-Interactive command editing
----------------------------
+Spaces and tabs separate arguments. Single and double quotes group text and
+are removed. Quoted and unquoted parts can form one argument, and empty quoted
+arguments are preserved. Outside quotes, backslash escapes the following
+character; inside quotes, backslashes are literal. An unquoted `//` begins a
+comment. `$name` expands a variable except inside single quotes; an unset
+variable expands to an empty argument.
 
-The prompt displays the current identity and working directory. A home path is
-shown as ~. Input uses a nonmodal line editor:
+Unquoted pathname patterns support `*`, `?`, `[abc]`, `[a-z]`, and `[!abc]`
+one path component at a time. Results are sorted. Hidden entries match only
+when the component pattern begins with a dot. Unmatched patterns remain
+literal. Quoting or escaping pattern characters keeps them literal. Shoot
+does not perform field splitting, command substitution, or recursive `**`
+matching.
 
-  Left / Right             Move by one UTF-8 scalar.
-  Up / Down                Browse history; returning to the newest position
-                           restores the unfinished command draft.
-  Alt+Left / Alt+Right     Move to the previous / next word.
-  Home / End               Move to the start / end of the command.
-  Backspace / Delete       Delete the previous / next scalar.
-  Alt+Backspace / Alt+Delete
-                           Delete to the previous / next word boundary.
-  Tab                      Complete a command or built-in at command position;
-                           otherwise complete a path.
-  Enter                    Execute the command.
-  Ctrl+C                   Discard the input and return to a fresh prompt.
-  Ctrl+D                   On an empty line, return end-of-file. Otherwise,
-                           delete the scalar under the cursor if present.
-  Ctrl+L                   Clear the terminal and redraw the prompt and input.
+Scripts use one command or assignment per line. Variables can be assigned a
+value or incremented/decremented by a bounded integer operation. `if`, optional
+`else`, `while`, and `end` provide conditional and loop blocks. Conditions
+support file existence, string equality, and signed integer comparisons.
+Blocks are checked before execution. A later command failure can follow
+earlier completed commands; the script then stops with a failure status.
 
-Shoot does not have command-line selection. Unbound modifier combinations are
-ignored. Cooked readers such as login keep their separate byte-input behavior.
-
-Shoot groups runs of ASCII letters, digits, underscore, and valid non-ASCII
-scalars into words. ASCII punctuation, spaces, and tabs separate words. This
-is scalar-safe, not Unicode word segmentation. Word movement skips separators.
-From inside a word, Alt+Left skips that word and moves to the preceding word's
-start; Alt+Right skips it and moves to the next word's end. At a word boundary,
-the adjacent word in the requested direction is selected. With no word in that
-direction, movement stops at the command boundary. Word deletion removes the
-same span that the corresponding motion would traverse.
-
-Commands and scripts
---------------------
-
-Shoot parses one command or assignment per line. Spaces and tabs separate
-arguments. Single and double quotes group text and are removed. Quoted and
-unquoted pieces can form one argument; empty quoted arguments are allowed.
-Outside quotes, backslash escapes the next character; within either quote
-style backslashes are ordinary text. An unquoted // starts a comment.
-
-$name expands a shell variable outside single quotes. An unset variable
-expands to an empty string. Unquoted argument patterns support *, ?, [abc],
-[a-z], and [!abc]. Patterns match one path component at a time; results are
-sorted, hidden names require a component beginning with ., and unmatched
-patterns remain literal. Quoting or escaping wildcard syntax keeps it literal.
-** does not recurse, and Shoot does not perform field splitting or command
-substitution. There is no environment-variable vector or general tilde
-expansion. ~ is expanded only in supported path-aware features such as jump,
-script paths, redirection, and the exists condition.
-
-Assignments use name = value. Names begin with an ASCII letter or underscore;
-later characters may also be digits. A bounded integer update is supported:
-
-    count = $count + 1
-    count = $count - 1
-
-Conditions use if, optional else, while, and end:
-
-    if exists PATH
-    if LEFT == RIGHT
-    if INTEGER < INTEGER
-    if INTEGER <= INTEGER
-    if INTEGER > INTEGER
-    if INTEGER >= INTEGER
-
-String equality compares expanded text. Relational comparisons use signed
-decimal integers. Compound conditions, break, and continue are not
-available. Interactive blocks are collected through their matching end.
-Scripts are checked for block structure before execution; a later command
-failure can occur after earlier commands have already run.
-
-Built-ins are jump, exit, logout, help, history, and reload. Logout is the
-no-status spelling of exit; either ends the current login session. Empty-line
-Ctrl+D also ends the session, while Ctrl+D on a nonempty command deletes the
-scalar under the cursor. Logind retires the session and clears the visible
-terminal and retained console rows before the next login prompt. Other commands
-resolve from /bin or by an absolute executable path. Shoot reports launch,
-wait, and crash failures. An ordinary nonzero child status remains a command
-failure and stops a script without adding a duplicate generic diagnostic.
-Arguments are passed separately to the child, not as an inherited environment.
-Expanded vectors grow dynamically under the native 8 MiB budget, including
-pointer slots and string terminators. Hundreds or thousands of matches can
-be passed to one child when memory permits. Preparation errors occur before
-execution or output-redirection side effects. Multi-file deletion itself is
-not transactional: later filesystem failures can leave earlier files deleted.
-Use ./* to keep matching names beginning with - from becoming command options.
-
-One output redirection may be used on a command:
+One stdout redirection may be attached to a command:
 
     command arguments > PATH
     command arguments >> PATH
 
-> creates or truncates a regular file; >> creates a missing file or
-appends to an existing one. Only standard output is redirected. There is no
-input redirection, separate standard error, pipe, background job, command
-chaining, or subshell.
+`>` creates or truncates a regular file. `>>` creates a missing file or
+appends. There is no input redirection, stderr redirection, pipeline,
+background job, command chaining, or subshell. A command's arguments remain
+separate argv entries. Argument preparation must complete before command
+execution; filesystem batches can still partially succeed after execution
+begins.
 
-The standalone say command prints its arguments separated by spaces, followed
-by a newline. Backslashes are always literal unless -e or --escapes is given.
-With that option, \\ emits a backslash, \n a newline, \r a carriage return,
-\t a tab, and \e the ASCII ESC byte (0x1b). Unknown escapes and a final
-backslash are preserved literally. For example:
+OPTIONS
 
-    say -e '\e{fg:b_green}Mangrove\e{reset}'
+    -h, --help — Show concise invocation help and exit.
 
-Semantic styles use the canonical short commands, for example
-`say -e '\e{warn}Low disk space!\e{reset}'`. Other controls include
-`cls`, `cll`, `cleol`, `at:ROW,COL`, `up:N`, `down:N`, `left:N`, `right:N`,
-`hide`, `show`, `alt`, and `main`; see the terminal behavior guide for details.
+KEYBINDINGS
 
-The terminal recognizes the resulting ESC{...} command only when output goes
-to the interactive console. Redirection writes emitted bytes unchanged.
-Ordinary say is the safe choice for literal or untrusted text; native programs
-can also use the explicit literal-write interface.
+    Left — Move one UTF-8 scalar left.
+    Right — Move one UTF-8 scalar right.
+    Up — Browse older history entries.
+    Down — Browse newer history entries and restore the unfinished draft.
+    Alt+Left — Move to the previous word.
+    Alt+Right — Move to the next word.
+    Home — Move to the beginning of the command.
+    End — Move to the end of the command.
+    Backspace — Delete the previous scalar.
+    Delete — Delete the next scalar.
+    Alt+Backspace — Delete to the previous word boundary.
+    Alt+Delete — Delete to the next word boundary.
+    Tab — Complete a command or built-in at command position; otherwise complete a path.
+    Enter — Execute the command.
+    Ctrl+C — Cancel current input, or interrupt a foreground command.
+    Ctrl+D — Return EOF on an empty line; otherwise delete at the cursor when possible.
+    Ctrl+L — Clear the terminal and redraw the prompt and input.
 
-For file commands, use copy SOURCE... DESTINATION and
-move SOURCE... DESTINATION. With multiple sources, the destination must be an
-existing directory. copy accepts regular files only. move uses filesystem
-move safeguards and supports files and directories. plant NAME... creates
-empty files; mkdir NAME... creates directories. del TARGET... removes files
-and empty directories. Tree removal requires the explicit -r or --recursive
-option. These batch commands report per-target failures and return failure if
-any requested operation fails; a batch can partially succeed.
+CONFIGURATION
 
-History and persistent state
-----------------------------
+Shoot reads the optional `~/.config/shoot/config` file at startup. `reload`
+reads it again. Missing configuration uses these defaults:
 
-The optional Shoot configuration is:
+    prompt_color=green
+    completion_color=dark_gray
+    completion_case_sensitive=true
+    history_enabled=true
+    history_limit=256
+    history_persist=true
+    history_ignore_duplicates=true
+    history_ignore_space=true
 
-    ~/.config/shoot/config
+`prompt_color` and `completion_color` accept `black`, `red`, `green`,
+`yellow`, `blue`, `magenta`, `cyan`, `light_gray`, `dark_gray`,
+`bright_red`, `bright_green`, `bright_yellow`, `bright_blue`,
+`bright_magenta`, `bright_cyan`, or `white`. The other settings except
+`history_limit` accept `true` or `false`. `history_limit` accepts an integer
+from 1 through 4096. Lines beginning with `//` are comments. Spaces and tabs
+around `=` are accepted; examples use canonical `key=value` form.
 
-Shoot does not create the file or its parent directories. To make a file,
-first use jump to go to your home directory, create each missing directory
-with mkdir, then open the new file in Reed, enter settings, and save with
-/s. For example, if .config does not yet exist:
+Duplicate or unknown keys, malformed assignments, invalid values, and read,
+allocation, or close errors reject the entire file. Shoot uses all built-in
+defaults rather than applying a valid prefix, prints the path and specific
+error (including a line number for parse errors), and continues running. It
+does not repair the file. The file is read dynamically with no fixed small
+size ceiling; memory availability bounds it.
 
-    jump
-    mkdir .config
-    mkdir .config/shoot
-    reed .config/shoot/config
+On upgrade, if the new file is absent but `~/.shoot/config` exists, Shoot reads
+the old file and attempts an exclusive copy. The old file is never deleted or
+overwritten. If both exist, the new path takes precedence. If a valid old file
+cannot be copied, its settings remain usable for the current run and a
+warning identifies the migration failure.
 
-Omit a mkdir command for a directory that already exists. The configuration
-is read at startup and can be reloaded with the reload built-in. Defaults
-apply when the file is missing. Lines beginning with // are comments; blank
-lines and whitespace around assignments are accepted. Boolean values are
-true or false; colors must be one of the names below. Unknown keys are
-ignored. A malformed line or invalid value for a recognized setting makes
-reload fail and leaves the prior settings active.
+Persistent history is stored in `~/.state/shoot/history`, not in the config
+file. History is bounded by `history_limit`; writes occur on normal shell exit
+and orderly system shutdown or reboot. The parent state directory is created
+only when history must be written.
 
-    prompt_color = green
-    completion_color = dark_gray
-    completion_case_sensitive = true
-    history_enabled = true
-    history_limit = 256
-    history_persist = true
-    history_ignore_duplicates = true
-    history_ignore_space = true
+COMMANDS
 
-prompt_color and completion_color accept black, red, green,
-yellow, blue, magenta, cyan, light_gray, dark_gray, bright_red,
-bright_green, bright_yellow, bright_blue, bright_magenta,
-bright_cyan, or white. The four history_* settings other than
-history_limit, and completion_case_sensitive, are booleans.
-history_limit is an integer from 1 through 4096 and controls the number of
-in-memory entries retained.
+    jump PATH — Change the current working directory.
+    help — List Shoot's built-in commands.
+    history — Display or manage command history.
+    reload — Reload Shoot's configuration.
+    exit — End the current login session.
+    logout — End the current login session.
 
-Persistent command history is stored at:
+EXAMPLES
 
-    ~/.state/shoot/history
+    shoot
+    shoot build.shoot
+    list *.txt
+    type notes.txt > notes-copy.txt
 
-History is read when persistence is enabled and written on normal shell exit
-or orderly system shutdown/reboot. Its parent directory is created only when
-a write is needed. The history built-in displays current entries; options
-include -c (clear memory), -d N (delete an entry), -a (append pending
-entries), -n (import reliably new entries), -r (import the saved file), and
--w (replace saved contents with current memory). -w is destructive to the
-saved history. Read history -h for quick usage and understand that filesystem
-mutation failures may leave an uncertain result.
+NOTES
 
-On upgrade, an old ~/.shoot/config is read if the new configuration is absent
-and copied exclusively to the new path; the old file remains. If both exist,
-the new file takes precedence. An old ~/.shoot/history is imported without
-modifying either path. If it is the only saved history, the first write moves
-it to the new path before appending. If both history files exist, old entries
-are loaded before new entries and writes go only to the new file. Migration
-never overwrites the destination or silently removes the old contents.
+The interactive command line is bounded, while expanded argv data uses the
+native process argument budget and available memory. Script resource limits
+are described in `documentation/shell/language.md`. Shoot is a small Mangrove
+shell language and does not claim Bash or POSIX shell compatibility.
 
-Limits and boundaries
----------------------
+SEE ALSO
 
-Interactive commands retain the 511 input-byte and 512 parsed word-byte limits.
-Expanded arguments use the dynamic native process budget instead of a fixed
-small argv array. Pathnames remain bounded to 255 UTF-8 bytes. Scripts are
-limited to 4096 source lines, 512
-statements, 511 bytes per line, and 64 nested blocks. Shoot's parser is a small
-native shell language, not Bash or POSIX sh. History persistence is subject to
-the filesystem's runtime mutation and durability guarantees; it is not a
-power-failure transaction.
+    info reed
+    documentation/shell/interactive.md
+    documentation/shell/language.md
+    documentation/shell/history.md

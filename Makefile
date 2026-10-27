@@ -1069,6 +1069,7 @@ test-shoot-config:
 		-idirafter libc/include tests/userspace/shoot_config_migration_test.c \
 		userspace/shoot/config.c userspace/common/app_directory.c \
 		userspace/common/path.c libc/src/string.c \
+		-Wl,--wrap=malloc \
 		-o /tmp/mangrove-shoot-config-migration-test
 	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-shoot-config-migration-test
 

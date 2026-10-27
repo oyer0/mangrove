@@ -6,7 +6,7 @@
 #include <mg/object.h>
 #include "../../userspace/shoot/config.h"
 
-#define FILE_CAP 2048U
+#define FILE_CAP 16384U
 static mg_identity_t identity;
 static struct { char path[256]; char data[FILE_CAP]; usize length; bool exists; } files[2];
 static usize file_count;
@@ -16,13 +16,28 @@ static usize directory_creates;
 static usize file_creates;
 static bool short_read;
 static mg_result_t create_result;
+static mg_result_t open_result;
+static mg_result_t close_result;
+static bool fail_next_allocation;
 static usize opened_file;
 static usize opened_offset;
+
+void *__real_malloc(size_t size);
+void *__wrap_malloc(size_t size)
+{
+    if (fail_next_allocation) {
+        fail_next_allocation = false;
+        return NULL;
+    }
+    return __real_malloc(size);
+}
 
 bool result_is_error(mg_result_t result) { return result < 0; }
 const char *error_string(mg_result_t result)
 {
-    (void)result;
+    if (result == MG_ERR_ACCESS_DENIED) return "access denied";
+    if (result == MG_ERR_IO) return "I/O failure";
+    if (result == MG_ERR_NO_MEMORY) return "out of memory";
     return "controlled filesystem error";
 }
 
@@ -84,6 +99,7 @@ mg_result_t directory_create(const char *path)
 mg_result_t file_open(const char *path, u32 flags)
 {
     (void)flags;
+    if (open_result < 0) return open_result;
     int index = find_file(path);
     if (index < 0) return MG_ERR_NOT_FOUND;
     opened_file = (usize)index;
@@ -105,7 +121,7 @@ mg_result_t object_read(mg_handle_t handle, void *buffer, usize length)
 mg_result_t handle_close(mg_handle_t handle)
 {
     assert(handle == opened_file + 1U || handle == 90U);
-    return MG_OK;
+    return close_result;
 }
 
 mg_result_t file_create_contents(const char *path, const void *data,
@@ -136,6 +152,9 @@ static void setup(void)
     file_count = directory_count = directory_creates = file_creates = 0;
     short_read = false;
     create_result = MG_OK;
+    open_result = MG_OK;
+    close_result = MG_OK;
+    fail_next_allocation = false;
 }
 
 static void seed(const char *path, const char *text)
@@ -157,18 +176,32 @@ static void check_value(const shoot_config_t *config,
 int main(void)
 {
     shoot_config_t config;
+    shoot_config_t unchanged;
+    char diagnostic[512];
+    const char valid[] = " prompt_color = blue\n\n// kept comments\n"
+                         "history_enabled=false\ncompletion_case_sensitive=false\n";
+    const char *invalid[] = {
+        "unknown=true\nprompt_color=red\n",
+        "prompt_color=blue\nhistory_limit=12\nhistory_limit=13\n",
+        "prompt_color=blue\nhistory_enabled=true\nunknown=value\n",
+        "prompt_color=purple\n",
+        "history_limit=4097\n",
+        "history_enabled=true\nhistory_enabled=false\n",
+        "history_enabled true\n",
+        "=true\n",
+    };
     const char *legacy = "/home/tester/.shoot/config";
     const char *current = "/home/tester/.config/shoot/config";
 
     setup();
     memset(&config, 0, sizeof(config));
-    assert(shoot_config_reload(&config));
+    assert(shoot_config_reload(&config, diagnostic, sizeof(diagnostic)));
     check_value(&config, MG_TERMINAL_COLOR_GREEN);
     assert(directory_creates == 0U && file_creates == 0U);
 
     setup(); seed(legacy, "prompt_color=blue\nhistory_limit=77\n");
     memset(&config, 0, sizeof(config));
-    assert(shoot_config_reload(&config));
+    assert(shoot_config_reload(&config, diagnostic, sizeof(diagnostic)));
     check_value(&config, MG_TERMINAL_COLOR_BLUE);
     assert(config.history_limit == 77U);
     assert(find_file(legacy) >= 0 && find_file(current) >= 0);
@@ -176,42 +209,110 @@ int main(void)
                    files[find_file(current)].data,
                    files[find_file(legacy)].length));
     assert(directory_creates == 2U && file_creates == 1U);
-    assert(shoot_config_reload(&config));
+    assert(shoot_config_reload(&config, diagnostic, sizeof(diagnostic)));
     assert(directory_creates == 2U && file_creates == 1U);
 
     setup(); seed(legacy, "prompt_color=blue\n");
     seed(current, "prompt_color=red\n");
     memset(&config, 0, sizeof(config));
-    assert(shoot_config_reload(&config));
+    assert(shoot_config_reload(&config, diagnostic, sizeof(diagnostic)));
     check_value(&config, MG_TERMINAL_COLOR_RED);
     assert(file_creates == 0U);
     assert(!strcmp(files[find_file(legacy)].data, "prompt_color=blue\n"));
 
     setup(); seed(current, "prompt_color=cyan\n");
     memset(&config, 0, sizeof(config));
-    assert(shoot_config_reload(&config));
+    assert(shoot_config_reload(&config, diagnostic, sizeof(diagnostic)));
     check_value(&config, MG_TERMINAL_COLOR_CYAN);
     assert(directory_creates == 0U && file_creates == 0U);
 
     setup(); seed(legacy, "prompt_color=purple\n");
     memset(&config, 0, sizeof(config));
     config.prompt_color = MG_TERMINAL_COLOR_YELLOW;
-    assert(!shoot_config_reload(&config));
-    check_value(&config, MG_TERMINAL_COLOR_YELLOW);
+    assert(!shoot_config_reload(&config, diagnostic, sizeof(diagnostic)));
+    check_value(&config, MG_TERMINAL_COLOR_GREEN);
     assert(find_file(current) < 0);
+    assert(strstr(diagnostic, legacy) != NULL &&
+           strstr(diagnostic, "line 1") != NULL &&
+           strstr(diagnostic, "built-in defaults") != NULL);
+
+    setup(); seed(current, "");
+    assert(shoot_config_reload(&config, diagnostic, sizeof(diagnostic)));
+    check_value(&config, MG_TERMINAL_COLOR_GREEN);
+    assert(config.history_limit == 256U && diagnostic[0] == '\0');
 
     setup(); seed(current, "prompt_color=blue\n");
     short_read = true;
     memset(&config, 0, sizeof(config));
     config.prompt_color = MG_TERMINAL_COLOR_YELLOW;
-    assert(!shoot_config_reload(&config));
-    check_value(&config, MG_TERMINAL_COLOR_YELLOW);
+    assert(!shoot_config_reload(&config, diagnostic, sizeof(diagnostic)));
+    check_value(&config, MG_TERMINAL_COLOR_GREEN);
+    assert(strstr(diagnostic, current) != NULL &&
+           strstr(diagnostic, "I/O failure") != NULL);
+
+    setup(); seed(current, "prompt_color=blue\n");
+    open_result = MG_ERR_ACCESS_DENIED;
+    assert(!shoot_config_reload(&config, diagnostic, sizeof(diagnostic)));
+    check_value(&config, MG_TERMINAL_COLOR_GREEN);
+    assert(strstr(diagnostic, current) != NULL &&
+           strstr(diagnostic, "access denied") != NULL);
+
+    setup(); seed(current, "prompt_color=blue\n");
+    fail_next_allocation = true;
+    assert(!shoot_config_reload(&config, diagnostic, sizeof(diagnostic)));
+    check_value(&config, MG_TERMINAL_COLOR_GREEN);
+    assert(strstr(diagnostic, current) != NULL &&
+           strstr(diagnostic, "out of memory") != NULL);
+
+    setup(); seed(current, "prompt_color=blue\n");
+    close_result = MG_ERR_IO;
+    assert(!shoot_config_reload(&config, diagnostic, sizeof(diagnostic)));
+    check_value(&config, MG_TERMINAL_COLOR_GREEN);
+    assert(strstr(diagnostic, current) != NULL &&
+           strstr(diagnostic, "I/O failure") != NULL);
 
     setup(); seed(legacy, "prompt_color=blue\n");
     create_result = MG_ERR_ACCESS_DENIED;
     memset(&config, 0, sizeof(config));
-    assert(shoot_config_reload(&config));
+    assert(shoot_config_reload(&config, diagnostic, sizeof(diagnostic)));
     check_value(&config, MG_TERMINAL_COLOR_BLUE);
     assert(find_file(legacy) >= 0 && find_file(current) < 0);
+    assert(strstr(diagnostic, "original is preserved") != NULL);
+
+    for (usize index = 0; index < sizeof(invalid) / sizeof(invalid[0]);
+         index++) {
+        shoot_config_defaults(&config);
+        config.prompt_color = MG_TERMINAL_COLOR_YELLOW;
+        unchanged = config;
+        assert(!shoot_config_parse(invalid[index], strlen(invalid[index]),
+                                   &config, diagnostic, sizeof(diagnostic)));
+        assert(memcmp(&config, &unchanged, sizeof(config)) == 0);
+        assert(strstr(diagnostic, "line ") != NULL);
+    }
+
+    shoot_config_defaults(&config);
+    assert(shoot_config_parse(valid, sizeof(valid) - 1U, &config,
+                              diagnostic, sizeof(diagnostic)));
+    check_value(&config, MG_TERMINAL_COLOR_BLUE);
+    assert(!config.history_enabled && !config.completion_case_sensitive);
+
+    {
+        char large[8193];
+        const char suffix[] = "\nhistory_limit=1024\n";
+        memset(large, 'x', sizeof(large) - 1U);
+        large[0] = '/';
+        large[1] = '/';
+        memcpy(large + sizeof(large) - sizeof(suffix), suffix,
+               sizeof(suffix));
+        assert(shoot_config_parse(large, sizeof(large) - 1U, &config,
+                                  diagnostic, sizeof(diagnostic)));
+        assert(config.history_limit == 1024U);
+        setup();
+        seed(current, large);
+        assert(files[0].length > 2048U);
+        assert(shoot_config_reload(&config, diagnostic,
+                                   sizeof(diagnostic)));
+        assert(config.history_limit == 1024U);
+    }
     return 0;
 }

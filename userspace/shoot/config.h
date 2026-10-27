@@ -15,7 +15,12 @@ typedef struct shoot_config {
 } shoot_config_t;
 
 void shoot_config_defaults(shoot_config_t *config);
+bool shoot_config_parse(const char *text, usize length,
+                        shoot_config_t *config, char *diagnostic,
+                        usize diagnostic_capacity);
 /* Loads the optional current-user config. Missing files use built-in defaults
- * without creating directories or files. Legacy settings are copied
- * non-destructively when possible. */
-bool shoot_config_reload(shoot_config_t *config);
+ * without creating directories or files. Invalid or unreadable files leave
+ * built-in defaults active. Valid legacy settings are copied non-destructively
+ * when possible. */
+bool shoot_config_reload(shoot_config_t *config, char *diagnostic,
+                         usize diagnostic_capacity);

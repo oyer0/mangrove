@@ -6,12 +6,19 @@
 
 bool execute_reload(shell_state_t *state, const shell_command_t *command)
 {
+    char diagnostic[512];
+    bool loaded;
+
     if (!state || !command) return true;
-    if (!shoot_config_reload(&state->config)) {
-        printf("Could not reload Shoot configuration; keeping current settings.\n");
+    loaded = shoot_config_reload(&state->config, diagnostic,
+                                 sizeof(diagnostic));
+    shoot_history_apply_config(state->history, &state->config);
+    if (!loaded) {
+        printf("Shoot: %s\n", diagnostic[0] ? diagnostic :
+               "configuration was rejected; using built-in defaults.");
         return true;
     }
-    shoot_history_apply_config(state->history, &state->config);
+    if (diagnostic[0]) printf("Shoot: %s\n", diagnostic);
     printf("Shoot configuration reloaded.\n");
     return true;
 }
