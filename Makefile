@@ -883,7 +883,17 @@ test-guest-fetch-https:
 	$(MAKE) -B -j4 BUILD_DIR="$(GUEST_FETCH_HTTPS_BUILD)" RTC_UTC_TRUST=1 binaries mkmgfs mgfsck
 	python3 tests/guest/guest_mgfs_test.py --build-dir "$(GUEST_FETCH_HTTPS_BUILD)" $(if $(GUEST_FETCH_HTTPS_OUTPUT),--output "$(GUEST_FETCH_HTTPS_OUTPUT)") --accel "$(GUEST_FETCH_HTTPS_ACCEL)" --cpus 2 --fetch-https-smoke
 
-test-terminal:
+.PHONY: test-terminal-api
+test-terminal-api:
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
+		-fsanitize=address,undefined -ffunction-sections -fdata-sections \
+		-Ilibc/include -Iinclude tests/terminal/terminal_stream_api_test.c \
+		libc/src/mangrove_syscall.c -Wl,--gc-sections \
+		-o /tmp/mangrove-terminal-stream-api-test
+	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-terminal-stream-api-test
+
+.PHONY: test-terminal
+test-terminal: test-terminal-api
 	python3 tests/terminal/framebuffer_rect_test.py "$(HOST_CC)"
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
 		-Ikernel/include -Iinclude tests/terminal/utf8_decode_test.c \

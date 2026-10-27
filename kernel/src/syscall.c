@@ -2169,99 +2169,23 @@ void syscall_dispatch(void *raw_frame)
             u32 operation = (u32)frame->rdi;
             i64 result = MG_OK;
 
-            if (!process || operation < MG_TERMINAL_OP_ALTERNATE_ENTER ||
+            if (!process ||
+                operation < MG_TERMINAL_OP_RESERVED_ALTERNATE_ENTER ||
                 operation > MG_TERMINAL_OP_INPUT_CURSOR) {
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
             }
 
             switch (operation) {
-                case MG_TERMINAL_OP_ALTERNATE_ENTER:
-                    if (frame->rsi || frame->rdx ||
-                        !terminal_alternate_enter_process(process->pid))
-                        result = MG_ERR_BUSY;
+                case MG_TERMINAL_OP_RESERVED_ALTERNATE_ENTER:
+                case MG_TERMINAL_OP_RESERVED_ALTERNATE_LEAVE:
+                case MG_TERMINAL_OP_RESERVED_CURSOR_MOVE:
+                case MG_TERMINAL_OP_RESERVED_CURSOR_VISIBILITY:
+                case MG_TERMINAL_OP_RESERVED_CLEAR:
+                case MG_TERMINAL_OP_RESERVED_STYLED_WRITE:
+                case MG_TERMINAL_OP_RESERVED_SEMANTIC_WRITE:
+                    result = MG_ERR_UNSUPPORTED;
                     break;
-                case MG_TERMINAL_OP_ALTERNATE_LEAVE:
-                    if (frame->rsi || frame->rdx ||
-                        !terminal_alternate_leave_process(process->pid))
-                        result = MG_ERR_ACCESS_DENIED;
-                    break;
-                case MG_TERMINAL_OP_CURSOR_MOVE: {
-                    mg_terminal_cursor_request_t request;
-                    if (!frame->rsi || frame->rdx ||
-                        !syscall_user_buffer_valid(
-                            (const void *)(uintptr_t)frame->rsi,
-                            sizeof(request))) {
-                        result = MG_ERR_BAD_ARGUMENT;
-                        break;
-                    }
-                    memcpy(&request, (const void *)(uintptr_t)frame->rsi,
-                           sizeof(request));
-                    if (request.version != MG_TERMINAL_API_VERSION ||
-                        !terminal_process_controls(process->pid) ||
-                        !terminal_move_cursor(request.row, request.column))
-                        result = MG_ERR_BAD_ARGUMENT;
-                    break;
-                }
-                case MG_TERMINAL_OP_CURSOR_VISIBILITY: {
-                    mg_terminal_visibility_request_t request;
-                    if (!frame->rsi || frame->rdx ||
-                        !syscall_user_buffer_valid(
-                            (const void *)(uintptr_t)frame->rsi,
-                            sizeof(request))) {
-                        result = MG_ERR_BAD_ARGUMENT;
-                        break;
-                    }
-                    memcpy(&request, (const void *)(uintptr_t)frame->rsi,
-                           sizeof(request));
-                    if (request.version != MG_TERMINAL_API_VERSION ||
-                        request.visible > 1U ||
-                        !terminal_process_controls(process->pid))
-                        result = MG_ERR_BAD_ARGUMENT;
-                    else
-                        terminal_set_cursor_visible(request.visible != 0U);
-                    break;
-                }
-                case MG_TERMINAL_OP_CLEAR: {
-                    mg_terminal_clear_request_t request;
-                    if (!frame->rsi || frame->rdx ||
-                        !syscall_user_buffer_valid(
-                            (const void *)(uintptr_t)frame->rsi,
-                            sizeof(request))) {
-                        result = MG_ERR_BAD_ARGUMENT;
-                        break;
-                    }
-                    memcpy(&request, (const void *)(uintptr_t)frame->rsi,
-                           sizeof(request));
-                    if (request.version != MG_TERMINAL_API_VERSION ||
-                        !terminal_process_controls(process->pid)) {
-                        result = MG_ERR_BAD_ARGUMENT;
-                        break;
-                    }
-                    switch (request.mode) {
-                        case MG_TERMINAL_CLEAR_LINE:
-                            if (!terminal_clear_current_line())
-                                result = MG_ERR_BAD_ARGUMENT;
-                            break;
-                        case MG_TERMINAL_CLEAR_TO_END:
-                            if (!terminal_clear_current_to_end())
-                                result = MG_ERR_BAD_ARGUMENT;
-                            break;
-                        case MG_TERMINAL_CLEAR_REGION:
-                            if (!terminal_clear_cells(
-                                    request.first_row, request.first_column,
-                                    request.last_row, request.last_column))
-                                result = MG_ERR_BAD_ARGUMENT;
-                            break;
-                        case MG_TERMINAL_CLEAR_SCREEN:
-                            terminal_clear();
-                            break;
-                        default:
-                            result = MG_ERR_BAD_ARGUMENT;
-                            break;
-                    }
-                    break;
-                }
                 case MG_TERMINAL_OP_SIZE: {
                     mg_terminal_size_t size;
                     if (frame->rsi || !frame->rdx ||
@@ -2434,7 +2358,7 @@ void syscall_dispatch(void *raw_frame)
                         result = MG_ERR_ACCESS_DENIED;
                     break;
                 case MG_TERMINAL_OP_INPUT_MODE: {
-                    mg_terminal_visibility_request_t request;
+                    mg_terminal_input_mode_request_t request;
                     if (!frame->rsi || frame->rdx ||
                         !syscall_user_buffer_valid(
                             (const void *)(uintptr_t)frame->rsi,
@@ -2445,74 +2369,12 @@ void syscall_dispatch(void *raw_frame)
                     memcpy(&request, (const void *)(uintptr_t)frame->rsi,
                            sizeof(request));
                     if (request.version != MG_TERMINAL_API_VERSION ||
-                        request.visible > 1U)
+                        request.enabled > 1U)
                         result = MG_ERR_BAD_ARGUMENT;
                     else
                         result = terminal_set_raw_input_for_process(
-                            process->pid, request.visible != 0U);
+                            process->pid, request.enabled != 0U);
                     break;
-                }
-                case MG_TERMINAL_OP_STYLED_WRITE: {
-                    mg_terminal_styled_write_request_t request;
-                    const char *buffer = (const char *)(uintptr_t)frame->rdx;
-
-                    if (!frame->rsi ||
-                        !syscall_user_buffer_valid(
-                            (const void *)(uintptr_t)frame->rsi,
-                            sizeof(request))) {
-                        result = MG_ERR_BAD_ARGUMENT;
-                        break;
-                    }
-                    memcpy(&request, (const void *)(uintptr_t)frame->rsi,
-                           sizeof(request));
-                    if (request.version != MG_TERMINAL_API_VERSION ||
-                        request.reserved ||
-                        request.foreground >= MG_TERMINAL_COLOR_COUNT ||
-                        request.background >= MG_TERMINAL_COLOR_COUNT ||
-                        !syscall_user_buffer_valid(buffer, request.length)) {
-                        result = MG_ERR_BAD_ARGUMENT;
-                        break;
-                    }
-                    result = terminal_write_styled_for_process(
-                        process->pid, buffer, request.length,
-                        (terminal_color_t)request.foreground,
-                        (terminal_color_t)request.background);
-                    if (result < 0) {
-                        syscall_fail(frame, result);
-                        return;
-                    }
-                    frame->rax = (u64)result;
-                    return;
-                }
-                case MG_TERMINAL_OP_SEMANTIC_WRITE: {
-                    mg_terminal_semantic_write_request_t request;
-                    const char *buffer = (const char *)(uintptr_t)frame->rdx;
-
-                    if (!frame->rsi ||
-                        !syscall_user_buffer_valid(
-                            (const void *)(uintptr_t)frame->rsi,
-                            sizeof(request))) {
-                        result = MG_ERR_BAD_ARGUMENT;
-                        break;
-                    }
-                    memcpy(&request, (const void *)(uintptr_t)frame->rsi,
-                           sizeof(request));
-                    if (request.version != MG_TERMINAL_API_VERSION ||
-                        request.reserved ||
-                        request.style >= MG_TERMINAL_STYLE_COUNT ||
-                        !syscall_user_buffer_valid(buffer, request.length)) {
-                        result = MG_ERR_BAD_ARGUMENT;
-                        break;
-                    }
-                    result = terminal_write_semantic_for_process(
-                        process->pid, buffer, request.length,
-                        (terminal_style_role_t)request.style);
-                    if (result < 0) {
-                        syscall_fail(frame, result);
-                        return;
-                    }
-                    frame->rax = (u64)result;
-                    return;
                 }
                 default:
                     result = MG_ERR_UNSUPPORTED;

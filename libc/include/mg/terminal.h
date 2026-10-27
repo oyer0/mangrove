@@ -5,25 +5,28 @@
 #include <mg/types.h>
 #include <terminal_colors.h>
 
-/* Versioned native terminal-control ABI.  These structures contain no
- * userspace pointers; the syscall copies them through separately validated
- * buffers. */
+/* Versioned native terminal input, geometry, and presentation ABI. Ordinary
+ * output controls use the canonical ESC{...} stream through stdout; the
+ * libc helpers below encode that stream rather than issuing a second set of
+ * output-control syscalls. */
 #define MG_TERMINAL_API_VERSION 1U
 #define MG_TERMINAL_WAIT_FOREVER 0xFFFFFFFFU
 
 typedef enum {
-    MG_TERMINAL_OP_ALTERNATE_ENTER = 1,
-    MG_TERMINAL_OP_ALTERNATE_LEAVE = 2,
-    MG_TERMINAL_OP_CURSOR_MOVE = 3,
-    MG_TERMINAL_OP_CURSOR_VISIBILITY = 4,
-    MG_TERMINAL_OP_CLEAR = 5,
+    /* Retired output-control operation slots remain reserved to preserve the
+     * version-1 operation numbering. */
+    MG_TERMINAL_OP_RESERVED_ALTERNATE_ENTER = 1,
+    MG_TERMINAL_OP_RESERVED_ALTERNATE_LEAVE = 2,
+    MG_TERMINAL_OP_RESERVED_CURSOR_MOVE = 3,
+    MG_TERMINAL_OP_RESERVED_CURSOR_VISIBILITY = 4,
+    MG_TERMINAL_OP_RESERVED_CLEAR = 5,
     MG_TERMINAL_OP_SIZE = 6,
     MG_TERMINAL_OP_READ_KEY = 7,
     MG_TERMINAL_OP_UPDATE_BEGIN = 8,
     MG_TERMINAL_OP_UPDATE_END = 9,
     MG_TERMINAL_OP_INPUT_MODE = 10,
-    MG_TERMINAL_OP_STYLED_WRITE = 11,
-    MG_TERMINAL_OP_SEMANTIC_WRITE = 12,
+    MG_TERMINAL_OP_RESERVED_STYLED_WRITE = 11,
+    MG_TERMINAL_OP_RESERVED_SEMANTIC_WRITE = 12,
     MG_TERMINAL_OP_CAPABILITIES = 13,
     MG_TERMINAL_OP_OVERLAY_SET = 14,
     MG_TERMINAL_OP_OVERLAY_CLEAR = 15,
@@ -71,32 +74,10 @@ static inline mg_terminal_style_t mg_terminal_style_for_role(
     return terminal_style_for_role((terminal_style_role_t)role);
 }
 
-typedef enum {
-    MG_TERMINAL_CLEAR_LINE = 1,
-    MG_TERMINAL_CLEAR_TO_END = 2,
-    MG_TERMINAL_CLEAR_REGION = 3,
-    MG_TERMINAL_CLEAR_SCREEN = 4,
-} mg_terminal_clear_mode_t;
-
 typedef struct PACKED {
     u32 version;
-    u32 row;
-    u32 column;
-} mg_terminal_cursor_request_t;
-
-typedef struct PACKED {
-    u32 version;
-    u32 visible;
-} mg_terminal_visibility_request_t;
-
-typedef struct PACKED {
-    u32 version;
-    u32 mode;
-    u32 first_row;
-    u32 first_column;
-    u32 last_row;
-    u32 last_column;
-} mg_terminal_clear_request_t;
+    u32 enabled;
+} mg_terminal_input_mode_request_t;
 
 typedef struct PACKED {
     u32 version;
@@ -173,31 +154,16 @@ typedef struct PACKED {
 #define MG_TERMINAL_MODIFIER_RIGHT_ALT   (1U << 6)
 #define MG_TERMINAL_MODIFIER_RIGHT_GUI   (1U << 7)
 
-typedef struct PACKED {
-    u32 version;
-    u32 foreground;
-    u32 background;
-    u32 reserved;
-    u64 length;
-} mg_terminal_styled_write_request_t;
-
-typedef struct PACKED {
-    u32 version;
-    u32 style;
-    u32 reserved;
-    u64 length;
-} mg_terminal_semantic_write_request_t;
-
-/* Native terminal operations.  Full-screen state operations are available
- * to the process that owns the active alternate screen. */
+/* Output-control conveniences in the C library emit canonical ESC{...}
+ * commands to stdout. They do not write to the framebuffer or bypass
+ * redirection. The styled-write helpers emit literal payload bytes between
+ * control commands and finish in the default style. */
 mg_result_t terminal_alternate_enter(void);
 mg_result_t terminal_alternate_leave(void);
 mg_result_t terminal_cursor_move(u32 row, u32 column);
 mg_result_t terminal_cursor_set_visible(bool visible);
 mg_result_t terminal_clear_line(void);
 mg_result_t terminal_clear_to_end(void);
-mg_result_t terminal_clear_region(u32 first_row, u32 first_column,
-                                  u32 last_row, u32 last_column);
 mg_result_t terminal_clear_screen(void);
 mg_result_t terminal_get_size(mg_terminal_size_t *out_size);
 mg_result_t terminal_get_capabilities(
@@ -214,15 +180,14 @@ mg_result_t terminal_input_raw(bool enabled);
 mg_result_t terminal_update_begin(void);
 mg_result_t terminal_update_end(void);
 
-/* The supplied attributes apply only to this complete write.  The buffer is
- * serialized with terminal mutation, so another writer cannot change its
- * colors halfway through the operation. */
+/* These convenience helpers use the canonical output stream. Payload bytes
+ * are written literally, so text containing ESC cannot invoke controls. A
+ * redirected stdout receives only payload text. The helper resets stream
+ * style to the default after a successful styled write. */
 mg_result_t terminal_write_styled(const void *buffer, usize length,
                                   mg_terminal_color_t foreground,
                                   mg_terminal_color_t background);
 
-/* The fixed console palette resolves the semantic role while the complete
- * write is serialized with terminal mutation. */
 mg_result_t terminal_write_semantic(const void *buffer, usize length,
                                     mg_terminal_style_role_t role);
 

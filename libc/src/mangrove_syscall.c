@@ -678,64 +678,114 @@ static mg_result_t terminal_control(u32 operation, const void *input,
                                    (unsigned long)output);
 }
 
+static mg_result_t terminal_require_interactive_output(void)
+{
+    mg_terminal_capabilities_t capabilities = {0};
+    mg_result_t result = terminal_get_capabilities(&capabilities);
+
+    if (result < 0) return result;
+    if (!(capabilities.capabilities &
+          MG_TERMINAL_CAP_INTERACTIVE_OUTPUT)) return MG_ERR_UNSUPPORTED;
+    return MG_OK;
+}
+
+static mg_result_t terminal_write_control_bytes(const char *sequence,
+                                                usize length)
+{
+    mg_result_t written;
+
+    written = console_write(sequence, length);
+    if (written < 0) return written;
+    return (usize)written == length ? MG_OK : MG_ERR_IO;
+}
+
+static mg_result_t terminal_emit_control(const char *sequence, usize length)
+{
+    mg_result_t result = terminal_require_interactive_output();
+    return result == MG_OK ? terminal_write_control_bytes(sequence, length) :
+                             result;
+}
+
+static usize terminal_append_u32_decimal(char *buffer, usize offset,
+                                         u32 value)
+{
+    char reversed[10];
+    usize digits = 0U;
+
+    do {
+        reversed[digits++] = (char)('0' + value % 10U);
+        value /= 10U;
+    } while (value);
+    while (digits) buffer[offset++] = reversed[--digits];
+    return offset;
+}
+
+static mg_result_t terminal_emit_position(u32 row, u32 column)
+{
+    mg_terminal_size_t size = {0};
+    char sequence[32];
+    usize length = 0U;
+    mg_result_t result = terminal_require_interactive_output();
+
+    if (result != MG_OK) return result;
+    result = terminal_get_size(&size);
+    if (result != MG_OK) return result;
+    if (row >= size.rows || column >= size.columns)
+        return MG_ERR_BAD_ARGUMENT;
+
+    sequence[length++] = '\x1b';
+    sequence[length++] = '{';
+    sequence[length++] = 'a';
+    sequence[length++] = 't';
+    sequence[length++] = ':';
+    length = terminal_append_u32_decimal(sequence, length, row + 1U);
+    sequence[length++] = ',';
+    length = terminal_append_u32_decimal(sequence, length, column + 1U);
+    sequence[length++] = '}';
+    return terminal_write_control_bytes(sequence, length);
+}
+
 mg_result_t terminal_alternate_enter(void)
 {
-    return terminal_control(MG_TERMINAL_OP_ALTERNATE_ENTER, NULL, NULL);
+    static const char sequence[] = "\x1b{alt}";
+    return terminal_emit_control(sequence, sizeof(sequence) - 1U);
 }
 
 mg_result_t terminal_alternate_leave(void)
 {
-    return terminal_control(MG_TERMINAL_OP_ALTERNATE_LEAVE, NULL, NULL);
+    static const char sequence[] = "\x1b{main}";
+    return terminal_emit_control(sequence, sizeof(sequence) - 1U);
 }
 
 mg_result_t terminal_cursor_move(u32 row, u32 column)
 {
-    mg_terminal_cursor_request_t request = {
-        MG_TERMINAL_API_VERSION, row, column
-    };
-    return terminal_control(MG_TERMINAL_OP_CURSOR_MOVE, &request, NULL);
+    return terminal_emit_position(row, column);
 }
 
 mg_result_t terminal_cursor_set_visible(bool visible)
 {
-    mg_terminal_visibility_request_t request = {
-        MG_TERMINAL_API_VERSION, visible ? 1U : 0U
-    };
-    return terminal_control(MG_TERMINAL_OP_CURSOR_VISIBILITY,
-                            &request, NULL);
-}
-
-static mg_result_t terminal_clear_mode(u32 mode, u32 first_row,
-                                       u32 first_column, u32 last_row,
-                                       u32 last_column)
-{
-    mg_terminal_clear_request_t request = {
-        MG_TERMINAL_API_VERSION, mode, first_row, first_column,
-        last_row, last_column
-    };
-    return terminal_control(MG_TERMINAL_OP_CLEAR, &request, NULL);
+    static const char show[] = "\x1b{show}";
+    static const char hide[] = "\x1b{hide}";
+    return visible ? terminal_emit_control(show, sizeof(show) - 1U) :
+                     terminal_emit_control(hide, sizeof(hide) - 1U);
 }
 
 mg_result_t terminal_clear_line(void)
 {
-    return terminal_clear_mode(MG_TERMINAL_CLEAR_LINE, 0, 0, 0, 0);
+    static const char sequence[] = "\x1b{cll}";
+    return terminal_emit_control(sequence, sizeof(sequence) - 1U);
 }
 
 mg_result_t terminal_clear_to_end(void)
 {
-    return terminal_clear_mode(MG_TERMINAL_CLEAR_TO_END, 0, 0, 0, 0);
-}
-
-mg_result_t terminal_clear_region(u32 first_row, u32 first_column,
-                                  u32 last_row, u32 last_column)
-{
-    return terminal_clear_mode(MG_TERMINAL_CLEAR_REGION, first_row,
-                               first_column, last_row, last_column);
+    static const char sequence[] = "\x1b{cleol}";
+    return terminal_emit_control(sequence, sizeof(sequence) - 1U);
 }
 
 mg_result_t terminal_clear_screen(void)
 {
-    return terminal_clear_mode(MG_TERMINAL_CLEAR_SCREEN, 0, 0, 0, 0);
+    static const char sequence[] = "\x1b{cls}";
+    return terminal_emit_control(sequence, sizeof(sequence) - 1U);
 }
 
 mg_result_t terminal_get_size(mg_terminal_size_t *out_size)
@@ -811,7 +861,7 @@ mg_result_t terminal_read_key_event(u32 timeout_ms,
 
 mg_result_t terminal_input_raw(bool enabled)
 {
-    mg_terminal_visibility_request_t request = {
+    mg_terminal_input_mode_request_t request = {
         MG_TERMINAL_API_VERSION, enabled ? 1U : 0U
     };
     return terminal_control(MG_TERMINAL_OP_INPUT_MODE, &request, NULL);
@@ -831,29 +881,93 @@ mg_result_t terminal_write_styled(const void *buffer, usize length,
                                   mg_terminal_color_t foreground,
                                   mg_terminal_color_t background)
 {
-    mg_terminal_styled_write_request_t request = {
-        MG_TERMINAL_API_VERSION, foreground, background, 0, length
+    static const char *const colors[MG_TERMINAL_COLOR_COUNT] = {
+        "black", "red", "green", "yellow", "blue", "magenta", "cyan",
+        "l_gray", "d_gray", "b_red", "b_green", "b_yellow", "b_blue",
+        "b_magenta", "b_cyan", "white"
     };
+    static const char reset[] = "\x1b{reset}";
+    mg_terminal_capabilities_t capabilities = {0};
+    char prefix[40];
+    usize prefix_length = 0U;
+    mg_result_t result;
+    mg_result_t text_result;
+    mg_result_t reset_result;
 
     if (length && !buffer) return MG_ERR_BAD_ARGUMENT;
     if (foreground >= MG_TERMINAL_COLOR_COUNT ||
         background >= MG_TERMINAL_COLOR_COUNT)
         return MG_ERR_BAD_ARGUMENT;
-    return terminal_control(MG_TERMINAL_OP_STYLED_WRITE, &request,
-                            (void *)buffer);
+    if (!length) return 0;
+    result = terminal_get_capabilities(&capabilities);
+    if (result != MG_OK) return result;
+    if (!(capabilities.capabilities & MG_TERMINAL_CAP_INTERACTIVE_OUTPUT))
+        return console_write_literal(buffer, length);
+
+    prefix[prefix_length++] = '\x1b';
+    prefix[prefix_length++] = '{';
+    prefix[prefix_length++] = 'f';
+    prefix[prefix_length++] = 'g';
+    prefix[prefix_length++] = ':';
+    for (const char *name = colors[foreground]; *name; name++)
+        prefix[prefix_length++] = *name;
+    prefix[prefix_length++] = '}';
+    prefix[prefix_length++] = '\x1b';
+    prefix[prefix_length++] = '{';
+    prefix[prefix_length++] = 'b';
+    prefix[prefix_length++] = 'g';
+    prefix[prefix_length++] = ':';
+    for (const char *name = colors[background]; *name; name++)
+        prefix[prefix_length++] = *name;
+    prefix[prefix_length++] = '}';
+
+    result = terminal_write_control_bytes(prefix, prefix_length);
+    if (result != MG_OK) return result;
+    text_result = console_write_literal(buffer, length);
+    reset_result = terminal_write_control_bytes(reset, sizeof(reset) - 1U);
+    if (text_result < 0) return text_result;
+    if ((usize)text_result != length) return MG_ERR_IO;
+    if (reset_result != MG_OK) return reset_result;
+    return text_result;
 }
 
 mg_result_t terminal_write_semantic(const void *buffer, usize length,
                                     mg_terminal_style_role_t role)
 {
-    mg_terminal_semantic_write_request_t request = {
-        MG_TERMINAL_API_VERSION, role, 0, length
+    static const char *const styles[MG_TERMINAL_STYLE_COUNT] = {
+        "\x1b{reset}", "\x1b{fg:b_blue}\x1b{bg:black}",
+        "\x1b{err}", "\x1b{warn}", "\x1b{ok}", "\x1b{head}"
     };
+    static const usize style_lengths[MG_TERMINAL_STYLE_COUNT] = {
+        sizeof("\x1b{reset}") - 1U,
+        sizeof("\x1b{fg:b_blue}\x1b{bg:black}") - 1U,
+        sizeof("\x1b{err}") - 1U,
+        sizeof("\x1b{warn}") - 1U,
+        sizeof("\x1b{ok}") - 1U,
+        sizeof("\x1b{head}") - 1U
+    };
+    static const char reset[] = "\x1b{reset}";
+    mg_terminal_capabilities_t capabilities = {0};
+    mg_result_t result;
+    mg_result_t text_result;
+    mg_result_t reset_result;
 
     if (length && !buffer) return MG_ERR_BAD_ARGUMENT;
     if (role >= MG_TERMINAL_STYLE_COUNT) return MG_ERR_BAD_ARGUMENT;
-    return terminal_control(MG_TERMINAL_OP_SEMANTIC_WRITE, &request,
-                             (void *)buffer);
+    if (!length) return 0;
+    result = terminal_get_capabilities(&capabilities);
+    if (result != MG_OK) return result;
+    if (!(capabilities.capabilities & MG_TERMINAL_CAP_INTERACTIVE_OUTPUT))
+        return console_write_literal(buffer, length);
+
+    result = terminal_write_control_bytes(styles[role], style_lengths[role]);
+    if (result != MG_OK) return result;
+    text_result = console_write_literal(buffer, length);
+    reset_result = terminal_write_control_bytes(reset, sizeof(reset) - 1U);
+    if (text_result < 0) return text_result;
+    if ((usize)text_result != length) return MG_ERR_IO;
+    if (reset_result != MG_OK) return reset_result;
+    return text_result;
 }
 
 mg_result_t file_snapshot(mg_handle_t handle, char *data, usize capacity,

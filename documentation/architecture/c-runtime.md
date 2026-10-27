@@ -181,8 +181,8 @@ units. MGFS remains limited to 255 UTF-8 bytes on disk. These are byte and
 format limits, not Unicode scalar counts;
 filesystem-specific validation rejects malformed UTF-8 before name mutation.
 Ordinary byte-string functions continue to operate on bytes without decoding.
-The [terminal contract](terminal.md) describes the framebuffer grid, native
-terminal-control interface, and limited output escape handling.
+The [terminal contract](terminal.md) describes the framebuffer grid and
+Mangrove's canonical `ESC{...}` output-control stream.
 
 ## Runtime architecture boundaries
 

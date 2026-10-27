@@ -131,9 +131,11 @@ Wrapping is deferred until the next printable character; while that wrap is
 pending, the visible cursor is drawn on the last cell of the current row.
 Mangrove's byte-oriented console output recognizes its native control stream:
 an actual ASCII ESC byte (`0x1b`) followed by `{`, a canonical command, and
-`}`. This is not ANSI/CSI or VT compatibility. `ESC{...}` commands and the
-structured `mg/terminal.h` operations converge on the same terminal state,
-renderer, and process ownership checks. Ordinary braces are printable text;
+`}`. This is not ANSI/CSI or VT compatibility. All byte-stream output
+controls use `ESC{...}` and pass through one parser, terminal state, renderer,
+and process-ownership check. The `mg/terminal.h` output convenience functions
+emit these same bytes through stdout; they do not invoke a second output
+control syscall. Ordinary braces are printable text;
 the source spelling `\e` is not itself a terminal command and is interpreted
 only by a program that explicitly translates it to byte `0x1b`.
 A C program can emit the same stream with `printf("\x1b{fg:green}...")` or
@@ -168,28 +170,32 @@ separate process writes may appear between one another's completed writes.
 
 Commands use the existing terminal control authorization. A process that does
 not own an active alternate screen cannot write to it or change it. The ESC
-grammar cannot claim keyboard input; applications use the structured API for
-that operation. `alt` and `main` use the same process ownership and raw-input
-checks as the structured alternate-screen API. On the ordinary screen,
-commands have the same authority as the existing structured cursor, clear,
-and style calls. They are not a safe encoding for untrusted text:
+grammar cannot claim keyboard input; applications use the native input API for
+that operation. `alt` and `main` use the kernel's existing process-ownership
+and raw-input checks. On the ordinary screen, commands can move or clear the
+display, so they are not safe for untrusted text:
 applications displaying file, network, or log contents must use
-`console_write_literal()`/`object_write_literal()` or the structured styled
-write API, which bypasses control parsing. `type` and `logv` use literal
-writes. `say` is literal by default; its explicit `-e`/`--escapes` option
+`console_write_literal()`/`object_write_literal()`. The styled-write helpers
+also send their payload through literal output between canonical style and
+reset commands. `type` and `logv` use literal writes. `say` is literal by
+default; its explicit `-e`/`--escapes` option
 translates selected backslash escapes before writing. When output is
 redirected, emitted bytes go to the file unchanged and are not interpreted by
 the terminal.
 
-The former MGTC record endpoint and `{...}` template encoder are retired; no
-binary control-record format is maintained alongside this stream. The
-versioned `mg/terminal.h` structured operations remain available for native
-applications needing explicit cursor, clear, ownership, input, or styled
-write calls. Applications using the short-lived MGTC/markup interface should
-migrate to actual ESC command bytes for stream output or to those structured
-operations. There is no PTY or general terminal-device abstraction. The
-userland line editor uses native input events rather than escape-sequence key
-compatibility.
+The terminal ioctl-style operation slots formerly used for alternate-screen,
+cursor, clear, and direct styled writes remain reserved in the version-1 ABI
+and return unsupported. `terminal_alternate_*`, cursor, clear, and styled
+write functions in loam are small encoders for the canonical output stream;
+they require interactive stdout for screen controls, and styled writes emit
+only literal text when stdout is redirected. Rectangular clearing has no
+canonical stream command and is not exposed as a public operation. The
+remaining `mg/terminal.h` syscall interface covers distinct facilities that
+are not output-control syntax: terminal dimensions/capabilities, input events
+and ownership, update transactions, line-editor cursor positioning, and the
+completion overlay. These operations do not define a second byte protocol.
+There is no PTY or general terminal-device abstraction. The userland line
+editor uses native input events rather than escape-sequence key compatibility.
 
 The loam line editor renders its prompt when an input line is prepared (and
 again when completion explicitly clears that line). Ordinary insertion and
@@ -234,6 +240,8 @@ combined to reduce rendering work.
 - Kernel input queue and raw event ownership: `kernel/src/console.c` and
   `kernel/src/drivers/input/keyboard.c`.
 - Native process API: `libc/include/mg/terminal.h`, implemented by the
-  terminal-control syscall path in `kernel/src/syscall.c`.
+  terminal syscall path for dimensions, input, overlays, and update
+  transactions in `kernel/src/syscall.c`; its output helpers encode the
+  canonical ESC stream through stdout.
 - Standard streams and line editor: `libc/src/stdio_stream.c` and
   `libc/src/line_editor.c`.
