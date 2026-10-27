@@ -28,6 +28,10 @@ HOST_CC     := gcc
 HOST_REED_TEST_FLAGS := -Wl,--gc-sections -Wl,--wrap=malloc
 endif
 
+# Production terminal fixtures include host pthread.h. Keep Mangrove's libc
+# headers after host headers so libc/include/time.h cannot shadow host time.h.
+HOST_TERMINAL_RENDER_INCLUDES := -Ikernel/include -Iinclude -idirafter libc/include
+
 CC          := $(ELF_CC)
 LD_KERNEL   := $(ELF_LD)
 AR          := $(ELF_AR)
@@ -901,7 +905,7 @@ test-terminal: test-terminal-api
 	/tmp/mangrove-utf8-test
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -Wno-unused-function \
 		-pthread -fno-builtin -fsanitize=address,undefined -ffunction-sections \
-		-fdata-sections -Ikernel/include -Iinclude -idirafter libc/include \
+		-fdata-sections $(HOST_TERMINAL_RENDER_INCLUDES) \
 		tests/terminal/terminal_render_test.c kernel/src/utf8.c libc/src/utf8.c \
 		libc/src/line_editor.c libc/src/string.c -Wl,--gc-sections \
 		-o /tmp/mangrove-terminal-render-test
@@ -1018,7 +1022,7 @@ test-reed:
 	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-reed-interaction-test
 	$(HOST_CC) -std=gnu17 -Wall -Wextra -Werror -Wno-unused-function \
 		-fno-builtin -fsanitize=address,undefined -ffunction-sections \
-		-fdata-sections -DTEST_REED_RENDER -Ikernel/include -Iinclude -Ilibc/include \
+		-fdata-sections -DTEST_REED_RENDER $(HOST_TERMINAL_RENDER_INCLUDES) \
 		tests/terminal/fullscreen_render_test.c libc/src/clipboard.c userspace/clipd/clipboard.c userspace/reed/buffer.c \
 		userspace/reed/config.c kernel/src/utf8.c libc/src/utf8.c \
 		libc/src/line_editor.c libc/src/string.c -Wl,--gc-sections \
@@ -1552,7 +1556,7 @@ test-pager:
 	ASAN_OPTIONS=detect_leaks=0 $(BUILD_DIR)/tests/text-pager-test
 	$(HOST_CC) -std=gnu17 -Wall -Wextra -Werror -Wno-unused-function \
 		-fno-builtin -fsanitize=address,undefined -ffunction-sections \
-		-fdata-sections -Ikernel/include -Iinclude -Ilibc/include \
+		-fdata-sections $(HOST_TERMINAL_RENDER_INCLUDES) \
 		tests/terminal/fullscreen_render_test.c kernel/src/utf8.c libc/src/utf8.c \
 		libc/src/line_editor.c libc/src/string.c -Wl,--gc-sections \
 		-o $(BUILD_DIR)/tests/pager-render-test
