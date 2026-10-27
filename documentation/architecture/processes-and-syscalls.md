@@ -172,10 +172,13 @@ binaries using either syscall remain compatible with the historical bound.
 
 `process_spawn_argv()` copies a bounded argument vector and inherits the
 caller's current standard output. `process_spawn_argv_with_output()` accepts a
-writable file handle for the child output without changing the parent's output
-slot. The kernel validates that handle and retains the child reference during
-creation. This direct form supports nested command redirection while preserving
-argument boundaries; the parent may close its handle after a successful spawn.
+writable file or console handle for the child output without changing the parent's
+output slot. The kernel validates the handle type and write right and retains the
+child reference during creation. A caller logging to a file can explicitly select
+its writable stdin console handle for an interactive child; ordinary spawn still
+inherits its stdout destination. This direct form supports nested command
+redirection while preserving argument boundaries; the parent may close its handle
+after a successful spawn.
 It uses additive syscall 96; the existing argv syscall remains unchanged.
 
 ## Working-directory identity and path resolution

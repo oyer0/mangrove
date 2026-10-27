@@ -15,12 +15,13 @@ mg_result_t process_spawn(const char *command_line);
  * MG_PROCESS_ARGUMENT_BYTES_MAX bounds pointer slots plus NUL-terminated
  * strings. Input is captured synchronously; callers retain their storage. */
 mg_result_t process_spawn_argv(const char *const *argv, usize argc);
-/* Spawns separated argv with stdout inherited from a writable file handle. */
+/* Spawns separated argv with stdout selected from a writable file or console
+ * handle. This does not change the parent's stdout or transfer handle ownership. */
 mg_result_t process_spawn_argv_with_output(const char *const *argv,
                                            usize argc,
                                            mg_handle_t output_handle);
-/* Legacy command-string form with stdout inherited from a writable file
- * handle. It has the same 255-byte-plus-NUL bound and quote parser as
+/* Legacy command-string form with stdout selected from a writable file or
+ * console handle. It has the same 255-byte-plus-NUL bound and quote parser as
  * process_spawn(); new callers should use the argv variant. */
 mg_result_t process_spawn_with_output(const char *command_line,
                                       mg_handle_t output_handle);

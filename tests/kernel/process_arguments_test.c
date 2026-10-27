@@ -230,6 +230,10 @@ static unsigned child_handles;
 static process_t spawned;
 static kernel_thread_t spawned_thread;
 static kernel_object_t console = {.type=OBJECT_TYPE_CONSOLE};
+static kernel_object_t output_file = {.type=OBJECT_TYPE_FILE};
+static kernel_object_t other_object = {.type=99};
+static bool redirected_output;
+static kernel_object_t *installed_output;
 typedef struct {int unused;} vfs_location_t;
 static vfs_location_t location;
 static bool stage_ok(void) {return ++stage != failed_stage;}
@@ -241,7 +245,17 @@ static int vfs_location_path(vfs_location_t *p,char *out,usize cap,void *require
 {(void)p;(void)cap;(void)required;if(!stage_ok())return VFS_ERR_NO_MEM;strcpy(out,"/bin/fixture");return VFS_OK;}
 static void *vfs_location_node(vfs_location_t *p){return p;}
 static kernel_object_t *process_handle_lookup(process_t *p,process_handle_t h,int t,u32 r)
-{(void)p;(void)h;(void)t;(void)r;return &console;}
+{
+ (void)p;
+ kernel_object_t *object=NULL;u32 rights=OBJECT_RIGHT_READ|OBJECT_RIGHT_WRITE;
+ if(h==PROCESS_INITIAL_STDIN_HANDLE || h==43) object=&console;
+ else if(h==PROCESS_INITIAL_CONSOLE_HANDLE) object=redirected_output?&output_file:&console;
+ else if(h==44) object=&output_file;
+ else if(h==45) {object=&console;rights=OBJECT_RIGHT_READ;}
+ else if(h==46) object=&other_object;
+ if(!object || (t!=OBJECT_TYPE_INVALID && object->type!=t) || (rights&r)!=r)return NULL;
+ return object;
+}
 static kernel_object_t *process_handle_lookup_any(process_t *p,process_handle_t h,int t,u32 r)
 {return process_handle_lookup(p,h,t,r);}
 static kernel_thread_t *thread_create_suspended(const char *n,void (*entry)(void *),void *arg)
@@ -257,8 +271,8 @@ static void process_abort(process_t *p)
 {assert(p==&spawned && child_live && thread_live && !parent_handle_live);destroy_child();child_live=thread_live=false;child_handles=0;}
 static bool process_handle_install(process_t *p,kernel_object_t *o,u32 r,process_handle_t *out)
 {
- (void)o;(void)r;if(!stage_ok())return false;
- if(p==&spawned){*out=++child_handles;}else{assert(!parent_handle_live);parent_handle_live=true;*out=77;}
+ (void)r;if(!stage_ok())return false;
+ if(p==&spawned){if(!child_handles)installed_output=o;*out=++child_handles;}else{assert(!parent_handle_live);parent_handle_live=true;*out=77;}
  return true;
 }
 static bool process_handle_close(process_t *p,process_handle_t h)
@@ -315,4 +329,37 @@ static void lifecycle(void)
     assert(!live_allocations);
     puts("spawn lookup/thread/process/ELF/child handles/parent handle/enqueue failure cleanup PASS");
 }
-int main(void){capture_and_map();initial_process_argv();boundaries();legacy_arguments();lifecycle();return 0;}
+static void output_selection(void)
+{
+    process_t parent={.state=PROCESS_STATE_ACTIVE};process_arguments_t args;
+    const char *argv[]={"/bin/fixture"};
+    assert(process_arguments_collect(&args,(uintptr_t)argv,1,NULL)==MG_OK);
+    redirected_output=true;
+    const process_handle_t handles[]={0,43,44,PROCESS_INITIAL_STDIN_HANDLE};
+    for(usize i=0;i<sizeof(handles)/sizeof(handles[0]);i++) {
+        process_handle_t handle=12345;stage=failed_stage=0;installed_output=NULL;
+        assert(process_spawn_args_with_context_internal(&parent,&args,NULL,0,false,NULL,false,0,
+            handles[i]==0,handles[i],&handle)==VFS_OK);
+        assert(installed_output==(i==0 || handles[i]==44?&output_file:&console));
+        process_handle_close(&parent,handle);process_abort(&spawned);
+    }
+    for(process_handle_t output=43;output<=44;output++) {
+        for(unsigned failure=1;failure<=9;failure++) {
+            process_handle_t handle=12345;stage=0;failed_stage=failure;
+            assert(process_spawn_args_with_context_internal(&parent,&args,NULL,0,false,NULL,false,0,
+                false,output,&handle)!=VFS_OK);
+            assert(handle==12345 && !child_live && !thread_live && !parent_handle_live && !child_handles && !live_frames);
+        }
+    }
+    const process_handle_t invalid[]={45,46,47};
+    for(usize i=0;i<sizeof(invalid)/sizeof(invalid[0]);i++) {
+        process_handle_t handle=12345;stage=failed_stage=0;
+        assert(process_spawn_args_with_context_internal(&parent,&args,NULL,0,false,NULL,false,0,
+            false,invalid[i],&handle)==VFS_ERR_BAD_FORMAT);
+        assert(handle==12345 && stage==2 && !child_live && !thread_live && !parent_handle_live);
+    }
+    redirected_output=false;
+    process_arguments_destroy(&args);assert(!live_allocations);
+    puts("spawn output: inherited files, explicit console/files, rights/type rejection and allocation cleanup PASS");
+}
+int main(void){capture_and_map();initial_process_argv();boundaries();legacy_arguments();lifecycle();output_selection();return 0;}

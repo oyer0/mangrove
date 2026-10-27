@@ -1417,9 +1417,9 @@ static int process_spawn_args_with_context_internal(
         return resolution;
     if (resolution == VFS_ERR_BUFFER_TOO_SMALL) resolved_path[0] = '\0';
 
-    /* Every child receives a keyboard input handle.  A redirected output
-     * handle is inherited separately so interactive children keep reading
-     * from the console while their output goes to a file. */
+    /* Console input and stdout are independent. A child can retain keyboard
+     * input while writing to a file; interactive screen controls require its
+     * caller to select console stdout explicitly when output is redirected. */
     console = process_handle_lookup(parent, PROCESS_INITIAL_STDIN_HANDLE,
                                     OBJECT_TYPE_CONSOLE,
                                     OBJECT_RIGHT_READ | OBJECT_RIGHT_WRITE);
@@ -1440,9 +1440,11 @@ static int process_spawn_args_with_context_internal(
         if (!output || (output->type != OBJECT_TYPE_FILE &&
                         output->type != OBJECT_TYPE_CONSOLE)) return VFS_ERR_BAD_FORMAT;
     } else if (output_handle != 0) {
-        output = process_handle_lookup(parent, output_handle,
-                                       OBJECT_TYPE_FILE, OBJECT_RIGHT_WRITE);
-        if (!output) return VFS_ERR_BAD_FORMAT;
+        output = process_handle_lookup_any(parent, output_handle,
+                                           OBJECT_TYPE_INVALID,
+                                           OBJECT_RIGHT_WRITE);
+        if (!output || (output->type != OBJECT_TYPE_FILE &&
+                        output->type != OBJECT_TYPE_CONSOLE)) return VFS_ERR_BAD_FORMAT;
     }
 
     process_name_source = bin_path;
