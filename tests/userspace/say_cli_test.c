@@ -56,8 +56,8 @@ static void reset(void)
 
 static void test_literal_default(void)
 {
-    char *argv[] = {"say", "left\\n", "\\e{clear:screen}"};
-    static const u8 expected[] = "left\\n \\e{clear:screen}\n";
+    char *argv[] = {"say", "left\\n", "\\e{cls}"};
+    static const u8 expected[] = "left\\n \\e{cls}\n";
     reset();
     assert(say_main(3, argv) == 0);
     assert(!used_escape_output);
@@ -68,10 +68,10 @@ static void test_literal_default(void)
 static void test_escape_option(void)
 {
     char *argv[] = {"say", "--escapes",
-                    "\\e{fg:green}ok\\e{reset}\\n\\q"};
+                    "\\e{fg:b_green}ok\\e{ok}\\n\\q"};
     static const u8 expected[] = {
-        0x1bU, '{', 'f', 'g', ':', 'g', 'r', 'e', 'e', 'n', '}',
-        'o', 'k', 0x1bU, '{', 'r', 'e', 's', 'e', 't', '}', '\n', '\\', 'q', '\n'
+        0x1bU, '{', 'f', 'g', ':', 'b', '_', 'g', 'r', 'e', 'e', 'n', '}',
+        'o', 'k', 0x1bU, '{', 'o', 'k', '}', '\n', '\\', 'q', '\n'
     };
     reset();
     assert(say_main(3, argv) == 0);

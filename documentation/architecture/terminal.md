@@ -144,31 +144,35 @@ The recognized command set is deliberately small:
 
 | Sequence | Effect |
 | --- | --- |
-| `ESC{fg:NAME}`, `ESC{bg:NAME}` | Set foreground or background using the 16 native palette names: `black`, `red`, `green`, `yellow`, `blue`, `magenta`, `cyan`, `light-gray`, `dark-gray`, `bright-red`, `bright-green`, `bright-yellow`, `bright-blue`, `bright-magenta`, `bright-cyan`, and `white`. |
-| `ESC{style:ROLE}` | Apply the native `default`, `directory`, `error`, `warning`, `success`, or `heading` role. |
+| `ESC{fg:COLOR}`, `ESC{bg:COLOR}` | Set foreground or background using the same 16 palette names: standard `black`, `red`, `green`, `yellow`, `blue`, `magenta`, `cyan`, `l_gray`; bright `d_gray`, `b_red`, `b_green`, `b_yellow`, `b_blue`, `b_magenta`, `b_cyan`, `white`. These names map in order to the existing palette entries; RGB values are unchanged. |
+| `ESC{warn}`, `ESC{err}`, `ESC{ok}`, `ESC{head}` | Apply the existing warning, error, success, and heading semantic styles. |
 | `ESC{reset}` | Restore default foreground and background. |
-| `ESC{at:ROW,COLUMN}` | Move to one-based visible-screen coordinates. Zero, overflow, and out-of-range coordinates are rejected as a command and displayed literally. |
-| `ESC{cursor:show}`, `ESC{cursor:hide}` | Set cursor visibility. |
-| `ESC{clear:line}`, `ESC{clear:to-end}`, `ESC{clear:screen}` | Clear the current line, from cursor to line end, or the screen. |
+| `ESC{at:ROW,COL}` | Move to one-based visible-screen coordinates. Zero, overflow, and out-of-range coordinates are rejected as a command and displayed literally. |
+| `ESC{up:N}`, `ESC{down:N}`, `ESC{left:N}`, `ESC{right:N}` | Move by a positive number of rows or columns. Motion stops at the visible screen edge; it does not wrap. |
+| `ESC{hide}`, `ESC{show}` | Hide or show the cursor. |
+| `ESC{cls}`, `ESC{cll}`, `ESC{cleol}` | Clear the screen, clear the current line, or clear from the cursor to the line end. |
+| `ESC{alt}`, `ESC{main}` | Enter the alternate screen or return to the retained main screen. Repeating `alt` by the current owner preserves the alternate screen; repeating `main` when already on main is a no-op. |
 
-Only these exact names and forms are supported. RGB, bold, underline, aliases,
-alternate-screen changes, and arbitrary device controls are not part of this
-stream. A candidate sequence is bounded to 128 bytes including ESC and its
-braces. The parser retains incomplete candidates across writes from the same
-process, validates the complete command before applying it, and keeps parser
-and style state per process. Different processes cannot complete each other's
-partial sequences. Unknown, malformed, oversized, and process-final
-incomplete sequences are rendered as literal text (ESC itself appears as the
-replacement glyph). A command that fails validation has no terminal side
-effect. Output writes are serialized under the terminal lock; separate
-process writes may appear between one another's completed writes.
+Only these exact names and forms are supported. Operation identifiers are at
+most five ASCII characters; color names and numeric arguments are exempt.
+There are no aliases. RGB, bold, underline, and arbitrary device controls are
+not part of this stream. A candidate sequence is bounded to 128 bytes,
+including ESC and its braces. The parser retains incomplete candidates across
+writes from the same process, validates the complete command before applying
+it, and keeps parser and style state per process. Different processes cannot
+complete each other's partial sequences. Unknown, malformed, oversized, and
+process-final incomplete sequences are rendered as literal text (ESC itself
+appears as the replacement glyph). A command that fails validation has no
+terminal side effect. Output writes are serialized under the terminal lock;
+separate process writes may appear between one another's completed writes.
 
 Commands use the existing terminal control authorization. A process that does
 not own an active alternate screen cannot write to it or change it. The ESC
-grammar cannot acquire/release the alternate screen or claim keyboard input;
-applications use the structured API for those operations. On the ordinary
-screen, commands have the same authority as the existing structured cursor,
-clear, and style calls. They are not a safe encoding for untrusted text:
+grammar cannot claim keyboard input; applications use the structured API for
+that operation. `alt` and `main` use the same process ownership and raw-input
+checks as the structured alternate-screen API. On the ordinary screen,
+commands have the same authority as the existing structured cursor, clear,
+and style calls. They are not a safe encoding for untrusted text:
 applications displaying file, network, or log contents must use
 `console_write_literal()`/`object_write_literal()` or the structured styled
 write API, which bypasses control parsing. `type` and `logv` use literal

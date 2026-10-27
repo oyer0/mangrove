@@ -142,6 +142,8 @@ static void terminal_force_end_batch_locked(void);
 static void terminal_present_locked(void);
 static bool terminal_process_is_owner_locked(u64 process_id);
 static bool terminal_process_controls_locked(u64 process_id);
+static bool terminal_alternate_enter_process_locked(u64 process_id);
+static bool terminal_alternate_leave_process_locked(u64 process_id);
 static bool terminal_move_cursor_locked(u32 row, u32 column);
 static void terminal_set_cursor_visible_locked(bool visible);
 static bool terminal_clear_current_line_locked(void);
@@ -1255,11 +1257,23 @@ i64 terminal_write_semantic_for_process(u64 process_id, const char *buffer,
 typedef enum {
     TERMINAL_ESCAPE_FOREGROUND,
     TERMINAL_ESCAPE_BACKGROUND,
-    TERMINAL_ESCAPE_STYLE,
+    TERMINAL_ESCAPE_WARNING,
+    TERMINAL_ESCAPE_ERROR,
+    TERMINAL_ESCAPE_SUCCESS,
+    TERMINAL_ESCAPE_HEADING,
     TERMINAL_ESCAPE_RESET,
     TERMINAL_ESCAPE_POSITION,
-    TERMINAL_ESCAPE_CURSOR,
-    TERMINAL_ESCAPE_CLEAR,
+    TERMINAL_ESCAPE_MOVE_UP,
+    TERMINAL_ESCAPE_MOVE_DOWN,
+    TERMINAL_ESCAPE_MOVE_LEFT,
+    TERMINAL_ESCAPE_MOVE_RIGHT,
+    TERMINAL_ESCAPE_HIDE_CURSOR,
+    TERMINAL_ESCAPE_SHOW_CURSOR,
+    TERMINAL_ESCAPE_CLEAR_SCREEN,
+    TERMINAL_ESCAPE_CLEAR_LINE,
+    TERMINAL_ESCAPE_CLEAR_TO_END,
+    TERMINAL_ESCAPE_ALT_SCREEN,
+    TERMINAL_ESCAPE_MAIN_SCREEN,
 } terminal_escape_kind_t;
 
 typedef struct {
@@ -1283,9 +1297,8 @@ static bool terminal_escape_color(const u8 *text, u32 length, u32 *out_color)
 {
     static const char *const names[TERMINAL_COLOR_COUNT] = {
         "black", "red", "green", "yellow", "blue", "magenta", "cyan",
-        "light-gray", "dark-gray", "bright-red", "bright-green",
-        "bright-yellow", "bright-blue", "bright-magenta", "bright-cyan",
-        "white"
+        "l_gray", "d_gray", "b_red", "b_green", "b_yellow", "b_blue",
+        "b_magenta", "b_cyan", "white"
     };
 
     if (!text || !out_color) return false;
@@ -1298,20 +1311,65 @@ static bool terminal_escape_color(const u8 *text, u32 length, u32 *out_color)
     return false;
 }
 
-static bool terminal_escape_style(const u8 *text, u32 length, u32 *out_style)
+static bool terminal_escape_semantic_style(const u8 *text, u32 length,
+                                           terminal_escape_kind_t *out_kind)
 {
-    static const char *const names[TERMINAL_STYLE_COUNT] = {
-        "default", "directory", "error", "warning", "success", "heading"
-    };
+    if (!text || !out_kind) return false;
+    if (terminal_escape_name(text, length, "warn"))
+        *out_kind = TERMINAL_ESCAPE_WARNING;
+    else if (terminal_escape_name(text, length, "err"))
+        *out_kind = TERMINAL_ESCAPE_ERROR;
+    else if (terminal_escape_name(text, length, "ok"))
+        *out_kind = TERMINAL_ESCAPE_SUCCESS;
+    else if (terminal_escape_name(text, length, "head"))
+        *out_kind = TERMINAL_ESCAPE_HEADING;
+    else return false;
+    return true;
+}
 
-    if (!text || !out_style) return false;
-    for (u32 style = 0U; style < TERMINAL_STYLE_COUNT; style++) {
-        if (terminal_escape_name(text, length, names[style])) {
-            *out_style = style;
-            return true;
-        }
-    }
-    return false;
+static bool terminal_escape_plain_command(const u8 *text, u32 length,
+                                          terminal_escape_kind_t *out_kind)
+{
+    if (!text || !out_kind) return false;
+    if (terminal_escape_name(text, length, "reset"))
+        *out_kind = TERMINAL_ESCAPE_RESET;
+    else if (terminal_escape_name(text, length, "warn") ||
+             terminal_escape_name(text, length, "err") ||
+             terminal_escape_name(text, length, "ok") ||
+             terminal_escape_name(text, length, "head"))
+        return terminal_escape_semantic_style(text, length, out_kind);
+    else if (terminal_escape_name(text, length, "cls"))
+        *out_kind = TERMINAL_ESCAPE_CLEAR_SCREEN;
+    else if (terminal_escape_name(text, length, "cll"))
+        *out_kind = TERMINAL_ESCAPE_CLEAR_LINE;
+    else if (terminal_escape_name(text, length, "cleol"))
+        *out_kind = TERMINAL_ESCAPE_CLEAR_TO_END;
+    else if (terminal_escape_name(text, length, "hide"))
+        *out_kind = TERMINAL_ESCAPE_HIDE_CURSOR;
+    else if (terminal_escape_name(text, length, "show"))
+        *out_kind = TERMINAL_ESCAPE_SHOW_CURSOR;
+    else if (terminal_escape_name(text, length, "alt"))
+        *out_kind = TERMINAL_ESCAPE_ALT_SCREEN;
+    else if (terminal_escape_name(text, length, "main"))
+        *out_kind = TERMINAL_ESCAPE_MAIN_SCREEN;
+    else return false;
+    return true;
+}
+
+static bool terminal_escape_motion(const u8 *text, u32 length,
+                                   terminal_escape_kind_t *out_kind)
+{
+    if (!text || !out_kind) return false;
+    if (terminal_escape_name(text, length, "up"))
+        *out_kind = TERMINAL_ESCAPE_MOVE_UP;
+    else if (terminal_escape_name(text, length, "down"))
+        *out_kind = TERMINAL_ESCAPE_MOVE_DOWN;
+    else if (terminal_escape_name(text, length, "left"))
+        *out_kind = TERMINAL_ESCAPE_MOVE_LEFT;
+    else if (terminal_escape_name(text, length, "right"))
+        *out_kind = TERMINAL_ESCAPE_MOVE_RIGHT;
+    else return false;
+    return true;
 }
 
 static bool terminal_escape_unsigned(const u8 *text, u32 length,
@@ -1350,8 +1408,8 @@ static bool terminal_escape_parse(const u8 *sequence, u16 length,
     body_length = length - 3U;
     while (colon < body_length && body[colon] != ':') colon++;
     if (colon == body_length) {
-        if (!terminal_escape_name(body, body_length, "reset")) return false;
-        out_command->kind = TERMINAL_ESCAPE_RESET;
+        if (!terminal_escape_plain_command(body, body_length,
+                                           &out_command->kind)) return false;
         out_command->first = out_command->second = 0U;
         return true;
     }
@@ -1369,38 +1427,6 @@ static bool terminal_escape_parse(const u8 *sequence, u16 length,
         out_command->second = 0U;
         return true;
     }
-    if (terminal_escape_name(body, colon, "style")) {
-        if (!terminal_escape_style(argument, argument_length, &value))
-            return false;
-        out_command->kind = TERMINAL_ESCAPE_STYLE;
-        out_command->first = value;
-        out_command->second = 0U;
-        return true;
-    }
-    if (terminal_escape_name(body, colon, "cursor")) {
-        if (terminal_escape_name(argument, argument_length, "show"))
-            value = 1U;
-        else if (terminal_escape_name(argument, argument_length, "hide"))
-            value = 0U;
-        else return false;
-        out_command->kind = TERMINAL_ESCAPE_CURSOR;
-        out_command->first = value;
-        out_command->second = 0U;
-        return true;
-    }
-    if (terminal_escape_name(body, colon, "clear")) {
-        if (terminal_escape_name(argument, argument_length, "line"))
-            value = 1U;
-        else if (terminal_escape_name(argument, argument_length, "to-end"))
-            value = 2U;
-        else if (terminal_escape_name(argument, argument_length, "screen"))
-            value = 3U;
-        else return false;
-        out_command->kind = TERMINAL_ESCAPE_CLEAR;
-        out_command->first = value;
-        out_command->second = 0U;
-        return true;
-    }
     if (terminal_escape_name(body, colon, "at")) {
         u32 comma = 0U;
         while (comma < argument_length && argument[comma] != ',') comma++;
@@ -1413,6 +1439,13 @@ static bool terminal_escape_parse(const u8 *sequence, u16 length,
             return false;
         out_command->kind = TERMINAL_ESCAPE_POSITION;
         out_command->first = value;
+        return true;
+    }
+    if (terminal_escape_motion(body, colon, &out_command->kind)) {
+        if (!terminal_escape_unsigned(argument, argument_length, &value) ||
+            !value) return false;
+        out_command->first = value;
+        out_command->second = 0U;
         return true;
     }
     return false;
@@ -1446,6 +1479,41 @@ static void terminal_output_flush_pending_locked(terminal_output_state_t *state)
                                          state->background);
 }
 
+static bool terminal_move_cursor_relative_locked(
+    terminal_escape_kind_t direction, u32 amount)
+{
+    u32 row = phys_to_screen_row(terminal.cursor_phys_row);
+    u32 column;
+    u32 last_row;
+    u32 last_column;
+
+    if (!terminal.visible_rows || !terminal.visible_cols || !amount ||
+        row >= terminal.visible_rows) return false;
+    last_row = terminal.visible_rows - 1U;
+    last_column = terminal.visible_cols - 1U;
+    column = terminal.cursor_col < terminal.visible_cols ?
+             terminal.cursor_col : last_column;
+
+    switch (direction) {
+        case TERMINAL_ESCAPE_MOVE_UP:
+            row = amount > row ? 0U : row - amount;
+            break;
+        case TERMINAL_ESCAPE_MOVE_DOWN:
+            row = amount > last_row - row ? last_row : row + amount;
+            break;
+        case TERMINAL_ESCAPE_MOVE_LEFT:
+            column = amount > column ? 0U : column - amount;
+            break;
+        case TERMINAL_ESCAPE_MOVE_RIGHT:
+            column = amount > last_column - column ?
+                     last_column : column + amount;
+            break;
+        default:
+            return false;
+    }
+    return terminal_move_cursor_locked(row, column);
+}
+
 static bool terminal_escape_apply_locked(u64 process_id,
                                          terminal_output_state_t *state,
                                          const terminal_escape_command_t *command)
@@ -1461,9 +1529,24 @@ static bool terminal_escape_apply_locked(u64 process_id,
         case TERMINAL_ESCAPE_BACKGROUND:
             state->background = (u8)command->first;
             break;
-        case TERMINAL_ESCAPE_STYLE:
+        case TERMINAL_ESCAPE_WARNING:
             style = terminal_style_for_role(
-                (terminal_style_role_t)command->first);
+                TERMINAL_STYLE_WARNING);
+            state->foreground = (u8)style.foreground;
+            state->background = (u8)style.background;
+            break;
+        case TERMINAL_ESCAPE_ERROR:
+            style = terminal_style_for_role(TERMINAL_STYLE_ERROR);
+            state->foreground = (u8)style.foreground;
+            state->background = (u8)style.background;
+            break;
+        case TERMINAL_ESCAPE_SUCCESS:
+            style = terminal_style_for_role(TERMINAL_STYLE_SUCCESS);
+            state->foreground = (u8)style.foreground;
+            state->background = (u8)style.background;
+            break;
+        case TERMINAL_ESCAPE_HEADING:
+            style = terminal_style_for_role(TERMINAL_STYLE_HEADING);
             state->foreground = (u8)style.foreground;
             state->background = (u8)style.background;
             break;
@@ -1479,17 +1562,40 @@ static bool terminal_escape_apply_locked(u64 process_id,
                 return false;
             return terminal_move_cursor_locked(command->first - 1U,
                                                command->second - 1U);
-        case TERMINAL_ESCAPE_CURSOR:
-            terminal_set_cursor_visible_locked(command->first != 0U);
+        case TERMINAL_ESCAPE_MOVE_UP:
+        case TERMINAL_ESCAPE_MOVE_DOWN:
+        case TERMINAL_ESCAPE_MOVE_LEFT:
+        case TERMINAL_ESCAPE_MOVE_RIGHT:
+            return terminal_move_cursor_relative_locked(command->kind,
+                                                        command->first);
+        case TERMINAL_ESCAPE_HIDE_CURSOR:
+            terminal_set_cursor_visible_locked(false);
             break;
-        case TERMINAL_ESCAPE_CLEAR:
-            if (command->first == 1U)
-                return terminal_clear_current_line_locked();
-            if (command->first == 2U)
-                return terminal_clear_current_to_end_locked();
-            if (command->first == 3U)
-                terminal_clear_locked();
-            else return false;
+        case TERMINAL_ESCAPE_SHOW_CURSOR:
+            terminal_set_cursor_visible_locked(true);
+            break;
+        case TERMINAL_ESCAPE_CLEAR_LINE:
+            return terminal_clear_current_line_locked();
+        case TERMINAL_ESCAPE_CLEAR_TO_END:
+            return terminal_clear_current_to_end_locked();
+        case TERMINAL_ESCAPE_CLEAR_SCREEN:
+            terminal_clear_locked();
+            break;
+        case TERMINAL_ESCAPE_ALT_SCREEN:
+            if (terminal.alternate_active)
+                return terminal.alternate_owner_pid == process_id;
+            if (!terminal_alternate_enter_process_locked(process_id))
+                return false;
+            /* Entering an alternate screen closes any outer update batch.
+             * Start a fresh one so later bytes in this write remain atomic. */
+            terminal_begin_batch_locked();
+            break;
+        case TERMINAL_ESCAPE_MAIN_SCREEN:
+            if (!terminal.alternate_active) return true;
+            if (!terminal_process_is_owner_locked(process_id) ||
+                !terminal_alternate_leave_process_locked(process_id))
+                return false;
+            terminal_begin_batch_locked();
             break;
         default:
             return false;
@@ -1687,15 +1793,13 @@ static bool terminal_restore_normal_state_locked(void)
     return true;
 }
 
-bool terminal_alternate_enter_process(u64 process_id)
+static bool terminal_alternate_enter_process_locked(u64 process_id)
 {
-    u64 saved_flags = spin_lock_irqsave(&terminal_lock);
-
-    if (!process_id || terminal.alternate_active ||
-        terminal.key_event_owner_pid != 0) {
-        spin_unlock_irqrestore(&terminal_lock, saved_flags);
-        return false;
-    }
+    if (!process_id) return false;
+    /* Repeating alt from the current owner must preserve the active screen. */
+    if (terminal.alternate_active)
+        return terminal.alternate_owner_pid == process_id;
+    if (terminal.key_event_owner_pid != 0) return false;
 
     terminal_force_end_batch_locked();
     terminal_save_normal_state_locked();
@@ -1718,33 +1822,40 @@ bool terminal_alternate_enter_process(u64 process_id)
     /* terminal_clear() selects the active cell store, so this initializes
      * only the alternate ring and leaves normal scrollback untouched. */
     terminal_clear_locked();
-    spin_unlock_irqrestore(&terminal_lock, saved_flags);
     return true;
 }
 
-bool terminal_alternate_leave_process(u64 process_id)
+bool terminal_alternate_enter_process(u64 process_id)
 {
     u64 saved_flags = spin_lock_irqsave(&terminal_lock);
+    bool entered = terminal_alternate_enter_process_locked(process_id);
+    spin_unlock_irqrestore(&terminal_lock, saved_flags);
+    return entered;
+}
 
+static bool terminal_alternate_leave_process_locked(u64 process_id)
+{
     if (!terminal.alternate_active && process_id != 0 &&
         terminal.key_event_owner_pid == process_id) {
         bool released = console_set_raw_input(false, NULL);
         if (released) terminal.key_event_owner_pid = 0;
-        spin_unlock_irqrestore(&terminal_lock, saved_flags);
         return released;
     }
-    if (!terminal_process_is_owner_locked(process_id)) {
-        spin_unlock_irqrestore(&terminal_lock, saved_flags);
-        return false;
-    }
+    if (!terminal_process_is_owner_locked(process_id)) return false;
     terminal_force_end_batch_locked();
     terminal_overlay_clear_locked(false);
     terminal_cursor_hide_locked();
     (void)console_set_raw_input(false, NULL);
     terminal.key_event_owner_pid = 0;
-    bool restored = terminal_restore_normal_state_locked();
+    return terminal_restore_normal_state_locked();
+}
+
+bool terminal_alternate_leave_process(u64 process_id)
+{
+    u64 saved_flags = spin_lock_irqsave(&terminal_lock);
+    bool left = terminal_alternate_leave_process_locked(process_id);
     spin_unlock_irqrestore(&terminal_lock, saved_flags);
-    return restored;
+    return left;
 }
 
 bool terminal_alternate_abort(void)

@@ -135,7 +135,7 @@ commands suitable for non-disposable media without careful target selection.
 `say -e` translates `\\`, `\n`, `\r`, `\t`, and `\e` to backslash,
 newline, carriage return, tab, and the ASCII ESC byte (`0x1b`). Unknown
 escapes and a trailing backslash are preserved literally. Without `-e`, all
-backslashes are literal. For example, `say -e '\e{fg:green}Mangrove\e{reset}'`
+backslashes are literal. For example, `say -e '\e{fg:b_green}Success!\e{ok}'`
 emits the ESC commands described in [terminal behavior](../architecture/terminal.md).
 Redirected output receives those emitted bytes unchanged; it is not interpreted
 by the console. Use ordinary `say` or the native literal-write API for

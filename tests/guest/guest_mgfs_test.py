@@ -346,8 +346,8 @@ def create_disk(folder, build, run, relative_launch=False,
                 "/bin/clear\n"
                 "/bin/clear > /temp/clear-redirected.log\n"
                 "/bin/say -e '\\e{fg:green}ESC INTERACTIVE PASS\\e{reset}'\n"
-                "/bin/say -e '\\e{style:warning}ESC STYLE PASS\\e{reset}'\n"
-                "/bin/say -e '\\e{clear:screen}UNTRUSTED LITERAL\\e{reset}' > /temp/literal-esc.txt\n"
+                "/bin/say -e '\\e{warn}ESC STYLE PASS\\e{reset}'\n"
+                "/bin/say -e '\\e{cls}UNTRUSTED LITERAL\\e{reset}' > /temp/literal-esc.txt\n"
                 "/bin/say BEFORE LITERAL TYPE\n"
                 "/bin/type /temp/literal-esc.txt\n"
                 "/bin/say AFTER LITERAL TYPE\n"
@@ -1087,7 +1087,7 @@ def inspect_shoot_v1(folder, disk, build, run):
     (folder / 'shoot-v1-guest.log').write_text(transcript)
     framebuffer_text = (folder / 'shoot-v1' / 'screen.txt').read_text()
     for marker in ('BEFORE LITERAL TYPE',
-                   '?{clear:screen}UNTRUSTED LITERAL?{reset}',
+                   '?{cls}UNTRUSTED LITERAL?{reset}',
                    'AFTER LITERAL TYPE'):
         if marker not in framebuffer_text:
             raise ValueError('type did not preserve literal ESC data: ' + marker)

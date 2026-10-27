@@ -6,3 +6,4 @@ option=-h, --help    show this help
 option=-e, --escapes translate supported backslash escapes before writing
 note=Supports \\, \n, \r, \t, and \e; unknown and trailing escapes stay literal.
 note=Without -e, backslashes stay literal. Redirected output receives emitted bytes unchanged.
+note=Example: say -e '\e{fg:b_green}Success!\e{ok}'

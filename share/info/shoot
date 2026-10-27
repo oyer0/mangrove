@@ -120,7 +120,12 @@ With that option, \\ emits a backslash, \n a newline, \r a carriage return,
 \t a tab, and \e the ASCII ESC byte (0x1b). Unknown escapes and a final
 backslash are preserved literally. For example:
 
-    say -e '\e{fg:green}Mangrove\e{reset}'
+    say -e '\e{fg:b_green}Mangrove\e{reset}'
+
+Semantic styles use the canonical short commands, for example
+`say -e '\e{warn}Low disk space!\e{reset}'`. Other controls include
+`cls`, `cll`, `cleol`, `at:ROW,COL`, `up:N`, `down:N`, `left:N`, `right:N`,
+`hide`, `show`, `alt`, and `main`; see the terminal behavior guide for details.
 
 The terminal recognizes the resulting ESC{...} command only when output goes
 to the interactive console. Redirection writes emitted bytes unchanged.

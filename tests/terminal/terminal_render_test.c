@@ -936,7 +936,7 @@ static void test_native_escape_commands(void)
         "\x1b{fg:green}mang\x1b{fg:yellow}rove\x1b{reset}";
     static const char attributes[] =
         "\x1b{bg:blue}\x1b{fg:white}X"
-        "\x1b{style:warning}Y\x1b{reset}Z";
+        "\x1b{warn}Y\x1b{reset}Z";
 
     initialize(116U, 92U);
     assert(terminal_write_for_process(EDITOR_TEST_PID, colors,
@@ -967,7 +967,7 @@ static void test_native_escape_commands(void)
     assert(terminal.cursor_phys_row == screen_to_phys_row(1U));
     assert(terminal.cursor_col == 2U);
 
-    static const char clearing[] = "\x1b{at:2,4}AB\x1b{clear:to-end}";
+    static const char clearing[] = "\x1b{at:2,4}AB\x1b{cleol}";
     assert(terminal_write_for_process(EDITOR_TEST_PID, clearing,
         sizeof(clearing) - 1U) == (i64)(sizeof(clearing) - 1U));
     assert(screen_cell(1U, 3U)->codepoint == 'A');
@@ -975,28 +975,238 @@ static void test_native_escape_commands(void)
     for (u32 column = 5U; column < terminal.visible_cols; column++)
         assert(screen_cell(1U, column)->codepoint == ' ');
 
-    static const char visibility[] = "\x1b{cursor:hide}";
+    static const char visibility[] = "\x1b{hide}";
     assert(terminal_write_for_process(EDITOR_TEST_PID, visibility,
         sizeof(visibility) - 1U) == (i64)(sizeof(visibility) - 1U));
     assert(!terminal.cursor_enabled);
-    static const char show[] = "\x1b{cursor:show}";
+    static const char show[] = "\x1b{show}";
     assert(terminal_write_for_process(EDITOR_TEST_PID, show,
         sizeof(show) - 1U) == (i64)(sizeof(show) - 1U));
     assert(terminal.cursor_enabled);
 
-    static const char clear_line[] = "\x1b{at:1,1}X\x1b{clear:line}";
+    static const char clear_line[] = "\x1b{at:1,1}X\x1b{cll}";
     assert(terminal_write_for_process(EDITOR_TEST_PID, clear_line,
         sizeof(clear_line) - 1U) == (i64)(sizeof(clear_line) - 1U));
     for (u32 column = 0U; column < terminal.visible_cols; column++)
         assert(screen_cell(0U, column)->codepoint == ' ');
 
-    static const char clear_screen[] = "\x1b{clear:screen}";
+    static const char clear_screen[] = "\x1b{cls}";
     assert(terminal_write_for_process(EDITOR_TEST_PID, clear_screen,
         sizeof(clear_screen) - 1U) == (i64)(sizeof(clear_screen) - 1U));
     assert(terminal.cursor_col == 0U);
     for (u32 row = 0U; row < terminal.visible_rows; row++)
         for (u32 column = 0U; column < terminal.visible_cols; column++)
             assert(screen_cell(row, column)->codepoint == ' ');
+}
+
+static void test_canonical_palette_and_style_names(void)
+{
+    static const char *const command_names[] = {
+        "fg", "bg", "warn", "err", "ok", "head", "reset", "cls",
+        "cll", "cleol", "at", "up", "down", "left", "right", "hide",
+        "show", "alt", "main"
+    };
+    static const char *const colors[TERMINAL_COLOR_COUNT] = {
+        "black", "red", "green", "yellow", "blue", "magenta", "cyan",
+        "l_gray", "d_gray", "b_red", "b_green", "b_yellow", "b_blue",
+        "b_magenta", "b_cyan", "white"
+    };
+    static const char *const style_commands[] = {
+        "warn", "err", "ok", "head"
+    };
+    static const terminal_style_role_t style_roles[] = {
+        TERMINAL_STYLE_WARNING, TERMINAL_STYLE_ERROR,
+        TERMINAL_STYLE_SUCCESS, TERMINAL_STYLE_HEADING
+    };
+
+    for (usize index = 0U;
+         index < sizeof(command_names) / sizeof(command_names[0]); index++)
+        assert(strlen(command_names[index]) <= 5U);
+
+    for (u32 color = 0U; color < TERMINAL_COLOR_COUNT; color++) {
+        char sequence[64];
+        int length;
+        initialize(116U, 92U);
+        length = snprintf(sequence, sizeof(sequence),
+            "\x1b{fg:%s}F\x1b{bg:%s}B", colors[color], colors[color]);
+        assert(length > 0 && (usize)length < sizeof(sequence));
+        assert(terminal_write_for_process(EDITOR_TEST_PID, sequence,
+            (u64)length) == length);
+        assert(screen_cell(0U, 0U)->codepoint == 'F');
+        assert(screen_cell(0U, 0U)->fg_color == color);
+        assert(screen_cell(0U, 0U)->bg_color == TERMINAL_COLOR_BLACK);
+        assert(screen_cell(0U, 1U)->codepoint == 'B');
+        assert(screen_cell(0U, 1U)->fg_color == color);
+        assert(screen_cell(0U, 1U)->bg_color == color);
+    }
+
+    for (usize index = 0U;
+         index < sizeof(style_commands) / sizeof(style_commands[0]);
+         index++) {
+        char sequence[24];
+        int length;
+        terminal_style_t expected = terminal_style_for_role(style_roles[index]);
+        initialize(116U, 92U);
+        length = snprintf(sequence, sizeof(sequence), "\x1b{%s}S",
+                          style_commands[index]);
+        assert(length > 0 && (usize)length < sizeof(sequence));
+        assert(terminal_write_for_process(EDITOR_TEST_PID, sequence,
+            (u64)length) == length);
+        assert(screen_cell(0U, 0U)->codepoint == 'S');
+        assert(screen_cell(0U, 0U)->fg_color == expected.foreground);
+        assert(screen_cell(0U, 0U)->bg_color == expected.background);
+    }
+}
+
+static void assert_cursor_at(u32 row, u32 column)
+{
+    assert(phys_to_screen_row(terminal.cursor_phys_row) == row);
+    assert(terminal.cursor_col == column);
+}
+
+static void test_canonical_cursor_motion(void)
+{
+    static const char start[] = "\x1b{at:3,5}X";
+    static const char right[] = "\x1b{right:2}";
+    static const char up[] = "\x1b{up:1}";
+    static const char left[] = "\x1b{left:3}";
+    static const char down[] = "\x1b{down:2}";
+    static const char right_edge[] = "\x1b{right:4294967295}";
+    static const char down_edge[] = "\x1b{down:4294967295}";
+    static const char up_edge[] = "\x1b{up:4294967295}";
+    static const char left_edge[] = "\x1b{left:4294967295}";
+
+    initialize(116U, 92U);
+    assert(terminal_write_for_process(EDITOR_TEST_PID, start,
+        sizeof(start) - 1U) == (i64)(sizeof(start) - 1U));
+    assert(screen_cell(2U, 4U)->codepoint == 'X');
+    assert_cursor_at(2U, 5U);
+    assert(terminal_write_for_process(EDITOR_TEST_PID, right,
+        sizeof(right) - 1U) == (i64)(sizeof(right) - 1U));
+    assert_cursor_at(2U, 7U);
+    assert(terminal_write_for_process(EDITOR_TEST_PID, up,
+        sizeof(up) - 1U) == (i64)(sizeof(up) - 1U));
+    assert_cursor_at(1U, 7U);
+    assert(terminal_write_for_process(EDITOR_TEST_PID, left,
+        sizeof(left) - 1U) == (i64)(sizeof(left) - 1U));
+    assert_cursor_at(1U, 4U);
+    assert(terminal_write_for_process(EDITOR_TEST_PID, down,
+        sizeof(down) - 1U) == (i64)(sizeof(down) - 1U));
+    assert_cursor_at(3U, 4U);
+
+    assert(terminal_write_for_process(EDITOR_TEST_PID, right_edge,
+        sizeof(right_edge) - 1U) == (i64)(sizeof(right_edge) - 1U));
+    assert_cursor_at(3U, terminal.visible_cols - 1U);
+    assert(terminal_write_for_process(EDITOR_TEST_PID, down_edge,
+        sizeof(down_edge) - 1U) == (i64)(sizeof(down_edge) - 1U));
+    assert_cursor_at(terminal.visible_rows - 1U, terminal.visible_cols - 1U);
+    assert(terminal_write_for_process(EDITOR_TEST_PID, up_edge,
+        sizeof(up_edge) - 1U) == (i64)(sizeof(up_edge) - 1U));
+    assert_cursor_at(0U, terminal.visible_cols - 1U);
+    assert(terminal_write_for_process(EDITOR_TEST_PID, left_edge,
+        sizeof(left_edge) - 1U) == (i64)(sizeof(left_edge) - 1U));
+    assert_cursor_at(0U, 0U);
+
+    static const char zero_motion[] = "\x1b{right:0}";
+    assert(terminal_write_for_process(EDITOR_TEST_PID, zero_motion,
+        sizeof(zero_motion) - 1U) == (i64)(sizeof(zero_motion) - 1U));
+    assert(screen_cell(0U, 0U)->codepoint == UTF8_REPLACEMENT_CODEPOINT);
+    assert(screen_cell(0U, 1U)->codepoint == '{');
+}
+
+static void test_canonical_alternate_screen_commands(void)
+{
+    static const char enter_and_write[] = "\x1b{alt}A";
+    static const char repeated_enter[] = "\x1b{alt}";
+    static const char write_and_return[] = "\x1b{at:1,2}B\x1b{main}X";
+    static const char repeated_return[] = "\x1b{main}Y";
+
+    initialize(240U, 160U);
+    assert(terminal_write_for_process(EDITOR_TEST_PID, "normal", 6U) == 6);
+    assert(terminal_write_for_process(EDITOR_TEST_PID, enter_and_write,
+        sizeof(enter_and_write) - 1U) ==
+        (i64)(sizeof(enter_and_write) - 1U));
+    assert(terminal.alternate_active &&
+           terminal.alternate_owner_pid == EDITOR_TEST_PID);
+    assert(screen_cell(0U, 0U)->codepoint == 'A');
+    assert_cursor_at(0U, 1U);
+
+    terminal_output_state_t other_process_state;
+    terminal_output_state_init(&other_process_state);
+    static const char unauthorized_main[] = "\x1b{main}";
+    assert(terminal_write_for_process_state(EDITOR_TEST_PID + 1U,
+        &other_process_state, unauthorized_main,
+        sizeof(unauthorized_main) - 1U) == MG_ERR_ACCESS_DENIED);
+    assert(terminal.alternate_active && screen_cell(0U, 0U)->codepoint == 'A');
+
+    assert(terminal_write_for_process(EDITOR_TEST_PID, repeated_enter,
+        sizeof(repeated_enter) - 1U) == (i64)(sizeof(repeated_enter) - 1U));
+    assert(terminal.alternate_active);
+    assert(screen_cell(0U, 0U)->codepoint == 'A');
+    assert_cursor_at(0U, 1U);
+
+    assert(terminal_write_for_process(EDITOR_TEST_PID, write_and_return,
+        sizeof(write_and_return) - 1U) ==
+        (i64)(sizeof(write_and_return) - 1U));
+    assert(!terminal.alternate_active);
+    assert(screen_cell(0U, 0U)->codepoint == 'n');
+    assert(screen_cell(0U, 6U)->codepoint == 'X');
+    assert_cursor_at(0U, 7U);
+
+    assert(terminal_write_for_process(EDITOR_TEST_PID, repeated_return,
+        sizeof(repeated_return) - 1U) ==
+        (i64)(sizeof(repeated_return) - 1U));
+    assert(!terminal.alternate_active);
+    assert(screen_cell(0U, 7U)->codepoint == 'Y');
+}
+
+static void test_obsolete_escape_spellings_are_literal(void)
+{
+    static const char old_clear[] = "\x1b{clear:screen}";
+    static const char old_style[] = "\x1b{style:warning}";
+    static const char old_cursor[] = "\x1b{cursor:hide}";
+    static const char old_color[] = "\x1b{fg:bright-red}";
+    static const char forbidden_colors[][20] = {
+        "\x1b{fg:b_black}", "\x1b{bg:b_white}"
+    };
+
+    initialize(240U, 160U);
+    assert(terminal_write_for_process(EDITOR_TEST_PID, "KEEP", 4U) == 4);
+    assert(terminal_write_for_process(EDITOR_TEST_PID, old_clear,
+        sizeof(old_clear) - 1U) == (i64)(sizeof(old_clear) - 1U));
+    assert(screen_cell(0U, 0U)->codepoint == 'K');
+    assert(screen_cell(0U, 4U)->codepoint == UTF8_REPLACEMENT_CODEPOINT);
+
+    initialize(240U, 160U);
+    assert(terminal_write_for_process(EDITOR_TEST_PID, old_style,
+        sizeof(old_style) - 1U) == (i64)(sizeof(old_style) - 1U));
+    assert(screen_cell(0U, sizeof(old_style) - 2U)->codepoint == '}');
+    assert(test_output_state.foreground == TERMINAL_COLOR_LIGHT_GRAY);
+
+    initialize(240U, 160U);
+    assert(terminal_set_cursor_visible(true));
+    assert(terminal_write_for_process(EDITOR_TEST_PID, old_cursor,
+        sizeof(old_cursor) - 1U) == (i64)(sizeof(old_cursor) - 1U));
+    assert(terminal.cursor_enabled);
+    assert(screen_cell(0U, sizeof(old_cursor) - 2U)->codepoint == '}');
+
+    initialize(240U, 160U);
+    assert(terminal_write_for_process(EDITOR_TEST_PID, old_color,
+        sizeof(old_color) - 1U) == (i64)(sizeof(old_color) - 1U));
+    assert(screen_cell(0U, 0U)->codepoint == UTF8_REPLACEMENT_CODEPOINT);
+    assert(test_output_state.foreground == TERMINAL_COLOR_LIGHT_GRAY);
+    for (usize index = 0U;
+         index < sizeof(forbidden_colors) / sizeof(forbidden_colors[0]);
+         index++) {
+        initialize(240U, 160U);
+        usize length = strlen(forbidden_colors[index]);
+        assert(terminal_write_for_process(EDITOR_TEST_PID,
+            forbidden_colors[index], length) == (i64)length);
+        assert(screen_cell(0U, 0U)->codepoint ==
+               UTF8_REPLACEMENT_CODEPOINT);
+        assert(test_output_state.foreground == TERMINAL_COLOR_LIGHT_GRAY);
+        assert(test_output_state.background == TERMINAL_COLOR_BLACK);
+    }
 }
 
 static void test_escape_recovery_and_literal_output(void)
@@ -1030,7 +1240,7 @@ static void test_escape_recovery_and_literal_output(void)
 
     /* An authorized literal-data write is a parser barrier and cannot clear
      * the screen or change the writer's format state. */
-    static const char literal[] = "\x1b{clear:screen}literal";
+    static const char literal[] = "\x1b{cls}literal";
     initialize(116U, 92U);
     assert(terminal_write_for_process(EDITOR_TEST_PID, "keep", 4U) == 4);
     before = terminal.cursor_col;
@@ -1155,7 +1365,7 @@ static void test_concurrent_process_escape_state(void)
     assert(terminal_write_for_process_state(9U, &writers[0].state,
         "owner", 5U) == 5);
     u32 cell = screen_cell(0U, 0U)->codepoint;
-    static const char denied[] = "\x1b{clear:screen}";
+    static const char denied[] = "\x1b{cls}";
     assert(terminal_write_for_process_state(7U, &test_output_state,
         denied, sizeof(denied) - 1U) == MG_ERR_ACCESS_DENIED);
     assert(screen_cell(0U, 0U)->codepoint == cell);
@@ -1221,6 +1431,11 @@ static void test_normal_screen_key_event_ownership(void)
     assert(terminal_set_raw_input_for_process(42U, true) == MG_OK);
     assert(terminal.key_event_owner_pid == 42U && mock_raw_input);
     assert(mock_raw_input_includes_cooked);
+    static const char denied_alternate[] = "\x1b{alt}";
+    assert(terminal_write_for_process(43U, denied_alternate,
+        sizeof(denied_alternate) - 1U) ==
+        (i64)(sizeof(denied_alternate) - 1U));
+    assert(!terminal.alternate_active && terminal.key_event_owner_pid == 42U);
     assert(terminal_read_key_event_for_process(43U, 0, &event) ==
            MG_ERR_ACCESS_DENIED);
     assert(terminal_set_raw_input_for_process(43U, true) == MG_ERR_BUSY);
@@ -1548,6 +1763,14 @@ int main(int argument_count, char **arguments)
         test_escape_sequences_are_literal();
     if (run_all || !strcmp(arguments[1], "esc-controls"))
         test_native_escape_commands();
+    if (run_all || !strcmp(arguments[1], "esc-palette"))
+        test_canonical_palette_and_style_names();
+    if (run_all || !strcmp(arguments[1], "esc-motion"))
+        test_canonical_cursor_motion();
+    if (run_all || !strcmp(arguments[1], "esc-screens"))
+        test_canonical_alternate_screen_commands();
+    if (run_all || !strcmp(arguments[1], "esc-legacy"))
+        test_obsolete_escape_spellings_are_literal();
     if (run_all || !strcmp(arguments[1], "esc-recovery"))
         test_escape_recovery_and_literal_output();
     if (run_all || !strcmp(arguments[1], "esc-concurrent"))
@@ -1568,6 +1791,6 @@ int main(int argument_count, char **arguments)
         test_production_line_editor_incremental_rendering();
     free(pixel_backbuffer);
     free(pixel_display);
-    puts("terminal renderer: cursor/scroll pixels, session-history clearing, startup cursor ownership, geometry, native ESC commands, literal data, UTF-8, alternate screen and incremental line editing passed");
+    puts("terminal renderer: cursor/scroll pixels, session-history clearing, startup cursor ownership, geometry, canonical ESC commands, 16 colors, relative motion, screen ownership, literal data, UTF-8 and incremental editing passed");
     return 0;
 }
