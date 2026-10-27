@@ -1614,6 +1614,7 @@ test-info:
 	$(HOST_CC) -std=gnu17 -Wall -Wextra -Werror -fno-builtin \
 		-fsanitize=address,undefined -ffunction-sections -fdata-sections \
 		-Ilibc/include -Iinclude tests/userspace/info_command_test.c \
+		userspace/common/path.c \
 		-Wl,--gc-sections -o $(BUILD_DIR)/tests/info-command-test
 	ASAN_OPTIONS=detect_leaks=0 $(BUILD_DIR)/tests/info-command-test
 
