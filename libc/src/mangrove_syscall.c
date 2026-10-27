@@ -784,7 +784,9 @@ mg_result_t terminal_clear_to_end(void)
 
 mg_result_t terminal_clear_screen(void)
 {
-    static const char sequence[] = "\x1b{cls}";
+    /* Screen clearing and cursor positioning are distinct stream operations.
+     * Preserve the userspace helper's clear-and-home contract explicitly. */
+    static const char sequence[] = "\x1b{cls}\x1b{at:1,1}";
     return terminal_emit_control(sequence, sizeof(sequence) - 1U);
 }
 

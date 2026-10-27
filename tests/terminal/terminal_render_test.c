@@ -46,9 +46,16 @@ typedef struct {
 static const char *editor_test_input;
 static usize editor_test_input_length;
 static usize editor_test_input_offset;
+static mg_terminal_key_event_t editor_test_key_events[
+    EDITOR_TEST_INPUT_CAPACITY];
+static usize editor_test_key_event_count;
+static usize editor_test_key_event_offset;
 static render_measurement_t editor_test_reads[EDITOR_TEST_INPUT_CAPACITY + 1U];
 static usize editor_test_read_count;
 static u32 flush_calls;
+static bool clear_screen_called;
+static u32 clear_screen_row;
+static u32 clear_screen_column;
 static presented_frame_t presented_frames[TERMINAL_BUFFER_ROWS];
 static kernel_thread_t mock_input_thread;
 static bool mock_raw_input;
@@ -171,7 +178,12 @@ mg_result_t terminal_clear_line(void)
 
 mg_result_t terminal_clear_screen(void)
 {
-    terminal_clear();
+    static const char sequence[] = "\x1b{cls}\x1b{at:1,1}";
+    assert(terminal_write_for_process(EDITOR_TEST_PID, sequence,
+        sizeof(sequence) - 1U) == (i64)(sizeof(sequence) - 1U));
+    clear_screen_called = true;
+    clear_screen_row = phys_to_screen_row(terminal.cursor_phys_row);
+    clear_screen_column = terminal.cursor_col;
     return MG_OK;
 }
 
@@ -185,8 +197,11 @@ mg_result_t terminal_read_key_event(u32 timeout_ms,
                                     mg_terminal_key_event_t *out_event)
 {
     (void)timeout_ms;
-    (void)out_event;
-    return MG_ERR_END_OF_FILE;
+    if (!out_event) return MG_ERR_BAD_ARGUMENT;
+    if (editor_test_key_event_offset >= editor_test_key_event_count)
+        return MG_ERR_END_OF_FILE;
+    *out_event = editor_test_key_events[editor_test_key_event_offset++];
+    return MG_OK;
 }
 
 static void set_editor_test_input(const char *input)
@@ -195,6 +210,18 @@ static void set_editor_test_input(const char *input)
     editor_test_input_length = strlen(input);
     editor_test_input_offset = 0;
     editor_test_read_count = 0;
+}
+
+static void set_editor_test_key_events(
+    const mg_terminal_key_event_t *events, usize count)
+{
+    assert(count <= EDITOR_TEST_INPUT_CAPACITY);
+    assert(events || count == 0U);
+    if (count)
+        memcpy(editor_test_key_events, events,
+               count * sizeof(editor_test_key_events[0]));
+    editor_test_key_event_count = count;
+    editor_test_key_event_offset = 0U;
 }
 
 static mg_result_t replace_with_completion(mg_line_editor_t *editor,
@@ -420,12 +447,16 @@ static void initialize(u32 width, u32 height)
     terminal_output_state_init(&test_output_state);
     terminal_reset_stats();
     flush_calls = 0;
+    editor_test_key_event_count = 0U;
+    editor_test_key_event_offset = 0U;
+    clear_screen_called = false;
     drawn_codepoint = 0;
     drawn_x = drawn_y = 0;
     drawn_foreground = drawn_background = 0;
 }
 
 static void assert_pixels_match_cells(void);
+static void assert_cursor_at(u32 row, u32 column);
 
 static void test_startup_cursor_hidden_until_input(void)
 {
@@ -1019,19 +1050,125 @@ static void test_native_escape_commands(void)
         assert(screen_cell(0U, column)->codepoint == ' ');
 
     static const char clear_screen[] = "\x1b{cls}";
+    static const char position_before_clear[] = "\x1b{at:3,4}";
+    assert(terminal_write_for_process(EDITOR_TEST_PID,
+        position_before_clear, sizeof(position_before_clear) - 1U) ==
+        (i64)(sizeof(position_before_clear) - 1U));
     assert(terminal_write_for_process(EDITOR_TEST_PID, clear_screen,
         sizeof(clear_screen) - 1U) == (i64)(sizeof(clear_screen) - 1U));
-    assert(terminal.cursor_col == 0U);
+    assert_cursor_at(2U, 3U);
     for (u32 row = 0U; row < terminal.visible_rows; row++)
         for (u32 column = 0U; column < terminal.visible_cols; column++)
             assert(screen_cell(row, column)->codepoint == ' ');
 }
 
+static void test_clear_sequence_preserves_viewport_cursor(void)
+{
+    static const char position[] = "\x1b{at:3,4}";
+    static const char clear[] = "\x1b{cls}";
+    static const char clear_and_home[] = "\x1b{cls}\x1b{at:1,1}";
+
+    initialize(240U, 160U);
+    for (u32 line = 0U; line < terminal.visible_rows + 2U; line++) {
+        assert(terminal_write_for_process(EDITOR_TEST_PID, "H\n", 2U) == 2);
+    }
+    assert(terminal.top_row_idx > 0U);
+    u32 old_top = terminal.top_row_idx;
+    u32 retained_row = (old_top + TERMINAL_BUFFER_ROWS - 1U) %
+                       TERMINAL_BUFFER_ROWS;
+    assert(terminal_cell_at(retained_row, 0U)->codepoint == 'H');
+    assert(terminal_write_for_process(EDITOR_TEST_PID, position,
+        sizeof(position) - 1U) == (i64)(sizeof(position) - 1U));
+    u32 old_cursor_phys = terminal.cursor_phys_row;
+    u32 old_cursor_column = terminal.cursor_col;
+    assert(terminal_set_cursor_visible(true));
+    assert_cursor_at(2U, 3U);
+
+    assert(terminal_write_for_process(EDITOR_TEST_PID, clear,
+        sizeof(clear) - 1U) == (i64)(sizeof(clear) - 1U));
+    assert(terminal.top_row_idx == old_top);
+    assert(terminal.cursor_phys_row == old_cursor_phys);
+    assert(terminal.cursor_col == old_cursor_column);
+    assert(terminal.cursor_enabled && terminal.cursor_visible);
+    assert_cursor_at(2U, 3U);
+    assert(terminal_cell_at(retained_row, 0U)->codepoint == 'H');
+    for (u32 row = 0U; row < terminal.visible_rows; row++)
+        for (u32 column = 0U; column < terminal.visible_cols; column++)
+            assert(screen_cell(row, column)->codepoint == ' ');
+    assert_pixels_match_cells();
+
+    /* Positioning moves the cursor but leaves existing visible cells alone. */
+    initialize(240U, 160U);
+    assert(terminal_write_for_process(EDITOR_TEST_PID, "keep", 4U) == 4);
+    assert(terminal_write_for_process(EDITOR_TEST_PID, position,
+        sizeof(position) - 1U) == (i64)(sizeof(position) - 1U));
+    assert_cursor_at(2U, 3U);
+    assert(screen_cell(0U, 0U)->codepoint == 'k');
+
+    /* The compound operation has the explicit home effect. */
+    assert(terminal_write_for_process(EDITOR_TEST_PID, clear_and_home,
+        sizeof(clear_and_home) - 1U) ==
+        (i64)(sizeof(clear_and_home) - 1U));
+    assert_cursor_at(0U, 0U);
+    for (u32 row = 0U; row < terminal.visible_rows; row++)
+        for (u32 column = 0U; column < terminal.visible_cols; column++)
+            assert(screen_cell(row, column)->codepoint == ' ');
+    assert_pixels_match_cells();
+
+    /* The same viewport semantics apply to the alternate ring; returning to
+     * main restores its original cells and cursor. */
+    initialize(240U, 160U);
+    assert(terminal_write_for_process(EDITOR_TEST_PID, "main", 4U) == 4);
+    assert(terminal_alternate_enter_process(EDITOR_TEST_PID));
+    assert(terminal_write_for_process(EDITOR_TEST_PID, "alternate", 9U) == 9);
+    assert(terminal_write_for_process(EDITOR_TEST_PID, position,
+        sizeof(position) - 1U) == (i64)(sizeof(position) - 1U));
+    old_cursor_phys = terminal.cursor_phys_row;
+    old_cursor_column = terminal.cursor_col;
+    old_top = terminal.top_row_idx;
+    assert(terminal_write_for_process(EDITOR_TEST_PID, clear,
+        sizeof(clear) - 1U) == (i64)(sizeof(clear) - 1U));
+    assert(terminal.alternate_active && terminal.top_row_idx == old_top);
+    assert(terminal.cursor_phys_row == old_cursor_phys);
+    assert(terminal.cursor_col == old_cursor_column);
+    assert_cursor_at(2U, 3U);
+    assert(screen_cell(0U, 0U)->codepoint == ' ');
+    assert(terminal_alternate_leave_process(EDITOR_TEST_PID));
+    assert(screen_cell(0U, 0U)->codepoint == 'm');
+    assert_cursor_at(0U, 4U);
+    assert_pixels_match_cells();
+}
+
 static void test_say_no_newline_clear_home(void)
 {
+    char *say_clear_only[] = {"say", "-ne", "\\e{cls}"};
+    char *say_position[] = {"say", "-ne", "\\e{at:1,1}"};
     char *say_clear[] = {"say", "-ne", "\\e{cls}\\e{at:1,1}"};
     char *say_clear_with_newline[] = {"say", "-e", "\\e{cls}\\e{at:1,1}"};
     static const char clear_home[] = "\x1b{cls}\x1b{at:1,1}";
+
+    initialize(120U, 92U);
+    assert(terminal_write_for_process(EDITOR_TEST_PID, "before", 6U) == 6);
+    static const char nonzero_position[] = "\x1b{at:2,4}marker";
+    assert(terminal_write_for_process(EDITOR_TEST_PID, nonzero_position,
+        sizeof(nonzero_position) - 1U) ==
+        (i64)(sizeof(nonzero_position) - 1U));
+    u32 prompt_row = phys_to_screen_row(terminal.cursor_phys_row);
+    u32 prompt_column = terminal.cursor_col;
+    assert(prompt_row == 1U && prompt_column == 9U);
+    assert(say_main(3, say_clear_only) == 0);
+    assert_cursor_at(prompt_row, prompt_column);
+    for (u32 row = 0U; row < terminal.visible_rows; row++)
+        for (u32 column = 0U; column < terminal.visible_cols; column++)
+            assert(screen_cell(row, column)->codepoint == ' ');
+    assert(terminal_write_for_process(EDITOR_TEST_PID, "prompt", 6U) == 6);
+    assert(screen_cell(prompt_row, prompt_column)->codepoint == 'p');
+
+    initialize(120U, 92U);
+    assert(terminal_write_for_process(EDITOR_TEST_PID, "keep", 4U) == 4);
+    assert(say_main(3, say_position) == 0);
+    assert_cursor_at(0U, 0U);
+    assert(screen_cell(0U, 0U)->codepoint == 'k');
 
     initialize(120U, 56U);
     assert(terminal_write_for_process(EDITOR_TEST_PID, "old", 3U) == 3);
@@ -1053,6 +1190,34 @@ static void test_say_no_newline_clear_home(void)
     assert(say_main(3, say_clear_with_newline) == 0);
     assert(terminal.cursor_phys_row == screen_to_phys_row(1U));
     assert(terminal.cursor_col == 0U);
+}
+
+static void test_ctrl_l_clears_and_homes_before_prompt_redraw(void)
+{
+    static const char prompt[] = "shell> ";
+    mg_terminal_key_event_t events[] = {
+        {.version = 1U, .keycode = 0x0fU,
+         .modifiers = MG_TERMINAL_MODIFIER_LEFT_CTRL, .codepoint = 'l'},
+    };
+    mg_line_editor_t editor;
+    char buffer[16];
+
+    initialize(240U, 160U);
+    assert(terminal_write_for_process(EDITOR_TEST_PID,
+        "previous output", sizeof("previous output") - 1U) ==
+        (i64)(sizeof("previous output") - 1U));
+    line_editor_init(&editor, buffer, sizeof(buffer), prompt);
+    line_editor_set_key_event_input(&editor, true);
+    assert(line_editor_prepare_next_prompt(&editor) == MG_OK);
+    assert_cursor_at(1U, (u32)strlen(prompt));
+    set_editor_test_key_events(events, sizeof(events) / sizeof(events[0]));
+
+    assert(line_editor_read_line(&editor) == MG_ERR_END_OF_FILE);
+    assert(clear_screen_called);
+    assert(clear_screen_row == 0U && clear_screen_column == 0U);
+    assert(screen_cell(0U, 0U)->codepoint == 's');
+    assert_cursor_at(0U, (u32)strlen(prompt));
+    assert_pixels_match_cells();
 }
 
 static void test_canonical_palette_and_style_names(void)
@@ -1819,8 +1984,12 @@ int main(int argument_count, char **arguments)
         test_escape_sequences_are_literal();
     if (run_all || !strcmp(arguments[1], "esc-controls"))
         test_native_escape_commands();
+    if (run_all || !strcmp(arguments[1], "esc-clear-position"))
+        test_clear_sequence_preserves_viewport_cursor();
     if (run_all || !strcmp(arguments[1], "say-clear"))
         test_say_no_newline_clear_home();
+    if (run_all || !strcmp(arguments[1], "ctrl-l-clear-home"))
+        test_ctrl_l_clears_and_homes_before_prompt_redraw();
     if (run_all || !strcmp(arguments[1], "esc-palette"))
         test_canonical_palette_and_style_names();
     if (run_all || !strcmp(arguments[1], "esc-motion"))

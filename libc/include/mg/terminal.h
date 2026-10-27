@@ -164,6 +164,7 @@ mg_result_t terminal_cursor_move(u32 row, u32 column);
 mg_result_t terminal_cursor_set_visible(bool visible);
 mg_result_t terminal_clear_line(void);
 mg_result_t terminal_clear_to_end(void);
+/* Clear the visible screen and explicitly move the cursor to its origin. */
 mg_result_t terminal_clear_screen(void);
 mg_result_t terminal_get_size(mg_terminal_size_t *out_size);
 mg_result_t terminal_get_capabilities(

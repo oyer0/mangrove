@@ -152,7 +152,8 @@ static void test_control_helpers(void)
     assert(terminal_clear_to_end() == MG_OK);
     assert(terminal_clear_screen() == MG_OK);
     expect_control("\x1b{alt}\x1b{main}\x1b{at:5,10}"
-                   "\x1b{hide}\x1b{show}\x1b{cll}\x1b{cleol}\x1b{cls}");
+                   "\x1b{hide}\x1b{show}\x1b{cll}\x1b{cleol}"
+                   "\x1b{cls}\x1b{at:1,1}");
     expect_operation_set();
 }
 

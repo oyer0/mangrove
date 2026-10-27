@@ -152,7 +152,7 @@ The recognized command set is deliberately small:
 | `ESC{at:ROW,COL}` | Move to one-based visible-screen coordinates. Zero, overflow, and out-of-range coordinates are rejected as a command and displayed literally. |
 | `ESC{up:N}`, `ESC{down:N}`, `ESC{left:N}`, `ESC{right:N}` | Move by a positive number of rows or columns. Motion stops at the visible screen edge; it does not wrap. |
 | `ESC{hide}`, `ESC{show}` | Hide or show the cursor. |
-| `ESC{cls}`, `ESC{cll}`, `ESC{cleol}` | Clear the screen, clear the current line, or clear from the cursor to the line end. |
+| `ESC{cls}`, `ESC{cll}`, `ESC{cleol}` | Clear the visible viewport without moving the cursor, clear the current line, or clear from the cursor to the line end. `cls` preserves the viewport's ring-buffer origin and rows retained outside the viewport. |
 | `ESC{alt}`, `ESC{main}` | Enter the alternate screen or return to the retained main screen. Repeating `alt` by the current owner preserves the alternate screen; repeating `main` when already on main is a no-op. |
 
 Only these exact names and forms are supported. Operation identifiers are at
@@ -182,6 +182,15 @@ default; its explicit `-e`/`--escapes` option
 translates selected backslash escapes before writing. When output is
 redirected, emitted bytes go to the file unchanged and are not interpreted by
 the terminal.
+
+`ESC{cls}` clears only the active screen's visible cell rows and keeps its
+cursor coordinates and ring-buffer origin. `ESC{at:ROW,COL}` moves without
+clearing, so a caller that wants a cleared screen at the origin emits both
+operations. The loam `terminal_clear_screen()` helper, used by the `clear`
+command and Ctrl+L, emits `ESC{cls}` followed by `ESC{at:1,1}`. Ctrl+L then
+redraws the Shoot prompt at the origin. The clear command preserves retained
+ring rows outside the viewport; the kernel's internal full reset remains
+separate and is used for initialization and alternate-screen setup.
 
 The terminal ioctl-style operation slots formerly used for alternate-screen,
 cursor, clear, and direct styled writes remain reserved in the version-1 ABI

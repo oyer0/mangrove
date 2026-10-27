@@ -999,6 +999,32 @@ static void terminal_clear_locked(void) {
     }
 }
 
+/* Clear the current viewport without changing its ring-buffer origin or
+ * logical cursor. Rows preceding the viewport remain available as retained
+ * console history; clear/home is provided separately by terminal_clear(). */
+static void terminal_clear_visible_locked(void)
+{
+    terminal_overlay_clear_locked(false);
+    terminal_cursor_hide_locked();
+
+    for (u32 row = 0U; row < terminal.visible_rows; row++)
+        terminal_clear_phys_row(screen_to_phys_row(row), terminal.bg_color);
+
+    /* The framebuffer now represents the blank logical viewport. Discard
+     * deferred scroll copies from the old pixels and present the final rows
+     * through the normal dirty-span path. */
+    framebuffer_fill_rows(0U, terminal.height,
+                          terminal_color_pixel(terminal.bg_color));
+    terminal.vram_valid = true;
+    terminal.pending_scroll_rows = 0U;
+    terminal_reset_dirty();
+    terminal_mark_all_dirty();
+    if (!terminal.batch_active) {
+        terminal_cursor_show_locked();
+        terminal_flush_dirty_locked();
+    }
+}
+
 void terminal_clear(void) {
     u64 saved_flags = spin_lock_irqsave(&terminal_lock);
     terminal_clear_locked();
@@ -1579,7 +1605,7 @@ static bool terminal_escape_apply_locked(u64 process_id,
         case TERMINAL_ESCAPE_CLEAR_TO_END:
             return terminal_clear_current_to_end_locked();
         case TERMINAL_ESCAPE_CLEAR_SCREEN:
-            terminal_clear_locked();
+            terminal_clear_visible_locked();
             break;
         case TERMINAL_ESCAPE_ALT_SCREEN:
             if (terminal.alternate_active)
