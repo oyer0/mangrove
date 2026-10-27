@@ -4,8 +4,10 @@
 from pathlib import Path
 import sys
 import tempfile
+import time
 sys.dont_write_bytecode=True
 import guest_safe_test as safe
+
 
 run='0123456789abcdef'
 assert safe.pattern(run,8,4)==bytes.fromhex('0422405e7c9ab8d6')
@@ -85,6 +87,14 @@ class QMP:
     def call(self,name,args):
         self.calls.append((name,args))
         if name=='human-monitor-command':self.keys.append(args['command-line'])
+        if name=='input-send-event':
+            pressed=[event['data']['key']['data'] for event in args['events']
+                     if event['data']['down']]
+            if pressed:
+                modifiers=[key for key in pressed if key in ('shift','ctrl','alt')]
+                keys=[key for key in pressed if key not in ('shift','ctrl','alt')]
+                code='-'.join(modifiers+keys)
+                self.keys.append('sendkey '+code+' 100')
         return {}
 with tempfile.TemporaryDirectory(prefix='mangrove-safe-evidence-') as temp:
     part=Path(temp);qmp=QMP();control=safe.ReedControl(run,'create')
@@ -106,14 +116,9 @@ with tempfile.TemporaryDirectory(prefix='mangrove-safe-evidence-') as temp:
     safe.key(qmp,'_');assert qmp.keys[-1]=='sendkey shift-minus 30'
     key_count=len(qmp.keys)
     safe.key(qmp,'shift-u')
-    assert len(qmp.keys)==key_count
-    assert qmp.calls[-2:]==[
-        ('input-send-event',{'events':[
-            {'type':'key','data':{'down':True,'key':{'type':'qcode','data':'shift'}}},
-            {'type':'key','data':{'down':True,'key':{'type':'qcode','data':'u'}}}]}),
-        ('input-send-event',{'events':[
-            {'type':'key','data':{'down':False,'key':{'type':'qcode','data':'u'}}},
-            {'type':'key','data':{'down':False,'key':{'type':'qcode','data':'shift'}}}]})]
+    assert qmp.keys[-1]=='sendkey shift-u 30' and len(qmp.keys)==key_count+1
+    assert qmp.calls[-1] == (
+        'human-monitor-command', {'command-line':'sendkey shift-u 30'})
     for phase in ('create','verify','readonly'):
         incomplete=safe.ReedControl(run,phase)
         for expected_failure,failed in ((False,False),(True,True),(True,False),(False,True)):
@@ -164,6 +169,73 @@ with tempfile.TemporaryDirectory(prefix='mangrove-shoot-acceptance-') as temp:
     assert qmp.keys[-1]=='sendkey b 30' and c.shell_typed==2
 print('Interactive Shoot controller: unrelated output cannot trigger input; exact command state drives cursor editing')
 
+# The filename-listing probe uses shell stages 27 and 28 after completing the
+# directory-completion sequence. These stages must remain in the integrated
+# shell controller even though Reed handoff begins at stage 20.
+with tempfile.TemporaryDirectory(prefix='mangrove-shoot-post-cd-') as temp:
+    part=Path(temp);qmp=QMP();c=safe.ReedControl(run,'create')
+    c.reed_from_shoot=True;c.shell_active=True;c.shell_stage=17
+    c.shell_prompt='developer /vol/QUAL_MGFS/work:'
+    c.shell_progress=time.monotonic();c.volume_label='QUAL_MGFS'
+    prompt=c.shell_prompt+'\n'+'\n'*20
+    c.observe(qmp,prompt,part,0)
+    assert c.shell_stage==27 and not qmp.keys
+    c.observe(qmp,prompt,part,0)
+    assert c.shell_stage==27 and qmp.keys==['sendkey l 30']
+    c.shell_stage=20
+    qmp.keys.clear()
+    c.observe(qmp,prompt,part,0)
+    assert not qmp.keys
+print('Integrated shell controller: post-directory stages remain active before Reed handoff')
+
+# Waiting after the final keyboard action must be bounded even after the
+# controller has entered the post-editor shell stage. A login screen or lost
+# child transition must fail with the current state instead of using the full
+# guest timeout.
+with tempfile.TemporaryDirectory(prefix='mangrove-shoot-stall-') as temp:
+    part=Path(temp);qmp=QMP();c=safe.ReedControl(run,'create')
+    c.reed_from_shoot=True;c.shell_active=True;c.shell_stage=23
+    c.stage=9;c.filename_probe_stage=6
+    c.shell_progress=time.monotonic()-26
+    try:
+        c.observe(qmp,'Username:',part,0)
+    except TimeoutError as error:
+        assert 'shell stage 23' in str(error) and 'editor stage 9' in str(error)
+    else:
+        raise AssertionError('stalled post-Reed shell stage was not bounded')
+print('Integrated shell controller: post-editor stalls fail with state diagnostics')
+
+# Reed quit is a slash command, not a Normal-mode `q` binding. Give the two
+# pathname probes distinct titles and contents so the next editor is a durable
+# rendered witness that `/q` returned to Shoot and the next command ran.
+with tempfile.TemporaryDirectory(prefix='mangrove-shoot-space-name-probes-') as temp:
+    part=Path(temp);(part/'screen.ppm').write_bytes(b'controller-fixture')
+    qmp=QMP();c=safe.ReedControl(run,'create')
+    c.reed_from_shoot=True;c.shoot_stage=3;c.shell_stage=20
+    c.filename_probe_stage=0
+    editor='NORMAL  /vol/QUAL_MGFS/work/hello world!\nargv-probe'
+    quoted='NORMAL  /vol/QUAL_MGFS/work/hello quoted!\nquoted-probe'
+    main='NORMAL  /vol/QUAL_MGFS/work/reed.txt\nbase'
+    c.observe(qmp,editor,part,0)
+    assert c.filename_probe_stage==1 and qmp.keys[-1]=='sendkey slash 30'
+    c.observe(qmp,'/',part,0)
+    assert c.filename_probe_stage==1 and qmp.keys[-1]=='sendkey q 30'
+    c.observe(qmp,'/q',part,0)
+    assert c.filename_probe_stage==2 and qmp.keys[-1]=='sendkey ret 30'
+    c.observe(qmp,editor,part,0)
+    assert c.filename_probe_stage==2 and qmp.keys[-1]=='sendkey ret 30'
+    c.observe(qmp,quoted,part,0)
+    assert c.filename_probe_stage==3
+    c.observe(qmp,quoted,part,0)
+    assert c.filename_probe_stage==4 and qmp.keys[-1]=='sendkey slash 30'
+    c.observe(qmp,'/',part,0);c.observe(qmp,'/q',part,0)
+    assert c.filename_probe_stage==5 and qmp.keys[-1]=='sendkey ret 30'
+    c.observe(qmp,quoted,part,0)
+    assert c.filename_probe_stage==5
+    c.observe(qmp,main,part,0)
+    assert c.filename_probe_stage==6
+print('Reed argv probes: both editor sessions close through the documented /q command')
+
 # Full keyboard-controller rehearsal, including trailing-space rendering. This
 # tests the harness only; actual applications and persistence require QEMU.
 class ReplyReceiver(Receiver):
@@ -204,7 +276,7 @@ print('Complete keyboard rehearsal: Shoot, edited save, external change, conflic
 # workflow.
 with tempfile.TemporaryDirectory(prefix='mangrove-reed-save-only-') as temp:
     part=Path(temp);(part/'screen.ppm').write_bytes(b'controller-fixture')
-    qmp=QMP();c=safe.ReedControl(run,'create');c.reed_no_conflict=True;c.reed_from_shoot=True;c.reed_path=f'/temp/reed-launch-{run}.shoot';c.filename_probe_stage=4;c.actions.append({'action':'list-space-filename'})
+    qmp=QMP();c=safe.ReedControl(run,'create');c.reed_no_conflict=True;c.reed_from_shoot=True;c.reed_path=f'/temp/reed-launch-{run}.shoot';c.filename_probe_stage=6;c.actions.append({'action':'list-space-filename'})
     c.shell_stage=20;c.shoot_stage=3
     normal='NORMAL  /vol/QUAL_MGFS/work/reed.txt'
     insert='INSERT  /vol/QUAL_MGFS/work/reed.txt [+]'
@@ -215,14 +287,9 @@ with tempfile.TemporaryDirectory(prefix='mangrove-reed-save-only-') as temp:
     c.observe(qmp,normal+' [+]\neditedbase',part,0)
     call_count=len(qmp.calls);key_count=len(qmp.keys)
     c.observe(qmp,normal+'\nbase',part,0)
-    assert len(qmp.keys)==key_count
-    assert qmp.calls[call_count:]==[
-        ('input-send-event',{'events':[
-            {'type':'key','data':{'down':True,'key':{'type':'qcode','data':'shift'}}},
-            {'type':'key','data':{'down':True,'key':{'type':'qcode','data':'u'}}}]}),
-        ('input-send-event',{'events':[
-            {'type':'key','data':{'down':False,'key':{'type':'qcode','data':'u'}}},
-            {'type':'key','data':{'down':False,'key':{'type':'qcode','data':'shift'}}}]})]
+    assert qmp.keys[-1]=='sendkey shift-u 30' and len(qmp.keys)==key_count+1
+    assert qmp.calls[call_count:] == [
+        ('human-monitor-command', {'command-line':'sendkey shift-u 30'})]
     c.observe(qmp,normal+' [+]\neditedbase',part,0)
     assert qmp.keys[-1]=='sendkey u 30'
     c.observe(qmp,normal+'\nbase',part,0)
@@ -241,8 +308,11 @@ with tempfile.TemporaryDirectory(prefix='mangrove-reed-save-only-') as temp:
     for i in range(len(readback)+1):
         c.observe(qmp,'developer ~: '+readback[:i],part,0)
     c.observe(qmp,'editedbase\ndeveloper ~:',part,0)
+    c.shell_stage=22
+    c.shell_typed=0
     for i in range(len('exit')+1):
         c.observe(qmp,'developer ~: '+'exit'[:i],part,0)
+    assert c.shell_stage==23 and c.shoot_stage==4
     c.finish(False,False)
     actions=[row['action'] for row in c.actions]
     assert 'edit-before-undo' in actions
@@ -255,7 +325,7 @@ with tempfile.TemporaryDirectory(prefix='mangrove-reed-save-only-') as temp:
     assert any(action.startswith('shell-read-saved-reed-file:') for action in actions)
     assert 'shell-read-saved-reed-file-submit' in actions
     assert any(action.startswith('shoot-exit-prefix:') for action in actions)
-print('Reed keyboard rehearsal: Shoot launches Reed, observes redo, saves, reads the file back, restores the prompt and exits')
+print('Reed keyboard rehearsal: Shoot launches Reed, observes redo, saves, reads the file back and returns from the editor')
 
 # The guest-side synchronization path must act on a rendered stale-generation
 # conflict, then retain the edited buffer through cancellation and Save As.
@@ -285,7 +355,7 @@ print('Guest file rendezvous controller: stale conflict, cancellation, retained 
 with tempfile.TemporaryDirectory(prefix='mangrove-reed-redo-unobserved-') as temp:
     part=Path(temp);(part/'screen.ppm').write_bytes(b'controller-fixture')
     qmp=QMP();c=safe.ReedControl(run,'create')
-    c.reed_from_shoot=True;c.shoot_stage=3;c.shell_stage=20;c.filename_probe_stage=4
+    c.reed_from_shoot=True;c.shoot_stage=3;c.shell_stage=20;c.filename_probe_stage=6
     c.stage=2.15;c.redo_status='attempted';c.redo_requested_at=0.0
     unchanged='NORMAL  reed.txt  1:1\nbase'
     c.observe(qmp,unchanged,part,0)
@@ -324,7 +394,7 @@ with tempfile.TemporaryDirectory(prefix='mangrove-reed-redo-conflict-') as temp:
     for i in range(7):c.observe(qmp,'edited'[:i]+'base\n'+insert,part,0)
     c.observe(qmp,normal+' [+]\neditedbase',part,0)
     c.observe(qmp,normal+'\nbase',part,0)
-    assert qmp.calls[-2][0]=='input-send-event' and c.stage==2.15
+    assert qmp.calls[-2][0]=='human-monitor-command' and c.stage==2.15
     diagnostic='editedbase\n'+normal+' [+]  1:7  test input U modifiers=2 action=redo bytes=10'
     c.observe(qmp,diagnostic,part,0)
     c.observe(qmp,diagnostic,part,0)
@@ -360,7 +430,7 @@ print('Independent exFAT oracle rejects duplicate complete checksummed entry set
 for phase, expected in (("create", 9), ("verify", 3), ("readonly", 9)):
     c=safe.ReedControl(run,phase);c.reed_from_shoot=True;c.stage=expected
     c.shell_stage=23 if phase=="create" else 0
-    c.filename_probe_stage=4
+    c.filename_probe_stage=6
     if phase=="create":c.actions.append({'action':'list-space-filename'})
     c.finish(False,False)
     c.stage=expected-1
@@ -368,7 +438,7 @@ for phase, expected in (("create", 9), ("verify", 3), ("readonly", 9)):
     except ValueError:pass
     else:raise AssertionError("incomplete per-phase editor workflow accepted")
 c=safe.ReedControl(run,"create");c.reed_from_shoot=True;c.stage=9
-c.filename_probe_stage=4;c.actions.append({'action':'list-space-filename'})
+c.filename_probe_stage=6;c.actions.append({'action':'list-space-filename'})
 try:c.finish(False,False)
 except ValueError:pass
 else:raise AssertionError("create without integrated shell completion accepted")

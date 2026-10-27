@@ -416,25 +416,28 @@ int fstest_shoot_phase(const char *run,const char *target,bool launch_reed)
 {
     sequence=0;printf("SHOOT1 phase=create run=%s\n",run);
     shoot_reed_completed=false;shoot_reed_status=-1;
-    char reed_path[256],occupied_path[256],spaced_path[256],reed_script_path[96],reed_marker_path[96],reed_script[640];
+    char reed_path[256],occupied_path[256],spaced_path[256],quoted_path[256];
+    char reed_script_path[96],reed_marker_path[96],reed_script[640];
     mg_path_info_t reed_marker_info;
     if(launch_reed) {
         int path_length=snprintf(reed_path,sizeof(reed_path),"%s/reed.txt",target);
         int occupied_length=snprintf(occupied_path,sizeof(occupied_path),"%s/occupied.txt",target);
         int spaced_length=snprintf(spaced_path,sizeof(spaced_path),"%s/hello world!",target);
+        int quoted_length=snprintf(quoted_path,sizeof(quoted_path),"%s/hello quoted!",target);
         int script_path_length=snprintf(reed_script_path,sizeof(reed_script_path),
                                         "/temp/reed-launch-%s.shoot",run);
         int marker_path_length=snprintf(reed_marker_path,sizeof(reed_marker_path),
                                         "/temp/reed-complete-%s.txt",run);
         if(path_length<0 || (usize)path_length>=sizeof(reed_path) || occupied_length<0 ||
            (usize)occupied_length>=sizeof(occupied_path) || spaced_length<0 ||
-           (usize)spaced_length>=sizeof(spaced_path) || script_path_length<0 ||
+           (usize)spaced_length>=sizeof(spaced_path) || quoted_length<0 ||
+           (usize)quoted_length>=sizeof(quoted_path) || script_path_length<0 ||
            (usize)script_path_length>=sizeof(reed_script_path) || marker_path_length<0 ||
            (usize)marker_path_length>=sizeof(reed_marker_path))return 43;
         int script_length=snprintf(reed_script,sizeof(reed_script),
                                    "jump %s\n/bin/reed hello\\ world!\n"
                                    "/bin/say filename-escaped-returned\n"
-                                   "/bin/reed \"hello world!\"\n"
+                                   "/bin/reed \"hello quoted!\"\n"
                                    "/bin/say filename-quoted-returned\n"
                                    "/bin/reed reed.txt\n"
                                    "/bin/say reed-complete > %s\n",
@@ -448,6 +451,10 @@ int fstest_shoot_phase(const char *run,const char *target,bool launch_reed)
         CHECK("shoot-occupied-close",MG_OK,handle_close(occupied));
         CHECK("shoot-space-file-create",MG_OK,file_create_contents(spaced_path,"argv-probe\n",11,&spaced));
         CHECK("shoot-space-file-close",MG_OK,handle_close(spaced));
+        mg_handle_t quoted=0;
+        CHECK("shoot-quoted-file-create",MG_OK,file_create_contents(quoted_path,
+              "quoted-probe\n",13,&quoted));
+        CHECK("shoot-quoted-file-close",MG_OK,handle_close(quoted));
         mg_handle_t script=0;
         CHECK("shoot-reed-script-create",MG_OK,file_create_contents(reed_script_path,reed_script,(usize)script_length,&script));
         CHECK("shoot-reed-script-close",MG_OK,handle_close(script));

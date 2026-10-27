@@ -37,7 +37,7 @@ def work_names(backend,run,reed_from_shoot=False):
     # the separately imported seed has lowercase flags. Do not apply generic
     # Unicode casefolding or derive this expectation from observed names.
     application=['REED.TXT','COPIED.TXT','OCCUPIED.TXT'] if backend=='fat32' else ['reed.txt','copied.txt','occupied.txt']
-    if reed_from_shoot:application.append('hello world!')
+    if reed_from_shoot:application.extend(('hello world!','hello quoted!'))
     return ['seed.txt',f'safe-{run}',*application]
 
 def pattern(run,length,version=4):
@@ -45,29 +45,20 @@ def pattern(run,length,version=4):
 
 def key(qmp,character):
     if character in ('U','shift-u'):
-        # Present Shift+U as explicit down/up events to the emulated USB HID
-        # keyboard; the controller supplies the shift-u label.
-        events=[]
-        for name,down in (('shift',True),('u',True)):
-            events.append({'type':'key','data':{'down':down,
-                'key':{'type':'qcode','data':name}}})
-        result=qmp.call('input-send-event',{'events':events})
-        if result:raise ValueError('keyboard chord injection rejected: '+str(result))
-        time.sleep(.08)
-        events=[]
-        for name in ('u','shift'):
-            events.append({'type':'key','data':{'down':False,
-                'key':{'type':'qcode','data':name}}})
-        result=qmp.call('input-send-event',{'events':events})
-        if result:raise ValueError('keyboard chord release rejected: '+str(result))
-        return
-    code={'/':'slash','.':'dot','>':'shift-dot',' ':'spc','-':'minus',
-          '_':'shift-minus',
-          '\n':'ret','\t':'tab','\b':'backspace','\x1b':'esc',
-          }.get(character,character)
-    if code==character and character.isupper():code='shift-'+character.lower()
-    result=qmp.call('human-monitor-command',{'command-line':f'sendkey {code} 30'})
-    if result:raise ValueError('keyboard injection rejected: '+str(result))
+        code='shift-u'
+    else:
+        code={'/':'slash','.':'dot','>':'shift-dot',' ':'spc','-':'minus',
+              '_':'shift-minus',
+              '\x04':'ctrl-d',
+              '\n':'ret','\t':'tab','\b':'backspace','\x1b':'esc',
+              }.get(character,character)
+        if code==character and character.isupper():code='shift-'+character.lower()
+    # Match the short QEMU key pulse already used by the shared guest runner.
+    # The controller advances only after a rendered screen proves the key took
+    # effect; a longer hold can trigger the guest's typematic repeat.
+    result=qmp.call('human-monitor-command',
+                    {'command-line':f'sendkey {code} 30'})
+    if result:raise ValueError('USB keyboard press rejected: '+str(result))
 
 def reed_cursor_column(path,expected):
     """Find Reed's inverted cursor cell in one rendered ASCII text row."""
@@ -345,26 +336,37 @@ class ReedControl:
             elif self.stage==2 and not re.search(r'^(?:NORMAL|INSERT|COMMAND|SEARCH)\s+',text,re.M):
                 self.record(qmp,part,text,'terminal-restored',None);self.stage=3
             return
-        if self.reed_from_shoot and self.shell_stage<20:
+        if (self.reed_from_shoot and
+                (self.shell_stage < 20 or self.shell_stage in (27, 28))):
             self.observe_interactive_shell(qmp,text,part)
             return
-        if self.reed_from_shoot and self.filename_probe_stage < 4:
+        if self.reed_from_shoot and self.filename_probe_stage < 6:
             if (self.filename_probe_stage==0 and
                     self.editor_title(text,'NORMAL','hello world!') and
                     re.search(r'^argv-probe\s*$',text,re.M)):
-                self.record(qmp,part,text,'space-filename-escaped-opened','q')
+                self.record(qmp,part,text,'space-filename-escaped-opened','/')
                 self.filename_probe_stage=1
             elif (self.filename_probe_stage==1 and
-                  'filename-escaped-returned' in text):
+                  self.command(qmp,text,part,'q')):
                 self.filename_probe_stage=2
             elif (self.filename_probe_stage==2 and
-                    self.editor_title(text,'NORMAL','hello world!') and
-                    re.search(r'^argv-probe\s*$',text,re.M)):
-                self.record(qmp,part,text,'space-filename-quoted-opened','q')
+                  self.editor_title(text,'NORMAL','hello quoted!') and
+                  re.search(r'^quoted-probe\s*$',text,re.M)):
+                self.record(qmp,part,text,'filename-escaped-returned',None)
                 self.filename_probe_stage=3
             elif (self.filename_probe_stage==3 and
-                  'filename-quoted-returned' in text):
+                    self.editor_title(text,'NORMAL','hello quoted!') and
+                    re.search(r'^quoted-probe\s*$',text,re.M)):
+                self.record(qmp,part,text,'space-filename-quoted-opened','/')
                 self.filename_probe_stage=4
+            elif (self.filename_probe_stage==4 and
+                  self.command(qmp,text,part,'q')):
+                self.filename_probe_stage=5
+            elif (self.filename_probe_stage==5 and
+                  self.editor_title(text,'NORMAL','reed.txt') and
+                  re.search(r'^base\s*$',text,re.M)):
+                self.record(qmp,part,text,'filename-quoted-returned',None)
+                self.filename_probe_stage=6
             return
         if self.reed_from_shoot and self.shoot_stage==3 and self.stage==8 and self.shell_stage==20:
             command=f'type /vol/{getattr(self,"volume_label","QUAL_MGFS")}/work/reed.txt'
@@ -510,7 +512,7 @@ class ReedControl:
                   9 if self.reed_from_shoot else 8 if self.reed_no_conflict else 12)
         if (expected_failure or failed or self.stage != expected or
             (self.reed_from_shoot and self.phase=='create' and
-             (self.shell_stage!=23 or self.filename_probe_stage!=4 or
+             (self.shell_stage!=23 or self.filename_probe_stage!=6 or
               not any(action['action']=='list-space-filename'
                       for action in self.actions)))):
             raise ValueError(f'incomplete real interactive workflow reed_stage={self.stage} shell_stage={self.shell_stage}')
@@ -556,7 +558,9 @@ def read_media(folder,disk,backend,build,run,phase,wrong=False,reed_no_conflict=
         # FAT/exFAT native identities describe mount-local entry positions; their
         # consistency is verified across snapshot and stat, not synthesized here.
     expected_text={'/work/reed.txt':b'editedbase\n' if reed_no_conflict else b'external\n','/work/copied.txt':b'editedbase\n','/work/occupied.txt':b'occupied\n','/work/seed.txt':secondary.SEED}
-    if reed_from_shoot:expected_text['/work/hello world!']=b'argv-probe\n'
+    if reed_from_shoot:
+        expected_text['/work/hello world!']=b'argv-probe\n'
+        expected_text['/work/hello quoted!']=b'quoted-probe\n'
     for path,want in expected_text.items():
         if read(path)!=want:raise ValueError('independent application content mismatch '+path)
     def names(path):
@@ -661,7 +665,7 @@ def evidence_writable(folder,disk,phase,backend,run,build,identities,text,image,
         shoot=re.findall(r'^SHOOT1 phase=.*?^SHOOT1 complete[^\n]*\n',text,re.M|re.S)
         if len(shoot)!=1:raise ValueError('missing real Shoot child')
         sr=[]
-        if reed_from_shoot:sr += [('shoot-reed-marker-absent',-2),('shoot-reed-source-create',0),('shoot-reed-source-close',0),('shoot-occupied-create',0),('shoot-occupied-close',0),('shoot-space-file-create',0),('shoot-space-file-close',0),('shoot-reed-script-create',0),('shoot-reed-script-close',0)]
+        if reed_from_shoot:sr += [('shoot-reed-marker-absent',-2),('shoot-reed-source-create',0),('shoot-reed-source-close',0),('shoot-occupied-create',0),('shoot-occupied-close',0),('shoot-space-file-create',0),('shoot-space-file-close',0),('shoot-quoted-file-create',0),('shoot-quoted-file-close',0),('shoot-reed-script-create',0),('shoot-reed-script-close',0)]
         sr += [('shoot-spawn',1),('shoot-wait',0),('shoot-status',0)]
         if reed_from_shoot:sr += [('shoot-reed-marker',0),('text-open',1),('text-snapshot',0),('text-bytes',1),('text-close',0)]
         sr += [('shoot-close',0)]
