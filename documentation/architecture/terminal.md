@@ -83,11 +83,18 @@ viewport advances only to the oldest row that remains valid. The live cursor
 stays at its logical position and is hidden over historical output, then is
 restored when the viewport returns live.
 
-`ESC{cls}` remains a viewport clear and leaves both cursor position and
-retained cells unchanged. While viewing history it blanks only the displayed
-framebuffer; scrolling to another position or returning live redraws retained
-cells. Cursor movement commands continue to address the live terminal. The
-`clear` command and Ctrl+L explicitly clear and home the live cursor.
+`ESC{cls}` is a viewport clear and preserves the logical cursor row and
+column. On the live normal screen, it advances the live origin by one visible
+page and clears the fresh live rows. The just-vacated rows become the newest
+scrollback page; if the 512-row ring is full, only its oldest rows are evicted
+to make room. The cursor is remapped to the same row and column in the new
+viewport, so later output cannot overwrite retained history. While viewing
+history, `cls` blanks only the displayed frame and retains its origin and
+cells; navigating, including a boundary Page key, restores the retained page.
+On the alternate screen, `cls` clears that screen's visible rows in place,
+preserving its existing cursor behavior. Cursor movement commands continue to
+address the live logical screen. The `clear` command and Ctrl+L explicitly
+clear and home the live cursor after preserving the vacated page.
 
 At a login-session boundary, after sessiond has retired the previous session's
 processes, logind invokes a separate kernel operation restricted to its
@@ -184,7 +191,7 @@ The recognized command set is deliberately small:
 | `ESC{at:ROW,COL}` | Move to one-based visible-screen coordinates. Zero, overflow, and out-of-range coordinates are rejected as a command and displayed literally. |
 | `ESC{up:N}`, `ESC{down:N}`, `ESC{left:N}`, `ESC{right:N}` | Move by a positive number of rows or columns. Motion stops at the visible screen edge; it does not wrap. |
 | `ESC{hide}`, `ESC{show}` | Hide or show the cursor. |
-| `ESC{cls}`, `ESC{cll}`, `ESC{cleol}` | Clear the visible viewport without moving the cursor, clear the current line, or clear from the cursor to the line end. `cls` preserves the viewport's ring-buffer origin and rows retained outside the viewport. |
+| `ESC{cls}`, `ESC{cll}`, `ESC{cleol}` | Clear the visible viewport without moving the logical cursor, clear the current line, or clear from the cursor to the line end. On the live normal screen, `cls` retains the vacated page in the ring; on a historical view it blanks only the presentation. |
 | `ESC{alt}`, `ESC{main}` | Enter the alternate screen or return to the retained main screen. Repeating `alt` by the current owner preserves the alternate screen; repeating `main` when already on main is a no-op. |
 
 Only these exact names and forms are supported. Operation identifiers are at
@@ -215,14 +222,17 @@ translates selected backslash escapes before writing. When output is
 redirected, emitted bytes go to the file unchanged and are not interpreted by
 the terminal.
 
-`ESC{cls}` clears only the active screen's visible cell rows and keeps its
-cursor coordinates and ring-buffer origin. `ESC{at:ROW,COL}` moves without
-clearing, so a caller that wants a cleared screen at the origin emits both
-operations. The loam `terminal_clear_screen()` helper, used by the `clear`
-command and Ctrl+L, emits `ESC{cls}` followed by `ESC{at:1,1}`. Ctrl+L then
-redraws the Shoot prompt at the origin. The clear command preserves retained
-ring rows outside the viewport; the kernel's internal full reset remains
-separate and is used for initialization and alternate-screen setup.
+On the live normal screen, `ESC{cls}` retains the vacated visible rows in the
+same ring and advances the live origin by one viewport. It preserves the
+cursor's row and column by remapping them into the fresh live rows. If the
+user is scrolled into history, `cls` blanks the presentation only; the next
+scrollback navigation redraws retained cells. Alternate-screen `cls` clears
+its visible rows in place. `ESC{at:ROW,COL}` moves without clearing, so a
+caller that wants a cleared screen at the origin emits both operations. The
+loam `terminal_clear_screen()` helper, used by the `clear` command and Ctrl+L,
+emits `ESC{cls}` followed by `ESC{at:1,1}`. Ctrl+L then redraws the Shoot
+prompt at the origin. The kernel's authorized session reset remains a
+separate operation that erases both rings and their validity metadata.
 
 The terminal ioctl-style operation slots formerly used for alternate-screen,
 cursor, clear, and direct styled writes remain reserved in the version-1 ABI

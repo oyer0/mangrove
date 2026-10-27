@@ -780,6 +780,42 @@ static void test_scrollback_clear_cursor_and_alternate_passthrough(void)
     assert(!terminal.history_view_cleared && terminal.cursor_visible);
     assert_pixels_match_cells();
 
+    /* A clear while historical keeps the same ring page. Even a repeated
+     * jump to that already-selected oldest page restores its retained cells. */
+    event = scroll_event(TERMINAL_KEY_PAGE_UP, 0U, 0U);
+    assert(read_scroll_event(&event, &returned) == MG_ERR_WOULD_BLOCK);
+    event = scroll_event(TERMINAL_KEY_PAGE_UP,
+                         TERMINAL_KEY_MODIFIER_LEFT_ALT, 0U);
+    assert(read_scroll_event(&event, &returned) == MG_ERR_WOULD_BLOCK);
+    bool saw_retained_z = false;
+    for (u32 row = 0U; row < terminal.visible_rows; row++)
+        for (u32 column = 0U; column < terminal.visible_cols; column++)
+            if (terminal_cell_at(screen_to_phys_row(row), column)->codepoint ==
+                'z')
+                saw_retained_z = true;
+    assert(saw_retained_z);
+    u32 oldest_origin = terminal.top_row_idx;
+    assert(terminal_write_for_process(7U, "\x1b{cls}", 6U) == 6);
+    assert(terminal.history_view_cleared &&
+           terminal.top_row_idx == oldest_origin);
+    event = scroll_event(TERMINAL_KEY_PAGE_UP,
+                         TERMINAL_KEY_MODIFIER_LEFT_ALT, 0U);
+    assert(read_scroll_event(&event, &returned) == MG_ERR_WOULD_BLOCK);
+    assert(!terminal.history_view_cleared &&
+           terminal.top_row_idx == oldest_origin);
+    saw_retained_z = false;
+    for (u32 row = 0U; row < terminal.visible_rows; row++)
+        for (u32 column = 0U; column < terminal.visible_cols; column++)
+            if (terminal_cell_at(screen_to_phys_row(row), column)->codepoint ==
+                'z')
+                saw_retained_z = true;
+    assert(saw_retained_z);
+    assert_pixels_match_cells();
+    event = scroll_event(TERMINAL_KEY_PAGE_DOWN,
+                         TERMINAL_KEY_MODIFIER_RIGHT_ALT, 0U);
+    assert(read_scroll_event(&event, &returned) == MG_ERR_WOULD_BLOCK);
+    assert(terminal_view_is_live_locked());
+
     /* Alternate-screen owners receive Page keys; the terminal does not
      * consume them as normal-screen history navigation. */
     assert(terminal_set_raw_input_for_process(7U, false) == MG_OK);
@@ -831,6 +867,23 @@ static void test_session_history_reset_state(void)
 static terminal_cell_t *screen_cell(u32 row, u32 column)
 {
     return terminal_cell_at(screen_to_phys_row(row), column);
+}
+
+static bool screen_contains_ascii(const char *text)
+{
+    usize length = text ? strlen(text) : 0U;
+    if (!length) return false;
+    for (u32 row = 0U; row < terminal.visible_rows; row++) {
+        for (u32 first = 0U; first + length <= terminal.visible_cols; first++) {
+            usize offset = 0U;
+            while (offset < length &&
+                   screen_cell(row, first + (u32)offset)->codepoint ==
+                       (u8)text[offset])
+                offset++;
+            if (offset == length) return true;
+        }
+    }
+    return false;
 }
 
 static void assert_pixels_match_cells(void)
@@ -1394,21 +1447,31 @@ static void test_clear_sequence_preserves_viewport_cursor(void)
         assert(terminal_write_for_process(EDITOR_TEST_PID, "H\n", 2U) == 2);
     }
     assert(terminal.top_row_idx > 0U);
-    u32 old_top = terminal.top_row_idx;
+    u32 old_top = terminal.live_top_row_idx;
+    u32 old_history_rows = terminal.history_rows;
+    u32 old_cursor_phys;
     u32 retained_row = (old_top + TERMINAL_BUFFER_ROWS - 1U) %
                        TERMINAL_BUFFER_ROWS;
     assert(terminal_cell_at(retained_row, 0U)->codepoint == 'H');
     assert(terminal_write_for_process(EDITOR_TEST_PID, position,
         sizeof(position) - 1U) == (i64)(sizeof(position) - 1U));
-    u32 old_cursor_phys = terminal.cursor_phys_row;
+    u32 old_cursor_row = phys_to_live_screen_row(terminal.cursor_phys_row);
     u32 old_cursor_column = terminal.cursor_col;
     assert(terminal_set_cursor_visible(true));
     assert_cursor_at(2U, 3U);
 
     assert(terminal_write_for_process(EDITOR_TEST_PID, clear,
         sizeof(clear) - 1U) == (i64)(sizeof(clear) - 1U));
-    assert(terminal.top_row_idx == old_top);
-    assert(terminal.cursor_phys_row == old_cursor_phys);
+    assert(terminal.live_top_row_idx ==
+           (old_top + terminal.visible_rows) % TERMINAL_BUFFER_ROWS);
+    assert(terminal.top_row_idx == terminal.live_top_row_idx);
+    assert(terminal.history_rows ==
+           (old_history_rows + terminal.visible_rows <=
+                    terminal_history_capacity_locked() ?
+                old_history_rows + terminal.visible_rows :
+                terminal_history_capacity_locked()));
+    assert(phys_to_live_screen_row(terminal.cursor_phys_row) ==
+           old_cursor_row);
     assert(terminal.cursor_col == old_cursor_column);
     assert(terminal.cursor_enabled && terminal.cursor_visible);
     assert_cursor_at(2U, 3U);
@@ -1417,6 +1480,21 @@ static void test_clear_sequence_preserves_viewport_cursor(void)
         for (u32 column = 0U; column < terminal.visible_cols; column++)
             assert(screen_cell(row, column)->codepoint == ' ');
     assert_pixels_match_cells();
+
+    /* The entire pre-clear live page is now one PageUp away, including the
+     * rows that occupied the visible screen rather than prior history. */
+    assert(terminal_set_raw_input_for_process(EDITOR_TEST_PID, true) == MG_OK);
+    terminal_key_event_t page_up = scroll_event(TERMINAL_KEY_PAGE_UP, 0U, 0U);
+    terminal_key_event_t returned = {0};
+    assert(read_scroll_event(&page_up, &returned) == MG_ERR_WOULD_BLOCK);
+    assert(terminal.top_row_idx == old_top);
+    assert(terminal_cell_at(screen_to_phys_row(0U), 0U)->codepoint == 'H');
+    assert_pixels_match_cells();
+    terminal_key_event_t live = scroll_event(TERMINAL_KEY_PAGE_DOWN,
+        TERMINAL_KEY_MODIFIER_LEFT_ALT, 0U);
+    assert(read_scroll_event(&live, &returned) == MG_ERR_WOULD_BLOCK);
+    assert(terminal_view_is_live_locked());
+    assert(terminal_set_raw_input_for_process(EDITOR_TEST_PID, false) == MG_OK);
 
     /* Positioning moves the cursor but leaves existing visible cells alone. */
     initialize(240U, 160U);
@@ -1458,6 +1536,87 @@ static void test_clear_sequence_preserves_viewport_cursor(void)
     assert(screen_cell(0U, 0U)->codepoint == 'm');
     assert_cursor_at(0U, 4U);
     assert_pixels_match_cells();
+}
+
+static void test_clear_retains_visible_and_older_history(void)
+{
+    static const char clear[] = "\x1b{cls}";
+    static const char clear_and_home[] = "\x1b{cls}\x1b{at:1,1}";
+    terminal_key_event_t returned = {0};
+    terminal_key_event_t event;
+    u32 prior_live;
+    u32 prior_history;
+
+    initialize(196U, 92U); /* Twenty-one columns by four visible rows. */
+    for (u32 index = 0U; index < 12U; index++)
+        assert(terminal_write_for_process(EDITOR_TEST_PID, "older-row\n", 10U) ==
+               10);
+    for (u32 index = 0U; index < 4U; index++)
+        assert(terminal_write_for_process(EDITOR_TEST_PID, "recent-row\n", 11U) ==
+               11);
+    assert(screen_contains_ascii("recent-row"));
+    assert(terminal.history_rows > 0U);
+    prior_live = terminal.live_top_row_idx;
+    prior_history = terminal.history_rows;
+
+    assert(terminal_write_for_process(EDITOR_TEST_PID, clear,
+        sizeof(clear) - 1U) == (i64)(sizeof(clear) - 1U));
+    assert(terminal.live_top_row_idx ==
+           (prior_live + terminal.visible_rows) % TERMINAL_BUFFER_ROWS);
+    assert(terminal.top_row_idx == terminal.live_top_row_idx);
+    assert(terminal.history_rows == prior_history + terminal.visible_rows);
+    assert(!screen_contains_ascii("recent-row"));
+    assert_pixels_match_cells();
+
+    /* Page Up reaches the exact viewport that cls just vacated. Older output
+     * remains farther back in the same ring. */
+    assert(terminal_set_raw_input_for_process(EDITOR_TEST_PID, true) == MG_OK);
+    event = scroll_event(TERMINAL_KEY_PAGE_UP, 0U, 0U);
+    assert(read_scroll_event(&event, &returned) == MG_ERR_WOULD_BLOCK);
+    assert(terminal.top_row_idx == prior_live);
+    assert(screen_contains_ascii("recent-row"));
+    assert_pixels_match_cells();
+    event = scroll_event(TERMINAL_KEY_PAGE_UP,
+                         TERMINAL_KEY_MODIFIER_LEFT_ALT, 0U);
+    assert(read_scroll_event(&event, &returned) == MG_ERR_WOULD_BLOCK);
+    assert(screen_contains_ascii("older-row"));
+    assert_pixels_match_cells();
+    event = scroll_event(TERMINAL_KEY_PAGE_DOWN,
+                         TERMINAL_KEY_MODIFIER_RIGHT_ALT, 0U);
+    assert(read_scroll_event(&event, &returned) == MG_ERR_WOULD_BLOCK);
+    assert(terminal_view_is_live_locked());
+
+    /* Cursor positioning remains independent: cls keeps its row and column,
+     * while at: changes them. Output after the clear targets fresh live cells. */
+    static const char position[] = "\x1b{at:3,4}";
+    assert(terminal_write_for_process(EDITOR_TEST_PID, position,
+        sizeof(position) - 1U) == (i64)(sizeof(position) - 1U));
+    assert(terminal_write_for_process(EDITOR_TEST_PID, clear,
+        sizeof(clear) - 1U) == (i64)(sizeof(clear) - 1U));
+    assert(phys_to_live_screen_row(terminal.cursor_phys_row) == 2U &&
+           terminal.cursor_col == 3U);
+    assert(terminal_write_for_process(EDITOR_TEST_PID, "Z", 1U) == 1);
+    assert(screen_cell(2U, 3U)->codepoint == 'Z');
+
+    /* Repeated clears append their vacated rows to history until ordinary
+     * ring capacity eviction. They never make the history count exceed the
+     * 512-row store minus the visible viewport. */
+    assert(terminal_write_for_process(EDITOR_TEST_PID, clear_and_home,
+        sizeof(clear_and_home) - 1U) == (i64)(sizeof(clear_and_home) - 1U));
+    for (u32 index = 0U; index < 140U; index++)
+        assert(terminal_write_for_process(EDITOR_TEST_PID, clear,
+            sizeof(clear) - 1U) == (i64)(sizeof(clear) - 1U));
+    assert(terminal.history_rows == terminal_history_capacity_locked());
+    assert(terminal.history_rows + terminal.visible_rows <=
+           TERMINAL_BUFFER_ROWS);
+    assert(terminal.top_row_idx == terminal.live_top_row_idx);
+    assert_pixels_match_cells();
+    event = scroll_event(TERMINAL_KEY_PAGE_UP,
+                         TERMINAL_KEY_MODIFIER_LEFT_ALT, 0U);
+    assert(read_scroll_event(&event, &returned) == MG_ERR_WOULD_BLOCK);
+    assert(terminal_rows_back() == terminal.history_rows);
+    assert_pixels_match_cells();
+    assert(terminal_set_raw_input_for_process(EDITOR_TEST_PID, false) == MG_OK);
 }
 
 static void test_say_no_newline_clear_home(void)
@@ -1539,6 +1698,17 @@ static void test_ctrl_l_clears_and_homes_before_prompt_redraw(void)
     assert(screen_cell(0U, 0U)->codepoint == 's');
     assert_cursor_at(0U, (u32)strlen(prompt));
     assert_pixels_match_cells();
+
+    /* Ctrl+L clears and homes the edited live screen, but the preceding
+     * visible prompt/output page remains available through terminal history. */
+    assert(terminal_set_raw_input_for_process(EDITOR_TEST_PID, true) == MG_OK);
+    terminal_key_event_t page_up = scroll_event(TERMINAL_KEY_PAGE_UP, 0U, 0U);
+    terminal_key_event_t returned = {0};
+    assert(read_scroll_event(&page_up, &returned) == MG_ERR_WOULD_BLOCK);
+    assert(screen_contains_ascii("previous output"));
+    assert(screen_contains_ascii(prompt));
+    assert_pixels_match_cells();
+    assert(terminal_set_raw_input_for_process(EDITOR_TEST_PID, false) == MG_OK);
 }
 
 static void test_canonical_palette_and_style_names(void)
@@ -2315,6 +2485,8 @@ int main(int argument_count, char **arguments)
         test_native_escape_commands();
     if (run_all || !strcmp(arguments[1], "esc-clear-position"))
         test_clear_sequence_preserves_viewport_cursor();
+    if (run_all || !strcmp(arguments[1], "clear-retains-history"))
+        test_clear_retains_visible_and_older_history();
     if (run_all || !strcmp(arguments[1], "say-clear"))
         test_say_no_newline_clear_home();
     if (run_all || !strcmp(arguments[1], "ctrl-l-clear-home"))

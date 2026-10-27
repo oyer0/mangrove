@@ -46,6 +46,13 @@ currently visible rows. The additional history capacity is therefore at most
 512 minus the visible row count. Logout clears the ring before the next login
 prompt, so previous-session output is not available through scrollback.
 
+`clear` and Ctrl+L clear the live viewport while keeping its former visible
+rows as the newest scrollback page, then move the cursor to the top-left.
+Repeated clears use the same ring capacity and can evict only the oldest
+retained rows. A clear issued while already viewing history blanks that
+displayed page without deleting it; the next scrollback navigation redraws
+the retained page.
+
 Shift+Arrow moves the cursor without selecting text. Shoot has no command-line
 selection mode. Modifier combinations that have no binding are ignored rather
 than inserted as printable text. Cooked byte readers, including login input,

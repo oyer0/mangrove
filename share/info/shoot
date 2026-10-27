@@ -140,9 +140,10 @@ are described in `documentation/shell/language.md`. Shoot is a small Mangrove
 shell language and does not claim Bash or POSIX shell compatibility.
 
 Terminal scrollback uses the normal screen's 512-row cell ring, including the
-visible rows; it is not 512 additional rows. Ordinary clear operations clear
-the viewport, while logind erases retained terminal contents at session
-boundaries.
+visible rows; it is not 512 additional rows. `clear` and Ctrl+L retain the
+vacated live screen as the newest history page before homing the prompt. A
+clear while viewing history blanks only that presentation. Logind erases
+retained terminal contents at session boundaries.
 
 SEE ALSO
 

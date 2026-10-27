@@ -159,10 +159,13 @@ def boot_logout(folder, disk, args):
             before = capture('session-output-before-scroll')
             if 'logoutmarker' not in before:
                 raise AssertionError('session marker was not rendered')
+            last_visible_fill = None
             for index in range(1, 30):
-                run_say(f'logoutfill{index:02d}')
+                token = f'logoutfill{index:02d}'
+                run_say(token)
                 visible = capture()
                 if 'logoutmarker' not in visible:
+                    last_visible_fill = token
                     save_capture('session-output-after-scroll', visible)
                     break
             else:
@@ -178,6 +181,46 @@ def boot_logout(folder, disk, args):
             qmp_key(qmp, 'alt-pgdn')
             wait_for(lambda text: text.rstrip().endswith('developer ~:'),
                      'Alt+PageDown to restore live Shoot output')
+
+            # Clearing the live viewport must retain the rows that were just
+            # visible, while leaving older retained output reachable farther
+            # back in the same ring.
+            send_line('clear', 'clear')
+            cleared = wait_for(lambda text: text.rstrip().endswith('developer ~:'),
+                               'clear command and next prompt',
+                               'after-clear-live')
+            if last_visible_fill in cleared:
+                raise AssertionError('clear left the old live page visible')
+            qmp_key(qmp, 'pgup')
+            wait_for(lambda text: last_visible_fill in text,
+                     'Page Up to recover the just-cleared live page',
+                     'scrollback-after-clear')
+            qmp_key(qmp, 'alt-pgup')
+            wait_for(lambda text: 'logoutmarker' in text,
+                     'older history remains available after clear')
+            qmp_key(qmp, 'alt-pgdn')
+            wait_for(lambda text: text.rstrip().endswith('developer ~:'),
+                     'return live after clear-history check')
+
+            # Ctrl+L uses the same clear plus explicit home sequence before
+            # redrawing the current input. That input page also remains in
+            # scrollback and does not cause the command to execute.
+            type_text(qmp, 'partialclear')
+            wait_for(lambda text: text.rstrip().endswith('partialclear'),
+                     'partially typed line before Ctrl+L')
+            qmp_key(qmp, 'ctrl-l')
+            wait_for(lambda text: text.rstrip().endswith('partialclear'),
+                     'prompt redraw after Ctrl+L')
+            qmp_key(qmp, 'pgup')
+            wait_for(lambda text: 'partialclear' in text,
+                     'Page Up to recover the pre-Ctrl+L screen',
+                     'scrollback-after-ctrl-l')
+            qmp_key(qmp, 'alt-pgdn')
+            wait_for(lambda text: text.rstrip().endswith('partialclear'),
+                     'return live after Ctrl+L scrollback check')
+            qmp_key(qmp, 'ctrl-c')
+            wait_for(lambda text: text.rstrip().endswith('developer ~:'),
+                     'cancel preserved partial input')
 
             send_line('exit', 'exit')
             expect_clean_login('login-after-exit', ('logoutmarker', 'logoutfill'))
@@ -223,6 +266,8 @@ def boot_logout(folder, disk, args):
                 'empty_ctrl_d': True, 'nonzero_shell_exit': True,
                 'scroll_before_logout': True,
                 'scrollback_reaches_prior_session_output': True,
+                'clear_preserves_live_and_older_history': True,
+                'ctrl_l_preserves_visible_input_page': True,
                 'scrollback_session_isolation': True,
                 'framebuffer_clean_after_each_session': True,
                 'framebuffer_checks': framebuffer_checks,

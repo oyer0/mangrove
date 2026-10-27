@@ -486,7 +486,16 @@ static void terminal_scrollback_set_back_locked(u32 rows_back)
         rows_back = terminal.history_rows;
     target = (terminal.live_top_row_idx + TERMINAL_BUFFER_ROWS - rows_back) %
              TERMINAL_BUFFER_ROWS;
-    if (target == terminal.top_row_idx) return;
+    if (target == terminal.top_row_idx) {
+        /* A clear while historical blanks the presentation without changing
+         * its origin. Even a boundary key with no origin change should
+         * restore that retained page. */
+        if (!terminal.history_view_cleared || terminal_view_is_live_locked())
+            return;
+        terminal.history_view_cleared = false;
+        terminal_redraw_locked();
+        return;
+    }
 
     terminal_overlay_clear_locked(false);
     terminal_cursor_hide_locked();
@@ -1098,9 +1107,10 @@ static void terminal_clear_locked(void) {
     }
 }
 
-/* Clear the current viewport without changing its ring-buffer origin or
- * logical cursor. Rows preceding the viewport remain available as retained
- * console history; clear/home is provided separately by terminal_clear(). */
+/* Clear the visible screen without moving the logical cursor. On the live
+ * normal screen, preserve the vacated viewport by advancing the ring origin;
+ * on a historical view, blank only the presentation. Clear-and-home remains
+ * a separate operation. */
 static void terminal_clear_visible_locked(void)
 {
     terminal_overlay_clear_locked(false);
@@ -1125,6 +1135,34 @@ static void terminal_clear_visible_locked(void)
         return;
     }
 
+    if (!terminal.alternate_active && terminal.visible_rows != 0U) {
+        /* Preserve the rows that were visible immediately before cls by
+         * advancing the live origin one viewport. They become the newest
+         * history rows; only ring capacity pressure may evict older output.
+         * Keep the cursor's screen row and column while assigning it to the
+         * fresh live viewport, so a later write does not target history. */
+        u32 cursor_row = phys_to_live_screen_row(terminal.cursor_phys_row);
+        u32 capacity = terminal_history_capacity_locked();
+        u32 available = capacity > terminal.history_rows ?
+                        capacity - terminal.history_rows : 0U;
+
+        if (cursor_row >= terminal.visible_rows)
+            cursor_row = terminal.visible_rows - 1U;
+        terminal.live_top_row_idx =
+            (terminal.live_top_row_idx + terminal.visible_rows) %
+            TERMINAL_BUFFER_ROWS;
+        terminal.top_row_idx = terminal.live_top_row_idx;
+        terminal.history_rows = terminal.visible_rows > available ?
+                                capacity :
+                                terminal.history_rows + terminal.visible_rows;
+        terminal.cursor_phys_row = live_screen_to_phys_row(cursor_row);
+        terminal.history_view_cleared = false;
+    }
+
+    /* On the normal screen, these are fresh ring rows after advancing the
+     * live viewport. On the alternate screen retain its existing clear
+     * behavior; its owner manages navigation and the saved normal ring is
+     * restored when the alternate screen closes. */
     for (u32 row = 0U; row < terminal.visible_rows; row++)
         terminal_clear_phys_row(screen_to_phys_row(row), terminal.bg_color);
 
