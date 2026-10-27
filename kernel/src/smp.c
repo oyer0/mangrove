@@ -382,12 +382,14 @@ void smp_ap_entry(u32 cpu_index)
         smp_store_state(&runtime->state, SMP_AP_MAILBOX_FAILED);
         for (;;) cpu_relax();
     }
+#if defined(KERNEL_STACK_DIAGNOSTICS)
     {
         uintptr_t stack_pointer;
         __asm__ volatile("movq %%rsp, %0" : "=r"(stack_pointer));
         kernel_stack_usage_sample(KERNEL_STACK_USAGE_AP_STARTUP,
                                   runtime->stack_top, stack_pointer);
     }
+#endif
     if (trampoline_mailbox->cpu_index != cpu_index ||
         trampoline_mailbox->apic_id != cpu->apic_id ||
         trampoline_mailbox->cpu_local != (u64)(uintptr_t)cpu) {
@@ -443,12 +445,14 @@ void smp_ap_entry(u32 cpu_index)
     KERNEL_BOOT_DEBUG_LOG("[SMP] APIC %u scheduler-ready (cpu%u)\n",
                           (u32)cpu->apic_id, cpu_index);
 
+#if defined(KERNEL_STACK_DIAGNOSTICS)
     {
         uintptr_t stack_pointer;
         __asm__ volatile("movq %%rsp, %0" : "=r"(stack_pointer));
         kernel_stack_usage_sample(KERNEL_STACK_USAGE_AP_STARTUP,
                                   runtime->stack_top, stack_pointer);
     }
+#endif
 
     if (!scheduler_start_cpu()) {
         cpu_mark_offline(cpu);

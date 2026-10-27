@@ -31,6 +31,7 @@ def function(name):
 
 prefix = r'''
 #define _GNU_SOURCE
+#define KERNEL_STACK_DIAGNOSTICS 1
 #include <assert.h>
 #include <stdbool.h>
 #include <stdint.h>

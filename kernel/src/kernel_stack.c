@@ -126,7 +126,9 @@ bool kernel_stack_release_context_valid(void)
 
 bool kernel_stack_release(kernel_stack_t *stack)
 {
+#if defined(KERNEL_STACK_DIAGNOSTICS)
     usize measured;
+#endif
     u32 usable_pages;
 
     if (!stack || !stack->active || !stack->range.base || !stack->base ||
@@ -135,10 +137,12 @@ bool kernel_stack_release(kernel_stack_t *stack)
         !kernel_stack_release_context_valid())
         return false;
 
+#if defined(KERNEL_STACK_DIAGNOSTICS)
     measured = kernel_stack_measure_high_water(stack);
     if (measured > stack->high_water_bytes)
         stack->high_water_bytes = measured;
     kernel_stack_record_usage(stack->usage_kind, stack->high_water_bytes);
+#endif
 
     usable_pages = (u32)(stack->size / KERNEL_STACK_PAGE_SIZE);
     if (!vmm_kernel_range_unmap(&stack->range, 1U, usable_pages))

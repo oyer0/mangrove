@@ -119,6 +119,10 @@ void panic(const char *message)
     (void)message;
     abort();
 }
+void kprint(const char *format, ...)
+{
+    (void)format;
+}
 
 #include "../../kernel/src/kernel_stack.c"
 

@@ -1187,7 +1187,8 @@ test-idt:
 test-kernel-stack: test-http-wire
 	@mkdir -p $(BUILD_DIR)/tests
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
-		-fsanitize=address,undefined -Ikernel/include -Iinclude \
+		-fsanitize=address,undefined -DKERNEL_STACK_DIAGNOSTICS=1 \
+		-Ikernel/include -Iinclude \
 		-idirafter libc/include tests/kernel/kernel_stack_test.c \
 		-o $(BUILD_DIR)/tests/kernel-stack-test
 	ASAN_OPTIONS=detect_leaks=0 $(BUILD_DIR)/tests/kernel-stack-test

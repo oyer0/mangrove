@@ -164,7 +164,9 @@ static void scheduler_update_runnable_peak(void)
  */
 static void thread_entry_trampoline(void)
 {
+#if defined(KERNEL_STACK_DIAGNOSTICS)
     uintptr_t stack_pointer;
+#endif
     u64 flags = spin_lock_irqsave(&scheduler_lock);
     kernel_thread_t *thread = current_thread;
     cpu_local_t *cpu = scheduler_cpu_local();
@@ -178,9 +180,11 @@ static void thread_entry_trampoline(void)
                                               __ATOMIC_RELAXED) == 1;
     spin_unlock_irqrestore(&scheduler_lock, flags);
 
+#if defined(KERNEL_STACK_DIAGNOSTICS)
     __asm__ volatile("movq %%rsp, %0" : "=r"(stack_pointer));
     if (thread && thread->kernel_stack.active)
         kernel_stack_sample_rsp(&thread->kernel_stack, stack_pointer);
+#endif
 
     if (first_kernel_run) {
         KERNEL_BOOT_DEBUG_LOG("[SCHED] kernel thread '%s' first ran on CPU %u\n",
@@ -204,11 +208,13 @@ static void idle_thread_entry(void *argument)
 {
     (void)argument;
     {
-        uintptr_t stack_pointer;
         kernel_thread_t *thread = scheduler_current_thread();
+#if defined(KERNEL_STACK_DIAGNOSTICS)
+        uintptr_t stack_pointer;
         __asm__ volatile("movq %%rsp, %0" : "=r"(stack_pointer));
         if (thread && thread->kernel_stack.active)
             kernel_stack_sample_rsp(&thread->kernel_stack, stack_pointer);
+#endif
         if (thread && !cpu_current()->bsp)
             smp_ap_idle_entered(cpu_current_index());
     }
@@ -266,7 +272,9 @@ void scheduler_context_switch_saved(uintptr_t *outgoing_rsp_slot,
                                     uintptr_t incoming_rsp)
 {
     kernel_thread_t *outgoing = NULL;
+#if defined(KERNEL_STACK_DIAGNOSTICS)
     uintptr_t stack_pointer;
+#endif
     u64 flags;
 
     if (outgoing_rsp_slot) {
@@ -275,6 +283,7 @@ void scheduler_context_switch_saved(uintptr_t *outgoing_rsp_slot,
     }
     if (outgoing)
         fpu_state_save(&outgoing->fpu_state);
+#if defined(KERNEL_STACK_DIAGNOSTICS)
     __asm__ volatile("movq %%rsp, %0" : "=r"(stack_pointer));
     if (outgoing && outgoing->kernel_stack.active) {
         kernel_stack_sample_rsp(&outgoing->kernel_stack, stack_pointer);
@@ -284,6 +293,7 @@ void scheduler_context_switch_saved(uintptr_t *outgoing_rsp_slot,
             outgoing->kernel_stack_base + outgoing->kernel_stack_size,
             stack_pointer);
     }
+#endif
     flags = spin_lock_irqsave(&scheduler_lock);
     if (outgoing) {
         outgoing->saved_context_valid = true;

@@ -27,6 +27,7 @@ def function(name):
     raise ValueError(name)
 
 pre = r'''
+#define KERNEL_STACK_DIAGNOSTICS 1
 #include <assert.h>
 #include <stdbool.h>
 #include <stdint.h>

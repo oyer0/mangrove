@@ -59,14 +59,17 @@ static const char *exception_messages[32] = {
 
 void exception_handler(struct cpu_registers *regs)
 {
+#if defined(KERNEL_STACK_DIAGNOSTICS)
     kernel_stack_usage_kind_t stack_kind;
     uintptr_t exception_stack_top;
     uintptr_t stack_pointer;
+#endif
 
     if (!regs) {
         panic_exception("Unknown CPU Exception", regs);
     }
 
+#if defined(KERNEL_STACK_DIAGNOSTICS)
     exception_stack_top = gdt_exception_stack_top(
         cpu_current(), regs->vec_no, &stack_kind);
     if (exception_stack_top) {
@@ -74,6 +77,7 @@ void exception_handler(struct cpu_registers *regs)
         kernel_stack_usage_sample(stack_kind, exception_stack_top,
                                   stack_pointer);
     }
+#endif
 
     if (regs->vec_no == IDT_VECTOR_PAGE_FAULT ||
         regs->vec_no == IDT_VECTOR_DOUBLE_FAULT) {
@@ -81,12 +85,14 @@ void exception_handler(struct cpu_registers *regs)
         kernel_stack_usage_kind_t fault_stack_kind;
 
         __asm__ volatile("movq %%cr2, %0" : "=r"(fault_address));
+#if defined(KERNEL_STACK_DIAGNOSTICS)
         if ((regs->cs & 3U) == 0U) {
             kernel_thread_t *thread = scheduler_current_thread();
             if (thread && thread->kernel_stack.active)
                 kernel_stack_sample_rsp(&thread->kernel_stack,
                                         (uintptr_t)regs->rsp);
         }
+#endif
 
         if (scheduler_current_stack_guard_fault(fault_address)) {
             kernel_thread_t *thread = scheduler_current_thread();
