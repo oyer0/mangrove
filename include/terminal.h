@@ -2,6 +2,8 @@
 #pragma once
 
 #include <bootinfo.h>
+#include <mutex.h>
+#include <terminal_control.h>
 #include <terminal_colors.h>
 #include <types.h>
 
@@ -79,6 +81,20 @@ bool terminal_alternate_abort(void);
 bool terminal_process_controls(u64 process_id);
 bool terminal_process_output_allowed(u64 process_id);
 bool terminal_process_input_allowed(u64 process_id);
+
+/* Per-handle styling state for the versioned MGTC stream.  The stream object
+ * owns this state; it is never shared through the process-wide console. */
+typedef struct {
+    mutex_t write_lock;
+    u8 foreground;
+    u8 background;
+} terminal_control_stream_state_t;
+
+void terminal_control_stream_init(terminal_control_stream_state_t *state);
+i64 terminal_control_stream_write_for_process(
+    u64 process_id, terminal_control_stream_state_t *state,
+    const void *records, u64 length);
+
 bool terminal_move_cursor(u32 row, u32 column);
 bool terminal_set_cursor_visible(bool visible);
 bool terminal_clear_current_line(void);

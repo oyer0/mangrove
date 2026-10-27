@@ -210,6 +210,32 @@ void spin_unlock_irqrestore(spinlock_t *lock, u64 flags)
     lock->value = 0;
 }
 
+void mutex_init(mutex_t *mutex)
+{
+    spinlock_init(&mutex->state_lock);
+    mutex->owner = NULL;
+    mutex->wait_head = NULL;
+    mutex->wait_tail = NULL;
+}
+
+bool mutex_lock(mutex_t *mutex)
+{
+    if (!mutex || mutex->owner) return false;
+    mutex->owner = (struct kernel_thread *)(uintptr_t)1U;
+    return true;
+}
+
+bool mutex_unlock(mutex_t *mutex)
+{
+    if (!mutex || mutex->owner != (struct kernel_thread *)(uintptr_t)1U)
+        return false;
+    mutex->owner = NULL;
+    return true;
+}
+
+void *kmalloc(usize size) { return malloc(size); }
+void kfree(void *pointer) { free(pointer); }
+
 u64 timer_uptime_ms(void) { return ++mock_time; }
 u32 font_width(void) { return 8U; }
 u32 font_height(void) { return 16U; }
@@ -853,58 +879,276 @@ static void test_wrap_cursor_stays_in_last_cell(void)
     assert(screen_cell(1U, 0U)->codepoint == 'F');
 }
 
-static void test_csi_parameters_are_local_and_unknown_sequences_are_consumed(void)
+static void test_escape_sequences_are_literal(void)
 {
-    static const u32 clear_screen[] = {0x1bU, '[', '2', 'J'};
-    static const u32 unparameterized_clear[] = {0x1bU, '[', 'J'};
+    static const char clear_sequence[] = "\x1b[2J";
+    static const char color_sequence[] = "\x1b[7m";
 
-    initialize(100U, 56U);
+    initialize(120U, 56U);
     terminal.top_row_idx = 4U;
     terminal.cursor_phys_row = 5U;
     terminal.cursor_col = 3U;
     terminal_cell_at(4U, 0U)->codepoint = 'Q';
-    write_sequence(clear_screen, sizeof(clear_screen) / sizeof(clear_screen[0]));
+    assert(terminal_write_for_process(EDITOR_TEST_PID, clear_sequence,
+                                      sizeof(clear_sequence) - 1U) ==
+           (i64)(sizeof(clear_sequence) - 1U));
+    assert(terminal.top_row_idx == 4U && terminal.cursor_phys_row == 5U);
+    assert(screen_cell(1U, 3U)->codepoint == 0xfffdU);
+    assert(screen_cell(1U, 4U)->codepoint == '[');
+    assert(screen_cell(1U, 5U)->codepoint == '2');
+    assert(screen_cell(1U, 6U)->codepoint == 'J');
+    assert(terminal_cell_at(4U, 0U)->codepoint == 'Q');
+
+    initialize(120U, 56U);
+    assert(terminal_write_styled_for_process(EDITOR_TEST_PID, color_sequence,
+        sizeof(color_sequence) - 1U, TERMINAL_COLOR_GREEN,
+        TERMINAL_COLOR_BLACK) == (i64)(sizeof(color_sequence) - 1U));
+    assert(screen_cell(0U, 0U)->codepoint == 0xfffdU);
+    assert(screen_cell(0U, 1U)->codepoint == '[');
+    assert(screen_cell(0U, 0U)->fg_color == TERMINAL_COLOR_GREEN);
+    assert(screen_cell(0U, 1U)->fg_color == TERMINAL_COLOR_GREEN);
+}
+
+static void test_text_controls_and_mgtc_stream(void)
+{
+    u8 records[128];
+    usize length = 0U;
+    terminal_control_stream_state_t stream;
+    terminal_control_stream_state_t second_stream;
+
+    #define APPEND_RECORD(type_value, payload_value, payload_size) do { \
+        const u8 *local_payload = (const u8 *)(payload_value); \
+        memcpy(records + length, "MGTC", 4U); \
+        records[length + 4U] = MG_TERMINAL_CONTROL_VERSION; \
+        records[length + 5U] = (u8)(type_value); \
+        u32 local_size = (u32)(payload_size); \
+        records[length + 6U] = (u8)local_size; \
+        records[length + 7U] = (u8)(local_size >> 8); \
+        records[length + 8U] = (u8)(local_size >> 16); \
+        records[length + 9U] = (u8)(local_size >> 24); \
+        if (local_size) memcpy(records + length + 10U, local_payload, local_size); \
+        length += 10U + local_size; \
+    } while (0)
+
+    initialize(116U, 92U); /* Twelve columns leave room for the whole batch. */
+    terminal_control_stream_init(&stream);
+    terminal_control_stream_init(&second_stream);
+    const u8 green[] = {TERMINAL_COLOR_GREEN};
+    const u8 mang[] = {'m', 'a', 'n', 'g'};
+    const u8 yellow[] = {TERMINAL_COLOR_YELLOW};
+    const u8 rove[] = {'r', 'o', 'v', 'e'};
+    APPEND_RECORD(MG_TERMINAL_CONTROL_FOREGROUND, green, sizeof(green));
+    APPEND_RECORD(MG_TERMINAL_CONTROL_TEXT, mang, sizeof(mang));
+    APPEND_RECORD(MG_TERMINAL_CONTROL_FOREGROUND, yellow, sizeof(yellow));
+    APPEND_RECORD(MG_TERMINAL_CONTROL_TEXT, rove, sizeof(rove));
+    APPEND_RECORD(MG_TERMINAL_CONTROL_RESET, NULL, 0U);
+    assert(terminal_control_stream_write_for_process(EDITOR_TEST_PID, &stream,
+        records, length) == (i64)length);
+    for (u32 column = 0; column < 4U; column++) {
+        assert(screen_cell(0U, column)->fg_color == TERMINAL_COLOR_GREEN);
+        assert(screen_cell(0U, column)->codepoint == mang[column]);
+        assert(screen_cell(0U, column + 4U)->fg_color == TERMINAL_COLOR_YELLOW);
+        assert(screen_cell(0U, column + 4U)->codepoint == rove[column]);
+    }
+    assert(stream.foreground == TERMINAL_COLOR_LIGHT_GRAY);
+    assert(second_stream.foreground == TERMINAL_COLOR_LIGHT_GRAY);
+
+    length = 0U;
+    const u8 warning[] = {TERMINAL_STYLE_WARNING};
+    const u8 bg_blue[] = {TERMINAL_COLOR_BLUE};
+    const u8 marked[] = {'!'};
+    APPEND_RECORD(MG_TERMINAL_CONTROL_STYLE, warning, sizeof(warning));
+    APPEND_RECORD(MG_TERMINAL_CONTROL_BACKGROUND, bg_blue, sizeof(bg_blue));
+    APPEND_RECORD(MG_TERMINAL_CONTROL_TEXT, marked, sizeof(marked));
+    assert(terminal_control_stream_write_for_process(EDITOR_TEST_PID, &stream,
+        records, length) == (i64)length);
+    terminal_style_t warning_style = terminal_style_for_role(
+        TERMINAL_STYLE_WARNING);
+    assert(screen_cell(0U, 8U)->fg_color == warning_style.foreground);
+    assert(screen_cell(0U, 8U)->bg_color == TERMINAL_COLOR_BLUE);
+    assert(screen_cell(0U, 8U)->codepoint == '!');
+
+    length = 0U;
+    const u8 continued[] = {'?'};
+    APPEND_RECORD(MG_TERMINAL_CONTROL_TEXT, continued, sizeof(continued));
+    assert(terminal_control_stream_write_for_process(EDITOR_TEST_PID, &stream,
+        records, length) == (i64)length);
+    assert(screen_cell(0U, 9U)->codepoint == '?');
+    assert(screen_cell(0U, 9U)->fg_color == warning_style.foreground);
+    assert(screen_cell(0U, 9U)->bg_color == TERMINAL_COLOR_BLUE);
+
+    /* A style-only batch is stream-local state and must not erase a live
+     * completion overlay or move the terminal cursor. */
+    terminal_overlay.active = true;
+    terminal_overlay.owner_pid = EDITOR_TEST_PID;
+    u32 cursor_before_style = terminal.cursor_col;
+    length = 0U;
+    const u8 foreground_only[] = {(u8)warning_style.foreground};
+    APPEND_RECORD(MG_TERMINAL_CONTROL_FOREGROUND, foreground_only,
+                  sizeof(foreground_only));
+    assert(terminal_control_stream_write_for_process(EDITOR_TEST_PID, &stream,
+        records, length) == (i64)length);
+    assert(terminal_overlay.active);
+    assert(terminal.cursor_col == cursor_before_style);
+    terminal_overlay.active = false;
+
+    /* A later bad record invalidates the whole batch before the leading text
+     * can change cells or cursor state. */
+    length = 0U;
+    const u8 prefix[] = {'X'};
+    APPEND_RECORD(MG_TERMINAL_CONTROL_TEXT, prefix, sizeof(prefix));
+    records[length] = 'M'; records[length + 1U] = 'G';
+    records[length + 2U] = 'T'; records[length + 3U] = 'C';
+    records[length + 4U] = MG_TERMINAL_CONTROL_VERSION;
+    records[length + 5U] = MG_TERMINAL_CONTROL_FOREGROUND;
+    records[length + 6U] = 1U; records[length + 7U] = 0U;
+    records[length + 8U] = 0U; records[length + 9U] = 0U;
+    records[length + 10U] = TERMINAL_COLOR_COUNT;
+    length += 11U;
+    u32 old_cursor = terminal.cursor_col;
+    assert(terminal_control_stream_write_for_process(EDITOR_TEST_PID, &stream,
+        records, length) == MG_ERR_BAD_ARGUMENT);
+    assert(terminal.cursor_col == old_cursor);
+    assert(screen_cell(0U, 10U)->codepoint == ' ');
+    assert(stream.foreground == warning_style.foreground);
+    assert(stream.background == TERMINAL_COLOR_BLUE);
+
+    length = 0U;
+    APPEND_RECORD(MG_TERMINAL_CONTROL_TEXT, prefix, sizeof(prefix));
+    records[length] = 'M'; records[length + 1U] = 'G';
+    records[length + 2U] = 'T'; records[length + 3U] = 'C';
+    records[length + 4U] = MG_TERMINAL_CONTROL_VERSION + 1U;
+    records[length + 5U] = MG_TERMINAL_CONTROL_TEXT;
+    records[length + 6U] = 1U; records[length + 7U] = 0U;
+    records[length + 8U] = 0U; records[length + 9U] = 0U;
+    records[length + 10U] = 'Y';
+    length += 11U;
+    assert(terminal_control_stream_write_for_process(EDITOR_TEST_PID, &stream,
+        records, length) == MG_ERR_BAD_ARGUMENT);
+    assert(screen_cell(0U, 10U)->codepoint == ' ');
+
+    length = 0U;
+    APPEND_RECORD(MG_TERMINAL_CONTROL_TEXT, prefix, sizeof(prefix));
+    records[length] = 'M'; records[length + 1U] = 'G';
+    records[length + 2U] = 'T'; records[length + 3U] = 'C';
+    records[length + 4U] = MG_TERMINAL_CONTROL_VERSION;
+    records[length + 5U] = MG_TERMINAL_CONTROL_TEXT;
+    records[length + 6U] = 2U; records[length + 7U] = 0U;
+    records[length + 8U] = 0U; records[length + 9U] = 0U;
+    records[length + 10U] = 'Y';
+    length += 11U; /* Declares two payload bytes but supplies one. */
+    assert(terminal_control_stream_write_for_process(EDITOR_TEST_PID, &stream,
+        records, length) == MG_ERR_BAD_ARGUMENT);
+    assert(screen_cell(0U, 10U)->codepoint == ' ');
+
+    length = 0U;
+    const u8 cursor_bad[] = {99U, 0U, 0U, 0U, 99U, 0U, 0U, 0U};
+    APPEND_RECORD(MG_TERMINAL_CONTROL_TEXT, prefix, sizeof(prefix));
+    APPEND_RECORD(MG_TERMINAL_CONTROL_CURSOR_POSITION, cursor_bad,
+                  sizeof(cursor_bad));
+    assert(terminal_control_stream_write_for_process(EDITOR_TEST_PID, &stream,
+        records, length) == MG_ERR_BAD_ARGUMENT);
+    assert(screen_cell(0U, 10U)->codepoint == ' ');
+
+    length = 0U;
+    APPEND_RECORD(MG_TERMINAL_CONTROL_TEXT, prefix, sizeof(prefix));
+    assert(terminal_alternate_enter_process(9U));
+    assert(terminal_control_stream_write_for_process(EDITOR_TEST_PID, &stream,
+        records, length) == MG_ERR_ACCESS_DENIED);
+    assert(screen_cell(0U, 10U)->codepoint == ' ');
+    assert(terminal_alternate_leave_process(9U));
+
+    /* The prior stream's style is not global terminal state: a fresh handle
+     * still emits with its own default colors. */
+    length = 0U;
+    APPEND_RECORD(MG_TERMINAL_CONTROL_TEXT, marked, sizeof(marked));
+    assert(terminal_control_stream_write_for_process(EDITOR_TEST_PID,
+        &second_stream, records, length) == (i64)length);
+    assert(screen_cell(0U, 10U)->fg_color == TERMINAL_COLOR_LIGHT_GRAY);
+
+    /* Cursor and clear records use the same production locked operations as
+     * the structured terminal API. Verify their effects on cells and cursor
+     * state, not only their record encoding. */
+    length = 0U;
+    const u8 origin[] = {0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U};
+    const u8 middle[] = {0U, 0U, 0U, 0U, 2U, 0U, 0U, 0U};
+    const u8 row_one_column_one[] = {1U, 0U, 0U, 0U, 1U, 0U, 0U, 0U};
+    const u8 hide[] = {0U};
+    const u8 show[] = {1U};
+    const u8 clear_to_end[] = {MG_TERMINAL_CONTROL_CLEAR_TO_END};
+    const u8 clear_line[] = {MG_TERMINAL_CONTROL_CLEAR_LINE};
+    const u8 clear_screen[] = {MG_TERMINAL_CONTROL_CLEAR_SCREEN};
+    const u8 sample[] = {'A', 'B', 'C', 'D', 'E'};
+    const u8 marker[] = {'Z'};
+    APPEND_RECORD(MG_TERMINAL_CONTROL_CURSOR_POSITION, origin,
+                  sizeof(origin));
+    APPEND_RECORD(MG_TERMINAL_CONTROL_TEXT, sample, sizeof(sample));
+    APPEND_RECORD(MG_TERMINAL_CONTROL_CURSOR_POSITION, middle,
+                  sizeof(middle));
+    APPEND_RECORD(MG_TERMINAL_CONTROL_CLEAR, clear_to_end,
+                  sizeof(clear_to_end));
+    assert(terminal_control_stream_write_for_process(EDITOR_TEST_PID, &stream,
+        records, length) == (i64)length);
+    assert(screen_cell(0U, 0U)->codepoint == 'A');
+    assert(screen_cell(0U, 1U)->codepoint == 'B');
+    for (u32 column = 2U; column < terminal.visible_cols; column++)
+        assert(screen_cell(0U, column)->codepoint == ' ');
+    assert(terminal.cursor_col == 2U);
+
+    length = 0U;
+    APPEND_RECORD(MG_TERMINAL_CONTROL_CLEAR, clear_line,
+                  sizeof(clear_line));
+    APPEND_RECORD(MG_TERMINAL_CONTROL_CURSOR_POSITION, row_one_column_one,
+                  sizeof(row_one_column_one));
+    APPEND_RECORD(MG_TERMINAL_CONTROL_TEXT, marker, sizeof(marker));
+    APPEND_RECORD(MG_TERMINAL_CONTROL_CURSOR_VISIBILITY, hide, sizeof(hide));
+    assert(terminal_control_stream_write_for_process(EDITOR_TEST_PID, &stream,
+        records, length) == (i64)length);
+    for (u32 column = 0U; column < terminal.visible_cols; column++)
+        assert(screen_cell(0U, column)->codepoint == ' ');
+    assert(screen_cell(1U, 1U)->codepoint == 'Z');
+    assert(!terminal.cursor_enabled);
+
+    length = 0U;
+    APPEND_RECORD(MG_TERMINAL_CONTROL_CURSOR_VISIBILITY, show, sizeof(show));
+    APPEND_RECORD(MG_TERMINAL_CONTROL_CLEAR, clear_screen,
+                  sizeof(clear_screen));
+    assert(terminal_control_stream_write_for_process(EDITOR_TEST_PID, &stream,
+        records, length) == (i64)length);
     assert(terminal.top_row_idx == 0U && terminal.cursor_col == 0U);
+    assert(terminal.cursor_enabled);
+    for (u32 row = 0U; row < terminal.visible_rows; row++)
+        for (u32 column = 0U; column < terminal.visible_cols; column++)
+            assert(screen_cell(row, column)->codepoint == ' ');
+
+    length = 0U;
+    APPEND_RECORD(MG_TERMINAL_CONTROL_TEXT, prefix, sizeof(prefix));
+    records[length] = 'M'; records[length + 1U] = 'G';
+    records[length + 2U] = 'T'; records[length + 3U] = 'C';
+    records[length + 4U] = MG_TERMINAL_CONTROL_VERSION;
+    records[length + 5U] = 0xffU; /* Unknown future record type. */
+    records[length + 6U] = 0U; records[length + 7U] = 0U;
+    records[length + 8U] = 0U; records[length + 9U] = 0U;
+    length += 10U;
+    assert(terminal_control_stream_write_for_process(EDITOR_TEST_PID, &stream,
+        records, length) == MG_ERR_UNSUPPORTED);
+    assert(terminal.cursor_col == 0U);
     assert(screen_cell(0U, 0U)->codepoint == ' ');
 
-    write_codepoint('P');
-    terminal.cursor_col = 4U;
-    write_sequence(unparameterized_clear,
-                   sizeof(unparameterized_clear) /
-                       sizeof(unparameterized_clear[0]));
-    assert(terminal.cursor_col == 4U);
-    assert(screen_cell(0U, 0U)->codepoint == 'P');
-
-}
-
-static void test_unknown_csi_is_consumed(void)
-{
-    static const u32 unsupported_color[] = {0x1bU, '[', '3', '1', 'm'};
-    initialize(100U, 56U);
-    write_sequence(unsupported_color,
-                   sizeof(unsupported_color) /
-                       sizeof(unsupported_color[0]));
+    u8 *oversized_batch = malloc(TERMINAL_CONTROL_MAX_BATCH + 1U);
+    assert(oversized_batch);
+    memset(oversized_batch, 0, TERMINAL_CONTROL_MAX_BATCH + 1U);
+    assert(terminal_control_stream_write_for_process(EDITOR_TEST_PID, &stream,
+        oversized_batch, TERMINAL_CONTROL_MAX_BATCH + 1U) ==
+        MG_ERR_BUFFER_TOO_SMALL);
     assert(terminal.cursor_col == 0U);
-    for (u32 column = 0; column < terminal.visible_cols; column++)
-        assert(screen_cell(0U, column)->codepoint == ' ');
-}
+    assert(screen_cell(0U, 0U)->codepoint == ' ');
+    free(oversized_batch);
 
-static void test_supported_sgr_and_cr_backspace_lf(void)
-{
-    static const u32 inverse_on[] = {0x1bU, '[', '7', 'm'};
-    static const u32 inverse_off[] = {0x1bU, '[', '0', 'm'};
+    #undef APPEND_RECORD
 
     initialize(100U, 56U);
-    write_sequence(inverse_on, sizeof(inverse_on) / sizeof(inverse_on[0]));
-    write_codepoint('I');
-    assert(screen_cell(0U, 0U)->fg_color == terminal.bg_color);
-    assert(screen_cell(0U, 0U)->bg_color == terminal.fg_color);
-    write_sequence(inverse_off,
-                   sizeof(inverse_off) / sizeof(inverse_off[0]));
-    write_codepoint('N');
-    assert(screen_cell(0U, 1U)->fg_color == terminal.fg_color);
-    assert(screen_cell(0U, 1U)->bg_color == terminal.bg_color);
-
+    write_codepoint('A');
     write_codepoint('\r');
     assert(terminal.cursor_col == 0U);
     write_codepoint('X');
@@ -1296,12 +1540,10 @@ int main(int argument_count, char **arguments)
         test_tab_stops_and_deferred_wrap();
     if (run_all || !strcmp(arguments[1], "cursor"))
         test_wrap_cursor_stays_in_last_cell();
-    if (run_all || !strcmp(arguments[1], "csi"))
-        test_csi_parameters_are_local_and_unknown_sequences_are_consumed();
-    if (run_all || !strcmp(arguments[1], "unknown"))
-        test_unknown_csi_is_consumed();
-    if (run_all || !strcmp(arguments[1], "controls"))
-        test_supported_sgr_and_cr_backspace_lf();
+    if (run_all || !strcmp(arguments[1], "literal-escape"))
+        test_escape_sequences_are_literal();
+    if (run_all || !strcmp(arguments[1], "mgtc"))
+        test_text_controls_and_mgtc_stream();
     if (run_all || !strcmp(arguments[1], "utf8"))
         test_utf8_across_write_boundaries();
     if (run_all || !strcmp(arguments[1], "alternate"))
@@ -1318,6 +1560,6 @@ int main(int argument_count, char **arguments)
         test_production_line_editor_incremental_rendering();
     free(pixel_backbuffer);
     free(pixel_display);
-    puts("terminal renderer: cursor/scroll pixels, session-history clearing, startup cursor ownership, geometry, wrapped input, CSI, UTF-8, alternate screen and incremental line editing passed");
+    puts("terminal renderer: cursor/scroll pixels, session-history clearing, startup cursor ownership, geometry, wrapped input, literal escape text, MGTC batches, UTF-8, alternate screen and incremental line editing passed");
     return 0;
 }

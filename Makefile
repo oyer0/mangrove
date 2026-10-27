@@ -2315,7 +2315,8 @@ $(COMMAND_PATH_OBJ): userspace/common/path.c userspace/common/path.h $(USER_LIBC
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -Iuserspace/common -c $< -o $@
 
-$(CLEAR_DIR)/clear.o: userspace/clear/main.c userspace/common/help.h $(USER_LIBC)
+$(CLEAR_DIR)/clear.o: userspace/clear/main.c userspace/common/help.h \
+		libc/include/mg/terminal.h $(USER_LIBC)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 

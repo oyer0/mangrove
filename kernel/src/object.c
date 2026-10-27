@@ -18,6 +18,11 @@ typedef struct {
 
 typedef struct {
     kernel_object_t base;
+    terminal_control_stream_state_t state;
+} terminal_control_stream_object_t;
+
+typedef struct {
+    kernel_object_t base;
     vfs_node_t *node;
     vfs_super_t *super;
     mutex_t state_lock;
@@ -50,6 +55,25 @@ static i64 console_read(kernel_object_t *object, void *buffer, u64 length)
      * before handing this process ownership of console input. */
     terminal_force_end_batch();
     return console_read_bytes_checked(buffer, length);
+}
+
+static i64 terminal_control_stream_write(kernel_object_t *object,
+                                         const void *buffer, u64 length)
+{
+    terminal_control_stream_object_t *stream =
+        (terminal_control_stream_object_t *)object;
+    process_t *process = process_current();
+
+    if (!stream || object->type != OBJECT_TYPE_TERMINAL_CONTROL_STREAM ||
+        (length && !buffer) || !process)
+        return MG_ERR_BAD_ARGUMENT;
+    return terminal_control_stream_write_for_process(
+        process->pid, &stream->state, buffer, length);
+}
+
+static void terminal_control_stream_destroy(kernel_object_t *object)
+{
+    kfree(object);
 }
 
 static i64 file_read(kernel_object_t *object, void *buffer, u64 length)
@@ -172,6 +196,19 @@ kernel_object_t *object_console_create(void)
     object->read = console_read;
     object->write = console_write;
     return object;
+}
+
+kernel_object_t *object_terminal_control_stream_create(void)
+{
+    terminal_control_stream_object_t *stream =
+        (terminal_control_stream_object_t *)kmalloc(sizeof(*stream));
+    if (!stream) return NULL;
+
+    object_init(&stream->base, OBJECT_TYPE_TERMINAL_CONTROL_STREAM,
+                terminal_control_stream_destroy);
+    stream->base.write = terminal_control_stream_write;
+    terminal_control_stream_init(&stream->state);
+    return &stream->base;
 }
 
 i64 object_read(kernel_object_t *object, void *buffer, u64 length)

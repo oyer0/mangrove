@@ -849,6 +849,30 @@ mg_result_t terminal_write_semantic(const void *buffer, usize length,
                              (void *)buffer);
 }
 
+mg_result_t terminal_control_stream_open(mg_handle_t *out_handle)
+{
+    long result;
+
+    if (!out_handle) return MG_ERR_BAD_ARGUMENT;
+    result = mg_syscall(65, MG_TERMINAL_OP_CONTROL_STREAM_OPEN, 0, 0);
+    if (result < 0) return (mg_result_t)result;
+    if ((unsigned long)result > 0xffffffffUL) return MG_ERR_IO;
+    *out_handle = (mg_handle_t)result;
+    return MG_OK;
+}
+
+mg_result_t terminal_control_stream_write(mg_handle_t handle,
+                                          const void *records,
+                                          usize length)
+{
+    mg_result_t result;
+
+    if (!handle || (length && !records)) return MG_ERR_BAD_ARGUMENT;
+    result = object_write(handle, records, length);
+    if (result < 0) return result;
+    return (usize)result == length ? MG_OK : MG_ERR_IO;
+}
+
 mg_result_t file_snapshot(mg_handle_t handle, char *data, usize capacity,
                            mg_file_lines_state_t *state)
 {

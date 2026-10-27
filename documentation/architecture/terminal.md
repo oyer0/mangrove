@@ -127,17 +127,52 @@ wide cells, shaping, or bidirectional layout.
 The console recognizes carriage return (column zero), backspace (move left by
 one cell when possible, without erasing), and line feed (column zero on the
 next row). A tab advances with blank cells to the next eight-column stop.
-Wrapping is deferred
-until the next printable character; while that wrap is pending, the visible
-cursor is drawn on the last cell of the current row. The limited escape parser
-handles `ESC [ 2 J` (clear the text ring and home the cursor), `ESC [ 0 m`
-(normal video), and `ESC [ 7 m` (inverse video). Each CSI sequence starts with
-no parameters; unsupported CSI input is consumed through its final byte and
-does not leak its remaining bytes into displayed text. Other escape/CSI
-sequences have no terminal effect; this is not a VT, ANSI, or xterm-compatible
-terminal emulator. There is no PTY or general terminal-device abstraction.
-The userland line editor supports its documented key actions through native
-input events rather than relying on broad escape-sequence compatibility.
+Wrapping is deferred until the next printable character; while that wrap is
+pending, the visible cursor is drawn on the last cell of the current row.
+Ordinary output is literal text: ESC bytes are rendered as U+FFFD and never
+start a control sequence. ANSI/CSI-looking text, MGTC-looking bytes, and
+markup-looking text therefore cannot clear or restyle the console. There is
+no PTY or general terminal-device abstraction. The userland line editor
+supports its documented key actions through native input events rather than
+escape-sequence compatibility.
+
+### Native terminal-control stream
+
+The structured `mg/terminal.h` operations remain the direct native interface
+for screen ownership, cursor movement and visibility, clearing, styling,
+updates, dimensions, and input. They share the kernel terminal renderer and
+process ownership checks. Applications can also open a dedicated, write-only
+MGTC control-stream handle. Opening it requires stdout to be the process's
+console handle and the process to be allowed to control the current screen;
+a redirected stdout cannot open a stream that manipulates the console. The
+handle is process-owned, is not inherited as stdout, and is closed with the
+ordinary handle API.
+
+MGTC version 1 is a concatenation of records:
+
+```text
+"MGTC" | version:u8 | type:u8 | payload_length:u32-le | payload
+```
+
+The header is 10 bytes. Defined types are UTF-8 text (1), foreground color
+(2), background color (3), semantic style (4), style reset (5), cursor
+position (6), cursor visibility (7), and clear (8). Color and style payloads
+are one-byte values from `terminal_colors.h`; reset has no payload. Cursor
+position is two little-endian u32 values, row then column, both zero-based as
+in the structured API. Visibility is one byte (0 hidden, 1 shown). Clear is
+one byte: line (1), cursor to line end (2), or screen (3). Text is opaque to
+the protocol parser and follows the console's UTF-8 and C0 text behavior.
+
+Each stream write is limited to 65,536 bytes and must contain only complete,
+well-formed records. The kernel copies and validates the complete batch,
+checks cursor bounds and terminal ownership, then applies it under one
+terminal-lock acquisition and schedules one coherent presentation. Invalid
+version/type/length/payload, out-of-range coordinates, allocation failure, or
+authorization failure leaves terminal contents and stream style unchanged.
+Stream style starts at the default role and is local to the handle; `fg` and
+`bg` change one component, a semantic role sets both components, and reset
+restores default. Closing the handle discards that style. Separate writes
+from any process may interleave; a write is the atomicity boundary.
 
 The loam line editor renders its prompt when an input line is prepared (and
 again when completion explicitly clears that line). Ordinary insertion and

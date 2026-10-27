@@ -2166,12 +2166,47 @@ void syscall_dispatch(void *raw_frame)
             i64 result = MG_OK;
 
             if (!process || operation < MG_TERMINAL_OP_ALTERNATE_ENTER ||
-                operation > MG_TERMINAL_OP_INPUT_CURSOR) {
+                operation > MG_TERMINAL_OP_CONTROL_STREAM_OPEN) {
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
             }
 
             switch (operation) {
+                case MG_TERMINAL_OP_CONTROL_STREAM_OPEN: {
+                    kernel_object_t *output;
+                    kernel_object_t *stream;
+                    process_handle_t handle;
+
+                    if (frame->rsi || frame->rdx) {
+                        result = MG_ERR_BAD_ARGUMENT;
+                        break;
+                    }
+                    output = process_handle_lookup_retain(
+                        process, PROCESS_INITIAL_CONSOLE_HANDLE,
+                        OBJECT_TYPE_CONSOLE, OBJECT_RIGHT_WRITE);
+                    if (!output ||
+                        !terminal_process_controls(process->pid)) {
+                        if (output) object_release(output);
+                        result = MG_ERR_ACCESS_DENIED;
+                        break;
+                    }
+                    object_release(output);
+
+                    stream = object_terminal_control_stream_create();
+                    if (!stream) {
+                        result = MG_ERR_NO_MEMORY;
+                        break;
+                    }
+                    if (!process_handle_install(process, stream,
+                            OBJECT_RIGHT_WRITE, &handle)) {
+                        object_release(stream);
+                        result = MG_ERR_NO_MEMORY;
+                        break;
+                    }
+                    object_release(stream);
+                    frame->rax = handle;
+                    return;
+                }
                 case MG_TERMINAL_OP_ALTERNATE_ENTER:
                     if (frame->rsi || frame->rdx ||
                         !terminal_alternate_enter_process(process->pid))
