@@ -84,12 +84,20 @@ def digest(path):
     return value.hexdigest()
 
 
-def native_test_failure(text):
+def native_test_failure(text, expected_status=None):
     """Fstest reports redirected assertion failures before its shell resumes."""
     match = re.search(r'(?m)^FSTEST1 failed pid=([1-9][0-9]*) status=(-?[0-9]+)$', text)
-    if match and int(match.group(2)) != 0:
+    if (match and int(match.group(2)) != 0 and
+            int(match.group(2)) != expected_status):
         return match.group(0)
     return None
+
+
+def expected_failure_returned_to_prompt(text, observed_status,
+                                        expected_status, prompt):
+    """Require the expected native failure and return to its launching shell."""
+    return (observed_status is not None and observed_status == expected_status
+            and bool(prompt) and text.rstrip().endswith(prompt))
 
 
 def command(args, log):
@@ -554,6 +562,7 @@ def boot(folder, disk, phase, args):
     negative_exit = False
     child_status = 0
     network_ping_completed = False
+    expected_failure_status = None
     hotplug_actions = []
     expected_failure = phase == 'negative' or getattr(args, 'expected_child_failure', False)
     pipe_qmp = getattr(args, 'qmp_pipe', False)
@@ -622,9 +631,24 @@ def boot(folder, disk, phase, args):
                     r'(?m)^\[FAIL\] Ring 3 process creation failed[^\r\n]*', text)
                 if failed_startup:
                     raise RuntimeError('guest startup failed: ' + failed_startup.group(0))
-                failed_test = native_test_failure(text)
+                # The negative media-content phase deliberately expects the
+                # native test to return 43. Let the ordinary child-status
+                # handling below verify that exact result.
+                failed_test = native_test_failure(
+                    text, expected_status=43 if expected_failure else None)
                 if launched and failed_test:
                     raise RuntimeError(failed_test + '; inspect the native phase log')
+                if launched and expected_failure:
+                    failure_match = re.search(
+                        r'(?m)^FSTEST1 failed pid=[1-9][0-9]* status=(-?[0-9]+)$',
+                        text)
+                    if failure_match:
+                        observed = int(failure_match.group(1))
+                        if observed != 43:
+                            raise RuntimeError(
+                                'negative control reported native status '
+                                f'{observed}, expected 43')
+                        expected_failure_status = observed
                 if launched and control is not None: control.observe(qmp, text, part, started)
                 if (phase == 'network-ping' and launched and
                         re.search(r'(?m)^PING1 complete$', text) and
@@ -673,6 +697,22 @@ def boot(folder, disk, phase, args):
                         raise RuntimeError(
                             f'negative control exited with status {child_status}, expected 43')
                     negative_exit = expected_failure
+                    (part / 'blockstats.json').write_text(json.dumps(
+                        qmp.call('query-blockstats'), indent=2))
+                    qmp.call('quit')
+                    process.wait(timeout=10)
+                    break
+                if (launched and expected_failure and
+                        expected_failure_returned_to_prompt(
+                            text, expected_failure_status, 43,
+                            getattr(args, 'login_prompt', 'developer ~:'))):
+                    # Some shell paths return to the prompt without printing
+                    # an ordinary-child status line. The native FSTEST1 marker
+                    # plus the rendered prompt is the completion witness; the
+                    # caller checks the exact failure log and that the script
+                    # did not run its following command.
+                    child_status = expected_failure_status
+                    negative_exit = True
                     (part / 'blockstats.json').write_text(json.dumps(
                         qmp.call('query-blockstats'), indent=2))
                     qmp.call('quit')

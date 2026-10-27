@@ -22,6 +22,19 @@ for text in ('developer ~:', 'FSTEST1 failed pid=27 status=0',
              'quoted FSTEST1 failed pid=27 status=43',
              'FSTEST1 failed pid=0 status=43'):
     assert guest.native_test_failure(text) is None
+assert guest.native_test_failure('FSTEST1 failed pid=27 status=43',
+                                 expected_status=43) is None
+assert guest.native_test_failure('FSTEST1 failed pid=27 status=42',
+                                 expected_status=43) == \
+    'FSTEST1 failed pid=27 status=42'
+assert not guest.expected_failure_returned_to_prompt(
+    'FSTEST1 failed pid=27 status=43\nworking...', 43, 43, 'developer ~:')
+assert not guest.expected_failure_returned_to_prompt(
+    'FSTEST1 failed pid=27 status=43\ndeveloper ~:', 42, 43,
+    'developer ~:')
+assert guest.expected_failure_returned_to_prompt(
+    'FSTEST1 failed pid=27 status=43\ndeveloper ~:', 43, 43,
+    'developer ~:')
 
 with tempfile.TemporaryDirectory(prefix='mangrove-reed-watchdog-') as directory:
     control = safe.ReedControl(RUN, 'create')
