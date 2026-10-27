@@ -34,8 +34,36 @@ mg_result_t console_write(const void *buffer, usize length)
     return object_write_all(MG_STDOUT_HANDLE, buffer, length);
 }
 
+mg_result_t object_write_all_literal(mg_handle_t handle, const void *buffer,
+                                     usize length)
+{
+    const u8 *bytes = (const u8 *)buffer;
+    usize written = 0;
+
+    if (length != 0 && !buffer) return MG_ERR_BAD_ARGUMENT;
+    while (written < length) {
+        mg_result_t result = object_write_literal(handle, bytes + written,
+                                                  length - written);
+        if (result < 0) return result;
+        if (result == 0 || (usize)result > length - written) return MG_ERR_IO;
+        written += (usize)result;
+    }
+    return (mg_result_t)written;
+}
+
+mg_result_t console_write_literal(const void *buffer, usize length)
+{
+    return object_write_all_literal(MG_STDOUT_HANDLE, buffer, length);
+}
+
 mg_result_t console_write_string(const char *string)
 {
     if (!string) return MG_ERR_BAD_ARGUMENT;
     return console_write(string, strlen(string));
+}
+
+mg_result_t console_write_literal_string(const char *string)
+{
+    if (!string) return MG_ERR_BAD_ARGUMENT;
+    return console_write_literal(string, strlen(string));
 }

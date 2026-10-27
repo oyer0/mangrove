@@ -1,7 +1,8 @@
 name=say
 category=system
-description=print text, optionally interpreting native terminal markup
-usage=say [--markup] [text ...]
+description=print text with optional backslash escape translation
+usage=say [-e|--escapes] [--] [text ...]
 option=-h, --help    show this help
-option=--markup     interpret canonical {operation} directives on the interactive terminal
-note=Without --markup, all text is printed literally; redirected markup output contains only visible text.
+option=-e, --escapes translate supported backslash escapes before writing
+note=Supports \\, \n, \r, \t, and \e; unknown and trailing escapes stay literal.
+note=Without -e, backslashes stay literal. Redirected output receives emitted bytes unchanged.

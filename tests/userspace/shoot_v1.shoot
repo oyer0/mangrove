@@ -5,8 +5,10 @@ report = "/temp/shoot-report.txt"
 rounds = 3
 
 say "Shoot scripting test for $name"
-say --markup '{fg:green}MGTC REDIRECT PASS{reset}'
-say '{fg:red}MGTC LITERAL PASS{reset}'
+say -e '\e{fg:green}ESC OUTPUT PASS\e{reset}'
+say '{fg:red}ESC LITERAL PASS{reset}'
+say -e '\e{fg:yellow}raw redirected bytes\e{reset}' > /temp/say-escape-bytes.txt
+type /temp/say-escape-bytes.txt
 
 say "System report" > $report
 say "=============" >> $report

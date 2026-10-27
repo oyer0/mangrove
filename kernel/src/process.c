@@ -279,6 +279,7 @@ process_t *process_create_with_failure(const char *name, process_t *parent,
     process->session_id = parent ? parent->session_id : PROCESS_NO_SESSION;
     process->session_shell = false;
     process->owner_reference_held = true;
+    terminal_output_state_init(&process->terminal_output);
     if (parent && parent->credentials_initialized &&
         identity_credentials_effective(&parent->credentials,
                                        &process->credentials)) {
@@ -774,6 +775,10 @@ bool process_exit(process_t *process, i32 status)
     }
     spin_unlock_irqrestore(&process_registry_lock, flags);
 
+    /* Complete any partial ESC command as visible text before the process's
+     * terminal state disappears. This is serialized with concurrent output. */
+    terminal_output_finish_for_process(process->pid,
+                                       &process->terminal_output);
     /* A full-screen terminal lease belongs to a process, not to its final
      * userspace instruction.  Restore the shell screen after the registry
      * transition, including for external termination and faults. */
@@ -865,6 +870,8 @@ static void process_abort(process_t *process)
     process_unlink_locked(process);
     process_unlink_all_locked(process);
     spin_unlock_irqrestore(&process_registry_lock, flags);
+    terminal_output_finish_for_process(process->pid,
+                                       &process->terminal_output);
     (void)terminal_alternate_leave_process(process->pid);
     ipc_process_exit(process);
     process_handle_close_all(process);

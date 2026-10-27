@@ -15,6 +15,8 @@ int main(int argc, char **argv)
     char buffer[512];
     const char *path = NULL;
     bool show_help = false;
+    bool console_transaction = false;
+    mg_terminal_capabilities_t capabilities;
     mg_handle_t file;
     mg_result_t result;
 
@@ -52,28 +54,31 @@ int main(int argc, char **argv)
         return 1;
     }
     file = (mg_handle_t)result;
-    if (console_begin_transaction() != MG_OK) {
-        (void)handle_close(file);
-        printf("Could not read \"%s\": console unavailable.\n", path);
-        return 1;
+    if (terminal_get_capabilities(&capabilities) == MG_OK &&
+        (capabilities.capabilities & MG_TERMINAL_CAP_INTERACTIVE_OUTPUT)) {
+        if (console_begin_transaction() != MG_OK) {
+            (void)handle_close(file);
+            printf("Could not read \"%s\": console unavailable.\n", path);
+            return 1;
+        }
+        console_transaction = true;
     }
     for (;;) {
-        result = object_read(file, buffer, sizeof(buffer) - 1);
+        result = object_read(file, buffer, sizeof(buffer));
         if (result == MG_ERR_END_OF_FILE || result == 0) break;
         if (result_is_error(result)) {
-            (void)console_end_transaction();
+            if (console_transaction) (void)console_end_transaction();
             printf("\nRead error: %s.\n", error_string(result));
             (void)handle_close(file);
             return 1;
         }
-        buffer[result] = '\0';
-        if (printf("%s", buffer) < 0) {
-            (void)console_end_transaction();
+        if (console_write_literal(buffer, (usize)result) != result) {
+            if (console_transaction) (void)console_end_transaction();
             (void)handle_close(file);
             return 1;
         }
     }
-    if (console_end_transaction() != MG_OK) {
+    if (console_transaction && console_end_transaction() != MG_OK) {
         (void)handle_close(file);
         return 1;
     }

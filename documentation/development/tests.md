@@ -1,20 +1,21 @@
 # Focused test coverage
 
-## Native terminal controls and markup
+## Native terminal controls and `say` escapes
 
-`make test-terminal-markup` runs the shared production markup encoder and
-Shoot `say` frontend under ASan/UBSan. It checks the canonical directive set,
-literal brace escaping, malformed directives, UTF-8 preservation, redirected
-text-only behavior, bounded MGTC batches, and explicit `say --markup` argument
-handling. `make test-terminal` includes this fixture and the production
-renderer fixture, which verifies MGTC batch validation, style isolation,
-terminal ownership, concurrent writes from two process identities with
-independent stream styles, literal ESC text, cursor operations, and clearing.
+`make test-terminal` compiles the production terminal renderer under
+ASan/UBSan and covers incremental ESC command parsing, malformed and
+incomplete sequence recovery, per-process style state, literal writes,
+terminal ownership, cursor operations, and clearing. `make test-say` tests the
+production byte-escape translator, including `\\`, `\n`, `\r`, `\t`, `\e`,
+unknown escapes, trailing backslashes, and UTF-8 preservation.
 
-The disposable `guest_mgfs_test.py --shoot-v1` workflow also exercises
-interactive `say --markup` through the native console stream and checks the
-resulting framebuffer text and foreground color. The guest image is built
-under the selected build directory and independently checked after shutdown.
+The disposable `guest_mgfs_test.py --shoot-v1` workflow exercises `say -e`
+through the native console and checks framebuffer text and palette pixels.
+The image is built under the selected build directory and independently
+checked after shutdown. The terminal parser treats actual ESC bytes as native
+commands only on ordinary console writes; `say` without `-e` and the explicit
+literal-write API preserve displayed bytes. See the
+[terminal behavior contract](../architecture/terminal.md).
 
 ## System CA root-store packaging
 

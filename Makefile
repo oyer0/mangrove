@@ -592,7 +592,7 @@ DEPS := $(BOOT_OBJS:.o=.d) $(ALL_KERNEL_OBJS:.o=.d)
 .PHONY: all help make fresh run fresh-run usb clean test exfat-upcase \
         binaries font sprout sessiond logind logd networkd deviced volumed clipd mount unmount eject lspci lsusb lsdsk diskutil crew about view info mem time tmon logv hello shoot clear copy list locate move mkdir plant type wait reed del say shutdown reboot uptime date version where fstest nettest ping resolve fetch netinfo netcfg power identity user \
         image fresh-image usb-image run-usb mkmgfs mgfsck test-time test-terminal test-mgfs-version test-mgfs-reconcile test-reed test-math \
-        check-image-deps check-usb-deps check-qemu-deps qemu-warning dev-image fresh-dev-image flash-image test-launch test-password test-random test-vmm test-heap test-history test-copy test-move test-del test-mfqs test-sync test-spinlock-context test-storage test-dev-tools test-unicode test-shoot test-shoot-help test-pager test-view test-info test-help test-list test-cli-options test-fetch test-fetch-transport test-tcp test-startup-presentation test-power-presentation test-rtc-build-policy test-terminal-markup
+        check-image-deps check-usb-deps check-qemu-deps qemu-warning dev-image fresh-dev-image flash-image test-launch test-password test-random test-vmm test-heap test-history test-copy test-move test-del test-mfqs test-sync test-spinlock-context test-storage test-dev-tools test-unicode test-shoot test-shoot-help test-pager test-view test-info test-help test-list test-cli-options test-fetch test-fetch-transport test-tcp test-startup-presentation test-power-presentation test-rtc-build-policy test-say
 
 # Everyday targets
 all: image
@@ -616,7 +616,7 @@ help:
 	@echo
 	@echo "Specialist targets: binaries image fresh-image usb-image mkmgfs mgfsck"
 	@echo "                    test-time test-terminal test-help test-guest-shutdown test-guest-logout test-guest-reed"
-	@echo "                    test-random test-guest-random and individual programs"
+	@echo "                    test-random test-guest-random test-say and individual programs"
 
 make: image
 
@@ -896,11 +896,6 @@ test-terminal:
 		libc/src/line_editor.c libc/src/string.c -Wl,--gc-sections \
 		-o /tmp/mangrove-terminal-render-test
 	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-terminal-render-test
-	$(HOST_CC) -std=gnu17 -Wall -Wextra -Werror -fno-builtin \
-		-fsanitize=address,undefined -Iinclude -idirafter libc/include \
-		tests/terminal/terminal_markup_test.c libc/src/terminal_markup.c \
-		-o /tmp/mangrove-terminal-markup-test
-	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-terminal-markup-test
 	python3 tests/terminal/terminal_overlay_test.py "$(HOST_CC)"
 	python3 tests/terminal/terminal_write_owner_test.py "$(HOST_CC)"
 	python3 tests/terminal/console_input_smp_test.py "$(HOST_CC)"
@@ -917,15 +912,27 @@ test-terminal:
 		libc/src/utf8.c libc/src/string.c -Wl,--gc-sections \
 		-o /tmp/mangrove-line-editor-key-event-test
 	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-line-editor-key-event-test
-	@echo terminal renderer, MGTC concurrency, markup, UTF-8, overlay, input synchronization and ownership tests passed
+	@echo terminal renderer, ESC parser, UTF-8, overlay, input synchronization and ownership tests passed
 
-.PHONY: test-terminal-markup
-test-terminal-markup:
-	$(HOST_CC) -std=gnu17 -Wall -Wextra -Werror -fno-builtin \
-		-fsanitize=address,undefined -Iinclude -idirafter libc/include \
-		tests/terminal/terminal_markup_test.c libc/src/terminal_markup.c \
-		-o /tmp/mangrove-terminal-markup-test
-	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-terminal-markup-test
+.PHONY: test-say
+test-say:
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
+		-fsanitize=address,undefined -I. -Iinclude \
+		-idirafter libc/include tests/userspace/say_escape_test.c \
+		userspace/say/escape.c -o /tmp/mangrove-say-escape-test
+	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-say-escape-test
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
+		-fsanitize=address,undefined -ffunction-sections -fdata-sections \
+		-Dmain=say_main -I. -Iinclude -Iuserspace/common \
+		-idirafter libc/include \
+		-c userspace/say/main.c -o /tmp/mangrove-say-main-test.o
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
+		-fsanitize=address,undefined -ffunction-sections -fdata-sections \
+		-I. -Iinclude -Iuserspace/common -idirafter libc/include \
+		userspace/say/escape.c userspace/common/cli_options.c \
+		/tmp/mangrove-say-main-test.o tests/userspace/say_cli_test.c \
+		-Wl,--gc-sections -o /tmp/mangrove-say-test
+	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-say-test
 
 .PHONY: test-unicode
 test-unicode:
@@ -1079,6 +1086,7 @@ test-shoot:
 		/tmp/mangrove-shoot-script-test.o userspace/shoot/shell.c \
 		userspace/shoot/builtin.c userspace/common/path.c \
 		userspace/common/cli_options.c \
+		userspace/say/escape.c \
 		libc/src/utf8.c \
 		/tmp/mangrove-shoot-glob-test.o /tmp/mangrove-shoot-del-test.o \
 		-Wl,--gc-sections -o /tmp/mangrove-shoot-language-test
@@ -1944,7 +1952,6 @@ USER_C_OBJS := $(SPROUT_DIR)/sprout.o \
                $(USER_LIBC_DIR)/string.o \
                $(USER_LIBC_DIR)/allocator.o \
                $(USER_LIBC_DIR)/clipboard.o \
-               $(USER_LIBC_DIR)/terminal_markup.o \
                $(USER_LIBC_DIR)/stdio.o \
                $(USER_LIBC_DIR)/native.o \
                $(USER_LIBC_DIR)/line_editor.o \
@@ -2449,15 +2456,19 @@ $(DEL): $(DEL_DIR)/main.o $(HELP_OBJ) $(CLI_OPTIONS_OBJ) $(COMMAND_PATH_OBJ) $(U
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
 		$(USER_CRT) $(DEL_DIR)/main.o $(HELP_OBJ) $(CLI_OPTIONS_OBJ) $(COMMAND_PATH_OBJ) $(USER_LIBC)
 
-$(SAY_DIR)/say.o: userspace/say/main.c userspace/common/help.h \
-		libc/include/mg/terminal_markup.h $(USER_LIBC)
+$(SAY_DIR)/say.o: userspace/say/main.c userspace/say/escape.h \
+		userspace/common/help.h userspace/common/cli_options.h $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -Iuserspace/common -c $< -o $@
+
+$(SAY_DIR)/escape.o: userspace/say/escape.c userspace/say/escape.h
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
-$(SAY): $(SAY_DIR)/say.o $(HELP_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+$(SAY): $(SAY_DIR)/say.o $(SAY_DIR)/escape.o $(HELP_OBJ) $(CLI_OPTIONS_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
-		$(USER_CRT) $(SAY_DIR)/say.o $(HELP_OBJ) $(USER_LIBC)
+		$(USER_CRT) $(SAY_DIR)/say.o $(SAY_DIR)/escape.o $(HELP_OBJ) $(CLI_OPTIONS_OBJ) $(USER_LIBC)
 
 $(SHUTDOWN_DIR)/shutdown.o: userspace/shutdown/main.c userspace/common/help.h $(USER_LIBC)
 	@mkdir -p $(dir $@)
@@ -2737,7 +2748,7 @@ $(USER_LIBC_DIR)/wchar.o: libc/src/wchar.c libc/include/wchar.h libc/include/std
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
-$(USER_LIBC): $(USER_LIBC_DIR)/syscall.o $(USER_LIBC_DIR)/syscall_c.o $(USER_LIBC_DIR)/random.o $(USER_LIBC_DIR)/string.o $(USER_LIBC_DIR)/strtok.o $(USER_LIBC_DIR)/utf8.o $(USER_LIBC_DIR)/wchar.o $(USER_LIBC_DIR)/allocator.o $(USER_LIBC_DIR)/clipboard.o $(USER_LIBC_DIR)/terminal_markup.o $(USER_LIBC_DIR)/stdio.o $(USER_LIBC_DIR)/stdio_stream.o $(USER_LIBC_DIR)/floatconv.o $(USER_LIBC_DIR)/scanf.o $(USER_LIBC_DIR)/native.o $(USER_LIBC_DIR)/line_editor.o $(USER_LIBC_DIR)/net.o $(USER_LIBC_DIR)/time.o $(USER_LIBC_DIR)/time_convert.o $(USER_LIBC_DIR)/time_standard.o $(USER_LIBC_DIR)/log.o $(USER_LIBC_DIR)/ctype.o $(USER_LIBC_DIR)/errno.o $(USER_LIBC_DIR)/error.o $(USER_LIBC_DIR)/exit.o $(USER_LIBC_DIR)/stdlib.o $(USER_LIBC_DIR)/assert.o
+$(USER_LIBC): $(USER_LIBC_DIR)/syscall.o $(USER_LIBC_DIR)/syscall_c.o $(USER_LIBC_DIR)/random.o $(USER_LIBC_DIR)/string.o $(USER_LIBC_DIR)/strtok.o $(USER_LIBC_DIR)/utf8.o $(USER_LIBC_DIR)/wchar.o $(USER_LIBC_DIR)/allocator.o $(USER_LIBC_DIR)/clipboard.o $(USER_LIBC_DIR)/stdio.o $(USER_LIBC_DIR)/stdio_stream.o $(USER_LIBC_DIR)/floatconv.o $(USER_LIBC_DIR)/scanf.o $(USER_LIBC_DIR)/native.o $(USER_LIBC_DIR)/line_editor.o $(USER_LIBC_DIR)/net.o $(USER_LIBC_DIR)/time.o $(USER_LIBC_DIR)/time_convert.o $(USER_LIBC_DIR)/time_standard.o $(USER_LIBC_DIR)/log.o $(USER_LIBC_DIR)/ctype.o $(USER_LIBC_DIR)/errno.o $(USER_LIBC_DIR)/error.o $(USER_LIBC_DIR)/exit.o $(USER_LIBC_DIR)/stdlib.o $(USER_LIBC_DIR)/assert.o
 	@mkdir -p $(dir $@)
 	$(AR) rcs $@ $^
 
@@ -2751,12 +2762,6 @@ $(USER_LIBC_DIR)/errno.o: libc/src/errno.c libc/include/errno.h
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
 $(USER_LIBC_DIR)/error.o: libc/src/error.c libc/include/errno.h libc/include/mg/error.h
-	@mkdir -p $(dir $@)
-	$(CC) $(USER_CFLAGS) -c $< -o $@
-
-$(USER_LIBC_DIR)/terminal_markup.o: libc/src/terminal_markup.c \
-		libc/include/mg/terminal_markup.h libc/include/mg/terminal.h \
-		include/terminal_control.h include/terminal_colors.h
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 

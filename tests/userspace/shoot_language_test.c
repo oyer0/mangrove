@@ -18,6 +18,7 @@
 #include <userspace/shoot/language.h>
 #include <userspace/shoot/script.h>
 #include <userspace/shoot/shell.h>
+#include <userspace/say/escape.h>
 
 #define MOCK_FILE_COUNT 2300U
 #define MOCK_DIRECTORY_COUNT 64U
@@ -804,10 +805,27 @@ mg_result_t process_spawn_argv(const char *const *argv, usize argc)
         spawned_child_status = del_command_main((int)argc, mutable_argv);
         free(mutable_argv);
     } else if (!strcmp(argv[0], "/bin/say")) {
-        if (argc == 3U && !strcmp(argv[1], "--markup") &&
-            !strcmp(argv[2], "{fg:green}MGTC REDIRECT PASS{reset}")) {
-            static const char visible[] = "MGTC REDIRECT PASS\n";
-            assert(output_bytes(visible, sizeof(visible) - 1U));
+        if (argc == 3U && !strcmp(argv[1], "-e")) {
+            if (!strcmp(argv[2], "\\e{fg:green}ESC OUTPUT PASS\\e{reset}")) {
+                /* The guest terminal strips the control command and renders
+                 * its text. Keep this integration fixture's console capture
+                 * at the visible-text boundary. */
+                static const char visible[] = "ESC OUTPUT PASS\n";
+                assert(output_bytes(visible, sizeof(visible) - 1U));
+                return (mg_result_t)(700U + spawn_count);
+            }
+            usize input_length = strlen(argv[2]);
+            usize offset = 0U;
+            while (offset < input_length) {
+                u8 expanded[2];
+                usize expanded_length;
+                assert(say_escape_next((const u8 *)argv[2], input_length,
+                                       &offset, expanded,
+                                       &expanded_length));
+                assert(output_bytes((const char *)expanded,
+                                    expanded_length));
+            }
+            assert(output_bytes("\n", 1U));
             return (mg_result_t)(700U + spawn_count);
         }
         char output[2048];
@@ -828,7 +846,15 @@ mg_result_t process_spawn_argv(const char *const *argv, usize argc)
     } else if (!strcmp(argv[0], "/bin/type")) {
         assert(argc == 2U);
         mock_file_t *file = file_find(argv[1]);
-        assert(file && output_bytes(file->contents, file->length));
+        assert(file);
+        if (!strcmp(argv[1], "/temp/say-escape-bytes.txt")) {
+            static const char literal_view[] =
+                "\xef\xbf\xbd{fg:yellow}raw redirected bytes"
+                "\xef\xbf\xbd{reset}\n";
+            assert(output_bytes(literal_view, sizeof(literal_view) - 1U));
+        } else {
+            assert(output_bytes(file->contents, file->length));
+        }
     } else if (!strcmp(argv[0], "/bin/mark")) {
         assert(argc == 2U && mark_event_count < 32U);
         assert(strlen(argv[1]) < sizeof(mark_events[0]));
@@ -1710,12 +1736,20 @@ static void test_existing_shoot_script(void)
     mock_file_t *report = file_find("/temp/shoot-report.txt");
     assert(report && report->length == sizeof(expected) - 1U);
     assert(!memcmp(report->contents, expected, sizeof(expected) - 1U));
-    assert(spawn_count == 17U && wait_count == 17U &&
-           child_close_count == 17U);
+    assert(spawn_count == 19U && wait_count == 19U &&
+           child_close_count == 19U);
+    mock_file_t *escaped = file_find("/temp/say-escape-bytes.txt");
+    static const u8 escaped_expected[] =
+        "\x1b{fg:yellow}raw redirected bytes\x1b{reset}\n";
+    assert(escaped && escaped->length == sizeof(escaped_expected) - 1U);
+    assert(!memcmp(escaped->contents, escaped_expected,
+                   sizeof(escaped_expected) - 1U));
     static const char console_prefix[] =
         "Shoot scripting test for Mangrove\n"
-        "MGTC REDIRECT PASS\n"
-        "{fg:red}MGTC LITERAL PASS{reset}\n"
+        "ESC OUTPUT PASS\n"
+        "{fg:red}ESC LITERAL PASS{reset}\n"
+        "\xef\xbf\xbd{fg:yellow}raw redirected bytes"
+        "\xef\xbf\xbd{reset}\n"
         "report created\n";
     assert(console_output_length == sizeof(console_prefix) - 1U +
                                      sizeof(expected) - 1U);

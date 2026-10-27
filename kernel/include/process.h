@@ -6,6 +6,7 @@
 #include <process_arguments.h>
 #include <object.h>
 #include <identity.h>
+#include <terminal_output.h>
 #include <mg/process_status.h>
 #include <mg/session.h>
 #include <mg/inspection.h>
@@ -80,6 +81,9 @@ struct process {
     volatile bool interrupt_requested;
     bool output_redirected;
     process_handle_t redirected_output_saved_handle;
+    /* ESC formatting state belongs to the process that emits console bytes,
+     * not to a shared inherited stdout object. */
+    terminal_output_state_t terminal_output;
     /* One-shot PASS authorization for the immediately following storage
      * mutation.  It is process-local and never supplied by userspace. */
     u32 storage_authorized_operation;

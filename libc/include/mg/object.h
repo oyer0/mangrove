@@ -10,13 +10,24 @@ mg_result_t file_open(const char *path, u32 flags);
 mg_result_t file_open_administrative(const char *path, u32 flags);
 /* Reads and writes may transfer fewer bytes than requested. */
 mg_result_t object_read(mg_handle_t handle, void *buffer, usize length);
+/* Console object writes recognize the native ESC{...} stream; other objects
+ * receive bytes as-is. Use object_write_literal for untrusted display text. */
 mg_result_t object_write(mg_handle_t handle, const void *buffer, usize length);
+/* A console object_write() recognizes Mangrove's actual ESC{...} controls.
+ * Use this variant for file, network, or log text that must remain literal.
+ * For non-console objects it has ordinary write semantics. */
+mg_result_t object_write_literal(mg_handle_t handle, const void *buffer,
+                                 usize length);
 mg_result_t handle_close(mg_handle_t handle);
 
 /* Allocation-free helpers for complete writes and the process console. */
 mg_result_t object_write_all(mg_handle_t handle, const void *buffer, usize length);
+mg_result_t object_write_all_literal(mg_handle_t handle, const void *buffer,
+                                     usize length);
 mg_result_t console_write(const void *buffer, usize length);
 mg_result_t console_write_string(const char *string);
+mg_result_t console_write_literal(const void *buffer, usize length);
+mg_result_t console_write_literal_string(const char *string);
 /* Console update transaction API for atomic shell presentation. */
 mg_result_t console_begin_transaction(void);
 mg_result_t console_end_transaction(void);

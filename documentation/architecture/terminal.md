@@ -129,80 +129,63 @@ one cell when possible, without erasing), and line feed (column zero on the
 next row). A tab advances with blank cells to the next eight-column stop.
 Wrapping is deferred until the next printable character; while that wrap is
 pending, the visible cursor is drawn on the last cell of the current row.
-Ordinary output is literal text: ESC bytes are rendered as U+FFFD and never
-start a control sequence. ANSI/CSI-looking text, MGTC-looking bytes, and
-markup-looking text therefore cannot clear or restyle the console. There is
-no PTY or general terminal-device abstraction. The userland line editor
-supports its documented key actions through native input events rather than
-escape-sequence compatibility.
+Mangrove's byte-oriented console output recognizes its native control stream:
+an actual ASCII ESC byte (`0x1b`) followed by `{`, a canonical command, and
+`}`. This is not ANSI/CSI or VT compatibility. `ESC{...}` commands and the
+structured `mg/terminal.h` operations converge on the same terminal state,
+renderer, and process ownership checks. Ordinary braces are printable text;
+the source spelling `\e` is not itself a terminal command and is interpreted
+only by a program that explicitly translates it to byte `0x1b`.
+A C program can emit the same stream with `printf("\x1b{fg:green}...")` or
+`console_write()`; Shoot's `say -e` explicitly translates `\e` in an
+argument to the ESC byte.
 
-### Native terminal-control stream
+The recognized command set is deliberately small:
 
-The structured `mg/terminal.h` operations remain the direct native interface
-for screen ownership, cursor movement and visibility, clearing, styling,
-updates, dimensions, and input. They share the kernel terminal renderer and
-process ownership checks. Applications can also open a dedicated, write-only
-MGTC control-stream handle. Opening it requires stdout to be the process's
-console handle and the process to be allowed to control the current screen;
-a redirected stdout cannot open a stream that manipulates the console. The
-handle is process-owned, is not inherited as stdout, and is closed with the
-ordinary handle API.
-
-MGTC version 1 is a concatenation of records:
-
-```text
-"MGTC" | version:u8 | type:u8 | payload_length:u32-le | payload
-```
-
-The header is 10 bytes. Defined types are UTF-8 text (1), foreground color
-(2), background color (3), semantic style (4), style reset (5), cursor
-position (6), cursor visibility (7), and clear (8). Color and style payloads
-are one-byte values from `terminal_colors.h`; reset has no payload. Cursor
-position is two little-endian u32 values, row then column, both zero-based as
-in the structured API. Visibility is one byte (0 hidden, 1 shown). Clear is
-one byte: line (1), cursor to line end (2), or screen (3). Text is opaque to
-the record parser and follows the console's UTF-8 and C0 text behavior;
-malformed UTF-8 is rendered with replacement characters.
-
-Each stream write is limited to 65,536 bytes and must contain only complete,
-well-formed records. The kernel copies and validates the complete batch,
-checks cursor bounds and terminal ownership, then applies it under one
-terminal-lock acquisition and schedules one coherent presentation. Invalid
-version/type/length/payload, out-of-range coordinates, allocation failure, or
-authorization failure leaves terminal contents and stream style unchanged.
-Stream style starts at the default role and is local to the handle; `fg` and
-`bg` change one component, a semantic role sets both components, and reset
-restores default. Closing the handle discards that style. Separate writes
-from any process may interleave; a write is the atomicity boundary. A userland
-template larger than one batch is encoded fully before output and split only
-between records, but a later I/O error can follow already-applied earlier
-batches.
-
-The shared loam encoder in `mg/terminal_markup.h` accepts explicit markup
-templates using this canonical notation:
-
-| Directive | Effect |
+| Sequence | Effect |
 | --- | --- |
-| `{fg:NAME}`, `{bg:NAME}` | Set foreground or background to one of the 16 palette names (`black`, `red`, `green`, `yellow`, `blue`, `magenta`, `cyan`, `light-gray`, `dark-gray`, `bright-red`, `bright-green`, `bright-yellow`, `bright-blue`, `bright-magenta`, `bright-cyan`, `white`). |
-| `{style:ROLE}` | Apply `default`, `directory`, `error`, `warning`, `success`, or `heading`. |
-| `{reset}` | Restore the stream's default colors. |
-| `{at:ROW,COLUMN}` | Move to one-based coordinates; an out-of-range position fails its MGTC write batch before any records in that batch are applied. |
-| `{cursor:show}`, `{cursor:hide}` | Set cursor visibility. |
-| `{clear:line}`, `{clear:to-end}`, `{clear:screen}` | Clear the current line, from cursor to line end, or the screen. |
-| `{{`, `}}` | Emit a literal opening or closing brace. |
+| `ESC{fg:NAME}`, `ESC{bg:NAME}` | Set foreground or background using the 16 native palette names: `black`, `red`, `green`, `yellow`, `blue`, `magenta`, `cyan`, `light-gray`, `dark-gray`, `bright-red`, `bright-green`, `bright-yellow`, `bright-blue`, `bright-magenta`, `bright-cyan`, and `white`. |
+| `ESC{style:ROLE}` | Apply the native `default`, `directory`, `error`, `warning`, `success`, or `heading` role. |
+| `ESC{reset}` | Restore default foreground and background. |
+| `ESC{at:ROW,COLUMN}` | Move to one-based visible-screen coordinates. Zero, overflow, and out-of-range coordinates are rejected as a command and displayed literally. |
+| `ESC{cursor:show}`, `ESC{cursor:hide}` | Set cursor visibility. |
+| `ESC{clear:line}`, `ESC{clear:to-end}`, `ESC{clear:screen}` | Clear the current line, from cursor to line end, or the screen. |
 
-Only these spellings are recognized. There are no RGB, bold, underline, or
-alias forms. A directive is limited to 128 source bytes; a longer candidate
-is emitted as literal text. Unknown, malformed, or incomplete directives
-remain literal. The parser validates a full directive before encoding it.
-Markup is never inferred from ordinary output: use
-`terminal_markup_write_template()` only for an explicit template. Display
-untrusted file, network, or log text with
-`console_write()` or a text record, never by inserting it into a template.
-When stdout is redirected or the control stream is unavailable, the encoder
-emits visible text only and omits recognized terminal operations. Ordinary
-stdout stays byte-oriented text, including literal braces and ESC sequences.
-`say` uses the encoder only when explicitly invoked with `--markup`.
+Only these exact names and forms are supported. RGB, bold, underline, aliases,
+alternate-screen changes, and arbitrary device controls are not part of this
+stream. A candidate sequence is bounded to 128 bytes including ESC and its
+braces. The parser retains incomplete candidates across writes from the same
+process, validates the complete command before applying it, and keeps parser
+and style state per process. Different processes cannot complete each other's
+partial sequences. Unknown, malformed, oversized, and process-final
+incomplete sequences are rendered as literal text (ESC itself appears as the
+replacement glyph). A command that fails validation has no terminal side
+effect. Output writes are serialized under the terminal lock; separate
+process writes may appear between one another's completed writes.
+
+Commands use the existing terminal control authorization. A process that does
+not own an active alternate screen cannot write to it or change it. The ESC
+grammar cannot acquire/release the alternate screen or claim keyboard input;
+applications use the structured API for those operations. On the ordinary
+screen, commands have the same authority as the existing structured cursor,
+clear, and style calls. They are not a safe encoding for untrusted text:
+applications displaying file, network, or log contents must use
+`console_write_literal()`/`object_write_literal()` or the structured styled
+write API, which bypasses control parsing. `type` and `logv` use literal
+writes. `say` is literal by default; its explicit `-e`/`--escapes` option
+translates selected backslash escapes before writing. When output is
+redirected, emitted bytes go to the file unchanged and are not interpreted by
+the terminal.
+
+The former MGTC record endpoint and `{...}` template encoder are retired; no
+binary control-record format is maintained alongside this stream. The
+versioned `mg/terminal.h` structured operations remain available for native
+applications needing explicit cursor, clear, ownership, input, or styled
+write calls. Applications using the short-lived MGTC/markup interface should
+migrate to actual ESC command bytes for stream output or to those structured
+operations. There is no PTY or general terminal-device abstraction. The
+userland line editor uses native input events rather than escape-sequence key
+compatibility.
 
 The loam line editor renders its prompt when an input line is prepared (and
 again when completion explicitly clears that line). Ordinary insertion and

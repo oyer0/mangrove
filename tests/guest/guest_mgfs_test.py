@@ -63,8 +63,9 @@ SHOOT_V1_REPORT = (
 def validate_shoot_v1_evidence(transcript, report, completion, run):
     expected_transcript = (
         'Shoot scripting test for Mangrove\n'
-        'MGTC REDIRECT PASS\n'
-        '{fg:red}MGTC LITERAL PASS{reset}\n'
+        '\x1b{fg:green}ESC OUTPUT PASS\x1b{reset}\n'
+        '{fg:red}ESC LITERAL PASS{reset}\n'
+        '\x1b{fg:yellow}raw redirected bytes\x1b{reset}\n'
         'report created\n' + SHOOT_V1_REPORT)
     if transcript != expected_transcript:
         raise ValueError('native Shoot language transcript is incomplete or malformed')
@@ -72,7 +73,7 @@ def validate_shoot_v1_evidence(transcript, report, completion, run):
         raise ValueError('native Shoot script report differs from expected content')
     if completion != f'child-exit-0-shoot-v1-{run}\n':
         raise ValueError('native Shoot script completion evidence is missing')
-    return {'external_child_commands': 17,
+    return {'external_child_commands': 19,
             'report_bytes': len(report.encode()), 'child_status': 0}
 
 
@@ -341,14 +342,18 @@ def create_disk(folder, build, run, relative_launch=False,
                 '/bin/say FETCHHTTPS1 complete > /temp/fetch-https.exit\n'
                 '/bin/shutdown\n').encode()
         else:
-            interactive_markup = (
+            interactive_esc = (
                 "/bin/clear\n"
                 "/bin/clear > /temp/clear-redirected.log\n"
-                "/bin/say --markup '{fg:green}MGTC INTERACTIVE PASS{reset}'\n"
-                "/bin/say --markup '{style:warning}MGTC STYLE PASS{reset}'\n"
+                "/bin/say -e '\\e{fg:green}ESC INTERACTIVE PASS\\e{reset}'\n"
+                "/bin/say -e '\\e{style:warning}ESC STYLE PASS\\e{reset}'\n"
+                "/bin/say -e '\\e{clear:screen}UNTRUSTED LITERAL\\e{reset}' > /temp/literal-esc.txt\n"
+                "/bin/say BEFORE LITERAL TYPE\n"
+                "/bin/type /temp/literal-esc.txt\n"
+                "/bin/say AFTER LITERAL TYPE\n"
                 if phase == 'shoot-v1' else '')
             script = (prefix + network_wait +
-                      interactive_markup +
+                      interactive_esc +
                       f'{launch_command} > /temp/{phase}.log\n' +
                       network_commands +
                       f'/bin/say child-exit-0-{phase}-{run} > /temp/{phase}.exit\n'
@@ -1066,30 +1071,39 @@ def inspect_shoot_v1(folder, disk, build, run):
     _, report_record = find(image, '/temp/shoot-report.txt')
     _, completion_record = find(image, '/temp/shoot-v1.exit')
     _, redirected_clear_record = find(image, '/temp/clear-redirected.log')
+    _, escaped_output_record = find(image, '/temp/say-escape-bytes.txt')
     transcript = payload(image, transcript_record).decode('utf-8')
     report = payload(image, report_record).decode('utf-8')
     completion = payload(image, completion_record).decode('ascii')
     if payload(image, redirected_clear_record):
         raise ValueError('clear wrote data while stdout was redirected')
+    expected_escaped_output = b'\x1b{fg:yellow}raw redirected bytes\x1b{reset}\n'
+    if payload(image, escaped_output_record) != expected_escaped_output:
+        raise ValueError('say -e redirected bytes were not preserved exactly')
     source = payload(image, script_record)
     expected_source = (ROOT / 'tests/userspace/shoot_v1.shoot').read_bytes()
     if source != expected_source:
         raise ValueError('guest did not execute the source-matched Shoot fixture')
     (folder / 'shoot-v1-guest.log').write_text(transcript)
     framebuffer_text = (folder / 'shoot-v1' / 'screen.txt').read_text()
+    for marker in ('BEFORE LITERAL TYPE',
+                   '?{clear:screen}UNTRUSTED LITERAL?{reset}',
+                   'AFTER LITERAL TYPE'):
+        if marker not in framebuffer_text:
+            raise ValueError('type did not preserve literal ESC data: ' + marker)
     ppm = folder / 'shoot-v1' / 'screen.ppm'
     header, dimensions, maximum, pixels = ppm.read_bytes().split(b'\n', 3)
     if header != b'P6' or maximum != b'255':
-        raise ValueError('unsupported native markup framebuffer capture')
+        raise ValueError('unsupported native ESC-control framebuffer capture')
     width, height = map(int, dimensions.split())
     if len(pixels) != width * height * 3:
-        raise ValueError('native markup framebuffer pixel length mismatch')
+        raise ValueError('native ESC-control framebuffer pixel length mismatch')
     rows = framebuffer_text.splitlines()
     for marker, expected_rgb in (
-            ('MGTC INTERACTIVE PASS', bytes((0x32, 0xc7, 0x6d))),
-            ('MGTC STYLE PASS', bytes((0xff, 0xd1, 0x66)))):
+            ('ESC INTERACTIVE PASS', bytes((0x32, 0xc7, 0x6d))),
+            ('ESC STYLE PASS', bytes((0xff, 0xd1, 0x66)))):
         if marker not in framebuffer_text:
-            raise ValueError(f'interactive say --markup text is not visible: {marker}')
+            raise ValueError(f'interactive say -e text is not visible: {marker}')
         marker_row = next(index for index, row in enumerate(rows)
                           if marker in row)
         start_column = rows[marker_row].index(marker)
@@ -1106,10 +1120,10 @@ def inspect_shoot_v1(folder, disk, build, run):
             if colored_pixel:
                 break
         if not colored_pixel:
-            raise ValueError(f'native markup color pixels missing for {marker}')
+            raise ValueError(f'native ESC color pixels missing for {marker}')
     evidence = validate_shoot_v1_evidence(transcript, report, completion, run)
-    evidence['interactive_markup_text'] = True
-    evidence['interactive_markup_palette_pixels'] = True
+    evidence['interactive_esc_text'] = True
+    evidence['interactive_esc_palette_pixels'] = True
     evidence['source_sha256'] = hashlib.sha256(source).hexdigest()
     evidence['report_sha256'] = hashlib.sha256(report.encode()).hexdigest()
     evidence['disk_sha256'] = digest(disk)

@@ -129,8 +129,17 @@ commands suitable for non-disposable media without careful target selection.
 | `power` | Show battery and AC status when available. |
 | `sprout status [SERVICE]` | Inspect service state. `start`, `stop`, `restart`, and supported `reload` operations require service-control authorization. |
 | `user` | List, show, create, remove, change role, or set account passwords, subject to identity privileges and PASS. |
-| `clear`, `say TEXT...` | Clear the interactive terminal or print text literally. `say --markup TEXT...` explicitly interprets the canonical native terminal markup directives; when redirected, it writes visible text only. |
+| `clear`, `say [-e|--escapes] [--] [TEXT...]` | Clear the interactive terminal or print text. `say` preserves backslashes literally; `-e`/`--escapes` translates the documented escapes before writing. |
 | `shutdown`, `reboot` | Request an orderly system power-off or restart. They display `Shutting down...` or `Restarting...` before the request. Active applications and leaf services receive a bounded cleanup window; mounted filesystems are synchronized before the ACPI transition. A cleanup timeout or sync error cancels the request and reports failure. |
+
+`say -e` translates `\\`, `\n`, `\r`, `\t`, and `\e` to backslash,
+newline, carriage return, tab, and the ASCII ESC byte (`0x1b`). Unknown
+escapes and a trailing backslash are preserved literally. Without `-e`, all
+backslashes are literal. For example, `say -e '\e{fg:green}Mangrove\e{reset}'`
+emits the ESC commands described in [terminal behavior](../architecture/terminal.md).
+Redirected output receives those emitted bytes unchanged; it is not interpreted
+by the console. Use ordinary `say` or the native literal-write API for
+untrusted text so embedded terminal commands remain visible data.
 
 ## Network
 

@@ -3,8 +3,8 @@
 
 #include <bootinfo.h>
 #include <mutex.h>
-#include <terminal_control.h>
 #include <terminal_colors.h>
+#include <terminal_output.h>
 #include <types.h>
 
 /* Versioned raw keyboard event.  keycode is the USB HID usage identity,
@@ -82,18 +82,9 @@ bool terminal_process_controls(u64 process_id);
 bool terminal_process_output_allowed(u64 process_id);
 bool terminal_process_input_allowed(u64 process_id);
 
-/* Per-handle styling state for the versioned MGTC stream.  The stream object
- * owns this state; it is never shared through the process-wide console. */
-typedef struct {
-    mutex_t write_lock;
-    u8 foreground;
-    u8 background;
-} terminal_control_stream_state_t;
-
-void terminal_control_stream_init(terminal_control_stream_state_t *state);
-i64 terminal_control_stream_write_for_process(
-    u64 process_id, terminal_control_stream_state_t *state,
-    const void *records, u64 length);
+void terminal_output_state_init(terminal_output_state_t *state);
+void terminal_output_finish_for_process(u64 process_id,
+                                        terminal_output_state_t *state);
 
 bool terminal_move_cursor(u32 row, u32 column);
 bool terminal_set_cursor_visible(bool visible);
@@ -119,8 +110,12 @@ i64 terminal_read_key_event_for_process(u64 process_id, u32 timeout_ms,
                                         terminal_key_event_t *event);
 bool terminal_begin_batch_for_process(u64 process_id);
 bool terminal_end_batch_for_process(u64 process_id);
-i64 terminal_write_for_process(u64 process_id, const char *buffer,
-                               u64 length);
+i64 terminal_write_for_process_state(u64 process_id,
+                                     terminal_output_state_t *state,
+                                     const char *buffer, u64 length);
+i64 terminal_write_literal_for_process(u64 process_id,
+                                       terminal_output_state_t *state,
+                                       const char *buffer, u64 length);
 i64 terminal_write_styled_for_process(u64 process_id, const char *buffer,
                                        u64 length, terminal_color_t foreground,
                                        terminal_color_t background);

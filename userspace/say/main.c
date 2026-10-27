@@ -1,65 +1,136 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+#include <mangrove.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
-#include <mg/error.h>
-#include <mg/terminal_markup.h>
+#include "../common/cli_options.h"
 #include "../common/help.h"
+#include "escape.h"
 
-static int say_markup(int argc, char **argv)
+#define SAY_OUTPUT_CHUNK 256U
+
+static const cli_option_spec_t say_options[] = {
+    { 'e', "escapes", false },
+    { 'h', "help", false },
+};
+
+typedef struct {
+    u8 bytes[SAY_OUTPUT_CHUNK];
+    usize length;
+    bool escapes;
+} say_output_t;
+
+static bool output_flush(say_output_t *output)
 {
-    usize length = 1U; /* final newline */
+    mg_result_t result;
 
-    for (int index = 2; index < argc; index++) {
-        usize part_length = strlen(argv[index]);
-        if (part_length > (usize)-1 - length) {
-            fprintf(stderr, "say: markup text is too large\n");
-            return 1;
-        }
-        length += part_length;
-        if (index + 1 < argc) {
-            if (length == (usize)-1) {
-                fprintf(stderr, "say: markup text is too large\n");
-                return 1;
-            }
-            length++;
-        }
-    }
+    if (!output || !output->length) return true;
+    result = output->escapes ? console_write(output->bytes, output->length) :
+        console_write_literal(output->bytes, output->length);
+    if (result != (mg_result_t)output->length) return false;
+    output->length = 0U;
+    return true;
+}
 
-    char *message = (char *)malloc(length);
-    if (!message) {
-        fprintf(stderr, "say: cannot allocate markup output\n");
-        return 1;
+static bool output_bytes(say_output_t *output, const u8 *bytes, usize length)
+{
+    if (!output || (length && !bytes)) return false;
+    for (usize index = 0U; index < length; index++) {
+        if (output->length == sizeof(output->bytes) &&
+            !output_flush(output)) return false;
+        output->bytes[output->length++] = bytes[index];
     }
+    return true;
+}
+
+static bool output_argument(say_output_t *output, const char *argument)
+{
+    usize length;
+
+    if (!output || !argument) return false;
+    length = strlen(argument);
+    if (!output->escapes)
+        return output_bytes(output, (const u8 *)argument, length);
+
     usize offset = 0U;
-    for (int index = 2; index < argc; index++) {
-        if (index > 2) message[offset++] = ' ';
-        usize part_length = strlen(argv[index]);
-        memcpy(message + offset, argv[index], part_length);
-        offset += part_length;
+    while (offset < length) {
+        u8 expanded[2];
+        usize expanded_length;
+        if (!say_escape_next((const u8 *)argument, length, &offset,
+                             expanded, &expanded_length) ||
+            !output_bytes(output, expanded, expanded_length))
+            return false;
     }
-    message[offset++] = '\n';
+    return true;
+}
 
-    mg_result_t result = terminal_markup_write_template(message, offset);
-    free(message);
-    if (result < 0) {
-        fprintf(stderr, "say: markup output failed: %s\n",
-                error_string(result));
-        return 1;
+static bool parse_options(int argc, char **argv, bool *escapes,
+                          bool *show_help, const char **error_argument,
+                          cli_options_error_t *error)
+{
+    cli_options_parser_t parser;
+    cli_options_item_t item;
+    cli_options_item_kind_t kind;
+
+    if (!escapes || !show_help || !error_argument || !error) return false;
+    *escapes = false;
+    *show_help = false;
+    *error_argument = NULL;
+    *error = CLI_OPTIONS_ERROR_NONE;
+    cli_options_init(&parser, argc, argv, say_options,
+                     sizeof(say_options) / sizeof(say_options[0]));
+    while ((kind = cli_options_next(&parser, &item)) != CLI_OPTIONS_DONE) {
+        if (kind == CLI_OPTIONS_ERROR) {
+            *error_argument = parser.error_argument;
+            *error = parser.error;
+            return false;
+        }
+        if (kind == CLI_OPTIONS_OPTION) {
+            if (item.option->short_name == 'e') *escapes = true;
+            else if (item.option->short_name == 'h') *show_help = true;
+        }
     }
-    return 0;
+    return true;
 }
 
 int main(int argc, char **argv)
 {
-    if (command_help_requested(argc, argv))
-        return command_print_help(argv[0]);
-    if (argc > 1 && strcmp(argv[1], "--markup") == 0)
-        return say_markup(argc, argv);
-    for (int i = 1; i < argc; i++) {
-        if (i > 1) printf(" ");
-        printf("%s", argv[i]);
+    bool escapes;
+    bool show_help;
+    const char *error_argument;
+    cli_options_error_t parse_error;
+    cli_options_parser_t parser;
+    cli_options_item_t item;
+    cli_options_item_kind_t kind;
+    say_output_t output = {{0}, 0U, false};
+    bool wrote_operand = false;
+
+    if (!parse_options(argc, argv, &escapes, &show_help, &error_argument,
+                       &parse_error)) {
+        fprintf(stderr, "say: %s%s%s\n", cli_options_error_message(parse_error),
+                error_argument ? ": " : "",
+                error_argument ? error_argument : "");
+        command_usage_error(argv[0], "say [-e|--escapes] [--] [text ...]",
+                            NULL);
+        return 1;
     }
-    printf("\n");
+    if (show_help) return command_print_help(argv[0]);
+
+    output.escapes = escapes;
+    cli_options_init(&parser, argc, argv, say_options,
+                     sizeof(say_options) / sizeof(say_options[0]));
+    while ((kind = cli_options_next(&parser, &item)) != CLI_OPTIONS_DONE) {
+        if (kind == CLI_OPTIONS_ERROR) return 1; /* Validated above. */
+        if (kind != CLI_OPTIONS_OPERAND) continue;
+        if (wrote_operand && !output_bytes(&output, (const u8 *)" ", 1U))
+            goto output_error;
+        if (!output_argument(&output, item.value)) goto output_error;
+        wrote_operand = true;
+    }
+    if (!output_bytes(&output, (const u8 *)"\n", 1U) ||
+        !output_flush(&output)) goto output_error;
     return 0;
+
+output_error:
+    fprintf(stderr, "say: output failed\n");
+    return 1;
 }

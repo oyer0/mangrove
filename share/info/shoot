@@ -114,6 +114,19 @@ appends to an existing one. Only standard output is redirected. There is no
 input redirection, separate standard error, pipe, background job, command
 chaining, or subshell.
 
+The standalone say command prints its arguments separated by spaces, followed
+by a newline. Backslashes are always literal unless -e or --escapes is given.
+With that option, \\ emits a backslash, \n a newline, \r a carriage return,
+\t a tab, and \e the ASCII ESC byte (0x1b). Unknown escapes and a final
+backslash are preserved literally. For example:
+
+    say -e '\e{fg:green}Mangrove\e{reset}'
+
+The terminal recognizes the resulting ESC{...} command only when output goes
+to the interactive console. Redirection writes emitted bytes unchanged.
+Ordinary say is the safe choice for literal or untrusted text; native programs
+can also use the explicit literal-write interface.
+
 For file commands, use copy SOURCE... DESTINATION and
 move SOURCE... DESTINATION. With multiple sources, the destination must be an
 existing directory. copy accepts regular files only. move uses filesystem

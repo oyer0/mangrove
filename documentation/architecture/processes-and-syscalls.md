@@ -236,6 +236,15 @@ before writing and propagates `MG_ERR_ENTROPY_UNAVAILABLE` if the kernel CSPRNG
 cannot initialize or reseed. See [cryptographic random bytes](randomness.md)
 for source assumptions, output error semantics, and verification limits.
 
+`object_write()` uses syscall 5 and `object_write_literal()` uses additive
+syscall 103. Writes to non-console objects, including redirected standard
+output files, preserve the supplied bytes in either case. Console writes
+through syscall 5 recognize Mangrove's bounded ESC `{...}` terminal commands;
+syscall 103 bypasses that parser and is the required path for displaying
+untrusted file, network, or log bytes. See the
+[terminal control contract](terminal.md) for the command grammar and process
+ownership rules.
+
 On entry the assembly path saves the user return state and general registers,
 switches to the current thread's kernel stack, and calls `syscall_dispatch`.
 The kernel masks interrupt, trap, and direction flags during entry and returns

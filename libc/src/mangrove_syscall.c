@@ -348,6 +348,13 @@ mg_result_t object_write(mg_handle_t handle, const void *buffer, usize length)
                                    length);
 }
 
+mg_result_t object_write_literal(mg_handle_t handle, const void *buffer,
+                                 usize length)
+{
+    return (mg_result_t)mg_syscall(103, handle, (unsigned long)buffer,
+                                   length);
+}
+
 mg_result_t handle_close(mg_handle_t handle)
 {
     return (mg_result_t)mg_syscall(6, handle, 0, 0);
@@ -847,30 +854,6 @@ mg_result_t terminal_write_semantic(const void *buffer, usize length,
     if (role >= MG_TERMINAL_STYLE_COUNT) return MG_ERR_BAD_ARGUMENT;
     return terminal_control(MG_TERMINAL_OP_SEMANTIC_WRITE, &request,
                              (void *)buffer);
-}
-
-mg_result_t terminal_control_stream_open(mg_handle_t *out_handle)
-{
-    long result;
-
-    if (!out_handle) return MG_ERR_BAD_ARGUMENT;
-    result = mg_syscall(65, MG_TERMINAL_OP_CONTROL_STREAM_OPEN, 0, 0);
-    if (result < 0) return (mg_result_t)result;
-    if ((unsigned long)result > 0xffffffffUL) return MG_ERR_IO;
-    *out_handle = (mg_handle_t)result;
-    return MG_OK;
-}
-
-mg_result_t terminal_control_stream_write(mg_handle_t handle,
-                                          const void *records,
-                                          usize length)
-{
-    mg_result_t result;
-
-    if (!handle || (length && !records)) return MG_ERR_BAD_ARGUMENT;
-    result = object_write(handle, records, length);
-    if (result < 0) return result;
-    return (usize)result == length ? MG_OK : MG_ERR_IO;
 }
 
 mg_result_t file_snapshot(mg_handle_t handle, char *data, usize capacity,

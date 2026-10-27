@@ -294,7 +294,7 @@ static usize next_utf8(const char *text, usize length, usize offset,
 
 static bool write_bytes(const char *text, usize length)
 {
-    return console_write(text, length) == (mg_result_t)length;
+    return console_write_literal(text, length) == (mg_result_t)length;
 }
 
 static mg_result_t print_record(const mg_log_record_t *record,

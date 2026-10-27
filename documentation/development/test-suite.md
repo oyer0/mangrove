@@ -101,7 +101,7 @@ Normal applications such as Reed, Shoot, device/volume services, `ping`,
 real application/diagnostic surfaces. Guest tests exercise the ordinary
 applications and services; MTS does not install alternative implementations.
 
-The host groups remain `test-time`, `test-terminal`, `test-clipboard`, `test-reed`, `test-shoot`,
+The host groups remain `test-time`, `test-terminal`, `test-say`, `test-clipboard`, `test-reed`, `test-shoot`,
 `test-mgfs-version`, `test-password`, `test-random`, `test-vmm`, `test-idt`, `test-pmm`, `test-heap`,
 `test-net`, `test-fsstress`,
 `test-history`, `test-mfqs`, `test-sync`, `test-storage`, `test-dev-tools` and

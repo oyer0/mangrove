@@ -32,12 +32,6 @@
 #define TERMINAL_CURSOR_BLINK_INTERVAL_MS 500ULL
 #define TERMINAL_PRESENTATION_INTERVAL_MS 16ULL
 
-#define TERMINAL_CONTROL_HEADER_SIZE 10U
-#define TERMINAL_CONTROL_MAX_BATCH 65536U
-#define TERMINAL_CONTROL_MAX_TEXT \
-    (TERMINAL_CONTROL_MAX_BATCH - TERMINAL_CONTROL_HEADER_SIZE)
-#define TERMINAL_CONTROL_MAX_RECORDS \
-    (TERMINAL_CONTROL_MAX_BATCH / TERMINAL_CONTROL_HEADER_SIZE)
 
 typedef struct {
     u32 codepoint;
@@ -831,8 +825,8 @@ static void terminal_put_codepoint_with_colors_locked(u32 codepoint,
                                                        u8 background) {
     if (!terminal.batch_active) terminal_cursor_hide_locked();
 
-    /* ESC is data on ordinary text streams. Render it visibly as the Unicode
-     * replacement glyph rather than interpreting an ANSI/CSI sequence. */
+    /* Literal writes and rejected native commands render ESC visibly instead
+     * of allowing it to start a different control language such as ANSI/CSI. */
     if (codepoint == 0x1BU) codepoint = 0xfffdU;
 
     if (codepoint == '\r') {
@@ -1219,30 +1213,6 @@ static i64 terminal_write_colors_locked(u64 process_id, const char *buffer,
     return (i64)length;
 }
 
-i64 terminal_write_for_process(u64 process_id, const char *buffer,
-                               u64 length)
-{
-    u64 saved_flags;
-    i64 result;
-
-    if (!process_id || (length && !buffer))
-        return MG_ERR_BAD_ARGUMENT;
-
-    saved_flags = spin_lock_irqsave(&terminal_lock);
-    if (!terminal_process_controls_locked(process_id)) {
-        result = MG_ERR_ACCESS_DENIED;
-    } else {
-        terminal_overlay_clear_locked(true);
-        terminal_begin_batch_locked();
-        for (u64 index = 0; index < length; index++)
-            terminal_putc_locked(buffer[index]);
-        terminal_end_batch_locked(true);
-        result = (i64)length;
-    }
-    spin_unlock_irqrestore(&terminal_lock, saved_flags);
-    return result;
-}
-
 i64 terminal_write_styled_for_process(u64 process_id, const char *buffer,
                                       u64 length,
                                       terminal_color_t foreground,
@@ -1282,352 +1252,381 @@ i64 terminal_write_semantic_for_process(u64 process_id, const char *buffer,
     return result;
 }
 
+typedef enum {
+    TERMINAL_ESCAPE_FOREGROUND,
+    TERMINAL_ESCAPE_BACKGROUND,
+    TERMINAL_ESCAPE_STYLE,
+    TERMINAL_ESCAPE_RESET,
+    TERMINAL_ESCAPE_POSITION,
+    TERMINAL_ESCAPE_CURSOR,
+    TERMINAL_ESCAPE_CLEAR,
+} terminal_escape_kind_t;
+
 typedef struct {
-    u8 type;
-    u8 foreground;
-    u8 background;
-    u8 value;
-    u32 row;
-    u32 column;
-    const u8 *text;
-    u32 text_length;
-} terminal_control_operation_t;
+    terminal_escape_kind_t kind;
+    u32 first;
+    u32 second;
+} terminal_escape_command_t;
 
-static u32 terminal_control_read_le32(const u8 *bytes)
+static bool terminal_escape_name(const u8 *text, u32 length,
+                                 const char *name)
 {
-    return (u32)bytes[0] | (u32)bytes[1] << 8 |
-           (u32)bytes[2] << 16 | (u32)bytes[3] << 24;
+    u32 index = 0U;
+    while (name[index]) {
+        if (index >= length || text[index] != (u8)name[index]) return false;
+        index++;
+    }
+    return index == length;
 }
 
-static bool terminal_control_read_record(const u8 *bytes, u64 length,
-                                         u64 *offset, u8 *type,
-                                         const u8 **payload,
-                                         u32 *payload_length)
+static bool terminal_escape_color(const u8 *text, u32 length, u32 *out_color)
 {
-    u64 remaining;
-    u32 size;
+    static const char *const names[TERMINAL_COLOR_COUNT] = {
+        "black", "red", "green", "yellow", "blue", "magenta", "cyan",
+        "light-gray", "dark-gray", "bright-red", "bright-green",
+        "bright-yellow", "bright-blue", "bright-magenta", "bright-cyan",
+        "white"
+    };
 
-    if (!bytes || !offset || !type || !payload || !payload_length ||
-        *offset > length)
-        return false;
-    remaining = length - *offset;
-    if (remaining < TERMINAL_CONTROL_HEADER_SIZE ||
-        memcmp(bytes + *offset, "MGTC", 4U) != 0)
-        return false;
-    if (bytes[*offset + 4U] != MG_TERMINAL_CONTROL_VERSION)
-        return false;
-    size = terminal_control_read_le32(bytes + *offset + 6U);
-    if ((u64)size > remaining - TERMINAL_CONTROL_HEADER_SIZE)
-        return false;
-    *type = bytes[*offset + 5U];
-    *payload_length = size;
-    *payload = bytes + *offset + TERMINAL_CONTROL_HEADER_SIZE;
-    *offset += TERMINAL_CONTROL_HEADER_SIZE + size;
-    return true;
-}
-
-static bool terminal_control_style_role(u8 role, u8 *foreground,
-                                        u8 *background)
-{
-    terminal_style_t style;
-
-    if (!foreground || !background || role >= TERMINAL_STYLE_COUNT)
-        return false;
-    style = terminal_style_for_role((terminal_style_role_t)role);
-    *foreground = (u8)style.foreground;
-    *background = (u8)style.background;
-    return true;
-}
-
-static i64 terminal_control_validate(const u8 *bytes, u64 length,
-                                     u8 initial_foreground,
-                                     u8 initial_background,
-                                     u64 *out_record_count,
-                                     u64 *out_operation_count,
-                                     u8 *out_foreground,
-                                     u8 *out_background)
-{
-    u64 offset = 0;
-    u64 records = 0;
-    u64 operations = 0;
-    u8 foreground = initial_foreground;
-    u8 background = initial_background;
-
-    while (offset < length) {
-        const u8 *payload;
-        u32 payload_length;
-        u8 type;
-
-        if (!terminal_control_read_record(bytes, length, &offset, &type,
-                                          &payload, &payload_length))
-            return MG_ERR_BAD_ARGUMENT;
-        if (++records > TERMINAL_CONTROL_MAX_RECORDS)
-            return MG_ERR_BUFFER_TOO_SMALL;
-
-        switch (type) {
-            case MG_TERMINAL_CONTROL_TEXT:
-                if (payload_length) operations++;
-                break;
-            case MG_TERMINAL_CONTROL_FOREGROUND:
-                if (payload_length != 1U ||
-                    payload[0] >= TERMINAL_COLOR_COUNT)
-                    return MG_ERR_BAD_ARGUMENT;
-                foreground = payload[0];
-                break;
-            case MG_TERMINAL_CONTROL_BACKGROUND:
-                if (payload_length != 1U ||
-                    payload[0] >= TERMINAL_COLOR_COUNT)
-                    return MG_ERR_BAD_ARGUMENT;
-                background = payload[0];
-                break;
-            case MG_TERMINAL_CONTROL_STYLE:
-                if (payload_length != 1U ||
-                    !terminal_control_style_role(payload[0], &foreground,
-                                                 &background))
-                    return MG_ERR_BAD_ARGUMENT;
-                break;
-            case MG_TERMINAL_CONTROL_RESET: {
-                terminal_style_t style = terminal_style_for_role(
-                    TERMINAL_STYLE_DEFAULT);
-                if (payload_length != 0U) return MG_ERR_BAD_ARGUMENT;
-                foreground = (u8)style.foreground;
-                background = (u8)style.background;
-                break;
-            }
-            case MG_TERMINAL_CONTROL_CURSOR_POSITION:
-                if (payload_length != 8U) return MG_ERR_BAD_ARGUMENT;
-                operations++;
-                break;
-            case MG_TERMINAL_CONTROL_CURSOR_VISIBILITY:
-                if (payload_length != 1U || payload[0] > 1U)
-                    return MG_ERR_BAD_ARGUMENT;
-                operations++;
-                break;
-            case MG_TERMINAL_CONTROL_CLEAR:
-                if (payload_length != 1U ||
-                    payload[0] < MG_TERMINAL_CONTROL_CLEAR_LINE ||
-                    payload[0] > MG_TERMINAL_CONTROL_CLEAR_SCREEN)
-                    return MG_ERR_BAD_ARGUMENT;
-                operations++;
-                break;
-            default:
-                return MG_ERR_UNSUPPORTED;
+    if (!text || !out_color) return false;
+    for (u32 color = 0U; color < TERMINAL_COLOR_COUNT; color++) {
+        if (terminal_escape_name(text, length, names[color])) {
+            *out_color = color;
+            return true;
         }
     }
-
-    if (out_record_count) *out_record_count = records;
-    if (out_operation_count) *out_operation_count = operations;
-    if (out_foreground) *out_foreground = foreground;
-    if (out_background) *out_background = background;
-    return MG_OK;
+    return false;
 }
 
-static bool terminal_control_build_plan(
-    const u8 *bytes, u64 length, u8 initial_foreground,
-    u8 initial_background, terminal_control_operation_t *operations,
-    u64 operation_capacity, u64 *out_operation_count)
+static bool terminal_escape_style(const u8 *text, u32 length, u32 *out_style)
 {
-    u64 offset = 0;
-    u64 count = 0;
-    u8 foreground = initial_foreground;
-    u8 background = initial_background;
+    static const char *const names[TERMINAL_STYLE_COUNT] = {
+        "default", "directory", "error", "warning", "success", "heading"
+    };
 
-    while (offset < length) {
-        const u8 *payload;
-        u32 payload_length;
-        u8 type;
-        terminal_control_operation_t *operation;
+    if (!text || !out_style) return false;
+    for (u32 style = 0U; style < TERMINAL_STYLE_COUNT; style++) {
+        if (terminal_escape_name(text, length, names[style])) {
+            *out_style = style;
+            return true;
+        }
+    }
+    return false;
+}
 
-        if (!terminal_control_read_record(bytes, length, &offset, &type,
-                                          &payload, &payload_length))
+static bool terminal_escape_unsigned(const u8 *text, u32 length,
+                                     u32 *out_value)
+{
+    u32 value = 0U;
+
+    if (!text || !length || !out_value) return false;
+    for (u32 index = 0U; index < length; index++) {
+        u32 digit;
+        if (text[index] < '0' || text[index] > '9') return false;
+        digit = text[index] - '0';
+        if (value > (0xffffffffU - digit) / 10U) return false;
+        value = value * 10U + digit;
+    }
+    *out_value = value;
+    return true;
+}
+
+/* The sequence includes ESC and the braces. A full command is validated
+ * before this returns true or any terminal state is changed. */
+static bool terminal_escape_parse(const u8 *sequence, u16 length,
+                                  terminal_escape_command_t *out_command)
+{
+    const u8 *body;
+    u32 body_length;
+    u32 colon = 0U;
+    const u8 *argument;
+    u32 argument_length;
+    u32 value;
+
+    if (!sequence || !out_command || length < 4U ||
+        length > TERMINAL_ESCAPE_SEQUENCE_MAX || sequence[0] != 0x1bU ||
+        sequence[1] != '{' || sequence[length - 1U] != '}') return false;
+    body = sequence + 2U;
+    body_length = length - 3U;
+    while (colon < body_length && body[colon] != ':') colon++;
+    if (colon == body_length) {
+        if (!terminal_escape_name(body, body_length, "reset")) return false;
+        out_command->kind = TERMINAL_ESCAPE_RESET;
+        out_command->first = out_command->second = 0U;
+        return true;
+    }
+
+    argument = body + colon + 1U;
+    argument_length = body_length - colon - 1U;
+    if (!argument_length) return false;
+    if (terminal_escape_name(body, colon, "fg") ||
+        terminal_escape_name(body, colon, "bg")) {
+        if (!terminal_escape_color(argument, argument_length, &value))
             return false;
-        switch (type) {
-            case MG_TERMINAL_CONTROL_TEXT:
-                if (!payload_length) break;
-                if (count >= operation_capacity) return false;
-                operation = &operations[count++];
-                *operation = (terminal_control_operation_t){0};
-                operation->type = type;
-                operation->foreground = foreground;
-                operation->background = background;
-                operation->text = payload;
-                operation->text_length = payload_length;
-                break;
-            case MG_TERMINAL_CONTROL_FOREGROUND:
-                foreground = payload[0];
-                break;
-            case MG_TERMINAL_CONTROL_BACKGROUND:
-                background = payload[0];
-                break;
-            case MG_TERMINAL_CONTROL_STYLE:
-                if (!terminal_control_style_role(payload[0], &foreground,
-                                                 &background))
-                    return false;
-                break;
-            case MG_TERMINAL_CONTROL_RESET: {
-                terminal_style_t style = terminal_style_for_role(
-                    TERMINAL_STYLE_DEFAULT);
-                foreground = (u8)style.foreground;
-                background = (u8)style.background;
-                break;
-            }
-            case MG_TERMINAL_CONTROL_CURSOR_POSITION:
-            case MG_TERMINAL_CONTROL_CURSOR_VISIBILITY:
-            case MG_TERMINAL_CONTROL_CLEAR:
-                if (count >= operation_capacity) return false;
-                operation = &operations[count++];
-                *operation = (terminal_control_operation_t){0};
-                operation->type = type;
-                if (type == MG_TERMINAL_CONTROL_CURSOR_POSITION) {
-                    operation->row = terminal_control_read_le32(payload);
-                    operation->column = terminal_control_read_le32(
-                        payload + 4U);
-                } else {
-                    operation->value = payload[0];
-                }
-                break;
-            default:
-                return false;
-        }
+        out_command->kind = terminal_escape_name(body, colon, "fg") ?
+            TERMINAL_ESCAPE_FOREGROUND : TERMINAL_ESCAPE_BACKGROUND;
+        out_command->first = value;
+        out_command->second = 0U;
+        return true;
     }
-    *out_operation_count = count;
-    return true;
+    if (terminal_escape_name(body, colon, "style")) {
+        if (!terminal_escape_style(argument, argument_length, &value))
+            return false;
+        out_command->kind = TERMINAL_ESCAPE_STYLE;
+        out_command->first = value;
+        out_command->second = 0U;
+        return true;
+    }
+    if (terminal_escape_name(body, colon, "cursor")) {
+        if (terminal_escape_name(argument, argument_length, "show"))
+            value = 1U;
+        else if (terminal_escape_name(argument, argument_length, "hide"))
+            value = 0U;
+        else return false;
+        out_command->kind = TERMINAL_ESCAPE_CURSOR;
+        out_command->first = value;
+        out_command->second = 0U;
+        return true;
+    }
+    if (terminal_escape_name(body, colon, "clear")) {
+        if (terminal_escape_name(argument, argument_length, "line"))
+            value = 1U;
+        else if (terminal_escape_name(argument, argument_length, "to-end"))
+            value = 2U;
+        else if (terminal_escape_name(argument, argument_length, "screen"))
+            value = 3U;
+        else return false;
+        out_command->kind = TERMINAL_ESCAPE_CLEAR;
+        out_command->first = value;
+        out_command->second = 0U;
+        return true;
+    }
+    if (terminal_escape_name(body, colon, "at")) {
+        u32 comma = 0U;
+        while (comma < argument_length && argument[comma] != ',') comma++;
+        if (comma == argument_length || !comma || comma + 1U >= argument_length ||
+            !terminal_escape_unsigned(argument, comma, &value) || !value ||
+            !terminal_escape_unsigned(argument + comma + 1U,
+                                      argument_length - comma - 1U,
+                                      &out_command->second) ||
+            !out_command->second)
+            return false;
+        out_command->kind = TERMINAL_ESCAPE_POSITION;
+        out_command->first = value;
+        return true;
+    }
+    return false;
 }
 
-void terminal_control_stream_init(terminal_control_stream_state_t *state)
+void terminal_output_state_init(terminal_output_state_t *state)
 {
     terminal_style_t style;
-
     if (!state) return;
-    mutex_init(&state->write_lock);
+    memset(state, 0, sizeof(*state));
     style = terminal_style_for_role(TERMINAL_STYLE_DEFAULT);
     state->foreground = (u8)style.foreground;
     state->background = (u8)style.background;
+    state->initialized = true;
 }
 
-i64 terminal_control_stream_write_for_process(
-    u64 process_id, terminal_control_stream_state_t *state,
-    const void *records, u64 length)
+static void terminal_output_ensure_initialized(terminal_output_state_t *state)
 {
-    u8 *copy = NULL;
-    terminal_control_operation_t *operations = NULL;
-    u64 record_count = 0;
-    u64 operation_count = 0;
-    u64 built_count = 0;
-    u8 final_foreground;
-    u8 final_background;
-    i64 result;
+    if (state && !state->initialized) terminal_output_state_init(state);
+}
+
+static void terminal_output_flush_pending_locked(terminal_output_state_t *state)
+{
+    u16 length;
+    if (!state || !state->pending_length) return;
+    length = state->pending_length;
+    state->pending_length = 0U;
+    for (u16 index = 0U; index < length; index++)
+        terminal_putc_with_colors_locked((char)state->pending[index],
+                                         state->foreground,
+                                         state->background);
+}
+
+static bool terminal_escape_apply_locked(u64 process_id,
+                                         terminal_output_state_t *state,
+                                         const terminal_escape_command_t *command)
+{
+    terminal_style_t style;
+
+    if (!terminal_process_controls_locked(process_id) || !state || !command)
+        return false;
+    switch (command->kind) {
+        case TERMINAL_ESCAPE_FOREGROUND:
+            state->foreground = (u8)command->first;
+            break;
+        case TERMINAL_ESCAPE_BACKGROUND:
+            state->background = (u8)command->first;
+            break;
+        case TERMINAL_ESCAPE_STYLE:
+            style = terminal_style_for_role(
+                (terminal_style_role_t)command->first);
+            state->foreground = (u8)style.foreground;
+            state->background = (u8)style.background;
+            break;
+        case TERMINAL_ESCAPE_RESET:
+            style = terminal_style_for_role(TERMINAL_STYLE_DEFAULT);
+            state->foreground = (u8)style.foreground;
+            state->background = (u8)style.background;
+            break;
+        case TERMINAL_ESCAPE_POSITION:
+            if (!command->first || !command->second ||
+                command->first > terminal.visible_rows ||
+                command->second > terminal.visible_cols)
+                return false;
+            return terminal_move_cursor_locked(command->first - 1U,
+                                               command->second - 1U);
+        case TERMINAL_ESCAPE_CURSOR:
+            terminal_set_cursor_visible_locked(command->first != 0U);
+            break;
+        case TERMINAL_ESCAPE_CLEAR:
+            if (command->first == 1U)
+                return terminal_clear_current_line_locked();
+            if (command->first == 2U)
+                return terminal_clear_current_to_end_locked();
+            if (command->first == 3U)
+                terminal_clear_locked();
+            else return false;
+            break;
+        default:
+            return false;
+    }
+    return true;
+}
+
+static void terminal_output_literal_byte_locked(
+    terminal_output_state_t *state, u8 byte)
+{
+    terminal_putc_with_colors_locked((char)byte, state->foreground,
+                                     state->background);
+}
+
+static void terminal_output_feed_byte_locked(u64 process_id,
+                                             terminal_output_state_t *state,
+                                             u8 byte)
+{
+    if (!state->pending_length) {
+        if (byte == 0x1bU) {
+            /* End an incomplete UTF-8 scalar before ESC starts a command. The
+             * ESC itself is consumed here rather than rendered. */
+            utf8_decode_result_t flushed = utf8_decoder_feed(
+                &terminal.utf8_decoder, byte);
+            for (u8 index = 0U; index < flushed.count; index++)
+                if (flushed.codepoints[index] != 0x1bU)
+                    terminal_put_codepoint_with_colors_locked(
+                        flushed.codepoints[index], state->foreground,
+                        state->background);
+            state->pending[0] = byte;
+            state->pending_length = 1U;
+            return;
+        }
+        terminal_output_literal_byte_locked(state, byte);
+        return;
+    }
+
+    if (state->pending_length == 1U && byte != '{') {
+        terminal_output_flush_pending_locked(state);
+        terminal_output_feed_byte_locked(process_id, state, byte);
+        return;
+    }
+    if (byte == 0x1bU || byte < 0x20U || byte == 0x7fU ||
+        state->pending_length >= TERMINAL_ESCAPE_SEQUENCE_MAX) {
+        terminal_output_flush_pending_locked(state);
+        terminal_output_feed_byte_locked(process_id, state, byte);
+        return;
+    }
+
+    state->pending[state->pending_length++] = byte;
+    if (state->pending_length == 2U && byte != '{') {
+        terminal_output_flush_pending_locked(state);
+        return;
+    }
+    if (byte == '}') {
+        terminal_escape_command_t command;
+        if (terminal_escape_parse(state->pending, state->pending_length,
+                                  &command) &&
+            terminal_escape_apply_locked(process_id, state, &command)) {
+            state->pending_length = 0U;
+        } else {
+            terminal_output_flush_pending_locked(state);
+        }
+    }
+}
+
+void terminal_output_finish_for_process(u64 process_id,
+                                        terminal_output_state_t *state)
+{
     u64 saved_flags;
 
-    if (!process_id || !state || (length && !records))
+    if (!state) return;
+    if (!terminal_lock_ready) {
+        state->pending_length = 0U;
+        state->initialized = false;
+        return;
+    }
+    saved_flags = spin_lock_irqsave(&terminal_lock);
+    terminal_output_ensure_initialized(state);
+    if (state->pending_length &&
+        terminal_process_controls_locked(process_id)) {
+        terminal_overlay_clear_locked(true);
+        terminal_begin_batch_locked();
+        terminal_output_flush_pending_locked(state);
+        terminal_end_batch_locked(true);
+    } else {
+        state->pending_length = 0U;
+    }
+    state->initialized = false;
+    spin_unlock_irqrestore(&terminal_lock, saved_flags);
+}
+
+static i64 terminal_write_common_for_process(
+    u64 process_id, terminal_output_state_t *state, const char *buffer,
+    u64 length, bool literal)
+{
+    u64 saved_flags;
+    i64 result;
+
+    if (!process_id || !state || (length && !buffer))
         return MG_ERR_BAD_ARGUMENT;
-    if (length > TERMINAL_CONTROL_MAX_BATCH)
-        return MG_ERR_BUFFER_TOO_SMALL;
-    if (!length) return 0;
-
-    copy = (u8 *)kmalloc((usize)length);
-    if (!copy) return MG_ERR_NO_MEMORY;
-    memcpy(copy, records, (usize)length);
-
-    if (!mutex_lock(&state->write_lock)) {
-        kfree(copy);
-        return MG_ERR_BUSY;
-    }
-    result = terminal_control_validate(copy, length, state->foreground,
-        state->background, &record_count, &operation_count,
-        &final_foreground, &final_background);
-    if (result != MG_OK) goto cleanup;
-    if (operation_count > record_count ||
-        operation_count > (~(u64)0 / sizeof(*operations)) ||
-        operation_count > (~(usize)0 / sizeof(*operations))) {
-        result = MG_ERR_BAD_ARGUMENT;
-        goto cleanup;
-    }
-    if (operation_count) {
-        operations = (terminal_control_operation_t *)kmalloc(
-            (usize)operation_count * sizeof(*operations));
-        if (!operations) {
-            result = MG_ERR_NO_MEMORY;
-            goto cleanup;
-        }
-        if (!terminal_control_build_plan(copy, length, state->foreground,
-                state->background, operations, operation_count, &built_count) ||
-            built_count != operation_count) {
-            result = MG_ERR_BAD_ARGUMENT;
-            goto cleanup;
-        }
-    }
-
     saved_flags = spin_lock_irqsave(&terminal_lock);
     if (!terminal_process_controls_locked(process_id)) {
         result = MG_ERR_ACCESS_DENIED;
-        spin_unlock_irqrestore(&terminal_lock, saved_flags);
-        goto cleanup;
-    }
-    for (u64 index = 0; index < operation_count; index++) {
-        terminal_control_operation_t *operation = &operations[index];
-        if (operation->type == MG_TERMINAL_CONTROL_CURSOR_POSITION &&
-            (operation->row >= terminal.visible_rows ||
-             operation->column >= terminal.visible_cols)) {
-            result = MG_ERR_BAD_ARGUMENT;
-            spin_unlock_irqrestore(&terminal_lock, saved_flags);
-            goto cleanup;
+    } else {
+        terminal_output_ensure_initialized(state);
+        terminal_overlay_clear_locked(true);
+        terminal_begin_batch_locked();
+        if (literal) terminal_output_flush_pending_locked(state);
+        for (u64 index = 0U; index < length; index++) {
+            u8 byte = (u8)buffer[index];
+            if (literal)
+                terminal_output_literal_byte_locked(state, byte);
+            else
+                terminal_output_feed_byte_locked(process_id, state, byte);
         }
-    }
-
-    /* Formatting records only change this handle's private state. Do not
-     * disturb a completion overlay or schedule a framebuffer update unless
-     * the batch contains an operation that actually affects the screen. */
-    if (!operation_count) {
-        state->foreground = final_foreground;
-        state->background = final_background;
+        terminal_end_batch_locked(true);
         result = (i64)length;
-        spin_unlock_irqrestore(&terminal_lock, saved_flags);
-        goto cleanup;
     }
-
-    terminal_overlay_clear_locked(false);
-    terminal_begin_batch_locked();
-    for (u64 index = 0; index < operation_count; index++) {
-        terminal_control_operation_t *operation = &operations[index];
-        switch (operation->type) {
-            case MG_TERMINAL_CONTROL_TEXT:
-                for (u32 byte = 0; byte < operation->text_length; byte++)
-                    terminal_putc_with_colors_locked(
-                        (char)operation->text[byte], operation->foreground,
-                        operation->background);
-                break;
-            case MG_TERMINAL_CONTROL_CURSOR_POSITION:
-                (void)terminal_move_cursor_locked(operation->row,
-                                                   operation->column);
-                break;
-            case MG_TERMINAL_CONTROL_CURSOR_VISIBILITY:
-                terminal_set_cursor_visible_locked(operation->value != 0U);
-                break;
-            case MG_TERMINAL_CONTROL_CLEAR:
-                if (operation->value == MG_TERMINAL_CONTROL_CLEAR_LINE)
-                    (void)terminal_clear_current_line_locked();
-                else if (operation->value ==
-                         MG_TERMINAL_CONTROL_CLEAR_TO_END)
-                    (void)terminal_clear_current_to_end_locked();
-                else
-                    terminal_clear_locked();
-                break;
-            default:
-                break;
-        }
-    }
-    terminal_end_batch_locked(true);
-    state->foreground = final_foreground;
-    state->background = final_background;
-    result = (i64)length;
     spin_unlock_irqrestore(&terminal_lock, saved_flags);
-
-cleanup:
-    if (operations) kfree(operations);
-    (void)mutex_unlock(&state->write_lock);
-    kfree(copy);
     return result;
+}
+
+i64 terminal_write_for_process_state(u64 process_id,
+                                     terminal_output_state_t *state,
+                                     const char *buffer, u64 length)
+{
+    return terminal_write_common_for_process(process_id, state, buffer,
+                                             length, false);
+}
+
+i64 terminal_write_literal_for_process(u64 process_id,
+                                       terminal_output_state_t *state,
+                                       const char *buffer, u64 length)
+{
+    return terminal_write_common_for_process(process_id, state, buffer,
+                                             length, true);
 }
 
 static void terminal_save_normal_state_locked(void)

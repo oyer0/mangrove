@@ -3,7 +3,6 @@
 
 #include <mg/error.h>
 #include <mg/types.h>
-#include <terminal_control.h>
 #include <terminal_colors.h>
 
 /* Versioned native terminal-control ABI.  These structures contain no
@@ -31,8 +30,6 @@ typedef enum {
     MG_TERMINAL_OP_READ_KEY_EVENT = 16,
     MG_TERMINAL_OP_PREPARE_INPUT_LINE = 17,
     MG_TERMINAL_OP_INPUT_CURSOR = 18,
-    /* Returns a write-only handle for a versioned MGTC control stream. */
-    MG_TERMINAL_OP_CONTROL_STREAM_OPEN = 19,
 } mg_terminal_operation_t;
 
 #define MG_TERMINAL_CAP_STYLED_OUTPUT TERMINAL_CAP_STYLED_OUTPUT
@@ -228,14 +225,6 @@ mg_result_t terminal_write_styled(const void *buffer, usize length,
  * write is serialized with terminal mutation. */
 mg_result_t terminal_write_semantic(const void *buffer, usize length,
                                     mg_terminal_style_role_t role);
-
-/* Explicitly open the authorized terminal-control stream. It is distinct
- * from stdout: ordinary writes always remain literal text. Close the returned
- * handle with handle_close(). A write is one atomic validation/application
- * batch; separate writes may interleave with output from other processes. */
-mg_result_t terminal_control_stream_open(mg_handle_t *out_handle);
-mg_result_t terminal_control_stream_write(mg_handle_t handle,
-                                         const void *records, usize length);
 
 /* Reposition within the input anchored by terminal_prepare_input_line().
  * Offsets/extents count display cells, not UTF-8 bytes. */

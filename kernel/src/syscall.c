@@ -1366,12 +1366,14 @@ void syscall_dispatch(void *raw_frame)
             return;
         }
         case SYSCALL_READ:
-        case SYSCALL_WRITE: {
+        case SYSCALL_WRITE:
+        case SYSCALL_WRITE_LITERAL: {
             process_handle_t handle = (process_handle_t)frame->rdi;
             void *buffer = (void *)(uintptr_t)frame->rsi;
             u64 length = frame->rdx;
+            process_t *process = process_current();
             kernel_object_t *object = process_handle_lookup_retain(
-                process_current(), handle, OBJECT_TYPE_INVALID,
+                process, handle, OBJECT_TYPE_INVALID,
                 frame->rax == SYSCALL_READ ? OBJECT_RIGHT_READ : OBJECT_RIGHT_WRITE);
             i64 result;
             bool file_write;
@@ -1386,8 +1388,10 @@ void syscall_dispatch(void *raw_frame)
             }
             result = frame->rax == SYSCALL_READ
                 ? object_read(object, buffer, length)
-                : object_write(object, buffer, length);
-            file_write = frame->rax == SYSCALL_WRITE &&
+                : frame->rax == SYSCALL_WRITE_LITERAL
+                    ? object_write_literal(object, buffer, length)
+                    : object_write(object, buffer, length);
+            file_write = frame->rax != SYSCALL_READ &&
                          object->type == OBJECT_TYPE_FILE;
             object_release(object);
             frame->rax = (u64)syscall_object_io_result(file_write, result);
@@ -2166,47 +2170,12 @@ void syscall_dispatch(void *raw_frame)
             i64 result = MG_OK;
 
             if (!process || operation < MG_TERMINAL_OP_ALTERNATE_ENTER ||
-                operation > MG_TERMINAL_OP_CONTROL_STREAM_OPEN) {
+                operation > MG_TERMINAL_OP_INPUT_CURSOR) {
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
             }
 
             switch (operation) {
-                case MG_TERMINAL_OP_CONTROL_STREAM_OPEN: {
-                    kernel_object_t *output;
-                    kernel_object_t *stream;
-                    process_handle_t handle;
-
-                    if (frame->rsi || frame->rdx) {
-                        result = MG_ERR_BAD_ARGUMENT;
-                        break;
-                    }
-                    output = process_handle_lookup_retain(
-                        process, PROCESS_INITIAL_CONSOLE_HANDLE,
-                        OBJECT_TYPE_CONSOLE, OBJECT_RIGHT_WRITE);
-                    if (!output ||
-                        !terminal_process_controls(process->pid)) {
-                        if (output) object_release(output);
-                        result = MG_ERR_ACCESS_DENIED;
-                        break;
-                    }
-                    object_release(output);
-
-                    stream = object_terminal_control_stream_create();
-                    if (!stream) {
-                        result = MG_ERR_NO_MEMORY;
-                        break;
-                    }
-                    if (!process_handle_install(process, stream,
-                            OBJECT_RIGHT_WRITE, &handle)) {
-                        object_release(stream);
-                        result = MG_ERR_NO_MEMORY;
-                        break;
-                    }
-                    object_release(stream);
-                    frame->rax = handle;
-                    return;
-                }
                 case MG_TERMINAL_OP_ALTERNATE_ENTER:
                     if (frame->rsi || frame->rdx ||
                         !terminal_alternate_enter_process(process->pid))

@@ -16,7 +16,6 @@ typedef enum {
     OBJECT_TYPE_NETWORK_STREAM,
     OBJECT_TYPE_IPC_ENDPOINT,
     OBJECT_TYPE_IPC_REQUEST,
-    OBJECT_TYPE_TERMINAL_CONTROL_STREAM,
 } kernel_object_type_t;
 
 #define OBJECT_RIGHT_READ  (1U << 0)
@@ -42,7 +41,6 @@ void object_init(kernel_object_t *object, kernel_object_type_t type,
 bool object_reference(kernel_object_t *object);
 void object_release(kernel_object_t *object);
 kernel_object_t *object_console_create(void);
-kernel_object_t *object_terminal_control_stream_create(void);
 kernel_object_t *object_file_create(const char *path, u32 flags);
 /* Allocate before a persistent create. Binding transfers the VFS handle to
  * this object and cannot allocate or fail. */
@@ -58,6 +56,8 @@ kernel_object_t *object_directory_create(const char *path);
 kernel_object_t *object_directory_create_node(vfs_node_t *node);
 i64 object_read(kernel_object_t *object, void *buffer, u64 length);
 i64 object_write(kernel_object_t *object, const void *buffer, u64 length);
+i64 object_write_literal(kernel_object_t *object, const void *buffer,
+                         u64 length);
 i64 object_directory_read(kernel_object_t *object, vfs_dirent_t *out_entry);
 i64 object_directory_read_batch(kernel_object_t *object,
                                 vfs_dirent_t *out_entries, u32 capacity,

@@ -16,7 +16,7 @@ OPTION_FLAGS = {
     "lspci": {"-h", "-v"},
     "lsusb": {"-h", "-v"},
     "ping": {"-h", "-c", "-i"},
-    "say": {"-h", "--markup"},
+    "say": {"-h", "-e"},
     "user": {"-h", "-p"},
 }
 
@@ -95,9 +95,9 @@ def main():
     assert option_flags(records["shoot"]) == {"-h"}
     require(records, "shoot", "note", "SCRIPT")
 
-    assert records["say"]["usage"] == ["say [--markup] [text ...]"]
-    require(records, "say", "option", "--markup")
-    require(records, "say", "note", "printed literally")
+    assert records["say"]["usage"] == ["say [-e|--escapes] [--] [text ...]"]
+    require(records, "say", "option", "-e, --escapes")
+    require(records, "say", "note", "stay literal")
 
     assert records["fetch"]["usage"] == [
         "fetch [OPTIONS] URL...", "fetch [OPTIONS] --input-file=FILE"]
