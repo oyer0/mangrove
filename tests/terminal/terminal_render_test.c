@@ -93,6 +93,34 @@ mg_result_t object_write_all(mg_handle_t handle, const void *buffer,
         EDITOR_TEST_PID, buffer, length);
 }
 
+mg_result_t console_write(const void *buffer, usize length)
+{
+    return (mg_result_t)terminal_write_for_process(
+        EDITOR_TEST_PID, buffer, length);
+}
+
+mg_result_t console_write_literal(const void *buffer, usize length)
+{
+    return (mg_result_t)terminal_write_literal_for_process(
+        EDITOR_TEST_PID, &test_output_state, (const char *)buffer, length);
+}
+
+int command_print_help(const char *argv0)
+{
+    (void)argv0;
+    return 0;
+}
+
+void command_usage_error(const char *argv0, const char *usage,
+                         const char *option)
+{
+    (void)argv0;
+    (void)usage;
+    (void)option;
+}
+
+int say_main(int argc, char **argv);
+
 mg_result_t terminal_update_begin(void)
 {
     return terminal_begin_batch_for_process(EDITOR_TEST_PID)
@@ -999,6 +1027,34 @@ static void test_native_escape_commands(void)
             assert(screen_cell(row, column)->codepoint == ' ');
 }
 
+static void test_say_no_newline_clear_home(void)
+{
+    char *say_clear[] = {"say", "-ne", "\\e{cls}\\e{at:1,1}"};
+    char *say_clear_with_newline[] = {"say", "-e", "\\e{cls}\\e{at:1,1}"};
+    static const char clear_home[] = "\x1b{cls}\x1b{at:1,1}";
+
+    initialize(120U, 56U);
+    assert(terminal_write_for_process(EDITOR_TEST_PID, "old", 3U) == 3);
+    assert(say_main(3, say_clear) == 0);
+    assert(terminal.cursor_phys_row == screen_to_phys_row(0U));
+    assert(terminal.cursor_col == 0U);
+    assert(terminal_write_for_process(EDITOR_TEST_PID, "P", 1U) == 1);
+    assert(screen_cell(0U, 0U)->codepoint == 'P');
+
+    initialize(120U, 56U);
+    assert(terminal_write_for_process(EDITOR_TEST_PID, "old", 3U) == 3);
+    assert(terminal_write_for_process(EDITOR_TEST_PID, clear_home,
+                                      sizeof(clear_home) - 1U) ==
+           (i64)(sizeof(clear_home) - 1U));
+    assert(terminal.cursor_phys_row == screen_to_phys_row(0U));
+    assert(terminal.cursor_col == 0U);
+
+    initialize(120U, 56U);
+    assert(say_main(3, say_clear_with_newline) == 0);
+    assert(terminal.cursor_phys_row == screen_to_phys_row(1U));
+    assert(terminal.cursor_col == 0U);
+}
+
 static void test_canonical_palette_and_style_names(void)
 {
     static const char *const command_names[] = {
@@ -1763,6 +1819,8 @@ int main(int argument_count, char **arguments)
         test_escape_sequences_are_literal();
     if (run_all || !strcmp(arguments[1], "esc-controls"))
         test_native_escape_commands();
+    if (run_all || !strcmp(arguments[1], "say-clear"))
+        test_say_no_newline_clear_home();
     if (run_all || !strcmp(arguments[1], "esc-palette"))
         test_canonical_palette_and_style_names();
     if (run_all || !strcmp(arguments[1], "esc-motion"))

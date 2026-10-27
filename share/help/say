@@ -1,9 +1,9 @@
 name=say
 category=system
 description=print text with optional backslash escape translation
-usage=say [-e|--escapes] [--] [text ...]
+usage=say [-e|--escapes] [-n|--no-newline] [--] [text ...]
 option=-h, --help    show this help
 option=-e, --escapes translate supported backslash escapes before writing
-note=Supports \\, \n, \r, \t, and \e; unknown and trailing escapes stay literal.
-note=Without -e, backslashes stay literal. Redirected output receives emitted bytes unchanged.
-note=Example: say -e '\e{fg:b_green}Success!\e{ok}'
+option=-n, --no-newline    omit the final newline
+note=-e translates \\, \n, \r, \t, and \e; without it, backslashes stay literal.
+note=-n suppresses the final newline. Redirected output receives emitted bytes unchanged.

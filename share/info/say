@@ -1,0 +1,97 @@
+NAME
+
+say - Write joined text to standard output
+
+SYNOPSIS
+
+    say [-e|--escapes] [-n|--no-newline] [--] [text ...]
+    say --help
+
+DESCRIPTION
+
+`say` writes its text operands to standard output, separated by one space. It
+appends a newline unless `-n` or `--no-newline` is selected. With no text
+operands it writes only the optional newline. Backslash translation is off by
+default so ordinary and untrusted text remains literal.
+
+OPTIONS
+
+    -e, --escapes — Translate the supported backslash escapes before writing.
+    -n, --no-newline — Do not append a final newline.
+    -h, --help — Show concise usage and option help, then exit.
+    -- — End option parsing; later arguments are text operands.
+
+Grouped short flags work in either order: `-ne` and `-en` both enable escape
+translation and suppress the final newline. Long options may be combined in
+separate arguments.
+
+ESCAPES
+
+With `-e`, these backslash escapes are translated:
+
+    \\ — Emit one literal backslash.
+    \n — Emit a line feed.
+    \r — Emit a carriage return.
+    \t — Emit a tab.
+    \e — Emit ASCII ESC byte 0x1b.
+
+Unknown escapes and a final backslash remain literal, including both bytes of
+an unknown pair. Without `-e`, all backslashes and the following characters
+remain unchanged.
+
+The ESC byte can introduce Mangrove terminal controls in the canonical
+`ESC{command}` form. `\e` is only the spelling recognized by `say -e`; it is
+not itself a terminal instruction. The supported commands are:
+
+    fg:COLOR — Set foreground color.
+    bg:COLOR — Set background color.
+    warn — Apply warning style.
+    err — Apply error style.
+    ok — Apply success style.
+    head — Apply heading style.
+    reset — Restore default foreground and background.
+    cls — Clear the screen.
+    cll — Clear the current line.
+    cleol — Clear from the cursor to the line end.
+    at:ROW,COL — Move to one-based screen coordinates.
+    up:N — Move up by N rows.
+    down:N — Move down by N rows.
+    left:N — Move left by N columns.
+    right:N — Move right by N columns.
+    hide — Hide the cursor.
+    show — Show the cursor.
+    alt — Enter the alternate screen.
+    main — Return to the main screen.
+
+`COLOR` is one of the existing palette names:
+`black`, `red`, `green`, `yellow`, `blue`, `magenta`, `cyan`, `l_gray`,
+`d_gray`, `b_red`, `b_green`, `b_yellow`, `b_blue`, `b_magenta`, `b_cyan`,
+or `white`. Both foreground and background accept all 16 names. The color
+values are Mangrove's existing palette; names do not select RGB values.
+
+Unknown, malformed, oversized, or incomplete terminal commands have no effect
+and remain visible as text; the ESC byte itself is displayed as U+FFFD. The
+terminal validates a complete command before applying it. Only an actual ESC
+byte followed by a recognized command is interpreted; printable `{fg:red}`
+text has no special meaning.
+
+EXAMPLES
+
+    say Hello, Mangrove!
+    say -n Loading...
+    say -e '\e{fg:b_green}Success!\e{reset}'
+    say -ne '\e{cls}\e{at:1,1}'
+
+NOTES
+
+Output redirection receives exactly the bytes `say` emits, including any ESC
+bytes produced by `-e`; a redirected file is not interpreted by the terminal.
+When writing to the interactive console, a valid terminal command can move the
+cursor, clear output, or switch screens. Do not pass untrusted text through
+`-e` if it may contain terminal-control bytes. The no-newline option lets the
+next prompt or output continue at the current cursor position.
+
+SEE ALSO
+
+    info shoot
+    documentation/architecture/terminal.md

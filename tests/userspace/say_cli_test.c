@@ -96,10 +96,45 @@ static void test_end_of_options_and_unknown_option(void)
     assert(!output_length && usage_errors == 1U);
 }
 
+static void test_no_newline_and_grouped_options(void)
+{
+    char *no_newline[] = {"say", "-n", "text"};
+    static const u8 text[] = "text";
+    char *escapes_first[] = {"say", "-ne", "\\e{cls}\\e{at:1,1}"};
+    char *newline_first[] = {"say", "-en", "\\e{cls}\\e{at:1,1}"};
+    static const u8 controls[] = {
+        0x1bU, '{', 'c', 'l', 's', '}',
+        0x1bU, '{', 'a', 't', ':', '1', ',', '1', '}',
+    };
+    char *long_forms[] = {"say", "--no-newline", "--escapes", "x\\n"};
+    static const u8 long_expected[] = {'x', '\n'};
+
+    reset();
+    assert(say_main(3, no_newline) == 0);
+    assert(output_length == sizeof(text) - 1U);
+    assert(!memcmp(output, text, sizeof(text) - 1U));
+
+    reset();
+    assert(say_main(3, escapes_first) == 0);
+    assert(used_escape_output && output_length == sizeof(controls));
+    assert(!memcmp(output, controls, sizeof(controls)));
+
+    reset();
+    assert(say_main(3, newline_first) == 0);
+    assert(used_escape_output && output_length == sizeof(controls));
+    assert(!memcmp(output, controls, sizeof(controls)));
+
+    reset();
+    assert(say_main(4, long_forms) == 0);
+    assert(used_escape_output && output_length == sizeof(long_expected));
+    assert(!memcmp(output, long_expected, sizeof(long_expected)));
+}
+
 int main(void)
 {
     test_literal_default();
     test_escape_option();
     test_end_of_options_and_unknown_option();
+    test_no_newline_and_grouped_options();
     return 0;
 }

@@ -901,6 +901,11 @@ test-terminal-api:
 test-terminal: test-terminal-api
 	python3 tests/terminal/framebuffer_rect_test.py "$(HOST_CC)"
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
+		-fsanitize=address,undefined -ffunction-sections -fdata-sections \
+		-Dmain=say_main -I. -Iinclude -Iuserspace/common \
+		-idirafter libc/include -c userspace/say/main.c \
+		-o /tmp/mangrove-say-main-render-test.o
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
 		-Ikernel/include -Iinclude tests/terminal/utf8_decode_test.c \
 		kernel/src/utf8.c libc/src/utf8.c -o /tmp/mangrove-utf8-test
 	/tmp/mangrove-utf8-test
@@ -908,7 +913,9 @@ test-terminal: test-terminal-api
 		-pthread -fno-builtin -fsanitize=address,undefined -ffunction-sections \
 		-fdata-sections $(HOST_TERMINAL_RENDER_INCLUDES) \
 		tests/terminal/terminal_render_test.c kernel/src/utf8.c libc/src/utf8.c \
-		libc/src/line_editor.c libc/src/string.c -Wl,--gc-sections \
+		libc/src/line_editor.c libc/src/string.c userspace/say/escape.c \
+		userspace/common/cli_options.c /tmp/mangrove-say-main-render-test.o \
+		-Wl,--gc-sections \
 		-o /tmp/mangrove-terminal-render-test
 	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-terminal-render-test
 	python3 tests/terminal/terminal_overlay_test.py "$(HOST_CC)"

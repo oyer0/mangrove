@@ -10,6 +10,7 @@
 
 static const cli_option_spec_t say_options[] = {
     { 'e', "escapes", false },
+    { 'n', "no-newline", false },
     { 'h', "help", false },
 };
 
@@ -17,6 +18,7 @@ typedef struct {
     u8 bytes[SAY_OUTPUT_CHUNK];
     usize length;
     bool escapes;
+    bool newline;
 } say_output_t;
 
 static bool output_flush(say_output_t *output)
@@ -64,6 +66,7 @@ static bool output_argument(say_output_t *output, const char *argument)
 }
 
 static bool parse_options(int argc, char **argv, bool *escapes,
+                          bool *newline,
                           bool *show_help, const char **error_argument,
                           cli_options_error_t *error)
 {
@@ -71,8 +74,10 @@ static bool parse_options(int argc, char **argv, bool *escapes,
     cli_options_item_t item;
     cli_options_item_kind_t kind;
 
-    if (!escapes || !show_help || !error_argument || !error) return false;
+    if (!escapes || !newline || !show_help || !error_argument || !error)
+        return false;
     *escapes = false;
+    *newline = true;
     *show_help = false;
     *error_argument = NULL;
     *error = CLI_OPTIONS_ERROR_NONE;
@@ -86,6 +91,7 @@ static bool parse_options(int argc, char **argv, bool *escapes,
         }
         if (kind == CLI_OPTIONS_OPTION) {
             if (item.option->short_name == 'e') *escapes = true;
+            else if (item.option->short_name == 'n') *newline = false;
             else if (item.option->short_name == 'h') *show_help = true;
         }
     }
@@ -95,27 +101,30 @@ static bool parse_options(int argc, char **argv, bool *escapes,
 int main(int argc, char **argv)
 {
     bool escapes;
+    bool newline;
     bool show_help;
     const char *error_argument;
     cli_options_error_t parse_error;
     cli_options_parser_t parser;
     cli_options_item_t item;
     cli_options_item_kind_t kind;
-    say_output_t output = {{0}, 0U, false};
+    say_output_t output = {{0}, 0U, false, true};
     bool wrote_operand = false;
 
-    if (!parse_options(argc, argv, &escapes, &show_help, &error_argument,
+    if (!parse_options(argc, argv, &escapes, &newline, &show_help, &error_argument,
                        &parse_error)) {
         fprintf(stderr, "say: %s%s%s\n", cli_options_error_message(parse_error),
                 error_argument ? ": " : "",
                 error_argument ? error_argument : "");
-        command_usage_error(argv[0], "say [-e|--escapes] [--] [text ...]",
+        command_usage_error(argv[0],
+                            "say [-e|--escapes] [-n|--no-newline] [--] [text ...]",
                             NULL);
         return 1;
     }
     if (show_help) return command_print_help(argv[0]);
 
     output.escapes = escapes;
+    output.newline = newline;
     cli_options_init(&parser, argc, argv, say_options,
                      sizeof(say_options) / sizeof(say_options[0]));
     while ((kind = cli_options_next(&parser, &item)) != CLI_OPTIONS_DONE) {
@@ -126,7 +135,8 @@ int main(int argc, char **argv)
         if (!output_argument(&output, item.value)) goto output_error;
         wrote_operand = true;
     }
-    if (!output_bytes(&output, (const u8 *)"\n", 1U) ||
+    if ((output.newline &&
+         !output_bytes(&output, (const u8 *)"\n", 1U)) ||
         !output_flush(&output)) goto output_error;
     return 0;
 
