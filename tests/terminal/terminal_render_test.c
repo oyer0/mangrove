@@ -61,6 +61,12 @@ static kernel_thread_t mock_input_thread;
 static bool mock_raw_input;
 static bool mock_raw_input_includes_cooked;
 static u32 preserving_release_count;
+static terminal_key_event_t terminal_test_events[EDITOR_TEST_INPUT_CAPACITY];
+static usize terminal_test_event_count;
+static usize terminal_test_event_offset;
+static u32 terminal_test_waits[EDITOR_TEST_INPUT_CAPACITY + 1U];
+static usize terminal_test_wait_count;
+static bool terminal_test_timeout_when_empty;
 
 kernel_thread_t *thread_current(void)
 {
@@ -403,9 +409,32 @@ bool console_set_raw_input_preserving_text(bool enabled,
 
 i64 console_read_key_event(u32 timeout_ms, terminal_key_event_t *event)
 {
-    (void)timeout_ms;
-    (void)event;
-    return MG_ERR_WOULD_BLOCK;
+    assert(__atomic_load_n(&terminal_lock.value, __ATOMIC_RELAXED) == 0U);
+    if (!event) return MG_ERR_BAD_ARGUMENT;
+    if (terminal_test_wait_count < EDITOR_TEST_INPUT_CAPACITY + 1U)
+        terminal_test_waits[terminal_test_wait_count++] = timeout_ms;
+    if (terminal_test_event_offset >= terminal_test_event_count) {
+        if (terminal_test_timeout_when_empty && timeout_ms != 0U) {
+            mock_time += timeout_ms;
+            return MG_ERR_TIMEOUT;
+        }
+        return MG_ERR_WOULD_BLOCK;
+    }
+    *event = terminal_test_events[terminal_test_event_offset++];
+    return MG_OK;
+}
+
+static void set_terminal_test_events(const terminal_key_event_t *events,
+                                     usize count)
+{
+    assert(count <= EDITOR_TEST_INPUT_CAPACITY);
+    assert(events || count == 0U);
+    if (count)
+        memcpy(terminal_test_events, events,
+               count * sizeof(terminal_test_events[0]));
+    terminal_test_event_count = count;
+    terminal_test_event_offset = 0U;
+    terminal_test_wait_count = 0U;
 }
 /* A deterministic cell glyph model makes foreground/background inversion and
  * stale overlay pixels observable. Font lookup itself is qualified elsewhere. */
@@ -449,6 +478,10 @@ static void initialize(u32 width, u32 height)
     flush_calls = 0;
     editor_test_key_event_count = 0U;
     editor_test_key_event_offset = 0U;
+    terminal_test_event_count = 0U;
+    terminal_test_event_offset = 0U;
+    terminal_test_wait_count = 0U;
+    terminal_test_timeout_when_empty = false;
     clear_screen_called = false;
     drawn_codepoint = 0;
     drawn_x = drawn_y = 0;
@@ -513,6 +546,288 @@ static void test_terminal_clear_erases_retained_session_rows(void)
     }
 }
 
+static terminal_key_event_t scroll_event(u32 keycode, u32 modifiers,
+                                         u32 flags)
+{
+    terminal_key_event_t event = {0};
+    event.keycode = keycode;
+    event.modifiers = modifiers;
+    event.flags = flags;
+    return event;
+}
+
+static void write_scroll_rows(u32 count, char marker)
+{
+    char rows[4096];
+    usize length = 0U;
+
+    assert(count <= sizeof(rows) / 2U);
+    for (u32 index = 0U; index < count; index++) {
+        rows[length++] = marker;
+        rows[length++] = '\n';
+    }
+    assert(terminal_write_for_process(7U, rows, length) == (i64)length);
+}
+
+static i64 read_scroll_event(const terminal_key_event_t *event,
+                             terminal_key_event_t *returned)
+{
+    set_terminal_test_events(event, 1U);
+    return terminal_read_key_event_for_process(7U, 0U, returned);
+}
+
+static u32 terminal_rows_back(void)
+{
+    return (terminal.live_top_row_idx + TERMINAL_BUFFER_ROWS -
+            terminal.top_row_idx) % TERMINAL_BUFFER_ROWS;
+}
+
+static void test_scrollback_navigation_and_input_order(void)
+{
+    terminal_key_event_t event;
+    terminal_key_event_t returned = {0};
+    u32 capacity;
+    u32 live_top;
+
+    initialize(116U, 92U); /* Twelve columns by four visible rows. */
+    assert(terminal_set_cursor_visible(true));
+    write_scroll_rows(12U, 'h');
+    assert(terminal.history_rows >= terminal.visible_rows);
+    capacity = terminal_history_capacity_locked();
+    live_top = terminal.live_top_row_idx;
+    assert(terminal_rows_back() == 0U && terminal.cursor_visible);
+    assert(terminal_set_raw_input_for_process(7U, true) == MG_OK);
+
+    event = scroll_event(TERMINAL_KEY_PAGE_UP, 0U, 0U);
+    assert(read_scroll_event(&event, &returned) == MG_ERR_WOULD_BLOCK);
+    assert(terminal_rows_back() == terminal.visible_rows);
+    assert(!terminal.cursor_visible);
+    assert_pixels_match_cells();
+
+    event.flags = TERMINAL_KEY_EVENT_REPEAT;
+    assert(read_scroll_event(&event, &returned) == MG_ERR_WOULD_BLOCK);
+    assert(terminal_rows_back() == terminal.visible_rows * 2U);
+    assert_pixels_match_cells();
+
+    event = scroll_event(TERMINAL_KEY_PAGE_UP,
+                         TERMINAL_KEY_MODIFIER_LEFT_ALT, 0U);
+    assert(read_scroll_event(&event, &returned) == MG_ERR_WOULD_BLOCK);
+    assert(terminal_rows_back() == terminal.history_rows);
+    assert(terminal_rows_back() <= capacity);
+    assert_pixels_match_cells();
+    event = scroll_event(TERMINAL_KEY_PAGE_UP, 0U, 0U);
+    assert(read_scroll_event(&event, &returned) == MG_ERR_WOULD_BLOCK);
+    assert(terminal_rows_back() == terminal.history_rows);
+
+    event = scroll_event(TERMINAL_KEY_PAGE_DOWN, 0U, 0U);
+    assert(read_scroll_event(&event, &returned) == MG_ERR_WOULD_BLOCK);
+    assert(terminal_rows_back() == terminal.history_rows -
+                                   terminal.visible_rows);
+    assert_pixels_match_cells();
+
+    event = scroll_event(TERMINAL_KEY_PAGE_DOWN,
+                         TERMINAL_KEY_MODIFIER_RIGHT_ALT, 0U);
+    assert(read_scroll_event(&event, &returned) == MG_ERR_WOULD_BLOCK);
+    assert(terminal_rows_back() == 0U);
+    assert(terminal.cursor_visible);
+    assert(terminal.live_top_row_idx == live_top);
+    assert_pixels_match_cells();
+    event = scroll_event(TERMINAL_KEY_PAGE_DOWN, 0U, 0U);
+    assert(read_scroll_event(&event, &returned) == MG_ERR_WOULD_BLOCK);
+    assert(terminal_rows_back() == 0U);
+
+    /* Ctrl+PageUp remains an application event, and an ordinary editing key
+     * returns to live before being delivered. Queue order is preserved. */
+    {
+        terminal_key_event_t events[] = {
+            scroll_event(TERMINAL_KEY_PAGE_UP,
+                         TERMINAL_KEY_MODIFIER_LEFT_CTRL, 0U),
+            scroll_event('x', 0U, TERMINAL_KEY_EVENT_REPEAT),
+        };
+        set_terminal_test_events(events, 2U);
+        assert(terminal_read_key_event_for_process(7U, 0U, &returned) ==
+               MG_OK);
+        assert(returned.keycode == TERMINAL_KEY_PAGE_UP &&
+               returned.modifiers == TERMINAL_KEY_MODIFIER_LEFT_CTRL);
+        assert(terminal_rows_back() == 0U);
+        assert(terminal_read_key_event_for_process(7U, 0U, &returned) ==
+               MG_OK);
+        assert(returned.keycode == 'x' &&
+               returned.flags == TERMINAL_KEY_EVENT_REPEAT);
+        assert(terminal_rows_back() == 0U);
+    }
+
+    /* Consuming a scrollback key must retain the caller's original timeout
+     * deadline rather than restarting it for each terminal-owned event. */
+    {
+        terminal_key_event_t page_up = scroll_event(TERMINAL_KEY_PAGE_UP,
+                                                     0U, 0U);
+        set_terminal_test_events(&page_up, 1U);
+        terminal_test_timeout_when_empty = true;
+        assert(terminal_read_key_event_for_process(7U, 10U, &returned) ==
+               MG_ERR_TIMEOUT);
+        assert(terminal_test_wait_count == 2U);
+        assert(terminal_test_waits[0] == 10U);
+        assert(terminal_test_waits[1] > 0U &&
+               terminal_test_waits[1] < terminal_test_waits[0]);
+        assert(terminal_rows_back() == terminal.visible_rows);
+        terminal_test_timeout_when_empty = false;
+    }
+    assert(terminal_set_raw_input_for_process(7U, false) == MG_OK);
+}
+
+static void test_scrollback_output_and_eviction(void)
+{
+    terminal_key_event_t event;
+    terminal_key_event_t returned = {0};
+    u32 capacity;
+    u32 displayed_origin;
+    u32 old_origin;
+
+    initialize(116U, 92U);
+    write_scroll_rows(20U, 'a');
+    capacity = terminal_history_capacity_locked();
+    assert(terminal.history_rows < capacity);
+    event = scroll_event(TERMINAL_KEY_PAGE_UP, 0U, 0U);
+    assert(terminal_set_raw_input_for_process(7U, true) == MG_OK);
+    assert(read_scroll_event(&event, &returned) == MG_ERR_WOULD_BLOCK);
+    displayed_origin = terminal.top_row_idx;
+    write_scroll_rows(1U, 'b');
+    assert(terminal.top_row_idx == displayed_origin);
+    assert(terminal_rows_back() > 0U);
+    assert_pixels_match_cells();
+
+    /* Fill and wrap the 512-row store while pinned to its oldest row. The
+     * viewport follows the oldest surviving row rather than snapping live. */
+    write_scroll_rows(capacity + 20U, 'c');
+    assert(terminal.history_rows == capacity);
+    event = scroll_event(TERMINAL_KEY_PAGE_UP,
+                         TERMINAL_KEY_MODIFIER_LEFT_ALT, 0U);
+    assert(read_scroll_event(&event, &returned) == MG_ERR_WOULD_BLOCK);
+    assert(terminal_rows_back() == capacity);
+    old_origin = terminal.top_row_idx;
+    write_scroll_rows(3U, 'd');
+    assert(terminal.history_rows == capacity);
+    assert(terminal.top_row_idx ==
+           (old_origin + 3U) % TERMINAL_BUFFER_ROWS);
+    assert(terminal_rows_back() == capacity);
+    assert(terminal_rows_back() < TERMINAL_BUFFER_ROWS);
+    assert_pixels_match_cells();
+
+    event = scroll_event(TERMINAL_KEY_PAGE_DOWN,
+                         TERMINAL_KEY_MODIFIER_LEFT_ALT, 0U);
+    assert(read_scroll_event(&event, &returned) == MG_ERR_WOULD_BLOCK);
+    assert(terminal_rows_back() == 0U && terminal.cursor_visible == false);
+    assert_pixels_match_cells();
+    assert(terminal_set_raw_input_for_process(7U, false) == MG_OK);
+}
+
+static void test_scrollback_clear_cursor_and_alternate_passthrough(void)
+{
+    terminal_key_event_t event;
+    terminal_key_event_t returned = {0};
+    terminal_cell_t *retained;
+    u32 retained_codepoint;
+    u32 displayed_origin;
+
+    initialize(116U, 92U);
+    assert(terminal_set_cursor_visible(true));
+    write_scroll_rows(12U, 'z');
+    event = scroll_event(TERMINAL_KEY_PAGE_UP, 0U, 0U);
+    assert(terminal_set_raw_input_for_process(7U, true) == MG_OK);
+    assert(read_scroll_event(&event, &returned) == MG_ERR_WOULD_BLOCK);
+    retained = terminal_cell_at(screen_to_phys_row(0U), 0U);
+    assert(retained && retained->codepoint == 'z');
+    retained_codepoint = retained->codepoint;
+    displayed_origin = terminal.top_row_idx;
+
+    assert(terminal_write_for_process(7U, "\x1b{at:1,1}", 9U) == 9);
+    assert(terminal.top_row_idx == displayed_origin &&
+           terminal.cursor_phys_row == terminal.live_top_row_idx &&
+           terminal.cursor_col == 0U && !terminal.cursor_visible);
+    assert_pixels_match_cells();
+
+    assert(terminal_write_for_process(7U, "\x1b{cls}", 6U) == 6);
+    assert(terminal.history_view_cleared && !terminal_view_is_live_locked());
+    assert(retained->codepoint == retained_codepoint);
+    assert(terminal.cursor_phys_row == terminal.live_top_row_idx &&
+           terminal.cursor_col == 0U);
+    assert_pixels_match_cells();
+    assert(terminal_write_for_process(7U, "\x1b{at:1,1}", 9U) == 9);
+    assert(terminal.cursor_phys_row == terminal.live_top_row_idx &&
+           terminal.cursor_col == 0U && !terminal.cursor_visible);
+
+    /* An ordinary text event first returns to the live prompt, then reaches
+     * the application unchanged. */
+    event = scroll_event('q', 0U, 0U);
+    assert(read_scroll_event(&event, &returned) == MG_OK);
+    assert(returned.keycode == 'q' && terminal_view_is_live_locked());
+    assert(!terminal.history_view_cleared && terminal.cursor_visible);
+
+    /* The combined form remains two distinct operations while history is
+     * displayed: clear the frame, then home the live logical cursor. */
+    event = scroll_event(TERMINAL_KEY_PAGE_UP, 0U, 0U);
+    assert(read_scroll_event(&event, &returned) == MG_ERR_WOULD_BLOCK);
+    assert(terminal_write_for_process(7U,
+        "\x1b{cls}\x1b{at:1,1}", 15U) == 15);
+    assert(terminal.cursor_phys_row == terminal.live_top_row_idx &&
+           terminal.cursor_col == 0U && !terminal.cursor_visible &&
+           terminal.history_view_cleared);
+    assert_pixels_match_cells();
+    event = scroll_event(TERMINAL_KEY_PAGE_DOWN,
+                         TERMINAL_KEY_MODIFIER_LEFT_ALT, 0U);
+    assert(read_scroll_event(&event, &returned) == MG_ERR_WOULD_BLOCK);
+    assert(!terminal.history_view_cleared && terminal.cursor_visible);
+    assert_pixels_match_cells();
+
+    /* Alternate-screen owners receive Page keys; the terminal does not
+     * consume them as normal-screen history navigation. */
+    assert(terminal_set_raw_input_for_process(7U, false) == MG_OK);
+    assert(terminal_alternate_enter_process(9U));
+    assert(terminal_set_raw_input_for_process(9U, true) == MG_OK);
+    event = scroll_event(TERMINAL_KEY_PAGE_UP, 0U, 0U);
+    set_terminal_test_events(&event, 1U);
+    assert(terminal_read_key_event_for_process(9U, 0U, &returned) == MG_OK);
+    assert(returned.keycode == TERMINAL_KEY_PAGE_UP &&
+           terminal.alternate_active && terminal_rows_back() == 0U);
+    assert(terminal_set_raw_input_for_process(9U, false) == MG_OK);
+    assert(terminal_alternate_leave_process(9U));
+    assert_pixels_match_cells();
+}
+
+static void test_session_history_reset_state(void)
+{
+    initialize(116U, 92U);
+    write_scroll_rows(12U, 's');
+    assert(terminal.history_rows != 0U);
+    assert(terminal_reset_session_history_authorized());
+    assert(terminal.top_row_idx == 0U && terminal.live_top_row_idx == 0U &&
+           terminal.history_rows == 0U && terminal_rows_back() == 0U);
+    for (usize index = 0U;
+         index < (usize)TERMINAL_BUFFER_ROWS * terminal.visible_cols; index++) {
+        terminal_cell_t *cell = &terminal.cells[index];
+        assert(cell->codepoint == ' ');
+    }
+    for (usize index = (usize)TERMINAL_BUFFER_ROWS * terminal.visible_cols;
+         index < sizeof(terminal.cells) / sizeof(terminal.cells[0]); index++)
+        assert(terminal.cells[index].codepoint == 0U);
+    for (usize index = 0U;
+         index < sizeof(terminal.alternate_cells) /
+                 sizeof(terminal.alternate_cells[0]); index++)
+        assert(terminal.alternate_cells[index].codepoint == 0U);
+    for (usize index = 0U;
+         index < sizeof(terminal_overlay.cells) /
+                 sizeof(terminal_overlay.cells[0]); index++)
+        assert(terminal_overlay.cells[index].codepoint == 0U);
+
+    assert(terminal_set_raw_input_for_process(7U, true) == MG_OK);
+    assert(!terminal_reset_session_history_authorized());
+    assert(terminal_set_raw_input_for_process(7U, false) == MG_OK);
+    assert(terminal_alternate_enter_process(9U));
+    assert(!terminal_reset_session_history_authorized());
+    assert(terminal_alternate_leave_process(9U));
+}
+
 static terminal_cell_t *screen_cell(u32 row, u32 column)
 {
     return terminal_cell_at(screen_to_phys_row(row), column);
@@ -523,8 +838,14 @@ static void assert_pixels_match_cells(void)
     for (u32 row = 0; row < terminal.visible_rows; row++) {
         for (u32 column = 0; column < terminal.visible_cols; column++) {
             terminal_cell_t *cell = screen_cell(row, column);
-            u32 foreground = terminal_color_pixel(cell->fg_color);
-            u32 background = terminal_color_pixel(cell->bg_color);
+            bool cleared_view = terminal.history_view_cleared &&
+                                !terminal_view_is_live_locked();
+            u32 codepoint = cleared_view ? ' ' :
+                            (cell->codepoint ? cell->codepoint : ' ');
+            u32 foreground = terminal_color_pixel(
+                cleared_view ? terminal.fg_color : cell->fg_color);
+            u32 background = terminal_color_pixel(
+                cleared_view ? terminal.bg_color : cell->bg_color);
             if (terminal.cursor_visible &&
                 row == phys_to_screen_row(terminal.cursor_phys_row) &&
                 column == terminal_cursor_display_column()) {
@@ -537,8 +858,8 @@ static void assert_pixels_match_cells(void)
                     u32 x = TERMINAL_MARGIN_X + column * font_width() + dx;
                     u32 y = TERMINAL_MARGIN_Y + row * terminal_line_height() + dy;
                     if (x >= mock_width || y >= mock_height) continue;
-                    u32 expected = glyph_ink(cell->codepoint ? cell->codepoint : ' ',
-                                              dx, dy) ? foreground : background;
+                    u32 expected = glyph_ink(codepoint, dx, dy) ?
+                                   foreground : background;
                     usize pixel = (usize)y * mock_width + x;
                     if (pixel_backbuffer[pixel] != expected ||
                         pixel_display[pixel] != expected) {
@@ -1968,6 +2289,14 @@ int main(int argument_count, char **arguments)
         test_startup_cursor_hidden_until_input();
     if (run_all || !strcmp(arguments[1], "clear-history"))
         test_terminal_clear_erases_retained_session_rows();
+    if (run_all || !strcmp(arguments[1], "scrollback-navigation"))
+        test_scrollback_navigation_and_input_order();
+    if (run_all || !strcmp(arguments[1], "scrollback-output"))
+        test_scrollback_output_and_eviction();
+    if (run_all || !strcmp(arguments[1], "scrollback-clear-alt"))
+        test_scrollback_clear_cursor_and_alternate_passthrough();
+    if (run_all || !strcmp(arguments[1], "session-history-reset"))
+        test_session_history_reset_state();
     if (run_all || !strcmp(arguments[1], "ring"))
         test_ring_wrap_and_scrolling();
     if (run_all || !strcmp(arguments[1], "scroll-pixels"))
@@ -2018,6 +2347,6 @@ int main(int argument_count, char **arguments)
         test_production_line_editor_incremental_rendering();
     free(pixel_backbuffer);
     free(pixel_display);
-    puts("terminal renderer: cursor/scroll pixels, session-history clearing, startup cursor ownership, geometry, canonical ESC commands, 16 colors, relative motion, screen ownership, literal data, UTF-8 and incremental editing passed");
+    puts("terminal renderer: pixel scrollback, session-history reset, startup cursor ownership, geometry, canonical ESC commands, screen ownership, literal data, UTF-8 and incremental editing passed");
     return 0;
 }

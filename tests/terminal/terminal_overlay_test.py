@@ -17,6 +17,13 @@ operations={name:int(value) for name,value in re.findall(r'(MG_TERMINAL_OP_\w+)\
 dispatch=(ROOT/'kernel/src/syscall.c').read_text()
 upper=re.search(r'operation > (MG_TERMINAL_OP_\w+)',dispatch).group(1)
 assert max(operations.values()) <= operations[upper], 'terminal syscall rejects a public operation'
+reset_case=re.search(r'case MG_TERMINAL_OP_SESSION_HISTORY_RESET:(.*?break;)',dispatch,re.S)
+assert reset_case, 'session history reset has no terminal syscall case'
+body=reset_case.group(1)
+assert re.search(r'frame->rsi\s*\|\|\s*frame->rdx',body), 'history reset accepts unexpected arguments'
+assert 'syscall_is_logind(process)' in body, 'history reset is not restricted to logind'
+assert 'MG_ERR_PRIVILEGE_REQUIRED' in body, 'unauthorized history reset lacks a privilege error'
+assert 'terminal_reset_session_history_authorized()' in body, 'authorized reset does not reach the ring reset'
 def function(name):
     match=next(m for m in re.finditer(r'^(?:static )?[A-Za-z_][^\n;{}]*\b'+name+r'\s*\(',source,re.M) if ';' not in source[m.end():source.index('{',m.end())])
     brace=source.index('{',match.end());end,depth=brace+1,1
@@ -37,7 +44,7 @@ typedef uint64_t u64;typedef uint32_t u32;typedef unsigned char u8;
 #define TERMINAL_MARGIN_Y 0U
 typedef struct {u32 codepoint;u8 foreground,background;unsigned short reserved;} terminal_overlay_cell_t;
 typedef struct {u32 codepoint;u8 fg_color,bg_color;} terminal_cell_t;
-static struct {u32 visible_rows,visible_cols,cursor_phys_row,cursor_col,top_row_idx,fg_color,bg_color,pending_scroll_rows;bool batch_active;} terminal;
+static struct {u32 visible_rows,visible_cols,cursor_phys_row,cursor_col,top_row_idx,live_top_row_idx,history_rows,fg_color,bg_color,pending_scroll_rows;bool history_view_cleared,viewport_redraw_pending,batch_active;} terminal;
 static struct {bool valid;u64 owner_pid;u32 physical_row,extent;} terminal_input;
 static struct {bool active;u64 owner_pid;u32 first_screen_row,rows,columns;terminal_cell_t cells[128*256];} terminal_overlay;
 static struct {u64 glyph_render_count,ram_bytes_shifted;} stats;
@@ -48,6 +55,9 @@ static bool terminal_process_controls_locked(u64 pid){return pid==1;}
 static bool terminal_color_valid(u8 c){return c<16;}
 static u32 phys_to_screen_row(u32 r){return(r+256-terminal.top_row_idx)%256;}
 static u32 screen_to_phys_row(u32 r){return(r+terminal.top_row_idx)%256;}
+static u32 phys_to_live_screen_row(u32 r){return(r+256-terminal.live_top_row_idx)%256;}
+static bool terminal_view_is_live_locked(void){return terminal.top_row_idx==terminal.live_top_row_idx;}
+static u32 terminal_history_capacity_locked(void){return terminal.visible_rows<256?256-terminal.visible_rows:0;}
 static terminal_cell_t*terminal_cell_at(u32 r,u32 c){return &backing[r*80+c];}
 static void terminal_clear_phys_row(u32 r,u32 bg){for(u32 c=0;c<80;c++)backing[r*80+c]=(terminal_cell_t){' ',0,(u8)bg};}
 static u32 terminal_line_height(void){return 1;}
@@ -62,13 +72,15 @@ static void terminal_mark_all_dirty(void){scroll_count++;}
 static void terminal_cursor_hide_locked(void){}
 static void terminal_cursor_show_locked(void){}
 static void terminal_flush_dirty_locked(void){}
+static void terminal_render_screen_row(u32 row);
+static void terminal_redraw_locked(void){for(u32 row=0;row<terminal.visible_rows;row++)terminal_render_screen_row(row);}
 '''
 for name in ['terminal_render_screen_row','terminal_render_overlay_row_locked','terminal_overlay_render_locked',
              'terminal_overlay_clear_locked','terminal_scroll','terminal_overlay_set_for_process',
              'terminal_input_cursor_for_process']:
     pre+=function(name)
 pre+=r'''
-static void reset(void){terminal.visible_rows=25;terminal.visible_cols=80;terminal.top_row_idx=250;terminal.batch_active=false;terminal.pending_scroll_rows=0;scroll_count=0;terminal_input.valid=false;terminal_overlay.active=false;for(u32 r=0;r<256;r++)terminal_clear_phys_row(r,0);for(u32 r=0;r<25;r++)terminal_render_screen_row(r);}
+static void reset(void){terminal.visible_rows=25;terminal.visible_cols=80;terminal.top_row_idx=250;terminal.live_top_row_idx=250;terminal.history_rows=0;terminal.history_view_cleared=false;terminal.viewport_redraw_pending=false;terminal.batch_active=false;terminal.pending_scroll_rows=0;scroll_count=0;terminal_input.valid=false;terminal_overlay.active=false;for(u32 r=0;r<256;r++)terminal_clear_phys_row(r,0);for(u32 r=0;r<25;r++)terminal_render_screen_row(r);}
 int main(void){
  terminal_overlay_cell_t cells[128*80];for(unsigned i=0;i<128*80;i++)cells[i]=(terminal_overlay_cell_t){'X',7,0,0};
  for(u32 cursor=0;cursor<25;cursor++)for(u32 rows=1;rows<=128;rows++){

@@ -18,6 +18,7 @@ static bool editor_probe;
 static bool raw_input;
 static unsigned key_reads;
 static unsigned editor_update_depth;
+static bool session_history_reset_called;
 
 static void reset_capture(void)
 {
@@ -25,6 +26,7 @@ static void reset_capture(void)
     literal_length = 0U;
     syscall_count = 0U;
     fail_literal_write = false;
+    session_history_reset_called = false;
 }
 
 static void append_bytes(char *destination, usize *destination_length,
@@ -104,6 +106,11 @@ long mg_syscall(unsigned long number, unsigned long argument0,
             MG_TERMINAL_CAP_STYLED_OUTPUT : 0U;
         return MG_OK;
     }
+    if (operation == MG_TERMINAL_OP_SESSION_HISTORY_RESET) {
+        assert(!argument1 && !argument2);
+        session_history_reset_called = true;
+        return MG_OK;
+    }
     if (operation == MG_TERMINAL_OP_SIZE) {
         mg_terminal_size_t *size =
             (mg_terminal_size_t *)(uintptr_t)argument2;
@@ -155,6 +162,16 @@ static void test_control_helpers(void)
                    "\x1b{hide}\x1b{show}\x1b{cll}\x1b{cleol}"
                    "\x1b{cls}\x1b{at:1,1}");
     expect_operation_set();
+}
+
+static void test_session_history_reset_helper(void)
+{
+    reset_capture();
+    assert(terminal_reset_session_history() == MG_OK);
+    assert(session_history_reset_called);
+    assert(control_length == 0U && literal_length == 0U);
+    assert(syscall_count == 1U &&
+           syscall_operations[0] == MG_TERMINAL_OP_SESSION_HISTORY_RESET);
 }
 
 static void test_styled_helper_palette(void)
@@ -270,6 +287,7 @@ static void test_line_editor_output_destination(void)
 int main(void)
 {
     test_control_helpers();
+    test_session_history_reset_helper();
     test_styled_helper_palette();
     test_semantic_helper_styles();
     test_redirected_output_has_no_controls();

@@ -30,6 +30,22 @@ application-facing key-event input mode. Its nonmodal keymap is:
 | Ctrl+D | Return end-of-file when the input is empty; otherwise delete the scalar under the cursor, if any. |
 | Ctrl+L | Clear the visible terminal and redraw the prompt and current input. |
 
+## Terminal scrollback
+
+When Shoot owns the normal console screen, `PgUp` and `PgDn` move through
+retained output by one visible page. `Alt+PgUp` jumps to the oldest retained
+output and `Alt+PgDn` returns to the live prompt. New output continues to be
+recorded while viewing older rows; if output evicts the displayed oldest row,
+the view advances to the oldest row still retained. The live cursor is hidden
+while viewing history. The next ordinary editing key returns to the live
+prompt before the key is processed. Fullscreen applications own their Page
+keys while using the alternate screen.
+
+The terminal retains at most 512 total rows in its cell ring, including the
+currently visible rows. The additional history capacity is therefore at most
+512 minus the visible row count. Logout clears the ring before the next login
+prompt, so previous-session output is not available through scrollback.
+
 Shift+Arrow moves the cursor without selecting text. Shoot has no command-line
 selection mode. Modifier combinations that have no binding are ignored rather
 than inserted as printable text. Cooked byte readers, including login input,

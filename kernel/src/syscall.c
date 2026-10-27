@@ -2171,7 +2171,7 @@ void syscall_dispatch(void *raw_frame)
 
             if (!process ||
                 operation < MG_TERMINAL_OP_RESERVED_ALTERNATE_ENTER ||
-                operation > MG_TERMINAL_OP_INPUT_CURSOR) {
+                operation > MG_TERMINAL_OP_SESSION_HISTORY_RESET) {
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
             }
@@ -2282,6 +2282,15 @@ void syscall_dispatch(void *raw_frame)
                         result = MG_ERR_BAD_ARGUMENT;
                     break;
                 }
+                case MG_TERMINAL_OP_SESSION_HISTORY_RESET:
+                    if (frame->rsi || frame->rdx) {
+                        result = MG_ERR_BAD_ARGUMENT;
+                    } else if (!syscall_is_logind(process)) {
+                        result = MG_ERR_PRIVILEGE_REQUIRED;
+                    } else if (!terminal_reset_session_history_authorized()) {
+                        result = MG_ERR_BUSY;
+                    }
+                    break;
                 case MG_TERMINAL_OP_PREPARE_INPUT_LINE:
                     if (frame->rsi || frame->rdx ||
                         !terminal_prepare_input_line_for_process(process->pid))

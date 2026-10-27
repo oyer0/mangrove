@@ -33,6 +33,7 @@ typedef enum {
     MG_TERMINAL_OP_READ_KEY_EVENT = 16,
     MG_TERMINAL_OP_PREPARE_INPUT_LINE = 17,
     MG_TERMINAL_OP_INPUT_CURSOR = 18,
+    MG_TERMINAL_OP_SESSION_HISTORY_RESET = 19,
 } mg_terminal_operation_t;
 
 #define MG_TERMINAL_CAP_STYLED_OUTPUT TERMINAL_CAP_STYLED_OUTPUT
@@ -166,6 +167,9 @@ mg_result_t terminal_clear_line(void);
 mg_result_t terminal_clear_to_end(void);
 /* Clear the visible screen and explicitly move the cursor to its origin. */
 mg_result_t terminal_clear_screen(void);
+/* Erase terminal contents and retained rows at an authenticated session
+ * boundary. The kernel restricts this operation to logind. */
+mg_result_t terminal_reset_session_history(void);
 mg_result_t terminal_get_size(mg_terminal_size_t *out_size);
 mg_result_t terminal_get_capabilities(
     mg_terminal_capabilities_t *out_capabilities);

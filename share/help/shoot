@@ -6,3 +6,7 @@ option=-h, --help    show this help
 note=With no SCRIPT, start the interactive shell; otherwise run the script and exit with its status.
 note=Unquoted arguments support *, ?, and bracket pathname patterns. Unmatched patterns remain literal.
 note=Expanded vectors grow within the native 8 MiB argument budget; input lines remain bounded. See info shoot for details.
+keybinding=PgUp    scroll up one visible page through terminal output
+keybinding=PgDn    scroll down one visible page through terminal output
+keybinding=Alt+PgUp    jump to the oldest retained terminal output
+keybinding=Alt+PgDn    return to live terminal output

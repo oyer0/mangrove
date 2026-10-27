@@ -74,15 +74,14 @@ static void retire_session_before_login(mg_session_id_t session_id,
     }
 }
 
-/* The clear operation resets both the visible rows and the kernel's retained
- * terminal cell ring.  Keep the next authentication prompt behind this
- * boundary even if terminal ownership has not yet become available. */
+/* A logind-only kernel operation resets the visible screen and retained ring.
+ * This runs only after sessiond has retired the previous session's processes. */
 static void reset_terminal_before_login(const char *username)
 {
     bool reported = false;
 
     for (;;) {
-        mg_result_t result = terminal_clear_screen();
+        mg_result_t result = terminal_reset_session_history();
         if (result == MG_OK) return;
         if (!reported) {
             log_login_event(MG_LOG_ERROR, "terminal reset is still pending",

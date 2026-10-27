@@ -22,6 +22,9 @@ typedef struct PACKED {
 /* A byte that was queued before a process claimed key-event input. */
 #define TERMINAL_KEY_EVENT_COOKED_BYTE (1U << 1)
 
+#define TERMINAL_KEY_PAGE_UP   0x4bU
+#define TERMINAL_KEY_PAGE_DOWN 0x4eU
+
 #define TERMINAL_KEY_MODIFIER_LEFT_CTRL   (1U << 0)
 #define TERMINAL_KEY_MODIFIER_LEFT_SHIFT  (1U << 1)
 #define TERMINAL_KEY_MODIFIER_LEFT_ALT    (1U << 2)
@@ -43,6 +46,9 @@ void terminal_write(const char *str);
 void terminal_write_bytes(const char *buffer, u64 length);
 
 void terminal_clear(void);
+/* Full retained-output reset, callable only through the logind-authorized
+ * terminal-control operation after prior-session processes are retired. */
+bool terminal_reset_session_history_authorized(void);
 
 void terminal_palette_set_foreground(terminal_color_t color);
 void terminal_palette_set_background(terminal_color_t color);

@@ -790,6 +790,11 @@ mg_result_t terminal_clear_screen(void)
     return terminal_emit_control(sequence, sizeof(sequence) - 1U);
 }
 
+mg_result_t terminal_reset_session_history(void)
+{
+    return terminal_control(MG_TERMINAL_OP_SESSION_HISTORY_RESET, NULL, NULL);
+}
+
 mg_result_t terminal_get_size(mg_terminal_size_t *out_size)
 {
     if (!out_size) return MG_ERR_BAD_ARGUMENT;

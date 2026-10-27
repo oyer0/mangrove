@@ -168,10 +168,39 @@ def boot_logout(folder, disk, args):
             else:
                 raise AssertionError('guest output did not scroll marker off screen')
 
+            # Positive control: the existing session can reach the marker in
+            # retained output before logout. This also synchronizes the guest
+            # key-event path rather than assuming sendkey has been consumed.
+            qmp_key(qmp, 'alt-pgup')
+            wait_for(lambda text: 'logoutmarker' in text,
+                     'Alt+PageUp to reveal retained session output',
+                     'scrollback-before-logout')
+            qmp_key(qmp, 'alt-pgdn')
+            wait_for(lambda text: text.rstrip().endswith('developer ~:'),
+                     'Alt+PageDown to restore live Shoot output')
+
             send_line('exit', 'exit')
             expect_clean_login('login-after-exit', ('logoutmarker', 'logoutfill'))
 
             login()
+            # If the old session's ring leaked, enough new output to make a
+            # scrollable viewport will leave its marker reachable at the
+            # oldest row. Verify isolation through actual terminal input and
+            # framebuffer capture, not by calling the reset implementation.
+            type_command = 'type /share/info/shoot'
+            send_line(type_command, type_command)
+            wait_for(lambda text: text.rstrip().endswith('developer ~:'),
+                     'new-session reference output and prompt')
+            qmp_key(qmp, 'alt-pgup')
+            oldest = wait_for(lambda text: 'NAME' in text,
+                              'scrollback to reach the new session history',
+                              'scrollback-after-login')
+            if 'logoutmarker' in oldest or 'logoutfill' in oldest:
+                raise AssertionError(
+                    'previous session output remains reachable in scrollback')
+            qmp_key(qmp, 'alt-pgdn')
+            wait_for(lambda text: text.rstrip().endswith('developer ~:'),
+                     'return live after session-isolation check')
             send_line('logout', 'logout')
             expect_clean_login('login-after-logout')
 
@@ -193,6 +222,8 @@ def boot_logout(folder, disk, args):
                 'normal_session_exit': True, 'logout_builtin': True,
                 'empty_ctrl_d': True, 'nonzero_shell_exit': True,
                 'scroll_before_logout': True,
+                'scrollback_reaches_prior_session_output': True,
+                'scrollback_session_isolation': True,
                 'framebuffer_clean_after_each_session': True,
                 'framebuffer_checks': framebuffer_checks,
                 'qemu_disposable_image': True,

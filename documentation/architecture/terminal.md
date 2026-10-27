@@ -64,6 +64,38 @@ not converted to text. Simple cooked readers such as login retain their byte int
 Concurrent cooked byte reads return `MG_ERR_BUSY` while a process owns normal
 screen key-event input, so they cannot consume bytes from its editing session.
 
+On the normal screen, the terminal consumes Page Up and Page Down from the
+authorized key-event reader to move the displayed viewport by one visible
+page. Alt+Page Up selects the oldest retained row; Alt+Page Down returns to
+live output. Ctrl-modified Page keys and other modifier combinations are
+delivered to the application. When an ordinary input event is delivered while
+the viewport is historical, the terminal first returns to live output so a
+shell cannot edit a prompt hidden from view. Alternate-screen owners receive
+all Page events unchanged.
+
+The normal screen and alternate screen each use their existing 512-row cell
+ring; scrollback does not add a second history store. Visible rows occupy part
+of that capacity, leaving at most `512 - visible_rows` rows before the live
+origin. The terminal tracks the live origin independently from the displayed
+origin while new output continues to update the ring. It does not follow new
+output while scrolled back. If output evicts the viewed oldest row, the
+viewport advances only to the oldest row that remains valid. The live cursor
+stays at its logical position and is hidden over historical output, then is
+restored when the viewport returns live.
+
+`ESC{cls}` remains a viewport clear and leaves both cursor position and
+retained cells unchanged. While viewing history it blanks only the displayed
+framebuffer; scrolling to another position or returning live redraws retained
+cells. Cursor movement commands continue to address the live terminal. The
+`clear` command and Ctrl+L explicitly clear and home the live cursor.
+
+At a login-session boundary, after sessiond has retired the previous session's
+processes, logind invokes a separate kernel operation restricted to its
+authenticated session-management service identity. That operation clears
+both rings and their history metadata before the next login prompt. The
+ordinary clear command cannot erase or expose another session's retained
+history.
+
 A full-screen application can acquire the alternate screen, which saves and
 restores the normal screen state. Its owner may also request cursor/clear
 operations, styled output, batched updates, and a bounded visual overlay.

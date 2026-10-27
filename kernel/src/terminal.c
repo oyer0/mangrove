@@ -45,6 +45,9 @@ _Static_assert(sizeof(terminal_cell_t) == 8,
 typedef struct {
     bool valid;
     u32 top_row_idx;
+    u32 live_top_row_idx;
+    u32 history_rows;
+    bool history_view_cleared;
     u32 cursor_phys_row;
     u32 cursor_col;
     u8 fg_color;
@@ -61,7 +64,11 @@ typedef struct {
     terminal_cell_t cells[TERMINAL_BUFFER_ROWS * TERMINAL_MAX_COLS];
     terminal_cell_t alternate_cells[TERMINAL_BUFFER_ROWS * TERMINAL_MAX_COLS];
 
-    u32 top_row_idx;        // Physical ring buffer index of top visible screen row
+    u32 top_row_idx;        // Physical ring index displayed at row zero
+    u32 live_top_row_idx;   // Physical ring index of the live output origin
+    u32 history_rows;       // Valid rows before live_top_row_idx
+    bool history_view_cleared; // Presentation-only clear while viewing history
+    bool viewport_redraw_pending;
     u32 cursor_phys_row;    // Physical ring buffer index of current cursor row
     u32 cursor_col;         // Current cursor column (0 .. visible_cols - 1)
 
@@ -227,6 +234,20 @@ static inline u32 screen_to_phys_row(u32 screen_row) {
     return (terminal.top_row_idx + screen_row) % TERMINAL_BUFFER_ROWS;
 }
 
+static inline u32 phys_to_live_screen_row(u32 phys_row) {
+    return (phys_row - terminal.live_top_row_idx + TERMINAL_BUFFER_ROWS) %
+           TERMINAL_BUFFER_ROWS;
+}
+
+static inline u32 live_screen_to_phys_row(u32 screen_row) {
+    return (terminal.live_top_row_idx + screen_row) % TERMINAL_BUFFER_ROWS;
+}
+
+static inline bool terminal_view_is_live_locked(void)
+{
+    return terminal.top_row_idx == terminal.live_top_row_idx;
+}
+
 /* A full-width line leaves the cursor at the pending-wrap position one cell
  * past the grid. Render it over the last visible cell instead of in the
  * framebuffer margin. */
@@ -341,6 +362,8 @@ static void terminal_flush_dirty_locked(void) {
 
 /* Render a single cell from the ring buffer into the backbuffer */
 static void terminal_render_cell(u32 phys_row, u32 col) {
+    if (terminal.history_view_cleared && !terminal_view_is_live_locked())
+        return;
     u32 screen_row = phys_to_screen_row(phys_row);
     if (screen_row >= terminal.visible_rows) return;
 
@@ -364,13 +387,16 @@ static void terminal_render_screen_row(u32 screen_row) {
 
     u32 phys_r = screen_to_phys_row(screen_row);
     u32 py = TERMINAL_MARGIN_Y + (screen_row * terminal_line_height());
+    bool cleared_view = terminal.history_view_cleared &&
+                        !terminal_view_is_live_locked();
 
     for (u32 c = 0; c < terminal.visible_cols; c++) {
         terminal_cell_t *cell = terminal_cell_at(phys_r, c);
         u32 px = TERMINAL_MARGIN_X + (c * font_width());
-        u32 codepoint = (cell && cell->codepoint) ? cell->codepoint : ' ';
-        u32 fg = cell ? cell->fg_color : terminal.fg_color;
-        u32 bg = cell ? cell->bg_color : terminal.bg_color;
+        u32 codepoint = !cleared_view && cell && cell->codepoint ?
+                        cell->codepoint : ' ';
+        u32 fg = !cleared_view && cell ? cell->fg_color : terminal.fg_color;
+        u32 bg = !cleared_view && cell ? cell->bg_color : terminal.bg_color;
 
         draw_codepoint(codepoint, px, py, terminal_color_pixel((u8)fg),
                        terminal_color_pixel((u8)bg));
@@ -444,6 +470,38 @@ void terminal_redraw(void) {
     spin_unlock_irqrestore(&terminal_lock, saved_flags);
 }
 
+static u32 terminal_history_capacity_locked(void)
+{
+    return TERMINAL_BUFFER_ROWS > terminal.visible_rows ?
+        TERMINAL_BUFFER_ROWS - terminal.visible_rows : 0U;
+}
+
+/* Set the displayed ring origin by its distance behind live output. The
+ * ring itself remains the only copy of terminal history. */
+static void terminal_scrollback_set_back_locked(u32 rows_back)
+{
+    u32 target;
+
+    if (rows_back > terminal.history_rows)
+        rows_back = terminal.history_rows;
+    target = (terminal.live_top_row_idx + TERMINAL_BUFFER_ROWS - rows_back) %
+             TERMINAL_BUFFER_ROWS;
+    if (target == terminal.top_row_idx) return;
+
+    terminal_overlay_clear_locked(false);
+    terminal_cursor_hide_locked();
+    terminal.top_row_idx = target;
+    terminal.history_view_cleared = false;
+    terminal.pending_scroll_rows = 0U;
+    terminal.viewport_redraw_pending = false;
+    terminal_redraw_locked();
+}
+
+static void terminal_scrollback_live_locked(void)
+{
+    terminal_scrollback_set_back_locked(0U);
+}
+
 void terminal_init(BOOT_INFO *BootInfo){
     (void)BootInfo;
 
@@ -481,6 +539,10 @@ void terminal_init(BOOT_INFO *BootInfo){
         terminal.visible_rows = TERMINAL_BUFFER_ROWS;
 
     terminal.top_row_idx = 0;
+    terminal.live_top_row_idx = 0;
+    terminal.history_rows = 0;
+    terminal.history_view_cleared = false;
+    terminal.viewport_redraw_pending = false;
     terminal.cursor_phys_row = 0;
     terminal.cursor_col = 0;
 
@@ -518,6 +580,7 @@ static void terminal_cursor_render_show_locked(void){
      * while the backbuffer still has its old layout. Wait for the transaction
      * to end and row copies to finish; otherwise they preserve a ghost. */
     if (!terminal.cursor_enabled || terminal.cursor_visible ||
+        !terminal_view_is_live_locked() ||
         terminal.batch_active || terminal.pending_scroll_rows)
         return;
 
@@ -764,12 +827,44 @@ bool terminal_presentation_start(void)
 }
 
 static void terminal_scroll(void) {
-    /* 1. Advance ring buffer indices in O(1) time */
-    terminal.top_row_idx = (terminal.top_row_idx + 1) % TERMINAL_BUFFER_ROWS;
-    terminal.cursor_phys_row = (terminal.top_row_idx + terminal.visible_rows - 1) % TERMINAL_BUFFER_ROWS;
+    bool following_live = terminal_view_is_live_locked();
+    u32 history_capacity = terminal_history_capacity_locked();
+
+    /* Live output always advances. The displayed viewport follows only when
+     * the user was at live output before this row was appended. */
+    terminal.live_top_row_idx =
+        (terminal.live_top_row_idx + 1U) % TERMINAL_BUFFER_ROWS;
+    if (terminal.history_rows < history_capacity)
+        terminal.history_rows++;
+    terminal.cursor_phys_row =
+        (terminal.live_top_row_idx + terminal.visible_rows - 1U) %
+        TERMINAL_BUFFER_ROWS;
+
+    if (following_live) {
+        terminal.top_row_idx = terminal.live_top_row_idx;
+    } else {
+        u32 rows_back = (terminal.live_top_row_idx + TERMINAL_BUFFER_ROWS -
+                         terminal.top_row_idx) % TERMINAL_BUFFER_ROWS;
+        if (rows_back > terminal.history_rows) {
+            terminal.top_row_idx =
+                (terminal.live_top_row_idx + TERMINAL_BUFFER_ROWS -
+                 terminal.history_rows) % TERMINAL_BUFFER_ROWS;
+            terminal.viewport_redraw_pending = true;
+            terminal.pending_scroll_rows = 0U;
+        }
+    }
 
     /* 2. Clear new bottom row in text ring buffer */
     terminal_clear_phys_row(terminal.cursor_phys_row, terminal.bg_color);
+
+    if (!following_live) {
+        if (terminal.batch_active) return;
+        if (terminal.viewport_redraw_pending) {
+            terminal.viewport_redraw_pending = false;
+            terminal_redraw_locked();
+        }
+        return;
+    }
 
     if (terminal.batch_active) {
         /* Hybrid strategy rule 3: Accumulate pending_scroll_rows inside batch */
@@ -813,7 +908,7 @@ static void terminal_scroll(void) {
 static void terminal_newline(void) {
     terminal.cursor_col = 0;
 
-    u32 current_srow = phys_to_screen_row(terminal.cursor_phys_row);
+    u32 current_srow = phys_to_live_screen_row(terminal.cursor_phys_row);
 
     if (current_srow >= terminal.visible_rows - 1) {
         terminal_scroll();
@@ -973,6 +1068,10 @@ static void terminal_clear_locked(void) {
     terminal_cursor_hide_locked();
 
     terminal.top_row_idx = 0;
+    terminal.live_top_row_idx = 0;
+    terminal.history_rows = 0U;
+    terminal.history_view_cleared = false;
+    terminal.viewport_redraw_pending = false;
     terminal.cursor_phys_row = 0;
     terminal.cursor_col = 0;
     terminal.pending_scroll_rows = 0;
@@ -1007,6 +1106,25 @@ static void terminal_clear_visible_locked(void)
     terminal_overlay_clear_locked(false);
     terminal_cursor_hide_locked();
 
+    if (!terminal_view_is_live_locked()) {
+        /* A clear while viewing history is a presentation-only blank page.
+         * Keep every retained cell intact so returning to live or navigating
+         * again can reveal the original output. */
+        terminal.history_view_cleared = true;
+        framebuffer_fill_rows(0U, terminal.height,
+                              terminal_color_pixel(terminal.bg_color));
+        terminal.vram_valid = true;
+        terminal.pending_scroll_rows = 0U;
+        terminal.viewport_redraw_pending = false;
+        terminal_reset_dirty();
+        terminal_mark_all_dirty();
+        if (!terminal.batch_active) {
+            terminal_cursor_show_locked();
+            terminal_flush_dirty_locked();
+        }
+        return;
+    }
+
     for (u32 row = 0U; row < terminal.visible_rows; row++)
         terminal_clear_phys_row(screen_to_phys_row(row), terminal.bg_color);
 
@@ -1029,6 +1147,43 @@ void terminal_clear(void) {
     u64 saved_flags = spin_lock_irqsave(&terminal_lock);
     terminal_clear_locked();
     spin_unlock_irqrestore(&terminal_lock, saved_flags);
+}
+
+bool terminal_reset_session_history_authorized(void)
+{
+    u64 saved_flags = spin_lock_irqsave(&terminal_lock);
+
+    /* The caller must first retire every process in the old login session.
+     * Refuse the reset while any process still owns terminal input or an
+     * alternate screen rather than erasing a live application's display. */
+    if (terminal.alternate_active || terminal.alternate_owner_pid != 0U ||
+        terminal.key_event_owner_pid != 0U) {
+        spin_unlock_irqrestore(&terminal_lock, saved_flags);
+        return false;
+    }
+
+    terminal_force_end_batch_locked();
+    terminal_overlay_clear_locked(false);
+    terminal_input.valid = false;
+    terminal_input.owner_pid = 0U;
+    terminal_input.physical_row = 0U;
+    terminal_input.extent = 0U;
+    memset(&terminal.saved_normal, 0, sizeof(terminal.saved_normal));
+    terminal_overlay.active = false;
+    terminal_overlay.owner_pid = 0U;
+    terminal_overlay.first_screen_row = 0U;
+    terminal_overlay.rows = 0U;
+    terminal_overlay.columns = 0U;
+    memset(terminal_overlay.cells, 0, sizeof(terminal_overlay.cells));
+    memset(terminal.cells, 0, sizeof(terminal.cells));
+    memset(terminal.alternate_cells, 0, sizeof(terminal.alternate_cells));
+    terminal_style_t default_style = terminal_style_for_role(
+        TERMINAL_STYLE_DEFAULT);
+    terminal.fg_color = (u8)default_style.foreground;
+    terminal.bg_color = (u8)default_style.background;
+    terminal_clear_locked();
+    spin_unlock_irqrestore(&terminal_lock, saved_flags);
+    return true;
 }
 
 static void terminal_set_colors_locked(terminal_color_t foreground,
@@ -1111,7 +1266,11 @@ static void terminal_present_locked(void)
         return;
 
     presentation_pending = false;
-    if (terminal.pending_scroll_rows == 0) {
+    if (terminal.viewport_redraw_pending) {
+        terminal.viewport_redraw_pending = false;
+        terminal.pending_scroll_rows = 0U;
+        terminal_redraw_locked();
+    } else if (terminal.pending_scroll_rows == 0) {
         terminal_cursor_show_locked();
         terminal_overlay_render_locked();
         terminal_flush_dirty_locked();
@@ -1149,7 +1308,7 @@ static void terminal_present_locked(void)
     if (terminal.alternate_active)
         input_trace_record(INPUT_TRACE_PRESENT, 0,
                            (terminal.cursor_phys_row + TERMINAL_BUFFER_ROWS -
-                            terminal.top_row_idx) % TERMINAL_BUFFER_ROWS,
+                            terminal.live_top_row_idx) % TERMINAL_BUFFER_ROWS,
                            terminal.cursor_col);
 }
 
@@ -1508,7 +1667,7 @@ static void terminal_output_flush_pending_locked(terminal_output_state_t *state)
 static bool terminal_move_cursor_relative_locked(
     terminal_escape_kind_t direction, u32 amount)
 {
-    u32 row = phys_to_screen_row(terminal.cursor_phys_row);
+    u32 row = phys_to_live_screen_row(terminal.cursor_phys_row);
     u32 column;
     u32 last_row;
     u32 last_column;
@@ -1767,6 +1926,9 @@ static void terminal_save_normal_state_locked(void)
 
     saved->valid = true;
     saved->top_row_idx = terminal.top_row_idx;
+    saved->live_top_row_idx = terminal.live_top_row_idx;
+    saved->history_rows = terminal.history_rows;
+    saved->history_view_cleared = terminal.history_view_cleared;
     saved->cursor_phys_row = terminal.cursor_phys_row;
     saved->cursor_col = terminal.cursor_col;
     saved->fg_color = terminal.fg_color;
@@ -1790,6 +1952,10 @@ static bool terminal_restore_normal_state_locked(void)
     terminal.alternate_owner_pid = 0;
     terminal.saved_normal.valid = false;
     terminal.top_row_idx = saved.top_row_idx;
+    terminal.live_top_row_idx = saved.live_top_row_idx;
+    terminal.history_rows = saved.history_rows;
+    terminal.history_view_cleared = saved.history_view_cleared;
+    terminal.viewport_redraw_pending = false;
     terminal.cursor_phys_row = saved.cursor_phys_row;
     terminal.cursor_col = saved.cursor_col;
     terminal.fg_color = saved.fg_color;
@@ -1836,6 +2002,10 @@ static bool terminal_alternate_enter_process_locked(u64 process_id)
     terminal.alternate_active = true;
     terminal.alternate_owner_pid = process_id;
     terminal.top_row_idx = 0;
+    terminal.live_top_row_idx = 0;
+    terminal.history_rows = 0U;
+    terminal.history_view_cleared = false;
+    terminal.viewport_redraw_pending = false;
     terminal.cursor_phys_row = 0;
     terminal.cursor_col = 0;
     terminal.cursor_visible = false;
@@ -1908,7 +2078,7 @@ static bool terminal_move_cursor_locked(u32 row, u32 column)
         return false;
     terminal_overlay_clear_locked(true);
     terminal_cursor_hide_locked();
-    terminal.cursor_phys_row = screen_to_phys_row(row);
+    terminal.cursor_phys_row = live_screen_to_phys_row(row);
     terminal.cursor_col = column;
     terminal_cursor_show_locked();
     if (!terminal.batch_active) terminal_flush_dirty_locked();
@@ -1965,13 +2135,29 @@ static void terminal_clear_cell_range(u32 screen_row, u32 first_column,
     terminal_render_screen_row(screen_row);
 }
 
+static void terminal_clear_live_cell_range(u32 phys_row, u32 first_column,
+                                           u32 last_column)
+{
+    if (phys_row >= TERMINAL_BUFFER_ROWS || first_column > last_column ||
+        last_column >= terminal.visible_cols)
+        return;
+    for (u32 column = first_column; column <= last_column; column++) {
+        terminal_cell_t *cell = terminal_cell_at(phys_row, column);
+        if (!cell) continue;
+        cell->codepoint = ' ';
+        cell->fg_color = terminal.fg_color;
+        cell->bg_color = terminal.bg_color;
+        terminal_render_cell(phys_row, column);
+    }
+}
+
 static bool terminal_clear_current_line_locked(void)
 {
-    u32 row = phys_to_screen_row(terminal.cursor_phys_row);
     if (terminal.visible_cols == 0) return false;
     terminal_overlay_clear_locked(true);
     terminal_cursor_hide_locked();
-    terminal_clear_cell_range(row, 0, terminal.visible_cols - 1U);
+    terminal_clear_live_cell_range(terminal.cursor_phys_row, 0,
+                                   terminal.visible_cols - 1U);
     terminal_cursor_show_locked();
     if (!terminal.batch_active) terminal_flush_dirty_locked();
     return true;
@@ -1987,12 +2173,12 @@ bool terminal_clear_current_line(void)
 
 static bool terminal_clear_current_to_end_locked(void)
 {
-    u32 row = phys_to_screen_row(terminal.cursor_phys_row);
     if (terminal.visible_cols == 0) return false;
     terminal_overlay_clear_locked(true);
     terminal_cursor_hide_locked();
-    terminal_clear_cell_range(row, terminal.cursor_col,
-                              terminal.visible_cols - 1U);
+    terminal_clear_live_cell_range(terminal.cursor_phys_row,
+                                   terminal.cursor_col,
+                                   terminal.visible_cols - 1U);
     terminal_cursor_show_locked();
     if (!terminal.batch_active) terminal_flush_dirty_locked();
     return true;
@@ -2058,6 +2244,7 @@ bool terminal_overlay_set_for_process(u64 process_id, u32 rows, u32 columns,
 
     saved_flags = spin_lock_irqsave(&terminal_lock);
     if (!terminal_process_controls_locked(process_id) ||
+        !terminal_view_is_live_locked() ||
         columns > terminal.visible_cols) {
         spin_unlock_irqrestore(&terminal_lock, saved_flags);
         return false;
@@ -2072,13 +2259,13 @@ bool terminal_overlay_set_for_process(u64 process_id, u32 rows, u32 columns,
         }
     }
 
-    cursor_row = phys_to_screen_row(terminal.cursor_phys_row);
+    cursor_row = phys_to_live_screen_row(terminal.cursor_phys_row);
     if (cursor_row >= terminal.visible_rows || terminal.visible_rows < 2U) {
         spin_unlock_irqrestore(&terminal_lock, saved_flags);
         return false;
     }
     if (terminal_input.valid && terminal_input.owner_pid == process_id) {
-        u32 anchor_row = phys_to_screen_row(terminal_input.physical_row);
+        u32 anchor_row = phys_to_live_screen_row(terminal_input.physical_row);
         input_rows = terminal_input.extent ?
             (terminal_input.extent - 1U) / terminal.visible_cols + 1U : 1U;
         if (anchor_row >= terminal.visible_rows ||
@@ -2140,6 +2327,8 @@ bool terminal_prepare_input_line_for_process(u64 process_id)
         spin_unlock_irqrestore(&terminal_lock, saved_flags);
         return false;
     }
+    if (!terminal_view_is_live_locked())
+        terminal_scrollback_live_locked();
     /* The terminal cursor is authoritative for committed output.  A prompt
      * redraw uses an anchored row, so first move to a new display row
      * only when the preceding writer left the cursor partway across one. */
@@ -2215,26 +2404,120 @@ i64 terminal_set_raw_input_for_process(u64 process_id, bool enabled)
     return result;
 }
 
+static bool terminal_apply_scrollback_key_locked(
+    const terminal_key_event_t *event)
+{
+    const u32 alt_mask = TERMINAL_KEY_MODIFIER_LEFT_ALT |
+                         TERMINAL_KEY_MODIFIER_RIGHT_ALT;
+    u32 rows_back;
+    u32 page_rows;
+    bool alt;
+
+    if (!event || (event->modifiers & ~alt_mask) != 0U)
+        return false;
+    alt = (event->modifiers & alt_mask) != 0U;
+    page_rows = terminal.visible_rows ? terminal.visible_rows : 1U;
+
+    if (event->keycode == TERMINAL_KEY_PAGE_UP) {
+        if (alt) {
+            rows_back = terminal.history_rows;
+        } else {
+            rows_back = (terminal.live_top_row_idx + TERMINAL_BUFFER_ROWS -
+                         terminal.top_row_idx) % TERMINAL_BUFFER_ROWS;
+            if (rows_back > terminal.history_rows)
+                rows_back = terminal.history_rows;
+            rows_back = page_rows > terminal.history_rows - rows_back ?
+                        terminal.history_rows : rows_back + page_rows;
+        }
+        terminal_scrollback_set_back_locked(rows_back);
+        return true;
+    }
+    if (event->keycode == TERMINAL_KEY_PAGE_DOWN) {
+        if (alt) {
+            rows_back = 0U;
+        } else {
+            rows_back = (terminal.live_top_row_idx + TERMINAL_BUFFER_ROWS -
+                         terminal.top_row_idx) % TERMINAL_BUFFER_ROWS;
+            if (rows_back > terminal.history_rows)
+                rows_back = terminal.history_rows;
+            rows_back = rows_back > page_rows ? rows_back - page_rows : 0U;
+        }
+        terminal_scrollback_set_back_locked(rows_back);
+        return true;
+    }
+    return false;
+}
+
+static i64 terminal_read_key_event_with_scrollback(
+    u64 process_id, u32 timeout_ms, terminal_key_event_t *event)
+{
+    u64 deadline = 0U;
+    u32 wait_ms = timeout_ms;
+    u64 saved_flags;
+    bool allowed;
+
+    saved_flags = spin_lock_irqsave(&terminal_lock);
+    allowed = terminal.alternate_active ?
+        terminal_process_is_owner_locked(process_id) :
+        (process_id != 0U && terminal.key_event_owner_pid == process_id);
+    spin_unlock_irqrestore(&terminal_lock, saved_flags);
+    if (!event || !allowed) return MG_ERR_ACCESS_DENIED;
+
+    if (timeout_ms != 0U && timeout_ms != 0xffffffffU) {
+        u64 now = timer_uptime_ms();
+        deadline = now > (~(u64)0 - timeout_ms) ? ~(u64)0 :
+                   now + timeout_ms;
+    }
+
+    for (;;) {
+        i64 result;
+        bool consumed = false;
+
+        /* Never sleep or dequeue while retaining the terminal lock. */
+        terminal_force_end_batch();
+        result = console_read_key_event(wait_ms, event);
+        if (result < 0) return result;
+
+        saved_flags = spin_lock_irqsave(&terminal_lock);
+        allowed = terminal.alternate_active ?
+            terminal_process_is_owner_locked(process_id) :
+            (process_id != 0U &&
+             terminal.key_event_owner_pid == process_id);
+        if (!allowed) {
+            spin_unlock_irqrestore(&terminal_lock, saved_flags);
+            return MG_ERR_ACCESS_DENIED;
+        }
+
+        /* Alternate-screen owners receive every event unchanged. On the main
+         * screen, navigation is terminal-owned and consumed in queue order. */
+        if (!terminal.alternate_active) {
+            consumed = terminal_apply_scrollback_key_locked(event);
+            if (!consumed && !terminal_view_is_live_locked())
+                terminal_scrollback_live_locked();
+        }
+        spin_unlock_irqrestore(&terminal_lock, saved_flags);
+        if (!consumed) return MG_OK;
+
+        if (timeout_ms == 0U) {
+            wait_ms = 0U;
+        } else if (timeout_ms != 0xffffffffU) {
+            u64 now = timer_uptime_ms();
+            if (now >= deadline) return MG_ERR_TIMEOUT;
+            u64 remaining = deadline - now;
+            wait_ms = remaining >= 0xffffffffU ? 0xfffffffeU :
+                      (u32)remaining;
+        }
+    }
+}
+
 i64 terminal_read_key_for_process(u64 process_id, u32 timeout_ms, u32 *key)
 {
     terminal_key_event_t event;
     i64 value;
-    u64 saved_flags;
 
-    saved_flags = spin_lock_irqsave(&terminal_lock);
-    bool allowed = terminal.alternate_active ?
-        terminal_process_is_owner_locked(process_id) :
-        (process_id != 0 && terminal.key_event_owner_pid == process_id);
-    if (!key || !allowed) {
-        spin_unlock_irqrestore(&terminal_lock, saved_flags);
-        return MG_ERR_ACCESS_DENIED;
-    }
-    spin_unlock_irqrestore(&terminal_lock, saved_flags);
-
-    /* A terminal key wait may sleep.  Present the prompt/output before
-     * entering that wait, without retaining the terminal spinlock. */
-    terminal_force_end_batch();
-    value = console_read_key_event(timeout_ms, &event);
+    if (!key) return MG_ERR_BAD_ARGUMENT;
+    value = terminal_read_key_event_with_scrollback(process_id, timeout_ms,
+                                                    &event);
     if (value < 0) return value;
     *key = event.codepoint ? event.codepoint : event.keycode;
     return MG_OK;
@@ -2243,23 +2526,8 @@ i64 terminal_read_key_for_process(u64 process_id, u32 timeout_ms, u32 *key)
 i64 terminal_read_key_event_for_process(u64 process_id, u32 timeout_ms,
                                         terminal_key_event_t *event)
 {
-    i64 value;
-    u64 saved_flags;
-
-    saved_flags = spin_lock_irqsave(&terminal_lock);
-    bool allowed = terminal.alternate_active ?
-        terminal_process_is_owner_locked(process_id) :
-        (process_id != 0 && terminal.key_event_owner_pid == process_id);
-    if (!event || !allowed) {
-        spin_unlock_irqrestore(&terminal_lock, saved_flags);
-        return MG_ERR_ACCESS_DENIED;
-    }
-    spin_unlock_irqrestore(&terminal_lock, saved_flags);
-
-    terminal_force_end_batch();
-    value = console_read_key_event(timeout_ms, event);
-    if (value < 0) return value;
-    return MG_OK;
+    return terminal_read_key_event_with_scrollback(process_id, timeout_ms,
+                                                   event);
 }
 
 bool terminal_begin_batch_for_process(u64 process_id)
@@ -2293,13 +2561,14 @@ bool terminal_input_cursor_for_process(u64 process_id, u32 offset, u32 extent)
 {
     u64 saved_flags = spin_lock_irqsave(&terminal_lock);
     bool allowed = terminal_process_controls_locked(process_id) &&
+        terminal_view_is_live_locked() &&
         terminal_input.valid && terminal_input.owner_pid == process_id &&
         terminal.visible_cols && offset <= extent &&
         extent <= terminal.visible_cols * terminal.visible_rows;
     if (allowed) {
         u32 row_offset = offset ? (offset - 1U) / terminal.visible_cols : 0;
         u32 physical = (terminal_input.physical_row + row_offset) % TERMINAL_BUFFER_ROWS;
-        allowed = phys_to_screen_row(physical) < terminal.visible_rows;
+        allowed = phys_to_live_screen_row(physical) < terminal.visible_rows;
         if (allowed) {
             terminal_cursor_hide_locked();
             terminal.cursor_phys_row = physical;
