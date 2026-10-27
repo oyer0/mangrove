@@ -26,7 +26,8 @@ SLAB_BACKING_RECLAIM = re.compile(
     r'ack=([0-9a-fA-F]+) other_cr3=([0-9a-fA-F]+)$', re.M)
 VMM_OWNED_RECLAIM = re.compile(
     r'^VMM_RANGE_GUEST pass=(\d+) online=(\d+) ack=([0-9a-fA-F]+) '
-    r'other_cr3=([0-9a-fA-F]+) release_blocked=(\d+) frame_reused=(\d+)$',
+    r'other_cr3=([0-9a-fA-F]+) release_blocked=(\d+) frame_reused=(\d+) '
+    r'slab=(\d+)$',
     re.M)
 HEAP_RECLAIM = re.compile(
     r'^HEAP_RECLAIM_GUEST pass=(\d+) groups=(\d+) frames=(\d+) '
@@ -123,13 +124,15 @@ def check_boot_log(text, cpus, deep_validation=0, hybrid_routing=False,
             (cpus == 2 and not (other_cr3 & (1 << 1)))):
         raise ValueError('PMM-backed slab retirement or shootdown evidence is invalid')
     vmm_pass, vmm_online, vmm_ack, vmm_other_cr3, release_blocked, \
-        vmm_frame_reused = owned_reclaims[0]
-    vmm_pass, vmm_online, release_blocked, vmm_frame_reused = map(
-        int, (vmm_pass, vmm_online, release_blocked, vmm_frame_reused))
+        vmm_frame_reused, vmm_slab_active = owned_reclaims[0]
+    vmm_pass, vmm_online, release_blocked, vmm_frame_reused, \
+        vmm_slab_active = map(int, (vmm_pass, vmm_online, release_blocked,
+                                    vmm_frame_reused, vmm_slab_active))
     vmm_ack, vmm_other_cr3 = map(lambda value: int(value, 16),
                                   (vmm_ack, vmm_other_cr3))
     if (vmm_pass != 1 or vmm_online < cpus or not release_blocked or
             not vmm_frame_reused or
+            vmm_slab_active != int(hybrid_routing) or
             (vmm_ack & ((1 << cpus) - 1)) != ((1 << cpus) - 1) or
             (cpus == 2 and not (vmm_other_cr3 & (1 << 1)))):
         raise ValueError('owned-frame VMM shootdown evidence is invalid')
@@ -226,6 +229,7 @@ def check_boot_log(text, cpus, deep_validation=0, hybrid_routing=False,
             'owned_frame_vmm_test': {
                 'premature_release_blocked': bool(release_blocked),
                 'physical_frame_reused': bool(vmm_frame_reused),
+                'slab_allocator_active': bool(vmm_slab_active),
                 'shootdown_ack_mask': vmm_ack,
                 'other_cr3_ack_mask': vmm_other_cr3,
             },
