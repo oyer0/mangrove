@@ -84,6 +84,14 @@ def digest(path):
     return value.hexdigest()
 
 
+def native_test_failure(text):
+    """Fstest reports redirected assertion failures before its shell resumes."""
+    match = re.search(r'(?m)^FSTEST1 failed pid=([1-9][0-9]*) status=(-?[0-9]+)$', text)
+    if match and int(match.group(2)) != 0:
+        return match.group(0)
+    return None
+
+
 def command(args, log):
     with log.open('ab') as output:
         subprocess.run([str(a) for a in args], cwd=ROOT, stdout=output,
@@ -614,6 +622,9 @@ def boot(folder, disk, phase, args):
                     r'(?m)^\[FAIL\] Ring 3 process creation failed[^\r\n]*', text)
                 if failed_startup:
                     raise RuntimeError('guest startup failed: ' + failed_startup.group(0))
+                failed_test = native_test_failure(text)
+                if launched and failed_test:
+                    raise RuntimeError(failed_test + '; inspect the native phase log')
                 if launched and control is not None: control.observe(qmp, text, part, started)
                 if (phase == 'network-ping' and launched and
                         re.search(r'(?m)^PING1 complete$', text) and

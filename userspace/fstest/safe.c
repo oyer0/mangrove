@@ -347,7 +347,7 @@ int fstest_reed_phase(const char *mode,const char *run,const char *target,u16 si
         CHECK("reed-sync-ready-absent",MG_ERR_NOT_FOUND,path_info(ready_path,&sync_info));
         CHECK("reed-sync-release-absent",MG_ERR_NOT_FOUND,path_info(release_path,&sync_info));
         const char *args[]={"/bin/reed","--test-conflict-sync",run,"reed.txt"};
-        mg_result_t child=process_spawn_argv(args,4);CHECK("reed-spawn",1,child>0?1:child);
+        mg_result_t child=process_spawn_argv_with_output(args,4,MG_STDIN_HANDLE);CHECK("reed-spawn",1,child>0?1:child);
         mg_handle_t guard __attribute__((cleanup(child_cleanup)))=(mg_handle_t)child;
         mg_monotonic_time_t start;CHECK("reed-clock",MG_OK,mg_clock_monotonic(&start));
         CHECK("reed-sync-ready",1,wait_for_reed_open_ready(ready_path,(mg_handle_t)child)?1:0);
@@ -367,7 +367,7 @@ int fstest_reed_phase(const char *mode,const char *run,const char *target,u16 si
         CHECK("reed-sync-ready-remove",MG_OK,path_remove(ready_path));
         CHECK("reed-sync-release-remove",MG_OK,path_remove(release_path));
 #else
-        const char *args[]={"/bin/reed","reed.txt"};mg_result_t child=process_spawn_argv(args,2);CHECK("reed-spawn",1,child>0?1:child);
+        const char *args[]={"/bin/reed","reed.txt"};mg_result_t child=process_spawn_argv_with_output(args,2,MG_STDIN_HANDLE);CHECK("reed-spawn",1,child>0?1:child);
         mg_handle_t guard __attribute__((cleanup(child_cleanup)))=(mg_handle_t)child;
         mg_monotonic_time_t start,now;CHECK("reed-clock",MG_OK,mg_clock_monotonic(&start));
         for(;;) {
@@ -399,7 +399,7 @@ int fstest_reed_phase(const char *mode,const char *run,const char *target,u16 si
 #endif
 #endif
     } else {
-        const char *args[]={"/bin/reed","copied.txt"};mg_result_t child=process_spawn_argv(args,2);CHECK("reed-reopen",1,child>0?1:child);
+        const char *args[]={"/bin/reed","copied.txt"};mg_result_t child=process_spawn_argv_with_output(args,2,MG_STDIN_HANDLE);CHECK("reed-reopen",1,child>0?1:child);
         i32 status=-1;CHECK("reed-rewait",MG_OK,process_wait((mg_handle_t)child,&status));CHECK("reed-reexit",0,status);
         CHECK("reed-reclose",MG_OK,handle_close((mg_handle_t)child));
     }
@@ -453,8 +453,8 @@ int fstest_shoot_phase(const char *run,const char *target,bool launch_reed)
         CHECK("shoot-reed-script-close",MG_OK,handle_close(script));
     }
     const char *shoot_argv[]={"/bin/shoot"};
-    mg_result_t child=process_spawn_argv(shoot_argv,
-        sizeof(shoot_argv)/sizeof(shoot_argv[0]));
+    mg_result_t child=process_spawn_argv_with_output(shoot_argv,
+        sizeof(shoot_argv)/sizeof(shoot_argv[0]),MG_STDIN_HANDLE);
     CHECK("shoot-spawn",1,child>0?1:child);i32 status=-1;
     CHECK("shoot-wait",MG_OK,process_wait((mg_handle_t)child,&status));CHECK("shoot-status",0,status);
     if(launch_reed) {
@@ -505,7 +505,7 @@ int fstest_safe_readonly(const char *run,const char *target,u64 instance)
     char cwd[256];usize needed=0;mg_result_t result=process_getcwd(cwd,sizeof(cwd),&needed);
     CHECK("readonly-getcwd",1,result>0 && needed==strlen(cwd)+1);
     CHECK("readonly-chdir",MG_OK,process_chdir(target));
-    const char *args[]={"/bin/reed","readonly-new.txt"};mg_result_t child=process_spawn_argv(args,2);
+    const char *args[]={"/bin/reed","readonly-new.txt"};mg_result_t child=process_spawn_argv_with_output(args,2,MG_STDIN_HANDLE);
     CHECK("readonly-reed-spawn",1,child>0?1:child);i32 status=-1;
     CHECK("readonly-reed-wait",MG_OK,process_wait((mg_handle_t)child,&status));CHECK("readonly-reed-exit",0,status);
     CHECK("readonly-reed-close",MG_OK,handle_close((mg_handle_t)child));

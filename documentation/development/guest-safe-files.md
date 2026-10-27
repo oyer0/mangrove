@@ -67,7 +67,13 @@ make test-guest-reed GUEST_REED_BUILD="$PWD/build/guest-reed-build" \
 
 This target uses the ordinary production hybrid kernel and a test-only `fstest`
 mode. Its two-vCPU interactive Shoot child receives normal emulated USB HID
-events. It checks command completion, cursor insertion, a command longer than
+events. Fstest keeps its assertion log redirected to a file but explicitly
+selects its writable console handle as stdout for interactive Shoot and Reed
+children. Script children continue to inherit the log destination. Screen
+controls in the canonical output stream follow stdout; a console input handle
+alone does not make redirected output interactive.
+
+It checks command completion, cursor insertion, a command longer than
 the terminal width, redirection, `history` Up/Down draft restoration, command
 completion, directory completion, output readback and returning to the home
 prompt. It lists a disposable `hello world!` file, then launches a per-run
@@ -83,9 +89,21 @@ the exact redirected contents, persistent command history, Reed source and
 copy contents, waited child statuses, terminal restoration, and independent
 stopped-image MGFS checking. This is a focused MGFS workflow, not qualification
 across all filesystem backends or physical hardware. The interactive child
-transcript contains 41 public `SHOOT1` checks; the evidence validator rejects
-missing, altered, or out-of-section operation records. The verify phase of the
+transcript contains checked public `SHOOT1` operations; the evidence validator
+compares every row against the operation oracle, verifies the completion count,
+and rejects out-of-section operation records. History is read from Shoot's
+current `~/.state/shoot/history` destination. The verify phase of the
 conflict target below separately reopens the saved copy inside Reed.
+
+Stage 23 follows submission of `exit` to the interactive child. It is only a
+controller checkpoint: native Fstest must still wait for that exact child with
+status zero and verify the run-bound Reed completion marker before continuing
+the safe-file assertions, unmount, and shutdown. An early child failure must
+not be mistaken for a new child prompt when the outer login shell resumes.
+Fstest reports nonzero completion to the console as well as retaining the
+assertions in the media log; the runner checks that failure marker before
+dispatching controller input. QMP deadlines and the rendered-progress watchdog
+remain independent bounds on transport and workflow progress.
 
 For native stale-save conflict and redo qualification without a host loopback
 UDP listener, use:

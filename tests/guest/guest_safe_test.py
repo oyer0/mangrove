@@ -596,10 +596,9 @@ def check_rows(body,rows):
         raise ValueError(f'native operation mismatch {first}: got={got[first:first+1]} expected={want[first:first+1]}')
 
 def validate_deliberate_shoot_failure(body):
-    # /bin/type reports the missing input, then Shoot reports the child's
-    # nonzero status. Both lines are part of this intentional negative test.
-    expected=('Could not read "/temp/no-such-safe-input": not found.\n'
-              'Could not run "/bin/type": exited with status 1.\n')
+    # The command reports its error; Shoot propagates ordinary nonzero exits
+    # without a second generic diagnostic.
+    expected='Could not read "/temp/no-such-safe-input": not found.\n'
     if body!=expected:raise ValueError('wrong deliberate script-error evidence')
 
 def evidence(folder,disk,phase,backend,run,build,identities,reed_no_conflict=False,
@@ -678,7 +677,7 @@ def evidence_writable(folder,disk,phase,backend,run,build,identities,text,image,
     long_expected=(INTERACTIVE_LONG_TEXT+'\n').encode()
     if reed_from_shoot and guest.payload(image,guest.find(image,'/temp/interactive-long.txt')[1])!=long_expected:
         raise ValueError('interactive wrapped-command redirection mismatch')
-    history=guest.payload(image,guest.find(image,'/home/developer/.shoot/history')[1])
+    history=guest.payload(image,guest.find(image,'/home/developer/.state/shoot/history')[1])
     required_history=(b'/bin/say shoot > /temp/shoot.txt\n',b'history -a\n')
     if reed_from_shoot:
         required_history += (
@@ -705,7 +704,7 @@ def validate_sections(text,phase,backend,run,safe_count,reed_count,
     prefix=f'VOLUME1 phase=volume-safe-{phase} run={run} label={secondary.LABELS[backend]} filesystem={backend} target=/vol/{secondary.LABELS[backend]}/work\n'
     if not text.startswith(prefix):raise ValueError('wrong volume phase header')
     names=['SHOOT1','SAFE1','REED1'] if phase=='create' else ['SAFE1','REED1'] if phase=='verify' else ['READSAFE1']
-    remaining=text;last=-1
+    remaining=text;last=-1;shoot_operations=0
     for name in names:
         blocks=re.findall(r'^'+name+r' phase=.*?^'+name+r' complete[^\n]*\n',text,re.M|re.S)
         if len(blocks)!=1:raise ValueError('missing/duplicate application section')
@@ -718,6 +717,10 @@ def validate_sections(text,phase,backend,run,safe_count,reed_count,
         if name=='SAFE1' and phase in ('create','verify'):
             body=re.sub(r'^RT1 PASS core-c17-runtime\n','',body,flags=re.M)
         if name=='SHOOT1':
+            completion=re.search(r'^SHOOT1 complete[^\n]* ops=([0-9]+)\n$',block,re.M)
+            if not completion or int(completion.group(1))!=len(re.findall(r'^SOP ',block,re.M)):
+                raise ValueError('Shoot operation count differs from completion')
+            shoot_operations=int(completion.group(1))
             validate_deliberate_shoot_failure(body)
             body=''
         if (name=='REED1' and phase=='create' and not reed_no_conflict and
@@ -729,9 +732,8 @@ def validate_sections(text,phase,backend,run,safe_count,reed_count,
             body=re.sub(r'^REED1 channel-attempt=\d+ sent=-?\d+ received=-?\d+\n','',body,flags=re.M)
         if body:raise ValueError('unknown application transcript line')
         remaining=remaining.replace(block,'',1)
-    # The interactive child path includes post-Reed readback checks in
-    # addition to the original 37-operation path.
-    shoot_operations=(41 if reed_from_shoot else 25) if phase=='create' else 0
+    # Each section's rows are validated against the native operation oracle
+    # before this aggregate check; reject additional rows outside sections.
     if len(re.findall(r'^SOP ',text,re.M))!=safe_count+reed_count+shoot_operations:raise ValueError('out-of-section native operation')
     tail=text.index(' final-unmount expected=')
     if tail<last:raise ValueError('unmount before application completion')

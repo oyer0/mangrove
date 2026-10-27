@@ -892,7 +892,8 @@ test-terminal-api:
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
 		-fsanitize=address,undefined -ffunction-sections -fdata-sections \
 		-Ilibc/include -Iinclude tests/terminal/terminal_stream_api_test.c \
-		libc/src/mangrove_syscall.c -Wl,--gc-sections \
+		libc/src/mangrove_syscall.c libc/src/line_editor.c libc/src/utf8.c \
+		-Wl,--gc-sections \
 		-o /tmp/mangrove-terminal-stream-api-test
 	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-terminal-stream-api-test
 

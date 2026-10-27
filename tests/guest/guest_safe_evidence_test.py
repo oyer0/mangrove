@@ -13,10 +13,9 @@ identities={s:100+i for i,s in enumerate(safe.SIZES)}
 assert safe.fat_listing_names('::/work/REED.TXT\n::/work/safe-0123456789abcdef/\n')==['REED.TXT','safe-'+run]
 assert safe.work_names('fat32',run)==['seed.txt','safe-'+run,'REED.TXT','COPIED.TXT','OCCUPIED.TXT']
 controls=0
-expected_shoot_error=('Could not read "/temp/no-such-safe-input": not found.\n'
-                      'Could not run "/bin/type": exited with status 1.\n')
+expected_shoot_error='Could not read "/temp/no-such-safe-input": not found.\n'
 safe.validate_deliberate_shoot_failure(expected_shoot_error)
-for incomplete in (expected_shoot_error.splitlines(keepends=True)[1],
+for incomplete in ('',
                    expected_shoot_error.replace('not found.', 'permission denied.'),
                    expected_shoot_error+'unexpected output\n'):
     try:safe.validate_deliberate_shoot_failure(incomplete)
@@ -75,6 +74,12 @@ with tempfile.TemporaryDirectory(prefix='mangrove-shoot-section-count-') as temp
         assert str(error)=='out-of-section native operation'
         controls+=1
     else:raise AssertionError('out-of-section operation accepted')
+    malformed=transcript.replace('ops=41\n','ops=42\n')
+    try:safe.validate_sections(malformed,'create','mgfs',run,333,18,True,True)
+    except ValueError as error:
+        assert str(error)=='Shoot operation count differs from completion'
+        controls+=1
+    else:raise AssertionError('incorrect Shoot completion count accepted')
 class QMP:
     def __init__(self):self.keys=[];self.calls=[]
     def call(self,name,args):

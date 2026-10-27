@@ -188,7 +188,12 @@ cursor, clear, and direct styled writes remain reserved in the version-1 ABI
 and return unsupported. `terminal_alternate_*`, cursor, clear, and styled
 write functions in loam are small encoders for the canonical output stream;
 they require interactive stdout for screen controls, and styled writes emit
-only literal text when stdout is redirected. Rectangular clearing has no
+only literal text when stdout is redirected. The loam line editor therefore
+requires console stdout as well as console input; with file stdout its initial
+cursor synchronization returns unsupported before reading a key. A launcher
+whose own stdout is redirected can explicitly select its writable console
+handle through `process_spawn_argv_with_output()`.
+Rectangular clearing has no
 canonical stream command and is not exposed as a public operation. The
 remaining `mg/terminal.h` syscall interface covers distinct facilities that
 are not output-control syntax: terminal dimensions/capabilities, input events

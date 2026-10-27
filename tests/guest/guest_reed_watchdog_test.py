@@ -11,9 +11,17 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(ROOT / 'tests' / 'guest'))
 import guest_safe_test as safe
+import guest_mgfs_test as guest
 
 
 RUN = '0123456789abcdef'
+
+assert guest.native_test_failure('FSTEST1 failed pid=27 status=43\ndeveloper ~:') == \
+    'FSTEST1 failed pid=27 status=43'
+for text in ('developer ~:', 'FSTEST1 failed pid=27 status=0',
+             'quoted FSTEST1 failed pid=27 status=43',
+             'FSTEST1 failed pid=0 status=43'):
+    assert guest.native_test_failure(text) is None
 
 with tempfile.TemporaryDirectory(prefix='mangrove-reed-watchdog-') as directory:
     control = safe.ReedControl(RUN, 'create')

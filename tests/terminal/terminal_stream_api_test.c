@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include <assert.h>
 #include <mg/terminal.h>
+#include <mg/line_editor.h>
 #include <mangrove.h>
 #include <stdio.h>
 #include <string.h>
@@ -13,6 +14,10 @@ static bool interactive_output = true;
 static bool fail_literal_write;
 static u32 syscall_operations[32];
 static usize syscall_count;
+static bool editor_probe;
+static bool raw_input;
+static unsigned key_reads;
+static unsigned editor_update_depth;
 
 static void reset_capture(void)
 {
@@ -45,6 +50,12 @@ mg_result_t console_write_literal(const void *buffer, usize length)
     return (mg_result_t)length;
 }
 
+mg_result_t object_write_all(mg_handle_t handle, const void *buffer, usize length)
+{
+    assert(editor_probe && handle == MG_STDOUT_HANDLE);
+    return console_write_literal(buffer, length) < 0 ? MG_ERR_IO : MG_OK;
+}
+
 long mg_syscall(unsigned long number, unsigned long argument0,
                 unsigned long argument1, unsigned long argument2)
 {
@@ -53,6 +64,36 @@ long mg_syscall(unsigned long number, unsigned long argument0,
                            sizeof(syscall_operations[0]));
     u32 operation = (u32)argument0;
     syscall_operations[syscall_count++] = operation;
+    if (editor_probe) {
+        switch (operation) {
+            case MG_TERMINAL_OP_INPUT_MODE: {
+                const mg_terminal_input_mode_request_t *request =
+                    (const void *)(uintptr_t)argument1;
+                raw_input = request->enabled != 0U;
+                return MG_OK;
+            }
+            case MG_TERMINAL_OP_PREPARE_INPUT_LINE:
+            case MG_TERMINAL_OP_INPUT_CURSOR:
+                return MG_OK;
+            case MG_TERMINAL_OP_UPDATE_BEGIN:
+                editor_update_depth++;
+                return MG_OK;
+            case MG_TERMINAL_OP_UPDATE_END:
+                assert(editor_update_depth > 0U);
+                editor_update_depth--;
+                return MG_OK;
+            case MG_TERMINAL_OP_READ_KEY_EVENT: {
+                mg_terminal_key_event_t *event = (void *)(uintptr_t)argument2;
+                assert(raw_input);
+                *event = (mg_terminal_key_event_t){
+                    .version = MG_TERMINAL_API_VERSION,
+                    .keycode = MG_TERMINAL_KEY_ENTER,
+                };
+                key_reads++;
+                return MG_OK;
+            }
+        }
+    }
     if (operation == MG_TERMINAL_OP_CAPABILITIES) {
         mg_terminal_capabilities_t *capabilities =
             (mg_terminal_capabilities_t *)(uintptr_t)argument2;
@@ -194,11 +235,43 @@ static void test_redirected_output_has_no_controls(void)
     interactive_output = true;
 }
 
+static void test_line_editor_output_destination(void)
+{
+    char buffer[32];
+    mg_line_editor_t editor;
+    editor_probe = true;
+    for (unsigned interactive = 0; interactive < 2U; interactive++) {
+        reset_capture();
+        key_reads = 0U;
+        interactive_output = interactive != 0U;
+        line_editor_init(&editor, buffer, sizeof(buffer), "developer ~: ");
+        line_editor_set_prompt_style(&editor, MG_TERMINAL_COLOR_GREEN,
+                                     MG_TERMINAL_COLOR_BLACK);
+        line_editor_set_key_event_input(&editor, true);
+        assert(line_editor_read_line(&editor) ==
+               (interactive ? 0 : MG_ERR_UNSUPPORTED));
+        assert(!raw_input && !editor_update_depth && key_reads == interactive);
+        if (!interactive) {
+            /* A redirected prompt cannot become an invisible input consumer.
+             * The caller must explicitly give an interactive child a console. */
+            assert(control_length == 0U);
+            assert(literal_length == strlen("developer ~: "));
+        } else {
+            static const char show[] = "\x1b{show}";
+            assert(control_length >= sizeof(show) - 1U);
+            assert(!memcmp(control_bytes + control_length - (sizeof(show) - 1U),
+                           show, sizeof(show) - 1U));
+        }
+    }
+    editor_probe = false;
+}
+
 int main(void)
 {
     test_control_helpers();
     test_styled_helper_palette();
     test_semantic_helper_styles();
     test_redirected_output_has_no_controls();
+    test_line_editor_output_destination();
     return 0;
 }

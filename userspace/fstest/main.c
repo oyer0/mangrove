@@ -327,5 +327,15 @@ int main(int argc, char **argv)
 #ifdef HEAP_PROFILE_GUEST
     if (!heap_profile_save()) return 2;
 #endif
+    if (status != 0) {
+        /* Assertion output can be redirected to a media log. Keep failure
+         * visible to the guest controller before the outer shell resumes. */
+        char message[96];
+        int length = snprintf(message, sizeof(message),
+            "FSTEST1 failed pid=%llu status=%d\n",
+            (unsigned long long)process_current_pid(), status);
+        if (length > 0 && (usize)length < sizeof(message))
+            (void)object_write_all(MG_STDIN_HANDLE, message, (usize)length);
+    }
     return status;
 }
