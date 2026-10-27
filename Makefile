@@ -890,8 +890,8 @@ test-terminal:
 		kernel/src/utf8.c libc/src/utf8.c -o /tmp/mangrove-utf8-test
 	/tmp/mangrove-utf8-test
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -Wno-unused-function \
-		-fno-builtin -fsanitize=address,undefined -ffunction-sections \
-		-fdata-sections -Ikernel/include -Iinclude -Ilibc/include \
+		-pthread -fno-builtin -fsanitize=address,undefined -ffunction-sections \
+		-fdata-sections -Ikernel/include -Iinclude -idirafter libc/include \
 		tests/terminal/terminal_render_test.c kernel/src/utf8.c libc/src/utf8.c \
 		libc/src/line_editor.c libc/src/string.c -Wl,--gc-sections \
 		-o /tmp/mangrove-terminal-render-test
@@ -917,7 +917,7 @@ test-terminal:
 		libc/src/utf8.c libc/src/string.c -Wl,--gc-sections \
 		-o /tmp/mangrove-line-editor-key-event-test
 	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-line-editor-key-event-test
-	@echo terminal renderer, MGTC, markup, UTF-8, overlay, input synchronization and ownership tests passed
+	@echo terminal renderer, MGTC concurrency, markup, UTF-8, overlay, input synchronization and ownership tests passed
 
 .PHONY: test-terminal-markup
 test-terminal-markup:

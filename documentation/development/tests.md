@@ -8,7 +8,8 @@ literal brace escaping, malformed directives, UTF-8 preservation, redirected
 text-only behavior, bounded MGTC batches, and explicit `say --markup` argument
 handling. `make test-terminal` includes this fixture and the production
 renderer fixture, which verifies MGTC batch validation, style isolation,
-terminal ownership, literal ESC text, cursor operations, and clearing.
+terminal ownership, concurrent writes from two process identities with
+independent stream styles, literal ESC text, cursor operations, and clearing.
 
 The disposable `guest_mgfs_test.py --shoot-v1` workflow also exercises
 interactive `say --markup` through the native console stream and checks the

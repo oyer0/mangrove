@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Deterministic framebuffer-pixel fixture for the production terminal source. */
 #include <assert.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -196,18 +197,21 @@ static u64 mock_time;
 static u32 flushed_start[TERMINAL_BUFFER_ROWS];
 static u32 flushed_height[TERMINAL_BUFFER_ROWS];
 
-void spinlock_init(spinlock_t *lock) { lock->value = 0; }
+void spinlock_init(spinlock_t *lock)
+{
+    __atomic_store_n(&lock->value, 0U, __ATOMIC_RELAXED);
+}
 u64 spin_lock_irqsave(spinlock_t *lock)
 {
-    assert(lock && !lock->value);
-    lock->value = 1;
+    assert(lock);
+    while (__atomic_exchange_n(&lock->value, 1U, __ATOMIC_ACQUIRE)) { }
     return 0;
 }
 void spin_unlock_irqrestore(spinlock_t *lock, u64 flags)
 {
     (void)flags;
-    assert(lock && lock->value);
-    lock->value = 0;
+    assert(lock && __atomic_load_n(&lock->value, __ATOMIC_RELAXED));
+    __atomic_store_n(&lock->value, 0U, __ATOMIC_RELEASE);
 }
 
 void mutex_init(mutex_t *mutex)
@@ -220,16 +224,27 @@ void mutex_init(mutex_t *mutex)
 
 bool mutex_lock(mutex_t *mutex)
 {
-    if (!mutex || mutex->owner) return false;
+    if (!mutex) return false;
+    u64 flags = spin_lock_irqsave(&mutex->state_lock);
+    if (mutex->owner) {
+        spin_unlock_irqrestore(&mutex->state_lock, flags);
+        return false;
+    }
     mutex->owner = (struct kernel_thread *)(uintptr_t)1U;
+    spin_unlock_irqrestore(&mutex->state_lock, flags);
     return true;
 }
 
 bool mutex_unlock(mutex_t *mutex)
 {
-    if (!mutex || mutex->owner != (struct kernel_thread *)(uintptr_t)1U)
+    if (!mutex) return false;
+    u64 flags = spin_lock_irqsave(&mutex->state_lock);
+    if (mutex->owner != (struct kernel_thread *)(uintptr_t)1U) {
+        spin_unlock_irqrestore(&mutex->state_lock, flags);
         return false;
+    }
     mutex->owner = NULL;
+    spin_unlock_irqrestore(&mutex->state_lock, flags);
     return true;
 }
 
@@ -1158,6 +1173,91 @@ static void test_text_controls_and_mgtc_stream(void)
     assert(phys_to_screen_row(terminal.cursor_phys_row) == 1U);
 }
 
+typedef struct {
+    terminal_control_stream_state_t *stream;
+    u64 process_id;
+    u8 foreground;
+    u8 character;
+    i64 result;
+} concurrent_control_writer_t;
+
+static volatile u32 concurrent_writers_ready;
+static volatile u32 concurrent_writers_go;
+
+static void control_record_header(u8 *output, u8 type, u32 length)
+{
+    memcpy(output, "MGTC", 4U);
+    output[4] = MG_TERMINAL_CONTROL_VERSION;
+    output[5] = type;
+    output[6] = (u8)length;
+    output[7] = (u8)(length >> 8);
+    output[8] = (u8)(length >> 16);
+    output[9] = (u8)(length >> 24);
+}
+
+static void *concurrent_control_writer(void *argument)
+{
+    concurrent_control_writer_t *writer =
+        (concurrent_control_writer_t *)argument;
+    u8 records[28];
+
+    control_record_header(records, MG_TERMINAL_CONTROL_FOREGROUND, 1U);
+    records[10] = writer->foreground;
+    control_record_header(records + 11U, MG_TERMINAL_CONTROL_TEXT, 7U);
+    memset(records + 21U, writer->character, 7U);
+    __atomic_add_fetch(&concurrent_writers_ready, 1U, __ATOMIC_RELEASE);
+    while (!__atomic_load_n(&concurrent_writers_go, __ATOMIC_ACQUIRE)) { }
+    writer->result = terminal_control_stream_write_for_process(
+        writer->process_id, writer->stream, records, sizeof(records));
+    return NULL;
+}
+
+static void test_concurrent_mgtc_process_streams(void)
+{
+    terminal_control_stream_state_t first_stream;
+    terminal_control_stream_state_t second_stream;
+    concurrent_control_writer_t writers[2];
+    pthread_t threads[2];
+
+    initialize(116U, 92U);
+    terminal_control_stream_init(&first_stream);
+    terminal_control_stream_init(&second_stream);
+    writers[0] = (concurrent_control_writer_t){
+        &first_stream, 101U, TERMINAL_COLOR_GREEN, 'G', 0
+    };
+    writers[1] = (concurrent_control_writer_t){
+        &second_stream, 102U, TERMINAL_COLOR_RED, 'R', 0
+    };
+    concurrent_writers_ready = 0U;
+    concurrent_writers_go = 0U;
+    assert(pthread_create(&threads[0], NULL, concurrent_control_writer,
+                          &writers[0]) == 0);
+    assert(pthread_create(&threads[1], NULL, concurrent_control_writer,
+                          &writers[1]) == 0);
+    while (__atomic_load_n(&concurrent_writers_ready, __ATOMIC_ACQUIRE) != 2U) { }
+    __atomic_store_n(&concurrent_writers_go, 1U, __ATOMIC_RELEASE);
+    assert(pthread_join(threads[0], NULL) == 0);
+    assert(pthread_join(threads[1], NULL) == 0);
+    assert(writers[0].result == 28 && writers[1].result == 28);
+    assert(first_stream.foreground == TERMINAL_COLOR_GREEN);
+    assert(second_stream.foreground == TERMINAL_COLOR_RED);
+
+    u8 first_character = (u8)screen_cell(0U, 0U)->codepoint;
+    assert(first_character == 'G' || first_character == 'R');
+    for (u32 index = 0U; index < 14U; index++) {
+        u32 row = index / terminal.visible_cols;
+        u32 column = index % terminal.visible_cols;
+        terminal_cell_t *cell = screen_cell(row, column);
+        bool first_group = index < 7U;
+        u8 character = first_group ? first_character :
+            (first_character == 'G' ? 'R' : 'G');
+        u8 color = character == 'G' ? TERMINAL_COLOR_GREEN :
+                   TERMINAL_COLOR_RED;
+        assert(cell->codepoint == character);
+        assert(cell->fg_color == color);
+    }
+}
+
 static void test_utf8_across_write_boundaries(void)
 {
     static const char first[] = {(char)0xe2};
@@ -1544,6 +1644,8 @@ int main(int argument_count, char **arguments)
         test_escape_sequences_are_literal();
     if (run_all || !strcmp(arguments[1], "mgtc"))
         test_text_controls_and_mgtc_stream();
+    if (run_all || !strcmp(arguments[1], "mgtc-concurrent"))
+        test_concurrent_mgtc_process_streams();
     if (run_all || !strcmp(arguments[1], "utf8"))
         test_utf8_across_write_boundaries();
     if (run_all || !strcmp(arguments[1], "alternate"))
