@@ -241,6 +241,15 @@ mg_result_t object_write(mg_handle_t handle, const void *buffer, usize length)
     return (mg_result_t)count;
 }
 
+/* The host adapter stores console output as bytes and does not interpret the
+ * terminal's ESC protocol. Literal output therefore has the same storage
+ * behavior here as ordinary object writes. */
+mg_result_t object_write_literal(mg_handle_t handle, const void *buffer,
+                                 usize length)
+{
+    return object_write(handle, buffer, length);
+}
+
 mg_result_t path_move(const char *source, const char *destination)
 {
     if (find_file(destination)) return MG_ERR_ALREADY_EXISTS;

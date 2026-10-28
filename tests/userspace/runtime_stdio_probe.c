@@ -121,6 +121,14 @@ mg_result_t terminal_clear_screen(void)
     return MG_OK;
 }
 
+mg_result_t terminal_reset_session_history(void)
+{
+    login_terminal_clears++;
+    if (login_lifecycle_order_length < sizeof(login_lifecycle_order))
+        login_lifecycle_order[login_lifecycle_order_length++] = 'C';
+    return MG_OK;
+}
+
 u64 uptime_ms(void)
 {
     login_test_time += 500U;
