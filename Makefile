@@ -323,7 +323,8 @@ endif
 KERNEL_LDFLAGS := -z max-page-size=0x1000 -T kernel/linker.ld -Map=$(KERNEL_MAP)
 
 USER_CFLAGS := -std=gnu17 -ffreestanding -fno-asynchronous-unwind-tables -fno-stack-protector \
-               -fno-builtin -fno-pic -fno-pie -mno-red-zone -nostdinc \
+               -fno-builtin -fno-pic -fno-pie -ftls-model=local-exec \
+               -mno-red-zone -nostdinc \
                -I. -Iuserspace/shoot -Ilibc/include -Iinclude \
                $(DEPFLAGS)
 USER_LINKER_SCRIPT := userspace/linker/userspace.ld
@@ -1397,7 +1398,7 @@ test-fetch-transport:
 	ASAN_OPTIONS=detect_leaks=0 $(HOST_TEST_DIR)/mangrove-fetch-transport-test
 
 .PHONY: test-libc
-test-libc: test-unicode test-libc-link test-math
+test-libc: test-unicode test-libc-link test-math test-user-tls
 	python3 tests/userspace/libc_string_test.py "$(HOST_CC)"
 	python3 tests/userspace/runtime_foundations_test.py "$(HOST_CC)"
 	python3 tests/userspace/runtime_stdio_test.py "$(HOST_CC)"
@@ -3341,6 +3342,18 @@ test-sync: test-syscall-user-memory
 test-sync: test-process-memory-unmap
 test-sync: test-process-interrupt
 test-sync: test-process-thread-lifecycle test-process-thread-termination
+test-sync: test-user-context
+test-sync: test-user-tls
+
+.PHONY: test-user-context
+test-user-context:
+	python3 tests/kernel/user_context_test.py "$(HOST_CC)"
+	python3 tests/kernel/user_regions_test.py "$(HOST_CC)"
+
+.PHONY: test-user-tls
+test-user-tls: test-libc-link $(PING)
+	python3 tests/userspace/tls_model_test.py "$(HOST_CC)" \
+		"$(RUNTIME_API_LINK_OBJ)" "$(RUNTIME_API_LINK_ELF)" "$(PING)"
 
 .PHONY: test-process-thread-lifecycle test-process-thread-termination
 test-process-thread-lifecycle:

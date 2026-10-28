@@ -132,6 +132,12 @@ void vmm_destroy_address_space(page_table_t *pml4);
 bool vmm_switch_address_space(page_table_t *pml4);
 bool vmm_user_range_valid(const void *address, usize length);
 bool vmm_user_range_writable(const void *address, usize length);
+/* Checks an address-space range under VMM metadata synchronization. These
+ * helpers are for trusted reservation/ELF validation, not user pointers. */
+bool vmm_user_range_unmapped(page_table_t *pml4, uintptr_t address,
+                             usize length);
+bool vmm_user_range_executable(page_table_t *pml4, uintptr_t address,
+                               usize length);
 bool vmm_user_range_lease(page_table_t *pml4, const void *address,
                           usize length, bool writable,
                           vmm_user_range_lease_t *out_lease);

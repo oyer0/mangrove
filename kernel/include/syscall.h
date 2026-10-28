@@ -115,6 +115,9 @@ enum syscall_number {
      * cannot begin a terminal command; on files this matches SYSCALL_WRITE. */
     SYSCALL_WRITE_LITERAL = 103,
     SYSCALL_CLOCK_MONOTONIC_INFO = 104,
+    /* Private CRT return path for a future non-initial process thread. Not a
+     * public thread-creation or join/detach interface. */
+    SYSCALL_THREAD_RETURN = 105,
 };
 
 /* Initialize the native syscall MSRs for the CPU executing this function. */

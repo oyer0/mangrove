@@ -60,7 +60,9 @@ static bool process_shutdown_active;
 #define PROCESS_SHUTDOWN_GRACE_MS 5000U
 #define PROCESS_SHUTDOWN_FORCE_MS 5000U
 
-extern void ring3_enter(uintptr_t entry, uintptr_t stack_pointer, uintptr_t argc, uintptr_t argv);
+extern void ring3_enter(uintptr_t entry, uintptr_t stack_pointer,
+                        uintptr_t arg0, uintptr_t arg1,
+                        uintptr_t fs_base) __attribute__((noreturn));
 
 typedef struct {
     kernel_object_t *object;
@@ -76,10 +78,41 @@ typedef struct process_memory_mapping {
     struct process_memory_mapping *next;
 } process_memory_mapping_t;
 
+#define PROCESS_USER_THREAD_RETURN_ADDRESS ((uintptr_t)0x00400000U)
+#define PROCESS_TLS_MIN_ALIGNMENT 1U
+#define PROCESS_TLS_TCB_BYTES (2U * sizeof(uintptr_t))
+
+static bool process_size_align_up(usize value, usize alignment,
+                                  usize *out_value)
+{
+    usize mask;
+    if (!alignment || (alignment & (alignment - 1U)) || !out_value)
+        return false;
+    mask = alignment - 1U;
+    if (value > ~(usize)0 - mask) return false;
+    *out_value = (value + mask) & ~mask;
+    return true;
+}
+
+static uintptr_t process_address_align_up(uintptr_t value, usize alignment,
+                                         bool *ok)
+{
+    uintptr_t mask = (uintptr_t)alignment - 1U;
+    if (!alignment || (alignment & (alignment - 1U)) ||
+        value > ~(uintptr_t)0 - mask) {
+        if (ok) *ok = false;
+        return 0;
+    }
+    if (ok) *ok = true;
+    return (value + mask) & ~mask;
+}
+
 #define PROCESS_HANDLE_SLOTS_INITIAL 16U
 #define HANDLE_INDEX_MASK 0xffffU
 
 static void process_memory_release_all(process_t *process);
+static void process_user_thread_entry(void *argument);
+static void process_user_region_metadata_release(process_t *process);
 static void process_unlink(process_t *process);
 static void process_unlink_all(process_t *process);
 static void process_unlink_locked(process_t *process);
@@ -238,6 +271,7 @@ static void process_object_destroy(kernel_object_t *object)
     }
     process_memory_release_all(process);
     vmm_destroy_address_space(process->address_space);
+    process_user_region_metadata_release(process);
     kfree(process->handle_table);
     kfree(process);
 }
@@ -259,6 +293,7 @@ static bool process_thread_register_locked(process_t *process,
                                            bool allow_bootstrap_current)
 {
     if (!process || !thread || process->state != PROCESS_STATE_ACTIVE ||
+        __atomic_load_n(&process->exit_requested, __ATOMIC_ACQUIRE) ||
         process->termination_pending || thread->process ||
         thread->process_state != THREAD_PROCESS_UNATTACHED ||
         thread->process_reference_held ||
@@ -846,6 +881,7 @@ static uintptr_t process_memory_find_space(process_t *process,
                                            usize page_count)
 {
     process_memory_mapping_t *mapping;
+    process_user_region_t *region;
     uintptr_t candidate = VMM_USER_ANON_BASE;
     usize request_bytes;
 
@@ -854,23 +890,148 @@ static uintptr_t process_memory_find_space(process_t *process,
         return 0;
     }
     request_bytes = page_count * VMM_PAGE_SIZE;
-    mapping = (process_memory_mapping_t *)process->memory_mappings;
-    while (mapping) {
-        if (candidate <= mapping->address &&
-            mapping->address - candidate >= request_bytes) {
-            return candidate;
-        }
-        if (mapping->page_count > ~(usize)0 / VMM_PAGE_SIZE) return 0;
-        usize mapping_bytes = mapping->page_count * VMM_PAGE_SIZE;
-        if (mapping->address > VMM_USER_ANON_LIMIT - mapping_bytes) return 0;
-        candidate = mapping->address + mapping_bytes;
+    for (;;) {
+        uintptr_t candidate_end;
+        uintptr_t skip_to = candidate;
+        bool conflict = false;
+
         if (candidate > VMM_USER_ANON_LIMIT ||
-            VMM_USER_ANON_LIMIT - candidate < request_bytes) {
+            request_bytes > VMM_USER_ANON_LIMIT - candidate)
             return 0;
+        candidate_end = candidate + request_bytes;
+        mapping = (process_memory_mapping_t *)process->memory_mappings;
+        while (mapping) {
+            usize bytes;
+            uintptr_t end;
+            if (mapping->page_count > ~(usize)0 / VMM_PAGE_SIZE)
+                return 0;
+            bytes = mapping->page_count * VMM_PAGE_SIZE;
+            if (mapping->address > ~(uintptr_t)0 - bytes) return 0;
+            end = mapping->address + bytes;
+            if (end > VMM_USER_ANON_BASE &&
+                mapping->address < VMM_USER_ANON_LIMIT &&
+                candidate < end && mapping->address < candidate_end) {
+                conflict = true;
+                if (end > skip_to) skip_to = end;
+            }
+            mapping = mapping->next;
         }
-        mapping = mapping->next;
+        region = process->user_regions;
+        while (region) {
+            usize bytes;
+            uintptr_t end;
+            if (region->reservation_pages > ~(usize)0 / VMM_PAGE_SIZE)
+                return 0;
+            bytes = region->reservation_pages * VMM_PAGE_SIZE;
+            if (region->reservation_base > ~(uintptr_t)0 - bytes) return 0;
+            end = region->reservation_base + bytes;
+            if (end > VMM_USER_ANON_BASE &&
+                region->reservation_base < VMM_USER_ANON_LIMIT &&
+                candidate < end && region->reservation_base < candidate_end) {
+                conflict = true;
+                if (end > skip_to) skip_to = end;
+            }
+            region = region->next;
+        }
+        if (conflict) {
+            candidate = skip_to;
+            continue;
+        }
+        if (vmm_user_range_unmapped(process->address_space, candidate,
+                                    request_bytes))
+            return candidate;
+        if (candidate > VMM_USER_ANON_LIMIT - VMM_PAGE_SIZE) return 0;
+        candidate += VMM_PAGE_SIZE;
     }
-    return VMM_USER_ANON_LIMIT - candidate >= request_bytes ? candidate : 0;
+}
+
+static void process_user_region_insert_locked(process_t *process,
+                                             process_user_region_t *region)
+{
+    process_user_region_t **cursor = &process->user_regions;
+    while (*cursor && (*cursor)->reservation_base < region->reservation_base)
+        cursor = &(*cursor)->next;
+    region->next = *cursor;
+    *cursor = region;
+}
+
+bool process_user_register_initial_stack(process_t *process,
+                                         uintptr_t stack_top,
+                                         usize stack_pages)
+{
+    process_user_region_t *region;
+    uintptr_t mapping_base;
+    uintptr_t reservation_base;
+    usize mapping_bytes;
+
+    if (!process || !process->address_space || !stack_pages ||
+        stack_pages > ~(usize)0 / VMM_PAGE_SIZE ||
+        stack_top & (VMM_PAGE_SIZE - 1U))
+        return false;
+    mapping_bytes = stack_pages * VMM_PAGE_SIZE;
+    if (stack_top < mapping_bytes + VMM_PAGE_SIZE) return false;
+    mapping_base = stack_top - mapping_bytes;
+    reservation_base = mapping_base - VMM_PAGE_SIZE;
+    region = kmalloc(sizeof(*region));
+    if (!region) return false;
+    *region = (process_user_region_t){
+        .reservation_base = reservation_base,
+        .reservation_pages = stack_pages + 1U,
+        .mapping_base = mapping_base,
+        .mapping_pages = stack_pages,
+        .kind = PROCESS_USER_REGION_INITIAL_STACK,
+        .next = NULL,
+    };
+    if (!vmm_user_range_unmapped(process->address_space, reservation_base,
+                                 VMM_PAGE_SIZE)) {
+        kfree(region);
+        return false;
+    }
+    if (!mutex_lock(&process->memory_lock)) {
+        kfree(region);
+        return false;
+    }
+    /* The initial stack is installed before launch publication. Reject an
+     * accidental overlap with any process mapping or prior reservation. */
+    for (process_user_region_t *other = process->user_regions; other;
+         other = other->next) {
+        uintptr_t end = other->reservation_base +
+                        other->reservation_pages * VMM_PAGE_SIZE;
+        if (reservation_base < end && other->reservation_base < stack_top) {
+            mutex_unlock(&process->memory_lock);
+            kfree(region);
+            return false;
+        }
+    }
+    for (process_memory_mapping_t *other = process->memory_mappings; other;
+         other = other->next) {
+        uintptr_t end = other->address + other->page_count * VMM_PAGE_SIZE;
+        if (reservation_base < end && other->address < stack_top) {
+            mutex_unlock(&process->memory_lock);
+            kfree(region);
+            return false;
+        }
+    }
+    process_user_region_insert_locked(process, region);
+    mutex_unlock(&process->memory_lock);
+    return true;
+}
+
+bool process_user_tls_template_adopt(process_t *process, u8 *image,
+                                     usize file_size, usize memory_size,
+                                     usize alignment)
+{
+    if (!process || (!image && file_size) || process->tls_present ||
+        file_size > memory_size || !memory_size || !alignment ||
+        (alignment & (alignment - 1U)))
+        return false;
+    process->tls_image = image;
+    process->tls_file_size = file_size;
+    process->tls_memory_size = memory_size;
+    process->tls_alignment = alignment < PROCESS_TLS_MIN_ALIGNMENT
+        ? PROCESS_TLS_MIN_ALIGNMENT : alignment;
+    process->tls_present = true;
+    return true;
 }
 
 static bool process_memory_release_mapping(process_t *process,
@@ -891,6 +1052,231 @@ static bool process_memory_release_mapping(process_t *process,
         pmm_free_frame(frame);
     }
     return released;
+}
+
+static bool process_user_region_copy_to_frames(const phys_addr_t *frames,
+                                              usize page_count,
+                                              uintptr_t mapping_base,
+                                              uintptr_t destination,
+                                              const void *source,
+                                              usize length)
+{
+    const u8 *bytes = source;
+
+    if ((!source && length) || !frames || !page_count) return false;
+    while (length) {
+        usize index = (usize)((destination - mapping_base) / VMM_PAGE_SIZE);
+        usize in_page = (usize)(destination & (VMM_PAGE_SIZE - 1U));
+        usize amount = VMM_PAGE_SIZE - in_page;
+        u8 *target;
+        if (index >= page_count) return false;
+        if (amount > length) amount = length;
+        if (!vmm_direct_map_valid(frames[index])) return false;
+        target = (u8 *)phys_to_virt(frames[index]);
+        if (!target) return false;
+        memcpy(target + in_page, bytes, amount);
+        bytes += amount;
+        destination += amount;
+        length -= amount;
+    }
+    return true;
+}
+
+static process_user_region_t *process_user_region_create(
+    process_t *process, process_user_region_kind_t kind,
+    usize guard_pages, usize mapping_pages, usize alignment,
+    const void *initial_data, usize initial_size, usize initial_offset,
+    usize tls_block_size, uintptr_t *out_data_start)
+{
+    process_user_region_t *region = NULL;
+    phys_addr_t *frames = NULL;
+    uintptr_t reservation_base;
+    uintptr_t mapping_base;
+    uintptr_t data_start = 0;
+    usize reservation_pages;
+    usize map_bytes;
+    usize reserve_bytes;
+    usize i;
+    usize mapped = 0;
+
+    if (out_data_start) *out_data_start = 0;
+    if (!process || !process->address_space || !mapping_pages ||
+        guard_pages > ~(usize)0 - mapping_pages ||
+        mapping_pages > ~(usize)0 / VMM_PAGE_SIZE ||
+        guard_pages + mapping_pages >
+            (VMM_USER_ANON_LIMIT - VMM_USER_ANON_BASE) / VMM_PAGE_SIZE ||
+        !alignment || (alignment & (alignment - 1U)) ||
+        (tls_block_size && initial_size > tls_block_size) ||
+        mapping_pages > ~(usize)0 / sizeof(*frames))
+        return NULL;
+    reservation_pages = guard_pages + mapping_pages;
+    reserve_bytes = reservation_pages * VMM_PAGE_SIZE;
+    map_bytes = mapping_pages * VMM_PAGE_SIZE;
+
+    region = kmalloc(sizeof(*region));
+    frames = kmalloc(mapping_pages * sizeof(*frames));
+    if (!region || !frames) goto fail;
+    memset(frames, 0, mapping_pages * sizeof(*frames));
+    for (i = 0; i < mapping_pages; i++) {
+        frames[i] = pmm_alloc_frame();
+        if (!frames[i]) goto fail_frames;
+        if (!vmm_direct_map_valid(frames[i])) goto fail_frames;
+        memset(phys_to_virt(frames[i]), 0, VMM_PAGE_SIZE);
+    }
+
+    if (!mutex_lock(&process->memory_lock)) goto fail_frames;
+    reservation_base = process_memory_find_space(process, reservation_pages);
+    if (!reservation_base || reserve_bytes >
+            VMM_USER_ANON_LIMIT - reservation_base) {
+        mutex_unlock(&process->memory_lock);
+        goto fail_frames;
+    }
+    mapping_base = reservation_base + guard_pages * VMM_PAGE_SIZE;
+    if (guard_pages && !vmm_user_range_unmapped(
+            process->address_space, reservation_base,
+            guard_pages * VMM_PAGE_SIZE)) {
+        mutex_unlock(&process->memory_lock);
+        goto fail_frames;
+    }
+    if (tls_block_size) {
+        uintptr_t thread_pointer;
+        uintptr_t dtv = 0;
+        bool aligned;
+        data_start = process_address_align_up(mapping_base, alignment,
+                                              &aligned);
+        if (!aligned || data_start < mapping_base ||
+            data_start - mapping_base > map_bytes ||
+            tls_block_size > map_bytes - (data_start - mapping_base) ||
+            (initial_size && !process_user_region_copy_to_frames(
+                frames, mapping_pages, mapping_base, data_start, initial_data,
+                initial_size))) {
+            mutex_unlock(&process->memory_lock);
+            goto fail_frames;
+        }
+        if (kind == PROCESS_USER_REGION_THREAD_TLS) {
+            if (data_start > ~(uintptr_t)0 - tls_block_size) {
+                mutex_unlock(&process->memory_lock);
+                goto fail_frames;
+            }
+            thread_pointer = data_start + tls_block_size;
+            if (thread_pointer < mapping_base ||
+                thread_pointer - mapping_base > map_bytes ||
+                PROCESS_TLS_TCB_BYTES > map_bytes -
+                    (thread_pointer - mapping_base) ||
+                !process_user_region_copy_to_frames(frames, mapping_pages,
+                    mapping_base, thread_pointer, &thread_pointer,
+                    sizeof(thread_pointer)) ||
+                !process_user_region_copy_to_frames(frames, mapping_pages,
+                    mapping_base, thread_pointer + sizeof(thread_pointer),
+                    &dtv, sizeof(dtv))) {
+                mutex_unlock(&process->memory_lock);
+                goto fail_frames;
+            }
+        }
+    } else {
+        if (initial_offset > map_bytes ||
+            initial_size > map_bytes - initial_offset) {
+            mutex_unlock(&process->memory_lock);
+            goto fail_frames;
+        }
+        data_start = mapping_base + initial_offset;
+        if (initial_size && !process_user_region_copy_to_frames(
+                frames, mapping_pages, mapping_base, data_start, initial_data,
+                initial_size)) {
+            mutex_unlock(&process->memory_lock);
+            goto fail_frames;
+        }
+    }
+
+    *region = (process_user_region_t){
+        .reservation_base = reservation_base,
+        .reservation_pages = reservation_pages,
+        .mapping_base = mapping_base,
+        .mapping_pages = mapping_pages,
+        .kind = kind,
+        .next = NULL,
+    };
+    for (mapped = 0; mapped < mapping_pages; mapped++) {
+        if (!vmm_map_user_page(process->address_space,
+                (void *)(mapping_base + mapped * VMM_PAGE_SIZE), frames[mapped],
+                PTE_USER | PTE_READWRITE | PTE_NX))
+            break;
+    }
+    if (mapped != mapping_pages) {
+        if (mapped && !vmm_unmap_user_range(process->address_space,
+                (void *)mapping_base, mapped))
+            panic("process: user-region mapping rollback failed");
+        for (i = mapped; i < mapping_pages; i++) pmm_free_frame(frames[i]);
+        mutex_unlock(&process->memory_lock);
+        kfree(frames);
+        kfree(region);
+        return NULL;
+    }
+    process_user_region_insert_locked(process, region);
+    mutex_unlock(&process->memory_lock);
+    kfree(frames);
+    if (out_data_start) *out_data_start = data_start;
+    return region;
+
+fail_frames:
+    if (frames) {
+        for (i = 0; i < mapping_pages; i++)
+            if (frames[i]) pmm_free_frame(frames[i]);
+    }
+fail:
+    if (frames) kfree(frames);
+    if (region) kfree(region);
+    return NULL;
+}
+
+static bool process_user_region_release_unpublished(
+    process_t *process, process_user_region_t *region)
+{
+    process_user_region_t **cursor;
+    if (!process || !region || !mutex_lock(&process->memory_lock))
+        return false;
+    cursor = &process->user_regions;
+    while (*cursor && *cursor != region) cursor = &(*cursor)->next;
+    if (*cursor != region || !vmm_unmap_user_range(process->address_space,
+            (void *)region->mapping_base, region->mapping_pages)) {
+        mutex_unlock(&process->memory_lock);
+        return false;
+    }
+    *cursor = region->next;
+    mutex_unlock(&process->memory_lock);
+    kfree(region);
+    return true;
+}
+
+static process_user_region_t *process_user_region_find(
+    process_t *process, process_user_region_kind_t kind)
+{
+    process_user_region_t *found = NULL;
+    if (!process || !mutex_lock(&process->memory_lock)) return NULL;
+    for (process_user_region_t *region = process->user_regions; region;
+         region = region->next) {
+        if (region->kind == kind) {
+            found = region;
+            break;
+        }
+    }
+    mutex_unlock(&process->memory_lock);
+    return found;
+}
+
+static void process_user_region_metadata_release(process_t *process)
+{
+    process_user_region_t *region;
+    if (!process) return;
+    region = process->user_regions;
+    process->user_regions = NULL;
+    while (region) {
+        process_user_region_t *next = region->next;
+        kfree(region);
+        region = next;
+    }
+    if (process->tls_image) kfree(process->tls_image);
+    process->tls_image = NULL;
 }
 
 static void process_memory_release_all(process_t *process)
@@ -2003,7 +2389,199 @@ bool process_setup_argv(process_t *process, const char *const *argv,
         return false;
     int result = setup_user_stack_args(process, &args);
     process_arguments_destroy(&args);
-    return result == VFS_OK;
+    if (result != VFS_OK) return false;
+    return !process->image_loaded ||
+        process_user_context_prepare_initial(process);
+}
+
+static process_user_region_t *process_user_tls_create(process_t *process,
+                                                       uintptr_t *out_fs_base)
+{
+    usize alignment;
+    usize module_size;
+    usize slack;
+    usize required;
+    usize mapped_pages;
+    process_user_region_t *region;
+    uintptr_t tls_start;
+
+    if (out_fs_base) *out_fs_base = 0;
+    if (!process || !process->tls_present || !process->tls_memory_size ||
+        !process->tls_alignment ||
+        !process_size_align_up(process->tls_memory_size,
+                               process->tls_alignment, &module_size))
+        return NULL;
+    alignment = process->tls_alignment;
+    slack = alignment - 1U;
+    if (module_size > ~(usize)0 - slack ||
+        module_size + slack > ~(usize)0 - PROCESS_TLS_TCB_BYTES)
+        return NULL;
+    required = module_size + slack + PROCESS_TLS_TCB_BYTES;
+    if (!process_memory_size_to_pages(required, &mapped_pages)) return NULL;
+    region = process_user_region_create(process,
+        PROCESS_USER_REGION_THREAD_TLS, 1U, mapped_pages, alignment,
+        process->tls_image, process->tls_file_size, 0U, module_size,
+        &tls_start);
+    if (!region) return NULL;
+    if (tls_start > VMM_USER_ADDRESS_LIMIT - module_size) {
+        if (!process_user_region_release_unpublished(process, region))
+            panic("process: TLS range rollback failed");
+        return NULL;
+    }
+    if (out_fs_base) *out_fs_base = tls_start + module_size;
+    return region;
+}
+
+bool process_user_context_prepare_initial(process_t *process)
+{
+    kernel_thread_t *thread;
+    user_execution_context_t *context;
+    process_user_region_t *stack_region;
+    process_user_region_t *tls_region = NULL;
+    uintptr_t fs_base = 0;
+
+    if (!process || !process->image_loaded || !process->main_thread ||
+        !process->entry_point || !process->user_stack_sp ||
+        !process->user_stack_top || !process->user_argc || !process->user_argv)
+        return false;
+    thread = process->main_thread;
+    if (thread->process != process || !thread->process_initial ||
+        thread->user_context.valid)
+        return false;
+
+    stack_region = process_user_region_find(process,
+                                  PROCESS_USER_REGION_INITIAL_STACK);
+    if (!stack_region) return false;
+    if (process->tls_present) {
+        tls_region = process_user_tls_create(process, &fs_base);
+        if (!tls_region) return false;
+    }
+
+    context = &thread->user_context;
+    memset(context, 0, sizeof(*context));
+    context->instruction_pointer = process->entry_point;
+    context->stack_pointer = process->user_stack_sp;
+    context->rdi = process->user_argc;
+    context->rsi = process->user_argv;
+    context->fs_base = fs_base;
+    context->stack_region = stack_region;
+    context->tls_region = tls_region;
+    thread->user_fs_base = fs_base;
+    __atomic_store_n(&context->valid, true, __ATOMIC_RELEASE);
+    return true;
+}
+
+bool process_user_context_prepare_worker(process_t *process,
+                                         struct kernel_thread *thread,
+                                         uintptr_t entry, uintptr_t argument)
+{
+    process_user_region_t *stack_region = NULL;
+    process_user_region_t *tls_region = NULL;
+    user_execution_context_t context;
+    uintptr_t fs_base = 0;
+    uintptr_t stack_top;
+    uintptr_t stack_pointer;
+    usize stack_bytes = PROCESS_USER_STACK_PAGES * VMM_PAGE_SIZE;
+    uintptr_t return_address = PROCESS_USER_THREAD_RETURN_ADDRESS;
+
+    if (!process || !thread || !process->image_loaded || !process->address_space ||
+        process->state != PROCESS_STATE_ACTIVE ||
+        __atomic_load_n(&process->exit_requested, __ATOMIC_ACQUIRE) ||
+        thread->process || thread->process_state != THREAD_PROCESS_UNATTACHED ||
+        thread->user_context.valid || !entry ||
+        !vmm_user_range_executable(process->address_space, entry, 1U) ||
+        !vmm_user_range_executable(process->address_space,
+            PROCESS_USER_THREAD_RETURN_ADDRESS, 1U))
+        return false;
+
+    /* Every allocation is private to this unpublished context. Nothing is
+     * attached to the process thread list or scheduler until the record is
+     * complete and its valid flag is released below. */
+    stack_region = process_user_region_create(process,
+        PROCESS_USER_REGION_WORKER_STACK, 1U, PROCESS_USER_STACK_PAGES,
+        VMM_PAGE_SIZE, &return_address, sizeof(return_address),
+        stack_bytes - sizeof(return_address), 0U, NULL);
+    if (!stack_region) return false;
+    stack_top = stack_region->mapping_base + stack_bytes;
+    stack_pointer = stack_top - sizeof(return_address);
+
+    if (process->tls_present) {
+        tls_region = process_user_tls_create(process, &fs_base);
+        if (!tls_region) {
+            if (!process_user_region_release_unpublished(process,
+                                                         stack_region))
+                panic("process: worker-stack rollback failed");
+            return false;
+        }
+    }
+
+    /* Process exit may race an admitted creator while its private mappings
+     * are being prepared. Keep this context unpublished and roll back now;
+     * process_attach_thread() remains the final serialized admission check
+     * for an exit racing after this point. */
+    if (process->state != PROCESS_STATE_ACTIVE ||
+        __atomic_load_n(&process->exit_requested, __ATOMIC_ACQUIRE)) {
+        if (tls_region && !process_user_region_release_unpublished(
+                process, tls_region))
+            panic("process: worker-TLS termination rollback failed");
+        if (!process_user_region_release_unpublished(process, stack_region))
+            panic("process: worker-stack termination rollback failed");
+        return false;
+    }
+
+    memset(&context, 0, sizeof(context));
+    context.instruction_pointer = entry;
+    context.stack_pointer = stack_pointer;
+    context.rdi = argument;
+    context.fs_base = fs_base;
+    context.stack_region = stack_region;
+    context.tls_region = tls_region;
+    context.valid = false;
+    thread->entry = process_user_thread_entry;
+    thread->entry_argument = process;
+    thread->user_fs_base = fs_base;
+    thread->user_context = context;
+    __atomic_store_n(&thread->user_context.valid, true, __ATOMIC_RELEASE);
+    return true;
+}
+
+bool process_user_context_discard_worker(process_t *process,
+                                         struct kernel_thread *thread)
+{
+    process_user_region_t *stack_region;
+    process_user_region_t *tls_region;
+
+    if (!process || !thread || thread->process ||
+        thread->process_state != THREAD_PROCESS_UNATTACHED ||
+        !__atomic_load_n(&thread->user_context.valid, __ATOMIC_ACQUIRE))
+        return false;
+    stack_region = thread->user_context.stack_region;
+    tls_region = thread->user_context.tls_region;
+    if (!stack_region || stack_region->kind != PROCESS_USER_REGION_WORKER_STACK)
+        return false;
+    if (tls_region &&
+        (tls_region->kind != PROCESS_USER_REGION_THREAD_TLS ||
+         !process_user_region_release_unpublished(process, tls_region)))
+        return false;
+    if (!process_user_region_release_unpublished(process, stack_region))
+        panic("process: unpublished worker-stack release failed");
+    memset(&thread->user_context, 0, sizeof(thread->user_context));
+    thread->user_fs_base = 0;
+    thread->entry = NULL;
+    thread->entry_argument = NULL;
+    return true;
+}
+
+void process_user_context_enter(void)
+{
+    kernel_thread_t *thread = thread_current();
+    user_execution_context_t *context = thread ? &thread->user_context : NULL;
+
+    if (!thread || !thread->process ||
+        !__atomic_load_n(&context->valid, __ATOMIC_ACQUIRE))
+        panic("process: invalid Ring 3 context");
+    ring3_enter(context->instruction_pointer, context->stack_pointer,
+                context->rdi, context->rsi, context->fs_base);
 }
 
 static void process_user_thread_entry(void *argument)
@@ -2012,8 +2590,11 @@ static void process_user_thread_entry(void *argument)
     if (!process || process->state != PROCESS_STATE_ACTIVE ||
         !process->image_loaded)
         return;
-    ring3_enter(process->entry_point, process->user_stack_sp,
-                process->user_argc, process->user_argv);
+    if (!thread_current() || thread_current()->process != process ||
+        !__atomic_load_n(&thread_current()->user_context.valid,
+                         __ATOMIC_ACQUIRE))
+        return;
+    process_user_context_enter();
 }
 
 static int process_spawn_args_with_context_internal(
@@ -2153,6 +2734,10 @@ static int process_spawn_args_with_context_internal(
     if (arguments_result != VFS_OK) {
         process_abort(child);
         return arguments_result;
+    }
+    if (!process_user_context_prepare_initial(child)) {
+        process_abort(child);
+        return VFS_ERR_BAD_FORMAT;
     }
 
     if (!process_handle_install(child, output, OBJECT_RIGHT_WRITE,

@@ -82,6 +82,9 @@ bool cpu_activate_kernel_gs(cpu_local_t *cpu)
      * depending on whatever GS base firmware left behind. */
     wrmsr(MSR_IA32_KERNEL_GS_BASE, (u64)(uintptr_t)cpu);
     wrmsr(MSR_IA32_GS_BASE, 0);
+    /* Kernel code has no FS-relative storage. A scheduled user context
+     * installs its own FS base before returning to Ring 3. */
+    wrmsr(MSR_IA32_FS_BASE, 0);
     __asm__ volatile("swapgs" ::: "memory");
     return cpu_current() == cpu;
 }

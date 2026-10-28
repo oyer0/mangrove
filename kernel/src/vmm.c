@@ -2863,6 +2863,118 @@ bool vmm_user_range_writable(const void *address, usize length)
     return vmm_user_range_accessible(address, length, true);
 }
 
+static bool vmm_user_subrange_unmapped_locked(
+    vmm_address_space_metadata_t *metadata, page_table_t *table,
+    u32 level, uintptr_t start, uintptr_t end)
+{
+    u32 shift = level == 4U ? 39U : level == 3U ? 30U :
+                level == 2U ? 21U : 12U;
+    uintptr_t span = (uintptr_t)1U << shift;
+    uintptr_t cursor = start;
+
+    while (cursor < end) {
+        uintptr_t slot_base = cursor & ~(span - 1U);
+        uintptr_t slot_end = slot_base + span;
+        uintptr_t covered_end = slot_end < end ? slot_end : end;
+        u32 index = (u32)((cursor >> shift) & 0x1ffU);
+        u64 entry = table->entries[index];
+
+        if (entry & PTE_PRESENT) {
+            if (level == 1U) return false;
+            if ((entry & (PTE_USER | PTE_HUGE)) != PTE_USER ||
+                !vmm_owned_contains(metadata->tables,
+                                    entry & PTE_FRAME_MASK))
+                return false;
+            if (!vmm_user_subrange_unmapped_locked(metadata,
+                    vmm_table_from_phys(entry), level - 1U,
+                    cursor, covered_end))
+                return false;
+        }
+        cursor = covered_end;
+    }
+    return true;
+}
+
+bool vmm_user_range_unmapped(page_table_t *pml4, uintptr_t address,
+                             usize length)
+{
+    uintptr_t end;
+    bool unmapped = true;
+    vmm_address_space_metadata_t *metadata;
+
+    if (!pml4 || !length || (address & (VMM_PAGE_SIZE - 1U)) ||
+        (length & (VMM_PAGE_SIZE - 1U)) ||
+        address >= VMM_USER_ADDRESS_LIMIT ||
+        length > VMM_USER_ADDRESS_LIMIT - address)
+        return false;
+    end = address + length;
+    u64 flags = spin_lock_irqsave(&vmm_metadata_lock);
+    metadata = vmm_metadata_find(pml4);
+    if (!metadata || metadata->destroy_pending) {
+        spin_unlock_irqrestore(&vmm_metadata_lock, flags);
+        return false;
+    }
+    unmapped = vmm_user_subrange_unmapped_locked(metadata, pml4, 4U,
+                                                 address, end);
+    spin_unlock_irqrestore(&vmm_metadata_lock, flags);
+    return unmapped;
+}
+
+static bool vmm_user_page_executable_locked(
+    vmm_address_space_metadata_t *metadata, page_table_t *pml4,
+    uintptr_t page)
+{
+    page_table_t *table = pml4;
+    u32 indexes[] = {
+        (u32)((page >> 39) & 0x1ffU),
+        (u32)((page >> 30) & 0x1ffU),
+        (u32)((page >> 21) & 0x1ffU),
+    };
+    u64 entry;
+
+    for (u32 level = 0; level < 3; level++) {
+        entry = table->entries[indexes[level]];
+        if ((entry & (PTE_PRESENT | PTE_USER | PTE_NX)) !=
+            (PTE_PRESENT | PTE_USER) || (entry & PTE_HUGE) ||
+            !vmm_owned_contains(metadata->tables, entry & PTE_FRAME_MASK))
+            return false;
+        table = vmm_table_from_phys(entry);
+    }
+    entry = table->entries[(page >> 12) & 0x1ffU];
+    return (entry & (PTE_PRESENT | PTE_USER | PTE_NX)) ==
+               (PTE_PRESENT | PTE_USER) &&
+           vmm_owned_find(metadata->leaves, entry & PTE_FRAME_MASK) != NULL;
+}
+
+bool vmm_user_range_executable(page_table_t *pml4, uintptr_t address,
+                               usize length)
+{
+    uintptr_t end;
+    bool executable = true;
+    vmm_address_space_metadata_t *metadata;
+
+    if (!pml4 || !length || length > ~(uintptr_t)0 - address ||
+        address >= VMM_USER_ADDRESS_LIMIT ||
+        length > VMM_USER_ADDRESS_LIMIT - address)
+        return false;
+    end = address + length;
+    u64 flags = spin_lock_irqsave(&vmm_metadata_lock);
+    metadata = vmm_metadata_find(pml4);
+    if (!metadata || metadata->destroy_pending) {
+        spin_unlock_irqrestore(&vmm_metadata_lock, flags);
+        return false;
+    }
+    uintptr_t page = address & ~(uintptr_t)(VMM_PAGE_SIZE - 1U);
+    for (; page < end; page += VMM_PAGE_SIZE) {
+        if (!vmm_user_page_executable_locked(metadata, pml4, page)) {
+            executable = false;
+            break;
+        }
+    }
+    spin_unlock_irqrestore(&vmm_metadata_lock, flags);
+    return executable;
+}
+
 bool vmm_user_range_lease(page_table_t *pml4, const void *address,
                           usize length, bool writable,
                           vmm_user_range_lease_t *out_lease)

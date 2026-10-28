@@ -35,6 +35,7 @@ pre = r'''
 #include <stdio.h>
 #include <stdlib.h>
 typedef uint64_t u64; typedef unsigned u32; typedef unsigned thread_priority_t;
+#define MSR_IA32_FS_BASE 0xc0000100U
 enum {THREAD_PRIORITY_HIGH,THREAD_PRIORITY_NORMAL,THREAD_PRIORITY_BACKGROUND};
 enum {THREAD_STATE_READY,THREAD_STATE_RUNNING,THREAD_STATE_BLOCKED,THREAD_STATE_TERMINATED};
 enum {KERNEL_STACK_USAGE_BOOTSTRAP};
@@ -49,6 +50,7 @@ typedef struct kernel_thread {
  kernel_stack_t kernel_stack;
  process_t *process;
  unsigned fpu_state;
+ uintptr_t user_fs_base;
 } kernel_thread_t;
 typedef struct {kernel_thread_t *scheduler_idle_thread;} cpu_local_t;
 static cpu_local_t cpu; static kernel_thread_t bootstrap_thread, *current_thread, *idle_thread;
@@ -57,6 +59,10 @@ static thread_ready_queue_t ready_queues[3];
 static struct {unsigned dispatches[3];} scheduler_stats;
 static unsigned scheduler_lock, scheduler_context_switch_in_progress;
 static unsigned sampled_kernel_stacks;
+static uintptr_t fake_fs_base;
+static u64 rdmsr(u32 msr){assert(msr==MSR_IA32_FS_BASE);return fake_fs_base;}
+static void wrmsr(u32 msr,u64 value)
+{assert(msr==MSR_IA32_FS_BASE);fake_fs_base=(uintptr_t)value;}
 static void kernel_stack_sample_rsp(kernel_stack_t *stack, uintptr_t rsp)
 {assert(stack && stack->active && rsp); sampled_kernel_stacks++;}
 static void kernel_stack_usage_sample(unsigned kind, uintptr_t top, uintptr_t rsp)
@@ -83,14 +89,19 @@ int main(void){
  kernel_thread_t outgoing={.state=THREAD_STATE_READY,.running_cpu=0,.context_switch_pending=true,.saved_stack_pointer=0x1000,.stack_external=true,.kernel_stack_base=0x4000,.kernel_stack_size=0x4000};
  outgoing.process=&process;
  kernel_thread_t incoming={.state=THREAD_STATE_RUNNING,.running_cpu=0,.saved_context_valid=true,.saved_stack_pointer=0x2000};
+ outgoing.user_fs_base=0;
+ incoming.user_fs_base=0x56780000;
+ fake_fs_base=0x12340000;
  current_thread=&incoming;scheduler_context_switch_in_progress=1;
  scheduler_context_switch_saved(&outgoing.saved_stack_pointer,incoming.saved_stack_pointer);
+ assert(outgoing.user_fs_base==0x12340000);
  assert(sampled_kernel_stacks==1);
  /* CPU 1 tries selection before CPU 0 has left outgoing's stack. */
  assert(scheduler_select_next_locked()==NULL);
  assert(outgoing.running_cpu==0 && !outgoing.queued && outgoing.context_switch_pending);
  assert(scheduler_context_switch_in_progress==1 && !incoming.saved_context_valid);
  scheduler_context_switch_complete(&outgoing.saved_stack_pointer);
+ assert(fake_fs_base==incoming.user_fs_base);
  assert(!outgoing.context_switch_pending && outgoing.running_cpu==THREAD_CPU_NONE);
  assert(scheduler_context_switch_in_progress==0);
  assert(scheduler_select_next_locked()==&outgoing);

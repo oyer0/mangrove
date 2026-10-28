@@ -43,6 +43,23 @@ typedef void (*thread_entry_t)(void *argument);
 struct process;
 struct cpu_local;
 struct kernel_mutex;
+struct process_user_region;
+
+/* Initial Ring 3 state belongs to a schedulable thread. Registers saved by
+ * an interrupt or syscall remain on that thread's kernel stack; this record
+ * is only the unpublished entry context used on its first user transition. */
+typedef struct {
+    uintptr_t instruction_pointer;
+    uintptr_t stack_pointer;
+    uintptr_t rdi;
+    uintptr_t rsi;
+    uintptr_t rdx;
+    uintptr_t rcx;
+    uintptr_t fs_base;
+    struct process_user_region *stack_region;
+    struct process_user_region *tls_region;
+    bool valid;
+} user_execution_context_t;
 
 typedef struct {
     u64 context_switches;
@@ -104,6 +121,11 @@ struct kernel_thread {
     /* Baseline x87/MMX/SSE state.  This area is private to the thread and
      * remains valid when the thread migrates between CPUs. */
     fpu_state_t fpu_state;
+    /* FS base is CPU state and must be saved/restored when a Ring 3 thread
+     * migrates or blocks. The entry record separately initializes its first
+     * value. Kernel code does not use FS-relative storage. */
+    uintptr_t user_fs_base;
+    user_execution_context_t user_context;
     /* Set while the assembly handoff still executes on this thread's stack.
      * Selection and reclamation must wait for the incoming-stack completion
      * helper. All ownership transitions are protected by scheduler_lock. */

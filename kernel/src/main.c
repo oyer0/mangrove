@@ -68,7 +68,6 @@ extern char __kernel_data_virt_start[];
 extern char __kernel_data_virt_end[];
 extern char __kernel_bss_virt_start[];
 extern char __kernel_bss_virt_end[];
-extern void ring3_enter(uintptr_t entry, uintptr_t stack_pointer, uintptr_t argc, uintptr_t argv);
 
 /* kmain_high receives a copied handoff record while running on the kernel
  * image's high stack.  Nothing after the permanent CR3 load dereferences the
@@ -995,8 +994,7 @@ static void start_pid1(void)
     vmm_switch_address_space(ring3_process->address_space);
     terminal_clear();
     __asm__ volatile("sti" ::: "memory");
-    ring3_enter(user_entry, ring3_process->user_stack_sp,
-                ring3_process->user_argc, ring3_process->user_argv);
+    process_user_context_enter();
 
     for (;;)
     {
