@@ -61,8 +61,21 @@ typedef struct syscall_frame {
     u64 rcx, r11;
 } syscall_frame_t;
 
+typedef struct syscall_user_lease_entry {
+    bool writable;
+    vmm_user_range_lease_t lease;
+} syscall_user_lease_entry_t;
+
+typedef struct syscall_user_access_context {
+    syscall_user_lease_entry_t *leases;
+    usize count;
+    usize capacity;
+    bool allocation_failed;
+} syscall_user_access_context_t;
+
 extern void syscall_entry(void);
 static void syscall_fail(syscall_frame_t *frame, i64 error);
+static void syscall_dispatch_inner(syscall_frame_t *frame);
 
 void syscall_init_cpu(void)
 {
@@ -76,11 +89,104 @@ void syscall_init_cpu(void)
     wrmsr(MSR_EFER, efer | EFER_SCE);
 }
 
+static bool syscall_user_buffer_accessible(const void *buffer, u64 length,
+                                           bool writable)
+{
+    kernel_thread_t *thread = thread_current();
+    syscall_user_access_context_t *context;
+    uintptr_t start = (uintptr_t)buffer;
+    uintptr_t end;
+    uintptr_t first_page;
+    uintptr_t last_page;
+    if (length == 0) return true;
+    if ((u64)(usize)length != length || !thread || !thread->process ||
+        !thread->syscall_user_access_context) return false;
+    if (!buffer || length > ~(uintptr_t)0 - start ||
+        start >= VMM_USER_ADDRESS_LIMIT ||
+        length > VMM_USER_ADDRESS_LIMIT - start) return false;
+    context = (syscall_user_access_context_t *)
+        thread->syscall_user_access_context;
+    end = start + (usize)length;
+    first_page = start & ~(uintptr_t)(VMM_PAGE_SIZE - 1U);
+    last_page = (end - 1U) & ~(uintptr_t)(VMM_PAGE_SIZE - 1U);
+    for (usize index = 0; index < context->count; index++) {
+        const vmm_user_range_lease_t *lease =
+            &context->leases[index].lease;
+        uintptr_t lease_end = lease->first_page +
+            lease->page_count * VMM_PAGE_SIZE;
+        if (lease->active &&
+            lease->address_space == thread->process->address_space &&
+            lease->first_page <= first_page && lease_end > last_page &&
+            (!writable || context->leases[index].writable))
+            return true;
+    }
+
+    if (context->count == context->capacity) {
+        usize new_capacity = context->capacity ? context->capacity * 2U : 8U;
+        if (new_capacity < context->capacity ||
+            new_capacity > ~(usize)0 / sizeof(*context->leases)) {
+            context->allocation_failed = true;
+            return false;
+        }
+        syscall_user_lease_entry_t *leases = kmalloc(
+            new_capacity * sizeof(*leases));
+        if (!leases) {
+            context->allocation_failed = true;
+            return false;
+        }
+        if (context->count)
+            memcpy(leases, context->leases,
+                   context->count * sizeof(*leases));
+        kfree(context->leases);
+        context->leases = leases;
+        context->capacity = new_capacity;
+    }
+
+    vmm_user_range_lease_t lease;
+    if (!vmm_user_range_lease(thread->process->address_space, buffer,
+                              (usize)length, writable, &lease))
+        return false;
+    context->leases[context->count].writable = writable;
+    context->leases[context->count].lease = lease;
+    context->count++;
+    return true;
+}
+
 static bool syscall_user_buffer_valid(const void *buffer, u64 length)
 {
-    uintptr_t start = (uintptr_t)buffer;
-    if (length == 0) return true;
-    return vmm_user_range_valid((const void *)start, (usize)length);
+    return syscall_user_buffer_accessible(buffer, length, false);
+}
+
+static bool syscall_user_buffer_writable(void *buffer, u64 length)
+{
+    return syscall_user_buffer_accessible(buffer, length, true);
+}
+
+static void syscall_user_lease_release_all(
+    syscall_user_access_context_t *context)
+{
+    if (!context) return;
+    for (usize i = 0; i < context->count; i++)
+        vmm_user_range_release(&context->leases[i].lease);
+    kfree(context->leases);
+    context->leases = NULL;
+    context->count = 0;
+    context->capacity = 0;
+}
+
+static bool syscall_copy_from_user_byte(char *destination,
+                                        const char *source)
+{
+    kernel_thread_t *thread = thread_current();
+    vmm_user_range_lease_t lease;
+    bool valid;
+    if (!destination || !source || !thread || !thread->process) return false;
+    valid = vmm_user_range_lease(thread->process->address_space, source, 1,
+                                 false, &lease);
+    if (!valid) return false;
+    *destination = *source;
+    vmm_user_range_release(&lease);
+    return true;
 }
 
 static void syscall_random_bytes(syscall_frame_t *frame)
@@ -118,19 +224,21 @@ static int syscall_copy_path(const char *user_path, char **out_path,
     for (length = 0; length <= MG_PATH_MAX_BYTES; length++) {
         if (length > (usize)(~(uintptr_t)0 - source))
             return VFS_ERR_INVALID_PARAM;
+        char value;
         const char *byte = (const char *)(source + length);
-        if (!vmm_user_range_valid(byte, 1)) return VFS_ERR_INVALID_PARAM;
-        if (!*byte) {
+        if (!syscall_copy_from_user_byte(&value, byte))
+            return VFS_ERR_INVALID_PARAM;
+        if (!value) {
             if (!length) return VFS_ERR_INVALID_PARAM;
             path = (char *)kmalloc(length + 1U);
             if (!path) return VFS_ERR_NO_MEM;
             for (usize i = 0; i <= length; i++) {
                 if (i > (usize)(~(uintptr_t)0 - source) ||
-                    !vmm_user_range_valid((const void *)(source + i), 1)) {
+                    !syscall_copy_from_user_byte(&path[i],
+                        (const char *)(source + i))) {
                     kfree(path);
                     return VFS_ERR_INVALID_PARAM;
                 }
-                path[i] = *(const char *)(source + i);
                 if ((i < length && !path[i]) ||
                     (i == length && path[i] != '\0')) {
                     kfree(path);
@@ -151,8 +259,8 @@ static bool syscall_copy_bounded_text(const char *user_text, char *text,
     usize i;
     if (!user_text || !text || size == 0) return false;
     for (i = 0; i < size; i++) {
-        if (!vmm_user_range_valid(user_text + i, 1)) return false;
-        text[i] = user_text[i];
+        if (!syscall_copy_from_user_byte(&text[i], user_text + i))
+            return false;
         if (!text[i]) return allow_empty || i != 0;
     }
     return false;
@@ -434,7 +542,7 @@ static void syscall_network(process_t *process, syscall_frame_t *frame)
     switch (request.operation) {
         case MG_NET_OP_INFO:
             if (!request.result || request.result_capacity < sizeof(mg_net_info_t) ||
-                !syscall_user_buffer_valid(request.result, sizeof(mg_net_info_t))) {
+                !syscall_user_buffer_writable(request.result, sizeof(mg_net_info_t))) {
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT); return;
             }
             frame->rax = (u64)net_user_info((mg_net_info_t *)request.result); return;
@@ -442,7 +550,7 @@ static void syscall_network(process_t *process, syscall_frame_t *frame)
             char hostname[256];
             if (!request.buffer || !request.result || request.result_capacity < sizeof(mg_ipv4_addr_t) ||
                 !syscall_copy_text((const char *)request.buffer, hostname, sizeof(hostname)) ||
-                !syscall_user_buffer_valid(request.result, sizeof(mg_ipv4_addr_t))) {
+                !syscall_user_buffer_writable(request.result, sizeof(mg_ipv4_addr_t))) {
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT); return;
             }
             frame->rax = (u64)net_user_resolve_a(hostname, (mg_ipv4_addr_t *)request.result,
@@ -451,19 +559,19 @@ static void syscall_network(process_t *process, syscall_frame_t *frame)
         }
         case MG_NET_OP_INTERFACES:
             if (request.result && request.result_capacity &&
-                !syscall_user_buffer_valid(request.result, request.result_capacity)) { syscall_fail(frame, MG_ERR_BAD_ARGUMENT); return; }
+                !syscall_user_buffer_writable(request.result, request.result_capacity)) { syscall_fail(frame, MG_ERR_BAD_ARGUMENT); return; }
             frame->rax = (u64)net_user_interfaces((mg_net_interface_info_t *)request.result, request.result_capacity); return;
         case MG_NET_OP_ROUTES:
             if (request.result && request.result_capacity &&
-                !syscall_user_buffer_valid(request.result, request.result_capacity)) { syscall_fail(frame, MG_ERR_BAD_ARGUMENT); return; }
+                !syscall_user_buffer_writable(request.result, request.result_capacity)) { syscall_fail(frame, MG_ERR_BAD_ARGUMENT); return; }
             frame->rax = (u64)net_user_routes((mg_net_route_info_t *)request.result, request.result_capacity); return;
         case MG_NET_OP_NEIGHBORS:
             if (request.result && request.result_capacity &&
-                !syscall_user_buffer_valid(request.result, request.result_capacity)) { syscall_fail(frame, MG_ERR_BAD_ARGUMENT); return; }
+                !syscall_user_buffer_writable(request.result, request.result_capacity)) { syscall_fail(frame, MG_ERR_BAD_ARGUMENT); return; }
             frame->rax = (u64)net_user_neighbors((mg_net_neighbor_info_t *)request.result, request.result_capacity); return;
         case MG_NET_OP_CONNECTIONS:
             if (request.result && request.result_capacity &&
-                !syscall_user_buffer_valid(request.result, request.result_capacity)) { syscall_fail(frame, MG_ERR_BAD_ARGUMENT); return; }
+                !syscall_user_buffer_writable(request.result, request.result_capacity)) { syscall_fail(frame, MG_ERR_BAD_ARGUMENT); return; }
             frame->rax = (u64)net_user_connections((mg_net_connection_info_t *)request.result, request.result_capacity); return;
         case MG_NET_OP_RENEW:
             if (!syscall_is_network_service(process)) {
@@ -538,39 +646,51 @@ static void syscall_network(process_t *process, syscall_frame_t *frame)
                                            OBJECT_RIGHT_WRITE);
             if (!object || !request.result || request.result_capacity < sizeof(mg_icmp_echo_result_t) ||
                 (!request.buffer && request.buffer_length) ||
-                !syscall_user_buffer_valid(request.result, sizeof(mg_icmp_echo_result_t)) ||
+                !syscall_user_buffer_writable(request.result, sizeof(mg_icmp_echo_result_t)) ||
                 !syscall_user_buffer_valid(request.buffer, request.buffer_length)) {
+                if (object) object_release(object);
                 syscall_fail(frame, !object ? MG_ERR_INVALID_HANDLE : MG_ERR_BAD_ARGUMENT); return;
             }
-            frame->rax = (u64)net_user_icmp_echo(object, &request.endpoint.address,
-                                                  request.buffer, request.buffer_length,
-                                                  request.timeout_ms,
-                                                  (mg_icmp_echo_result_t *)request.result);
+            result = net_user_icmp_echo(object, &request.endpoint.address,
+                                        request.buffer, request.buffer_length,
+                                        request.timeout_ms,
+                                        (mg_icmp_echo_result_t *)request.result);
+            object_release(object);
+            frame->rax = (u64)result;
             return;
         case MG_NET_OP_DATAGRAM_SEND:
             object = process_handle_lookup(process, request.handle, OBJECT_TYPE_NETWORK_DATAGRAM,
                                            OBJECT_RIGHT_WRITE);
             if (!object || (!request.buffer && request.buffer_length) ||
                 !syscall_user_buffer_valid(request.buffer, request.buffer_length)) {
+                if (object) object_release(object);
                 syscall_fail(frame, !object ? MG_ERR_INVALID_HANDLE : MG_ERR_BAD_ARGUMENT); return;
             }
-            frame->rax = (u64)net_user_datagram_send(object, &request.endpoint,
-                                                      request.buffer, request.buffer_length,
-                                                      request.timeout_ms); return;
+            result = net_user_datagram_send(object, &request.endpoint,
+                                            request.buffer, request.buffer_length,
+                                            request.timeout_ms);
+            object_release(object);
+            frame->rax = (u64)result;
+            return;
         case MG_NET_OP_DATAGRAM_RECEIVE:
             object = process_handle_lookup(process, request.handle, OBJECT_TYPE_NETWORK_DATAGRAM,
                                            OBJECT_RIGHT_READ);
             if (!object || !request.buffer || !request.result ||
                 request.result_capacity < sizeof(mg_datagram_result_t) ||
-                !syscall_user_buffer_valid(request.buffer, request.buffer_length) ||
-                !syscall_user_buffer_valid(request.result, sizeof(mg_datagram_result_t))) {
+                !syscall_user_buffer_writable((void *)request.buffer,
+                                              request.buffer_length) ||
+                !syscall_user_buffer_writable(request.result, sizeof(mg_datagram_result_t))) {
+                if (object) object_release(object);
                 syscall_fail(frame, !object ? MG_ERR_INVALID_HANDLE : MG_ERR_BAD_ARGUMENT); return;
             }
-            frame->rax = (u64)net_user_datagram_receive(object, (void *)request.buffer,
-                                                         request.buffer_length, request.timeout_ms,
-                                                         (mg_datagram_result_t *)request.result); return;
+            result = net_user_datagram_receive(object, (void *)request.buffer,
+                                               request.buffer_length, request.timeout_ms,
+                                               (mg_datagram_result_t *)request.result);
+            object_release(object);
+            frame->rax = (u64)result;
+            return;
         case MG_NET_OP_STREAM_SEND:
-            object = process_handle_lookup_retain(
+            object = process_handle_lookup(
                 process, request.handle, OBJECT_TYPE_NETWORK_STREAM,
                 OBJECT_RIGHT_WRITE);
             if (!object || (!request.buffer && request.buffer_length) ||
@@ -585,11 +705,12 @@ static void syscall_network(process_t *process, syscall_frame_t *frame)
             frame->rax = (u64)result;
             return;
         case MG_NET_OP_STREAM_RECEIVE:
-            object = process_handle_lookup_retain(
+            object = process_handle_lookup(
                 process, request.handle, OBJECT_TYPE_NETWORK_STREAM,
                 OBJECT_RIGHT_READ);
             if (!object || !request.buffer || !request.buffer_length ||
-                !syscall_user_buffer_valid(request.buffer, request.buffer_length)) {
+                !syscall_user_buffer_writable((void *)request.buffer,
+                                              request.buffer_length)) {
                 if (object) object_release(object);
                 syscall_fail(frame, !object ? MG_ERR_INVALID_HANDLE : MG_ERR_BAD_ARGUMENT); return;
             }
@@ -600,7 +721,7 @@ static void syscall_network(process_t *process, syscall_frame_t *frame)
             frame->rax = (u64)result;
             return;
         case MG_NET_OP_STREAM_CLOSE:
-            object = process_handle_lookup_retain(
+            object = process_handle_lookup(
                 process, request.handle, OBJECT_TYPE_NETWORK_STREAM,
                 OBJECT_RIGHT_WRITE);
             if (!object) { syscall_fail(frame, MG_ERR_INVALID_HANDLE); return; }
@@ -615,18 +736,24 @@ static void syscall_network(process_t *process, syscall_frame_t *frame)
             object_release(object);
             frame->rax = (u64)result;
             return;
-        case MG_NET_OP_ICMP_CLOSE:
+        case MG_NET_OP_ICMP_CLOSE: {
             object = process_handle_lookup(process, request.handle, OBJECT_TYPE_NETWORK_ICMP,
                                            OBJECT_RIGHT_WRITE);
             if (!object) { syscall_fail(frame, MG_ERR_INVALID_HANDLE); return; }
-            frame->rax = process_handle_close(process, request.handle) ? MG_OK : MG_ERR_INVALID_HANDLE;
+            bool closed = process_handle_close(process, request.handle);
+            object_release(object);
+            frame->rax = closed ? MG_OK : MG_ERR_INVALID_HANDLE;
             return;
-        case MG_NET_OP_DATAGRAM_CLOSE:
+        }
+        case MG_NET_OP_DATAGRAM_CLOSE: {
             object = process_handle_lookup(process, request.handle, OBJECT_TYPE_NETWORK_DATAGRAM,
                                            OBJECT_RIGHT_WRITE);
             if (!object) { syscall_fail(frame, MG_ERR_INVALID_HANDLE); return; }
-            frame->rax = process_handle_close(process, request.handle) ? MG_OK : MG_ERR_INVALID_HANDLE;
+            bool closed = process_handle_close(process, request.handle);
+            object_release(object);
+            frame->rax = closed ? MG_OK : MG_ERR_INVALID_HANDLE;
             return;
+        }
         default:
             syscall_fail(frame, MG_ERR_UNSUPPORTED); return;
     }
@@ -725,8 +852,7 @@ static int syscall_snapshot_copy_chunk(void *context, u64 offset,
 {
     mg_file_snapshot_request_t *request = context;
     if (!request || !data || offset > request->capacity ||
-        length > request->capacity - offset ||
-        !vmm_user_range_writable(request->data + offset, length))
+        length > request->capacity - offset)
         return VFS_ERR_INVALID_PARAM;
     memcpy(request->data + offset, data, length);
     return VFS_OK;
@@ -736,8 +862,7 @@ static int syscall_snapshot_copy_state(void *context,
                                        const mg_file_lines_state_t *state)
 {
     mg_file_snapshot_request_t *request = context;
-    if (!request || !state ||
-        !vmm_user_range_writable(request->state, sizeof(*state)))
+    if (!request || !state)
         return VFS_ERR_INVALID_PARAM;
     memcpy(request->state, state, sizeof(*state));
     return VFS_OK;
@@ -754,14 +879,14 @@ static i64 syscall_file_snapshot(process_t *process, process_handle_t handle,
         return MG_ERR_BAD_ARGUMENT;
     memcpy(&request, user_request, sizeof(request));
     if (!request.capacity || request.capacity > MG_FILE_CONTENT_ADDRESS_MAX ||
-        !vmm_user_range_writable(request.data, request.capacity) ||
-        !vmm_user_range_writable(request.state, sizeof(*request.state)) ||
+        !syscall_user_buffer_writable(request.data, request.capacity) ||
+        !syscall_user_buffer_writable(request.state, sizeof(*request.state)) ||
         ((uintptr_t)request.data <
              (uintptr_t)request.state + sizeof(*request.state) &&
          (uintptr_t)request.state <
              (uintptr_t)request.data + request.capacity))
         return MG_ERR_BAD_ARGUMENT;
-    object = process_handle_lookup_retain(process, handle, OBJECT_TYPE_FILE,
+    object = process_handle_lookup(process, handle, OBJECT_TYPE_FILE,
                                           OBJECT_RIGHT_READ);
     if (!object) return MG_ERR_INVALID_HANDLE;
     result = object_file_snapshot_stream(
@@ -804,7 +929,7 @@ static i64 syscall_file_replace(process_t *process, process_handle_t handle,
         return MG_ERR_REPLACEMENT_TOO_LARGE;
     if (!syscall_user_buffer_valid(user_data, length))
         return MG_ERR_BAD_ARGUMENT;
-    object = process_handle_lookup_retain(process, handle, OBJECT_TYPE_FILE,
+    object = process_handle_lookup(process, handle, OBJECT_TYPE_FILE,
                                           OBJECT_RIGHT_WRITE);
     if (!object) return MG_ERR_INVALID_HANDLE;
 
@@ -881,7 +1006,7 @@ static i64 syscall_file_create_contents_common(
     if (request.length > MG_FILE_CONTENT_ADDRESS_MAX)
         return MG_ERR_REPLACEMENT_TOO_LARGE;
     if (!request.out_handle ||
-        !vmm_user_range_writable(request.out_handle,
+        !syscall_user_buffer_writable(request.out_handle,
                                  sizeof(*request.out_handle)) ||
         !syscall_user_buffer_valid(request.data, request.length))
         return MG_ERR_BAD_ARGUMENT;
@@ -911,9 +1036,8 @@ static i64 syscall_file_create_contents_common(
         flags, &file_handle));
     if (result != MG_OK) goto failure;
 
-    /* The initiating process has one userspace thread and its active syscall
-     * cannot be externally terminated. Its validated writable mapping and
-     * reserved slot therefore remain stable across the VFS operation. */
+    /* The output page lease and the reserved handle remain owned by this
+     * admitted syscall across the VFS operation. */
     object_file_bind_prepared(object, file_handle);
     if (!process_handle_activate(process, reserved))
         panic("file_create_contents: reserved handle lost");
@@ -1222,9 +1346,9 @@ static i64 syscall_recovery_owners(process_t *process,
         return MG_ERR_BAD_ARGUMENT;
     memcpy(&request, user_request, sizeof(request));
     if (!request.out_count || request.result_capacity > MG_RECOVERY_OWNER_MAX ||
-        !vmm_user_range_writable(request.out_count, sizeof(*request.out_count)) ||
+        !syscall_user_buffer_writable(request.out_count, sizeof(*request.out_count)) ||
         (request.result_capacity && (!request.result ||
-         !vmm_user_range_writable(request.result,
+         !syscall_user_buffer_writable(request.result,
              (u64)request.result_capacity * sizeof(*request.result)))))
         return MG_ERR_BAD_ARGUMENT;
     uintptr_t entries_address = (uintptr_t)request.result;
@@ -1270,10 +1394,8 @@ static i64 syscall_spawn_error(int result)
     return MG_ERR_INVALID_EXEC;
 }
 
-void syscall_dispatch(void *raw_frame)
+static void syscall_dispatch_inner(syscall_frame_t *frame)
 {
-    syscall_frame_t *frame = (syscall_frame_t *)raw_frame;
-
     if (!frame) return;
 
     switch (frame->rax) {
@@ -1372,7 +1494,7 @@ void syscall_dispatch(void *raw_frame)
             void *buffer = (void *)(uintptr_t)frame->rsi;
             u64 length = frame->rdx;
             process_t *process = process_current();
-            kernel_object_t *object = process_handle_lookup_retain(
+            kernel_object_t *object = process_handle_lookup(
                 process, handle, OBJECT_TYPE_INVALID,
                 frame->rax == SYSCALL_READ ? OBJECT_RIGHT_READ : OBJECT_RIGHT_WRITE);
             i64 result;
@@ -1381,7 +1503,9 @@ void syscall_dispatch(void *raw_frame)
                 syscall_fail(frame, MG_ERR_INVALID_HANDLE);
                 return;
             }
-            if (!syscall_user_buffer_valid(buffer, length)) {
+            if (!(frame->rax == SYSCALL_READ
+                    ? syscall_user_buffer_writable(buffer, length)
+                    : syscall_user_buffer_valid(buffer, length))) {
                 object_release(object);
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
@@ -1434,7 +1558,8 @@ void syscall_dispatch(void *raw_frame)
                 return;
             }
             mg_result_t copied = process_arguments_collect(&args,
-                (uintptr_t)frame->rdi, (usize)frame->rsi, vmm_user_range_valid);
+                (uintptr_t)frame->rdi, (usize)frame->rsi,
+                syscall_user_buffer_valid);
             if (copied != MG_OK) {
                 syscall_fail(frame, copied);
                 return;
@@ -1471,7 +1596,7 @@ void syscall_dispatch(void *raw_frame)
             process_handle_t saved;
             process_handle_t *user_saved =
                 (process_handle_t *)(uintptr_t)frame->rsi;
-            if (!user_saved || !syscall_user_buffer_valid(user_saved,
+            if (!user_saved || !syscall_user_buffer_writable(user_saved,
                                                           sizeof(*user_saved)) ||
                 !process_redirect_output(process_current(),
                                          (process_handle_t)frame->rdi,
@@ -1493,7 +1618,7 @@ void syscall_dispatch(void *raw_frame)
             i32 status;
             int result;
             i32 *user_status = (i32 *)(uintptr_t)frame->rsi;
-            if (!syscall_user_buffer_valid(user_status, sizeof(*user_status))) {
+            if (!syscall_user_buffer_writable(user_status, sizeof(*user_status))) {
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
             }
@@ -1529,7 +1654,7 @@ void syscall_dispatch(void *raw_frame)
             uintptr_t *user_address = (uintptr_t *)(uintptr_t)frame->rsi;
             i64 result;
 
-            if (!syscall_user_buffer_valid(user_address,
+            if (!syscall_user_buffer_writable(user_address,
                                            sizeof(*user_address))) {
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
@@ -1556,8 +1681,8 @@ void syscall_dispatch(void *raw_frame)
             usize required = 0;
 
             if (!process || !buffer || capacity == 0 || !user_size ||
-                !vmm_user_range_writable(buffer, capacity) ||
-                !vmm_user_range_writable(user_size, sizeof(*user_size))) {
+                !syscall_user_buffer_writable(buffer, capacity) ||
+                !syscall_user_buffer_writable(user_size, sizeof(*user_size))) {
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
             }
@@ -1577,7 +1702,7 @@ void syscall_dispatch(void *raw_frame)
             vfs_node_metadata_t metadata;
             int lookup_result;
 
-            if (!info || !syscall_user_buffer_valid(info, sizeof(*info))) {
+            if (!info || !syscall_user_buffer_writable(info, sizeof(*info))) {
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
             }
@@ -1649,11 +1774,11 @@ void syscall_dispatch(void *raw_frame)
             i64 result;
 
             if (!user_entry ||
-                !syscall_user_buffer_valid(user_entry, sizeof(*user_entry))) {
+                !syscall_user_buffer_writable(user_entry, sizeof(*user_entry))) {
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
             }
-            object = process_handle_lookup_retain(process_current(),
+            object = process_handle_lookup(process_current(),
                                            (process_handle_t)frame->rdi,
                                            OBJECT_TYPE_DIRECTORY,
                                            OBJECT_RIGHT_READ);
@@ -1696,12 +1821,12 @@ void syscall_dispatch(void *raw_frame)
 
             if (!user_entries || capacity == 0 ||
                 capacity > VFS_DIRECTORY_BATCH_MAX ||
-                !syscall_user_buffer_valid(user_entries,
+                !syscall_user_buffer_writable(user_entries,
                     (usize)capacity * sizeof(*user_entries))) {
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
             }
-            object = process_handle_lookup_retain(process_current(),
+            object = process_handle_lookup(process_current(),
                                            (process_handle_t)frame->rdi,
                                            OBJECT_TYPE_DIRECTORY,
                                            OBJECT_RIGHT_READ);
@@ -1747,12 +1872,12 @@ void syscall_dispatch(void *raw_frame)
             vfs_dirent_t entry;
             i64 result;
 
-            if (!user_entry || !syscall_user_buffer_valid(user_entry,
+            if (!user_entry || !syscall_user_buffer_writable(user_entry,
                     sizeof(*user_entry))) {
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
             }
-            object = process_handle_lookup_retain(process_current(),
+            object = process_handle_lookup(process_current(),
                 (process_handle_t)frame->rdi, OBJECT_TYPE_DIRECTORY,
                 OBJECT_RIGHT_READ);
             if (!object) {
@@ -1787,12 +1912,12 @@ void syscall_dispatch(void *raw_frame)
 
             if (!user_entries || capacity == 0 ||
                 capacity > VFS_DIRECTORY_BATCH_MAX ||
-                !syscall_user_buffer_valid(user_entries,
+                !syscall_user_buffer_writable(user_entries,
                     (usize)capacity * sizeof(*user_entries))) {
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
             }
-            object = process_handle_lookup_retain(process_current(),
+            object = process_handle_lookup(process_current(),
                 (process_handle_t)frame->rdi, OBJECT_TYPE_DIRECTORY,
                 OBJECT_RIGHT_READ);
             if (!object) {
@@ -2028,14 +2153,14 @@ void syscall_dispatch(void *raw_frame)
             memcpy(&request, user_request, sizeof(request));
             if (!request.max_lines || request.max_lines > MG_FILE_LINES_MAX ||
                 (request.flags & ~MG_FILE_LINES_RESET) ||
-                (request.state && !syscall_user_buffer_valid(request.state, sizeof(state))) ||
+                (request.state && !syscall_user_buffer_writable(request.state, sizeof(state))) ||
                 request.length > MG_FILE_LINES_MAX * MG_FILE_LINE_CAPACITY ||
                 (request.length && !syscall_user_buffer_valid(request.data,
                                                                request.length))) {
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
             }
-            object = process_handle_lookup_retain(process_current(),
+            object = process_handle_lookup(process_current(),
                 (process_handle_t)frame->rdi, OBJECT_TYPE_FILE,
                 OBJECT_RIGHT_READ | OBJECT_RIGHT_WRITE);
             if (!object) {
@@ -2083,7 +2208,7 @@ void syscall_dispatch(void *raw_frame)
                 (const mg_file_create_stream_request_t *)(uintptr_t)frame->rdi);
             return;
         case SYSCALL_FILE_TRUNCATE: {
-            kernel_object_t *object = process_handle_lookup_retain(
+            kernel_object_t *object = process_handle_lookup(
                 process_current(), (process_handle_t)frame->rdi,
                 OBJECT_TYPE_FILE, OBJECT_RIGHT_WRITE);
             if (!object) {
@@ -2096,7 +2221,7 @@ void syscall_dispatch(void *raw_frame)
             return;
         }
         case SYSCALL_FILE_SEEK: {
-            kernel_object_t *object = process_handle_lookup_retain(
+            kernel_object_t *object = process_handle_lookup(
                 process_current(), (process_handle_t)frame->rdi,
                 OBJECT_TYPE_FILE, 0);
             if (!object || frame->rdx > MG_SEEK_END) {
@@ -2112,7 +2237,7 @@ void syscall_dispatch(void *raw_frame)
             return;
         }
         case SYSCALL_FILE_POSITION: {
-            kernel_object_t *object = process_handle_lookup_retain(
+            kernel_object_t *object = process_handle_lookup(
                 process_current(), (process_handle_t)frame->rdi,
                 OBJECT_TYPE_FILE, 0);
             u64 position = 0;
@@ -2189,7 +2314,7 @@ void syscall_dispatch(void *raw_frame)
                 case MG_TERMINAL_OP_SIZE: {
                     mg_terminal_size_t size;
                     if (frame->rsi || !frame->rdx ||
-                        !syscall_user_buffer_valid(
+                        !syscall_user_buffer_writable(
                             (void *)(uintptr_t)frame->rdx, sizeof(size))) {
                         result = MG_ERR_BAD_ARGUMENT;
                         break;
@@ -2210,7 +2335,7 @@ void syscall_dispatch(void *raw_frame)
                     kernel_object_t *output;
                     u32 capability_mask;
                     if (frame->rsi || !frame->rdx ||
-                        !syscall_user_buffer_valid(
+                        !syscall_user_buffer_writable(
                             (void *)(uintptr_t)frame->rdx,
                             sizeof(capabilities))) {
                         result = MG_ERR_BAD_ARGUMENT;
@@ -2218,7 +2343,7 @@ void syscall_dispatch(void *raw_frame)
                     }
                     capabilities.version = MG_TERMINAL_API_VERSION;
                     terminal_get_capability_mask(&capability_mask);
-                    output = process_handle_lookup_retain(
+                    output = process_handle_lookup(
                         process, PROCESS_INITIAL_CONSOLE_HANDLE,
                         OBJECT_TYPE_INVALID, OBJECT_RIGHT_WRITE);
                     if (output) {
@@ -2304,7 +2429,7 @@ void syscall_dispatch(void *raw_frame)
                         !syscall_user_buffer_valid(
                             (const void *)(uintptr_t)frame->rsi,
                             sizeof(request)) ||
-                        !syscall_user_buffer_valid(
+                        !syscall_user_buffer_writable(
                             (void *)(uintptr_t)frame->rdx,
                             sizeof(key_result))) {
                         result = MG_ERR_BAD_ARGUMENT;
@@ -2336,7 +2461,7 @@ void syscall_dispatch(void *raw_frame)
                         !syscall_user_buffer_valid(
                             (const void *)(uintptr_t)frame->rsi,
                             sizeof(request)) ||
-                        !syscall_user_buffer_valid(
+                        !syscall_user_buffer_writable(
                             (void *)(uintptr_t)frame->rdx, sizeof(event))) {
                         result = MG_ERR_BAD_ARGUMENT;
                         break;
@@ -2404,7 +2529,7 @@ void syscall_dispatch(void *raw_frame)
             mg_monotonic_time_t *user_value =
                 (mg_monotonic_time_t *)(uintptr_t)frame->rdi;
 
-            if (!user_value || !syscall_user_buffer_valid(user_value,
+            if (!user_value || !syscall_user_buffer_writable(user_value,
                                                             sizeof(value))) {
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
@@ -2431,7 +2556,7 @@ void syscall_dispatch(void *raw_frame)
             mg_mangrove_time_t *user_value =
                 (mg_mangrove_time_t *)(uintptr_t)frame->rdi;
 
-            if (!user_value || !syscall_user_buffer_valid(user_value,
+            if (!user_value || !syscall_user_buffer_writable(user_value,
                                                             sizeof(value))) {
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
@@ -2449,7 +2574,7 @@ void syscall_dispatch(void *raw_frame)
             mg_realtime_info_t *user_value =
                 (mg_realtime_info_t *)(uintptr_t)frame->rdi;
 
-            if (!user_value || !syscall_user_buffer_valid(user_value,
+            if (!user_value || !syscall_user_buffer_writable(user_value,
                                                             sizeof(value))) {
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
@@ -2472,7 +2597,7 @@ void syscall_dispatch(void *raw_frame)
                 (mg_process_cpu_time_t *)(uintptr_t)frame->rdi;
 
             if (!process || !user_value ||
-                !syscall_user_buffer_valid(user_value, sizeof(value))) {
+                !syscall_user_buffer_writable(user_value, sizeof(value))) {
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
             }
@@ -2518,7 +2643,7 @@ void syscall_dispatch(void *raw_frame)
         case SYSCALL_POWER_STATUS: {
             mg_power_status_t *status =
                 (mg_power_status_t *)(uintptr_t)frame->rdi;
-            if (!status || !syscall_user_buffer_valid(status, sizeof(*status))) {
+            if (!status || !syscall_user_buffer_writable(status, sizeof(*status))) {
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
             }
@@ -2531,7 +2656,7 @@ void syscall_dispatch(void *raw_frame)
             mg_identity_t *identity =
                 (mg_identity_t *)(uintptr_t)frame->rdi;
 
-            if (!identity || !syscall_user_buffer_valid(identity,
+            if (!identity || !syscall_user_buffer_writable(identity,
                                                          sizeof(*identity))) {
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
@@ -2575,10 +2700,10 @@ void syscall_dispatch(void *raw_frame)
             switch (request.operation) {
                 case MG_ACCOUNT_OP_LIST:
                     if (request.result_capacity > MG_ACCOUNT_MAX_RECORDS ||
-                        !out_count || !syscall_user_buffer_valid(
+                        !out_count || !syscall_user_buffer_writable(
                             out_count, sizeof(*out_count)) ||
                         (request.result_capacity && (!result_buffer ||
-                            !syscall_user_buffer_valid(result_buffer,
+                            !syscall_user_buffer_writable(result_buffer,
                                 request.result_capacity * sizeof(*result_buffer))))) {
                         syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                         return;
@@ -2590,7 +2715,7 @@ void syscall_dispatch(void *raw_frame)
                     return;
                 case MG_ACCOUNT_OP_SHOW:
                     if (!result_buffer || request.result_capacity != 1U ||
-                        !syscall_user_buffer_valid(result_buffer,
+                        !syscall_user_buffer_writable(result_buffer,
                                                    sizeof(*result_buffer))) {
                         syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                         return;
@@ -2658,7 +2783,7 @@ void syscall_dispatch(void *raw_frame)
             int result;
 
             if (!syscall_is_logind(process_current()) || !user_identity ||
-                !syscall_user_buffer_valid(user_identity, sizeof(*user_identity)) ||
+                !syscall_user_buffer_writable(user_identity, sizeof(*user_identity)) ||
                 !syscall_copy_text((const char *)(uintptr_t)frame->rdi,
                                    username, sizeof(username)) ||
                 !syscall_copy_text((const char *)(uintptr_t)frame->rsi,
@@ -2679,7 +2804,7 @@ void syscall_dispatch(void *raw_frame)
                 (mg_identity_t *)(uintptr_t)frame->rdi;
             int result;
 
-            if (!user_identity || !syscall_user_buffer_valid(
+            if (!user_identity || !syscall_user_buffer_writable(
                     user_identity, sizeof(*user_identity))) {
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
@@ -2697,7 +2822,7 @@ void syscall_dispatch(void *raw_frame)
                 (mg_session_info_t *)(uintptr_t)frame->rdx;
             int result;
 
-            if (!user_session || !syscall_user_buffer_valid(
+            if (!user_session || !syscall_user_buffer_writable(
                     user_session, sizeof(*user_session)) ||
                 !syscall_copy_text((const char *)(uintptr_t)frame->rsi,
                                    username, sizeof(username))) {
@@ -2716,7 +2841,7 @@ void syscall_dispatch(void *raw_frame)
                 (mg_handle_t *)(uintptr_t)frame->rsi;
             int result;
 
-            if (!user_shell || !syscall_user_buffer_valid(user_shell,
+            if (!user_shell || !syscall_user_buffer_writable(user_shell,
                                                             sizeof(*user_shell))) {
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
@@ -2732,7 +2857,7 @@ void syscall_dispatch(void *raw_frame)
                 (mg_session_status_t *)(uintptr_t)frame->rsi;
             int result;
 
-            if (!status || !syscall_user_buffer_valid(status, sizeof(*status))) {
+            if (!status || !syscall_user_buffer_writable(status, sizeof(*status))) {
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
             }
@@ -2758,11 +2883,11 @@ void syscall_dispatch(void *raw_frame)
             memcpy(&request, user_request, sizeof(request));
             if (!request.result || !request.out_count || !request.out_total ||
                 request.capacity == 0U || request.capacity > 8U ||
-                !syscall_user_buffer_valid(request.result,
+                !syscall_user_buffer_writable(request.result,
                     (u64)request.capacity * sizeof(*request.result)) ||
-                !syscall_user_buffer_valid(request.out_count,
+                !syscall_user_buffer_writable(request.out_count,
                                             sizeof(*request.out_count)) ||
-                !syscall_user_buffer_valid(request.out_total,
+                !syscall_user_buffer_writable(request.out_total,
                                             sizeof(*request.out_total))) {
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
@@ -2786,7 +2911,7 @@ void syscall_dispatch(void *raw_frame)
             mg_handle_t *user_handle = (mg_handle_t *)(uintptr_t)frame->rsi;
             int result;
 
-            if (!user_handle || !syscall_user_buffer_valid(user_handle,
+            if (!user_handle || !syscall_user_buffer_writable(user_handle,
                                                             sizeof(*user_handle))) {
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
@@ -2807,7 +2932,7 @@ void syscall_dispatch(void *raw_frame)
             mg_handle_t *user_handle = (mg_handle_t *)(uintptr_t)frame->rsi;
             int result;
 
-            if (!user_handle || !syscall_user_buffer_valid(user_handle,
+            if (!user_handle || !syscall_user_buffer_writable(user_handle,
                                                             sizeof(*user_handle)) ||
                 !syscall_copy_text((const char *)(uintptr_t)frame->rdi,
                                    name, sizeof(name))) {
@@ -2829,7 +2954,7 @@ void syscall_dispatch(void *raw_frame)
             mg_handle_t *user_handle = (mg_handle_t *)(uintptr_t)frame->rsi;
             int result;
 
-            if (!user_handle || !syscall_user_buffer_valid(user_handle,
+            if (!user_handle || !syscall_user_buffer_writable(user_handle,
                                                             sizeof(*user_handle)) ||
                 !syscall_copy_text((const char *)(uintptr_t)frame->rdi,
                                    name, sizeof(name))) {
@@ -2856,7 +2981,7 @@ void syscall_dispatch(void *raw_frame)
 
             if (!user_request || !user_reply ||
                 !syscall_user_buffer_valid(user_request, sizeof(request)) ||
-                !syscall_user_buffer_valid(user_reply, sizeof(reply))) {
+                !syscall_user_buffer_writable(user_reply, sizeof(reply))) {
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
             }
@@ -2880,7 +3005,7 @@ void syscall_dispatch(void *raw_frame)
                 (mg_ipc_received_t *)(uintptr_t)frame->rsi;
             int result;
 
-            if (!user_received || !syscall_user_buffer_valid(user_received,
+            if (!user_received || !syscall_user_buffer_writable(user_received,
                                                               sizeof(received))) {
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
@@ -2904,7 +3029,7 @@ void syscall_dispatch(void *raw_frame)
                 (mg_ipc_received_t *)(uintptr_t)frame->rsi;
             int result;
 
-            if (!user_received || !syscall_user_buffer_valid(user_received,
+            if (!user_received || !syscall_user_buffer_writable(user_received,
                                                               sizeof(received))) {
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
@@ -2947,7 +3072,7 @@ void syscall_dispatch(void *raw_frame)
                 (mg_ipc_received_t *)(uintptr_t)frame->rsi;
             int result;
 
-            if (!user_received || !syscall_user_buffer_valid(user_received,
+            if (!user_received || !syscall_user_buffer_writable(user_received,
                                                               sizeof(received))) {
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
@@ -2989,7 +3114,7 @@ void syscall_dispatch(void *raw_frame)
             i32 *user_status = (i32 *)(uintptr_t)frame->rsi;
             int result;
 
-            if (!user_status || !syscall_user_buffer_valid(user_status,
+            if (!user_status || !syscall_user_buffer_writable(user_status,
                                                             sizeof(*user_status))) {
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
@@ -3071,12 +3196,12 @@ void syscall_dispatch(void *raw_frame)
             if (request.reserved || request.result_capacity == 0U ||
                 request.result_capacity > MG_DEVICE_RESPONSE_MAX ||
                 !request.result || !request.out_total ||
-                !syscall_user_buffer_valid(request.result,
+                !syscall_user_buffer_writable(request.result,
                     (u64)request.result_capacity * sizeof(*request.result)) ||
-                !syscall_user_buffer_valid(request.out_total,
+                !syscall_user_buffer_writable(request.out_total,
                                             sizeof(*request.out_total)) ||
                 (request.out_snapshot_generation &&
-                 !syscall_user_buffer_valid(request.out_snapshot_generation,
+                 !syscall_user_buffer_writable(request.out_snapshot_generation,
                                             sizeof(*request.out_snapshot_generation))) ||
                 (request.snapshot_generation &&
                  !request.out_snapshot_generation)) {
@@ -3435,7 +3560,7 @@ void syscall_dispatch(void *raw_frame)
 
             if (!user_request || !user_info ||
                 !syscall_user_buffer_valid(user_request, sizeof(request)) ||
-                !syscall_user_buffer_valid(user_info, sizeof(*user_info))) {
+                !syscall_user_buffer_writable(user_info, sizeof(*user_info))) {
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
             }
@@ -3477,7 +3602,7 @@ void syscall_dispatch(void *raw_frame)
 
             if (!user_request || !user_plan ||
                 !syscall_user_buffer_valid(user_request, sizeof(request)) ||
-                !syscall_user_buffer_valid(user_plan, sizeof(*user_plan))) {
+                !syscall_user_buffer_writable(user_plan, sizeof(*user_plan))) {
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
             }
@@ -3650,7 +3775,7 @@ void syscall_dispatch(void *raw_frame)
         case SYSCALL_SYSTEM_SHUTDOWN_PENDING: {
             bool *user_pending = (bool *)(uintptr_t)frame->rdi;
             bool pending;
-            if (!user_pending || !syscall_user_buffer_valid(
+            if (!user_pending || !syscall_user_buffer_writable(
                     user_pending, sizeof(*user_pending))) {
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
@@ -3676,11 +3801,11 @@ void syscall_dispatch(void *raw_frame)
             if (!request.result || !request.out_count || !request.out_total ||
                 request.result_capacity == 0U ||
                 request.result_capacity > MG_PROCESS_SNAPSHOT_PAGE_MAX ||
-                !syscall_user_buffer_valid(request.result,
+                !syscall_user_buffer_writable(request.result,
                     (u64)request.result_capacity * sizeof(*request.result)) ||
-                !syscall_user_buffer_valid(request.out_count,
+                !syscall_user_buffer_writable(request.out_count,
                                             sizeof(*request.out_count)) ||
-                !syscall_user_buffer_valid(request.out_total,
+                !syscall_user_buffer_writable(request.out_total,
                                             sizeof(*request.out_total))) {
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
@@ -3696,7 +3821,7 @@ void syscall_dispatch(void *raw_frame)
             mg_system_memory_info_t *info =
                 (mg_system_memory_info_t *)(uintptr_t)frame->rdi;
 
-            if (!info || !syscall_user_buffer_valid(info, sizeof(*info))) {
+            if (!info || !syscall_user_buffer_writable(info, sizeof(*info))) {
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
             }
@@ -3725,11 +3850,11 @@ void syscall_dispatch(void *raw_frame)
             if (!request.result || !request.out_count || !request.out_total ||
                 request.result_capacity == 0U ||
                 request.result_capacity > MG_CPU_SNAPSHOT_PAGE_MAX ||
-                !syscall_user_buffer_valid(request.result,
+                !syscall_user_buffer_writable(request.result,
                     (u64)request.result_capacity * sizeof(*request.result)) ||
-                !syscall_user_buffer_valid(request.out_count,
+                !syscall_user_buffer_writable(request.out_count,
                                             sizeof(*request.out_count)) ||
-                !syscall_user_buffer_valid(request.out_total,
+                !syscall_user_buffer_writable(request.out_total,
                                             sizeof(*request.out_total))) {
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
@@ -3745,7 +3870,7 @@ void syscall_dispatch(void *raw_frame)
             mg_system_info_t *info =
                 (mg_system_info_t *)(uintptr_t)frame->rdi;
 
-            if (!info || !syscall_user_buffer_valid(info, sizeof(*info))) {
+            if (!info || !syscall_user_buffer_writable(info, sizeof(*info))) {
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
             }
@@ -3799,7 +3924,7 @@ void syscall_dispatch(void *raw_frame)
                     request.snapshot_bytes >
                         heap_profile_total_bytes() -
                             (usize)request.phase || !destination ||
-                    !syscall_user_buffer_valid(destination,
+                    !syscall_user_buffer_writable(destination,
                         (usize)request.snapshot_bytes) ||
                     !heap_profile_read(destination, (usize)request.phase,
                         (usize)request.snapshot_bytes)) {
@@ -3819,7 +3944,7 @@ void syscall_dispatch(void *raw_frame)
             process_t *current = process_current();
 
             if (!user_session_id || !current ||
-                !syscall_user_buffer_valid(user_session_id,
+                !syscall_user_buffer_writable(user_session_id,
                                             sizeof(*user_session_id))) {
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
@@ -3858,4 +3983,36 @@ void syscall_dispatch(void *raw_frame)
             syscall_fail(frame, MG_ERR_UNSUPPORTED);
             return;
     }
+}
+
+void syscall_dispatch(void *raw_frame)
+{
+    syscall_frame_t *frame = (syscall_frame_t *)raw_frame;
+    kernel_thread_t *thread = thread_current();
+    process_t *process;
+    syscall_user_access_context_t context = {0};
+    void *previous_context;
+    bool tracked;
+
+    if (!frame) return;
+    if (!thread || !thread->process) {
+        syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+        return;
+    }
+    process = thread->process;
+    tracked = frame->rax != SYSCALL_EXIT;
+    if (tracked && !process_syscall_enter(process)) {
+        syscall_fail(frame, MG_ERR_BUSY);
+        return;
+    }
+    previous_context = thread->syscall_user_access_context;
+    thread->syscall_user_access_context = &context;
+    if (tracked) scheduler_syscall_enter();
+    syscall_dispatch_inner(frame);
+    syscall_user_lease_release_all(&context);
+    thread->syscall_user_access_context = previous_context;
+    if (tracked) scheduler_syscall_leave();
+    if (tracked) process_syscall_leave(process);
+    if (context.allocation_failed && (i64)frame->rax == MG_ERR_BAD_ARGUMENT)
+        syscall_fail(frame, MG_ERR_NO_MEMORY);
 }

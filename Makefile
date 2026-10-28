@@ -1156,6 +1156,7 @@ test-framebuffer-mapping:
 
 test-vmm: test-x86-cache test-framebuffer-mapping
 	python3 tests/memory/vmm_test.py "$(HOST_CC)"
+	python3 tests/memory/vmm_address_space_lifetime_test.py "$(HOST_CC)"
 
 .PHONY: test-pmm
 test-pmm:
@@ -3218,6 +3219,14 @@ test-process-arguments:
 test-process-handles:
 	python3 tests/kernel/process_handles_test.py "$(HOST_CC)"
 
+.PHONY: test-syscall-user-memory
+test-syscall-user-memory:
+	python3 tests/kernel/syscall_user_memory_test.py "$(HOST_CC)"
+
+.PHONY: test-process-memory-unmap
+test-process-memory-unmap:
+	python3 tests/kernel/process_memory_unmap_test.py "$(HOST_CC)"
+
 .PHONY: test-process-interrupt
 test-process-interrupt:
 	python3 tests/kernel/process_interrupt_test.py "$(HOST_CC)"
@@ -3261,4 +3270,6 @@ test-guest-random:
 
 test-sync: test-process-arguments
 test-sync: test-process-handles
+test-sync: test-syscall-user-memory
+test-sync: test-process-memory-unmap
 test-sync: test-process-interrupt

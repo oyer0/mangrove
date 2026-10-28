@@ -56,6 +56,7 @@ typedef enum {OBJECT_TYPE_INVALID, OBJECT_TYPE_FILE} kernel_object_type_t;
 typedef struct kernel_object kernel_object_t;
 typedef struct process process_t;
 typedef struct {pthread_mutex_t native;} spinlock_t;
+typedef struct {pthread_mutex_t native;} mutex_t;
 typedef struct {kernel_object_t *object; u32 rights; u16 generation;
                 bool active, reserved;} process_handle_slot_t;
 typedef struct {u64 offset; u64 save_generation;} vfs_file_handle_t;
@@ -68,7 +69,7 @@ typedef struct {kernel_object_t base; vfs_file_handle_t *handle;} file_object_t;
 struct process {
     process_state_t state; void *handle_table; usize handle_capacity;
     u64 handle_revision; usize next_handle_slot;
-    spinlock_t handle_lock;
+    spinlock_t handle_lock; mutex_t handle_growth_mutex;
 };
 typedef struct mg_file_create_contents_request {
     const char *path; const void *data; usize length; mg_handle_t *out_handle;
@@ -119,6 +120,12 @@ static u64 spin_lock_irqsave(spinlock_t *lock) {
 static void spin_unlock_irqrestore(spinlock_t *lock,u64 flags) {
     (void)flags; assert(!pthread_mutex_unlock(&lock->native));
 }
+static bool mutex_lock(mutex_t *mutex) {
+    return pthread_mutex_lock(&mutex->native)==0;
+}
+static void mutex_unlock(mutex_t *mutex) {
+    assert(!pthread_mutex_unlock(&mutex->native));
+}
 static bool vmm_user_range_valid(const void *address,usize length) {
     uintptr_t start=(uintptr_t)address, base=(uintptr_t)user_bytes;
     if (address==&request) return request_valid && length==sizeof(request);
@@ -144,7 +151,7 @@ static void kfree(void *p) {
 static void panic(const char *reason) {
     fprintf(stderr,"panic: %s\n",reason); abort();
 }
-kernel_object_t *process_handle_lookup_retain(process_t *,
+kernel_object_t *process_handle_lookup(process_t *,
     process_handle_t, kernel_object_type_t, u32);
 bool object_reference(kernel_object_t *);
 void object_release(kernel_object_t *);
@@ -162,6 +169,9 @@ static void file_destroy(kernel_object_t *object) {
 }
 static bool syscall_user_buffer_valid(const void *p,u64 n) {
     return n==0 || vmm_user_range_valid(p,(usize)n);
+}
+static bool syscall_user_buffer_writable(void *p,u64 n) {
+    return n==0 || vmm_user_range_writable(p,(usize)n);
 }
 typedef struct {unsigned unused;} vfs_node_t;
 typedef struct {vfs_node_t node;unsigned references;} vfs_location_t;
@@ -184,7 +194,7 @@ static int vfs_file_create_exclusive_at(vfs_node_t *parent,const char *name,
     vfs_file_handle_t **out) {
     u8 sample[7];
     assert(parent==&parent_location.node && !strcmp(name,"new"));
-    assert(!process_handle_lookup_retain(&process, (u32)user_handle,
+    assert(!process_handle_lookup(&process, (u32)user_handle,
                                          OBJECT_TYPE_FILE,0));
     vfs_calls++; last_length=length;
     if (length) {
@@ -216,7 +226,7 @@ parts = "".join(function(path, name) for path, name in (
     ("kernel/src/process.c", "process_handle_activate"),
     ("kernel/src/process.c", "process_handle_cancel"),
     ("kernel/src/process.c", "process_handle_lookup_reference"),
-    ("kernel/src/process.c", "process_handle_lookup_retain"),
+    ("kernel/src/process.c", "process_handle_lookup"),
     ("kernel/src/process.c", "process_handle_close"),
     ("kernel/src/process.c", "process_handle_close_all"),
     ("kernel/src/object.c", "object_init"),
@@ -264,7 +274,7 @@ static void test_success(usize length) {
     assert(syscall_file_create_contents(&process,&request)==MG_OK);
     assert(vfs_calls==1 && published==1 && last_length==length);
     assert(user_handle);
-    kernel_object_t *retained=process_handle_lookup_retain(&process,user_handle,
+    kernel_object_t *retained=process_handle_lookup(&process,user_handle,
         OBJECT_TYPE_FILE,OBJECT_RIGHT_READ|OBJECT_RIGHT_WRITE);
     assert(retained);
     assert(!process_handle_cancel(&process,user_handle));
@@ -285,7 +295,7 @@ static void test_reservation(void) {
     kernel_object_t *object=object_file_prepare(); assert(object);
     process_handle_t reserved=0;
     assert(process_handle_reserve(&process,object,OBJECT_RIGHT_READ,&reserved));
-    assert(!process_handle_lookup_retain(&process,reserved,OBJECT_TYPE_FILE,0));
+    assert(!process_handle_lookup(&process,reserved,OBJECT_TYPE_FILE,0));
     assert(!process_handle_close(&process,reserved));
     assert(process_handle_cancel(&process,reserved));
     assert(!process_handle_cancel(&process,reserved) && destroyed==1);
@@ -372,6 +382,7 @@ static void test_preflight_failures(void) {
 }
 int main(void) {
     assert(!pthread_mutex_init(&process.handle_lock.native,NULL));
+    assert(!pthread_mutex_init(&process.handle_growth_mutex.native,NULL));
     test_reservation(); test_exhaustion(); test_concurrent_and_teardown();
     test_preflight_failures();
     test_success(0); test_success(19);
@@ -383,6 +394,8 @@ int main(void) {
     test_failure(VFS_ERR_UNCERTAIN,MG_ERR_UNCERTAIN);
     test_failure(VFS_ERR_ACCESS_DENIED,MG_ERR_ACCESS_DENIED);
     puts("production create syscall and reservation: ok");
+    assert(!pthread_mutex_destroy(&process.handle_growth_mutex.native));
+    assert(!pthread_mutex_destroy(&process.handle_lock.native));
     return 0;
 }
 '''

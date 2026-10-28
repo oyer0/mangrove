@@ -58,13 +58,18 @@ enum {PROCESS_STATE_ACTIVE, PROCESS_STATE_TERMINATED};
 #define MG_ERR_BAD_ARGUMENT -1
 #define MG_ERR_INVALID_HANDLE -3
 #define MG_ERR_NOT_CHILD -4
+#define MG_SERVICE_SPROUT 1U
+#define MG_SERVICE_SESSIOND 2U
+#define MG_SERVICE_LOGIND 3U
 #define OBJECT_TYPE_PROCESS 2
 #define THREAD_CPU_NONE ((u32)-1)
 typedef struct kernel_thread kernel_thread_t;
 typedef struct process process_t;
 typedef struct {bool active;} kernel_stack_t;
-struct process {int state; kernel_thread_t *main_thread; process_t *parent;};
-typedef struct {process_t *process;} kernel_object_t;
+struct process {int state; kernel_thread_t *main_thread; process_t *parent;
+ u32 active_syscalls; bool termination_pending, launch_ready;
+ bool system_service; u32 service_id;};
+typedef struct {process_t *process; u32 references;} kernel_object_t;
 static kernel_object_t target_object;
 struct kernel_thread {
  int state; u32 running_cpu, syscall_nesting;
@@ -83,6 +88,7 @@ static struct {u32 blocked_threads, sleeping_threads;} scheduler_stats;
 static u32 scheduler_lock, process_registry_lock;
 static unsigned removed, cancelled, freed, exited, closed_handles, unmapped;
 static unsigned self_dispatches, self_handoffs;
+static unsigned lookup_references, lookup_releases;
 static process_t *current_process;
 static kernel_thread_t *current_thread, *idle_thread;
 static kernel_thread_t selected_thread;
@@ -121,12 +127,19 @@ static process_t *process_current(void) {return current_process;}
 static kernel_object_t *process_handle_lookup_any(process_t *parent,
   process_handle_t handle, int type, u32 rights)
 {(void)parent; (void)rights; assert(type==OBJECT_TYPE_PROCESS);
- return handle==17 ? &target_object : NULL;}
+ if(handle!=17)return NULL;
+ target_object.references++;
+ lookup_references++;
+ return &target_object;}
 static process_t *object_process(kernel_object_t *object) {return object->process;}
+static void object_release(kernel_object_t *object)
+{assert(object&&object->references);object->references--;lookup_releases++;}
 static void console_cancel_waiter(kernel_thread_t *thread) {(void)thread;}
 static bool process_exit(process_t *process, i32 status)
-{(void)status; assert(process->state == PROCESS_STATE_ACTIVE);
- process->state = PROCESS_STATE_TERMINATED; exited++; closed_handles++;
+{(void)status; assert(process->state == PROCESS_STATE_ACTIVE &&
+                      !process->active_syscalls);
+ process->state = PROCESS_STATE_TERMINATED;
+ process->termination_pending=false;exited++; closed_handles++;
  unmapped++; return true;}
 '''
 scheduler_functions = "".join(function(path, name) for path, name in (
@@ -135,13 +148,18 @@ scheduler_functions = "".join(function(path, name) for path, name in (
     ("kernel/src/scheduler.c", "scheduler_terminate"),
     ("kernel/src/scheduler.c", "thread_destroy"),
     ("kernel/src/process.c", "process_attach_thread"),
+    ("kernel/src/process.c", "process_publish_launch"),
+    ("kernel/src/process.c", "process_termination_begin"),
+    ("kernel/src/process.c", "process_termination_cancel"),
+    ("kernel/src/process.c", "process_matches_shutdown_phase"),
     ("kernel/src/process.c", "process_terminate_external"),
     ("kernel/src/process.c", "process_terminate_child"),
 ))
 scheduler_suffix = r'''
 int main(void) {
  process_t caller={.state=PROCESS_STATE_ACTIVE};
- process_t target = {.state=PROCESS_STATE_ACTIVE,.parent=&caller};
+ process_t target = {.state=PROCESS_STATE_ACTIVE,.parent=&caller,
+   .launch_ready=true};
  target_object.process=&target;
  kernel_thread_t thread = {.state=THREAD_STATE_BLOCKED,
    .running_cpu=THREAD_CPU_NONE, .syscall_active=true,
@@ -149,6 +167,10 @@ int main(void) {
    .waiting_mutex=&scheduler_lock, .process=&target};
  target.main_thread=&thread;
  scheduler_stats.blocked_threads=1;
+ target.active_syscalls=1;
+ assert(!process_terminate_external(&target, 1) &&
+        target.state==PROCESS_STATE_ACTIVE && !target.termination_pending);
+ target.active_syscalls=0;
  assert(!process_terminate_external(&target, 1));
  assert(process_terminate_child(&caller,17,1)==MG_ERR_BUSY);
 
@@ -157,7 +179,7 @@ int main(void) {
  assert(!scheduler_terminate_thread(&kernel_worker));
  assert(!thread_destroy(&kernel_worker));
  assert(kernel_worker.queued && !freed);
- assert(target.state == PROCESS_STATE_ACTIVE &&
+ assert(target.state == PROCESS_STATE_ACTIVE && !target.termination_pending &&
         thread.state == THREAD_STATE_BLOCKED &&
         thread.waiting_mutex == &scheduler_lock &&
         scheduler_stats.blocked_threads == 1);
@@ -171,7 +193,8 @@ int main(void) {
  thread.syscall_nesting=0;
  thread.running_cpu=0;
  assert(process_terminate_child(&caller,17,1)==MG_ERR_BUSY);
- assert(target.state==PROCESS_STATE_ACTIVE && thread.state==THREAD_STATE_READY &&
+ assert(target.state==PROCESS_STATE_ACTIVE && !target.termination_pending &&
+        thread.state==THREAD_STATE_READY &&
         thread.queued && thread.waiting_mutex==&scheduler_lock &&
         !removed && !cancelled && !exited && !closed_handles && !unmapped);
  thread.running_cpu=THREAD_CPU_NONE;
@@ -193,6 +216,8 @@ int main(void) {
         thread.state == THREAD_STATE_TERMINATED && removed == 1 &&
         cancelled == 1 && exited == 1 && closed_handles == 1 &&
         unmapped == 1);
+ assert(!target.termination_pending &&
+        lookup_references==lookup_releases&&target_object.references==0U);
  assert(!process_terminate_external(&target, 1));
  assert(exited==1 && closed_handles==1 && unmapped==1 && cancelled==1);
 
@@ -232,6 +257,27 @@ int main(void) {
  assert(process_attach_thread(&single, &main_thread));
  assert(!process_attach_thread(&single, &extra));
  assert(single.main_thread == &main_thread && !extra.process);
+
+ /* A session/shutdown scan can encounter a process after registry insertion
+  * but before its executable, handles and session metadata are complete. It
+  * is tracked as in-flight work, but cannot be externally terminated until
+  * its creator publishes the fully prepared launch. */
+ process_t launching={.state=PROCESS_STATE_ACTIVE,.main_thread=&main_thread};
+ assert(process_matches_shutdown_phase(&launching,&caller,false));
+ assert(process_matches_shutdown_phase(&launching,&caller,true));
+ unsigned before_launch_exit=exited;
+ assert(!process_terminate_external(&launching,3));
+ assert(!launching.termination_pending && exited==before_launch_exit);
+ assert(process_publish_launch(&launching));
+ assert(!process_matches_shutdown_phase(&launching,&caller,true));
+ assert(process_matches_shutdown_phase(&launching,&caller,false));
+ launching.system_service=true;
+ launching.service_id=10U;
+ assert(!process_matches_shutdown_phase(&launching,&caller,false));
+ assert(process_matches_shutdown_phase(&launching,&caller,true));
+ assert(process_termination_begin(&launching));
+ process_termination_cancel(&launching);
+ assert(!launching.termination_pending);
  puts("termination: production scheduler/process guards passed");
  return 0;
 }

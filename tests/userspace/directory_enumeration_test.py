@@ -352,10 +352,10 @@ typedef struct {u64 rax, rdi, rsi, rdx;} frame_t;
 static i64 answer; static bool valid = true, fail_alloc; static unsigned references, allocations;
 static kernel_object_t object;
 static void *process_current(void) { return &object; }
-static kernel_object_t *process_handle_lookup_retain(void *p, process_handle_t h, kernel_object_type_t t, u32 r)
+static kernel_object_t *process_handle_lookup(void *p, process_handle_t h, kernel_object_type_t t, u32 r)
 { assert(p && h == 7 && t == OBJECT_TYPE_DIRECTORY && r == OBJECT_RIGHT_READ); references++; return &object; }
 void object_release(kernel_object_t *o) { assert(o == &object && references); references--; }
-static bool syscall_user_buffer_valid(void *p, usize n) { return p && n && valid; }
+static bool syscall_user_buffer_writable(void *p, usize n) { return p && n && valid; }
 static void syscall_fail(frame_t *f, i64 error) { f->rax = (u64)error; }
 static void *kmalloc(usize n) { if (fail_alloc) return NULL; allocations++; return malloc(n); }
 static void kfree(void *p) { assert(p && allocations); allocations--; free(p); }

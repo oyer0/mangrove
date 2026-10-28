@@ -42,6 +42,7 @@ bool process_get_credentials(const process_t *p,process_credentials_t *out)
 bool identity_registry_lookup_uid(mg_uid_t uid,user_identity_t *out)
 { if(uid!=7)return false;memset(out,0,sizeof(*out));out->uid=uid;out->role=MG_IDENTITY_ROLE_ADMIN;return true; }
 static bool syscall_user_buffer_valid(const void *p,u64 n){return p && n;}
+static bool syscall_user_buffer_writable(void *p,u64 n){return p && n && p!=unwritable;}
 bool vmm_user_range_writable(const void *p,usize n){return p && n && p!=unwritable;}
 '''
 SUFFIX = r'''

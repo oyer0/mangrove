@@ -68,6 +68,7 @@ typedef struct kernel_thread { bool pending_wake,running,exit_pending; } kernel_
 typedef struct process process_t;
 struct process {
  int state; bool system_service, shutdown_requested, shutdown_wake_sent;
+ bool launch_ready;
  u32 service_id; u64 pid; char name[32]; kernel_thread_t *main_thread;
  kernel_object_t object; process_t *next_all;
 };
@@ -128,7 +129,8 @@ static void init_process(process_t *p,u64 pid,const char *name,bool service,
                          u32 service_id,kernel_thread_t *thread)
 { memset(p,0,sizeof(*p)); p->state=PROCESS_STATE_ACTIVE; p->pid=pid;
   strncpy(p->name,name,sizeof(p->name)-1); p->system_service=service;
-  p->service_id=service_id; p->main_thread=thread; p->object.references=1; }
+  p->service_id=service_id; p->main_thread=thread; p->object.references=1;
+  p->launch_ready=true; }
 int main(void)
 {
  process_t caller,app,leaf,sprout,sessiond,logind;

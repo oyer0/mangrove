@@ -23,18 +23,64 @@ exists. This diagnostic does not retry or mask construction failures.
 
 Each process has a generation-tagged handle table. Handles name kernel objects
 and carry explicit read/write rights; raw kernel pointers are never a
-userspace object identity. Fresh programs receive separate standard output and
-keyboard-input handles. Closing the last reference releases the underlying
-object according to its object-type lifetime. The table starts with 16 slots
-and grows geometrically when full, allocating and copying outside the
-interrupt-disabled slot lock. Allocation failure leaves existing handles
-usable. The 32-bit handle ABI encodes a one-based slot index in 16 bits, so
-65,535 slots per process is the format ceiling; actual capacity depends on
-kernel memory and other live objects. Handle generation tags also remain
-16-bit for ABI compatibility.
+userspace object identity. Every successful handle lookup returns a retained
+object reference; its caller releases that reference after the operation,
+including on error paths. Closing a handle removes the table's reference but
+does not invalidate an operation that already retained the object. Fresh
+programs receive separate standard output and keyboard-input handles. The
+table starts with 16 slots and grows geometrically when full. A growth mutex
+serializes every slot mutation against the out-of-lock copy; the slot spinlock
+still protects lookup references and atomic table publication. Allocation
+failure leaves existing handles usable. The 32-bit handle ABI encodes a
+one-based slot index in 16 bits, so 65,535 slots per process is the format
+ceiling; actual capacity depends on kernel memory and other live objects.
+Handle generation tags also remain 16-bit for ABI compatibility.
 
-External termination fails with `MG_ERR_BUSY` while the target has a live
-syscall frame, is in a scheduler handoff, or is executing on a CPU. It does not
+The process object owns its address space, credentials, session membership,
+CWD, handle table, child relationships, and process-wide terminal and service
+state. The scheduler thread owns the saved CPU context, kernel stack, and
+current syscall frame. Each process currently has one main thread; native
+userspace threads, per-thread TLS, and thread-specific libc state are not yet
+implemented.
+
+Process credentials and launch/session metadata are published under the
+process registry lock. A newly constructed process is not visible in process
+snapshots or eligible for session/shutdown termination until its image,
+arguments, and handles are ready and its thread has been enqueued. In-flight
+launches remain shutdown work; session retirement reports busy rather than
+terminating a partially initialized process. CWD replacement uses a separate
+lock and retained VFS locations. These ownership rules keep process metadata
+stable for concurrent kernel readers; they do not provide per-thread
+application-level synchronization.
+
+Every returning syscall is admitted under the process registry lock and holds
+a process-object reference until its syscall frame and user-memory leases have
+been released. The active-syscall count prevents external termination and
+process exit from closing process resources while a syscall is in flight.
+External termination that races an admitted syscall returns busy and leaves
+the process intact. Process teardown also waits for scheduler exit and stack
+handoff completion before final destruction. The non-returning exit syscall
+uses its ordinary thread ownership and scheduler handoff rather than retaining
+a returning-syscall admission.
+
+Syscall input and output buffers are leased page ranges in the current
+address space. The syscall context retains range descriptors, rather than a
+separate bookkeeping allocation per page; VMM validates and pins each covered
+owned user page before the kernel dereferences it. Leases remain active across
+blocking I/O and are released on every returning syscall path. Read and write
+permissions are checked separately. If a range is invalid or lease bookkeeping
+allocation fails, no successful result is reported and any earlier ranges are
+released by syscall cleanup. Bounded string copies lease each source byte only
+for the duration of that copy. Mapping unmap checks the same pin counts.
+Multi-page anonymous unmap validates the complete extent before changing any
+mapping, so a busy page cannot leave a partial unmap. Address-space destruction
+rejects new leases and waits for both active CPU references and outstanding
+leases before reclaiming page tables or leaf frames. This protects memory
+lifetime; it does not serialize application writes to shared bytes between
+future threads.
+
+External termination fails with `MG_ERR_BUSY` while the target has an admitted
+syscall, is in a scheduler handoff, or is executing on a CPU. It does not
 unwind that frame or release process resources on this failure. A suspended
 kernel thread with an entered C frame likewise cannot be externally discarded.
 Self-exit still completes through the thread's normal termination path. A
@@ -254,20 +300,15 @@ The kernel masks interrupt, trap, and direction flags during entry and returns
 with `SYSRET`. A syscall may block because every schedulable thread has its own
 kernel stack and saved syscall frame.
 
-Pointer arguments are not trusted. Dispatch validates mapped user ranges and
-copies bounded strings or request records before using them. Kernel objects
-are resolved through the caller's handle table with required type and rights.
+Pointer arguments are not trusted. Dispatch leases mapped user ranges before
+using them and copies bounded strings or request records into kernel-owned
+storage where the operation needs a stable snapshot. Kernel objects are
+resolved through the caller's handle table with required type and rights.
 Identity, service, session, IPC, network, volume, and storage operations apply
 their additional authenticated policy in the kernel rather than accepting
-client-supplied authority.
-
-Each process currently has one userspace thread. Its address space cannot be
-changed by that process while its syscall is executing, and external process
-termination/reaping waits for the active syscall/thread lifetime. Thus a
-successful mapping check remains stable for the current syscall access model;
-user pages are not generally pinned for every syscall. Any future support for
-multiple userspace threads in one address space must add a mapping-lifetime
-contract before allowing concurrent unmap or protection changes.
+client-supplied authority. A lease protects mapping lifetime, not concurrent
+mutation of the bytes by another future thread; applications will need their
+own synchronization when the contents must form one coherent snapshot.
 
 ## Contract boundaries
 

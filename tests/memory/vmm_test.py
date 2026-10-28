@@ -95,19 +95,21 @@ vmm = r'''
 typedef u64 phys_addr_t;
 typedef struct {u64 entries[512];} page_table_t;
 typedef struct {phys_addr_t physical;u64 generation;u32 slot;} pmm_owned_frame_t;
-typedef struct {bool held;} mutex_t;
-typedef int spinlock_t;
-typedef struct vmm_owned_frame {phys_addr_t physical;struct vmm_owned_frame*next;} vmm_owned_frame_t;
-typedef struct {page_table_t *root;vmm_owned_frame_t *tables,*leaves;mutex_t operation_lock;bool destroy_pending,shootdown_pending;} vmm_address_space_metadata_t;
-static page_table_t *kernel_pml4,*active_pml4;static spinlock_t vmm_metadata_lock,vmm_kernel_lock;
+typedef pthread_mutex_t mutex_t;
+typedef pthread_mutex_t spinlock_t;
+typedef struct vmm_owned_frame {phys_addr_t physical;u32 user_pin_count;struct vmm_owned_frame*next;} vmm_owned_frame_t;
+typedef struct {page_table_t *root;vmm_owned_frame_t *tables,*leaves;mutex_t operation_lock;u64 active_user_leases;bool destroy_pending,shootdown_pending;} vmm_address_space_metadata_t;
+typedef struct {page_table_t *address_space;uintptr_t first_page;usize page_count;bool active;} vmm_user_range_lease_t;
+static page_table_t *kernel_pml4,*active_pml4;static spinlock_t vmm_metadata_lock=PTHREAD_MUTEX_INITIALIZER,vmm_kernel_lock=PTHREAD_MUTEX_INITIALIZER;
 static phys_addr_t framebuffer_first,framebuffer_limit;
 static phys_addr_t owned_frame_physical;
 static vmm_address_space_metadata_t meta;
 static unsigned table_allocations,table_frees;static int fail_after=-1;
-static bool mutex_lock(mutex_t*m){assert(!m->held);m->held=true;return true;}
-static void mutex_unlock(mutex_t*m){assert(m->held);m->held=false;}
-static u64 spin_lock_irqsave(spinlock_t*l){assert(!*l);*l=1;return 0;}
-static void spin_unlock_irqrestore(spinlock_t*l,u64 flags){(void)flags;assert(*l);*l=0;}
+static bool mutex_lock(mutex_t*m){return pthread_mutex_lock(m)==0;}
+static void mutex_unlock(mutex_t*m){assert(pthread_mutex_unlock(m)==0);}
+static void assert_mutex_unlocked(mutex_t*m){assert(pthread_mutex_trylock(m)==0);assert(pthread_mutex_unlock(m)==0);}
+static u64 spin_lock_irqsave(spinlock_t*l){assert(pthread_mutex_lock(l)==0);return 0;}
+static void spin_unlock_irqrestore(spinlock_t*l,u64 flags){(void)flags;assert(pthread_mutex_unlock(l)==0);}
 static bool phys_map_contains(u64 p){return p!=0;}
 static bool pmm_owned_frame_mapping_begin_physical(phys_addr_t physical,
                                                     bool leased) {
@@ -117,27 +119,36 @@ static page_table_t *vmm_alloc_table(void){if(fail_after==0)return NULL;if(fail_
 static void pmm_free_frame(u64 p){table_frees++;free((void*)(uintptr_t)p);}
 static phys_addr_t vmm_table_phys(page_table_t*t){return (u64)(uintptr_t)t;}
 static page_table_t *vmm_table_from_phys(u64 p){return (page_table_t*)(uintptr_t)(p&PTE_FRAME_MASK);}
-static void *kmalloc(usize n){assert(!vmm_metadata_lock&&!vmm_kernel_lock);return malloc(n);}
+static void *kmalloc(usize n){return malloc(n);}
 static void kfree(void*p){free(p);}
 static vmm_address_space_metadata_t*vmm_metadata_find(const page_table_t*p){return p==meta.root?&meta:NULL;}
 static bool vmm_owned_contains(const vmm_owned_frame_t*n,u64 p){for(;n;n=n->next)if(n->physical==p)return true;return false;}
-static void vmm_owned_insert(vmm_owned_frame_t**list,vmm_owned_frame_t*n,u64 p){n->physical=p;n->next=*list;*list=n;}
+static vmm_owned_frame_t*vmm_owned_find(vmm_owned_frame_t*n,u64 p){for(;n;n=n->next)if(n->physical==p)return n;return NULL;}
+static vmm_owned_frame_t*vmm_owned_detach(vmm_owned_frame_t**list,u64 p){while(*list){if((*list)->physical==p){vmm_owned_frame_t*n=*list;*list=n->next;n->next=NULL;return n;}list=&(*list)->next;}return NULL;}
+static void vmm_owned_insert(vmm_owned_frame_t**list,vmm_owned_frame_t*n,u64 p){n->physical=p;n->user_pin_count=0;n->next=*list;*list=n;}
 static bool vmm_address_space_validate_locked(page_table_t*p){return p==meta.root;}
 static void vmm_capture_active_targets_locked(vmm_address_space_metadata_t*m,u64*out){(void)m;out[0]=0;}
-static void vmm_tlb_shootdown(u64*targets,page_table_t*p){(void)targets;(void)p;assert(!vmm_metadata_lock&&!vmm_kernel_lock);}
+static void vmm_tlb_shootdown(u64*targets,page_table_t*p){(void)targets;(void)p;}
+static void vmm_reload_current_cr3(void){}
 static void panic(const char*s){fprintf(stderr,"%s\n",s);abort();}
 static void invalidate_page(void *p){(void)p;}
 '''
 for name in ['vmm_framebuffer_page','vmm_user_child_reserved','vmm_user_path_available',
-             'vmm_map_user_page','vmm_user_range_accessible',
-             'vmm_user_range_valid','vmm_user_range_writable']:
+             'vmm_map_user_page','vmm_user_range_leaf_locked',
+             'vmm_user_range_accessible','vmm_user_range_valid',
+             'vmm_user_range_writable','vmm_user_range_lease',
+             'vmm_user_range_release','vmm_unmap_user_page',
+             'vmm_unmap_user_range']:
     code = function('kernel/src/vmm.c', name)
     code = re.sub(r'__asm__ volatile\("invlpg.*?;', 'invalidate_page(virtual_addr);', code, flags=re.S)
     vmm += code
 vmm += r'''
-static u64 map(u64 address){u64 frame=(u64)(uintptr_t)aligned_alloc(4096,4096);assert(frame);assert(vmm_map_user_page(meta.root,(void*)(uintptr_t)address,frame,PTE_USER|PTE_READWRITE));assert(!meta.operation_lock.held);return frame;}
+typedef struct {pthread_barrier_t held,release;vmm_user_range_lease_t lease;bool acquired;} lease_race_t;
+static void *lease_worker(void *opaque){lease_race_t*r=opaque;r->acquired=vmm_user_range_lease(meta.root,(void*)0x800000,8192,true,&r->lease);int x=pthread_barrier_wait(&r->held);assert(x==0||x==PTHREAD_BARRIER_SERIAL_THREAD);x=pthread_barrier_wait(&r->release);assert(x==0||x==PTHREAD_BARRIER_SERIAL_THREAD);if(r->acquired)vmm_user_range_release(&r->lease);return NULL;}
+static u64 map(u64 address){u64 frame=(u64)(uintptr_t)aligned_alloc(4096,4096);assert(frame);assert(vmm_map_user_page(meta.root,(void*)(uintptr_t)address,frame,PTE_USER|PTE_READWRITE));assert_mutex_unlocked(&meta.operation_lock);return frame;}
 int main(void){
  kernel_pml4=aligned_alloc(4096,4096);memset(kernel_pml4,0,4096);meta.root=aligned_alloc(4096,4096);memset(meta.root,0,4096);
+ assert(pthread_mutex_init(&meta.operation_lock,NULL)==0);
  active_pml4=meta.root;
  framebuffer_first=0x80000000ULL;framebuffer_limit=framebuffer_first+4096;
  assert(!vmm_map_user_page(meta.root,(void*)0x700000,framebuffer_first,PTE_USER));
@@ -156,10 +167,38 @@ int main(void){
  assert(!vmm_user_range_writable((void*)0x402000,4));
  assert(!vmm_user_range_writable((void*)0x401fff,2));
  assert(vmm_user_range_writable((void*)0x401fff,1));
- assert(!vmm_map_user_page(meta.root,(void*)0x400000,first,PTE_USER));assert(table_allocations==9&&!meta.operation_lock.held);
- assert(!vmm_map_user_page(meta.root,(void*)0x402000,first,PTE_USER));assert(!meta.operation_lock.held);
- fail_after=1;u64 frame=(u64)(uintptr_t)aligned_alloc(4096,4096);assert(!vmm_map_user_page(meta.root,(void*)(2ULL<<39),frame,PTE_USER));assert(table_allocations==10&&table_frees==1&&!meta.operation_lock.held);free((void*)(uintptr_t)frame);fail_after=-1;
- meta.root->entries[3]=vmm_table_phys(kernel_pml4)|PTE_PRESENT;frame=(u64)(uintptr_t)aligned_alloc(4096,4096);assert(!vmm_map_user_page(meta.root,(void*)(3ULL<<39),frame,PTE_USER));free((void*)(uintptr_t)frame);assert(table_allocations==10);
+ /* A syscall lease prevents unmap until the final kernel access is done. The
+    barriers hold the lease in another host thread while production unmap is
+    attempted, rather than relying on a timing race. */
+ u64 leased_first=map(0x800000),leased_second=map(0x801000);
+ unsigned range_frame_frees=table_frees;
+ lease_race_t race={0};
+ assert(pthread_barrier_init(&race.held,NULL,2)==0);
+ assert(pthread_barrier_init(&race.release,NULL,2)==0);
+ pthread_t lease_thread;assert(pthread_create(&lease_thread,NULL,lease_worker,&race)==0);
+ int sync_result=pthread_barrier_wait(&race.held);assert(sync_result==0||sync_result==PTHREAD_BARRIER_SERIAL_THREAD);
+ assert(race.acquired&&race.lease.page_count==2&&meta.active_user_leases==2);
+ assert(!vmm_unmap_user_page(meta.root,(void*)0x800000,&leased_first));
+ assert(!vmm_unmap_user_range(meta.root,(void*)0x800000,2));
+ assert((meta.active_user_leases==2)&&vmm_user_range_writable((void*)0x800000,8192));
+ sync_result=pthread_barrier_wait(&race.release);assert(sync_result==0||sync_result==PTHREAD_BARRIER_SERIAL_THREAD);
+ assert(pthread_join(lease_thread,NULL)==0&&meta.active_user_leases==0);
+ assert(pthread_barrier_destroy(&race.held)==0&&pthread_barrier_destroy(&race.release)==0);
+ assert(vmm_unmap_user_range(meta.root,(void*)0x800000,2));
+ assert(table_frees==range_frame_frees+2U);
+ (void)leased_second;
+ assert(!vmm_user_range_valid((void*)0x800000,1));
+ u64 intact_first=map(0x800000),intact_second=map(0x801000);
+ u64 intact_third=map(0x802000);
+ assert(!vmm_unmap_user_range(meta.root,(void*)0x800000,4));
+ assert(vmm_user_range_valid((void*)0x800000,3*4096));
+ assert(vmm_unmap_user_range(meta.root,(void*)0x800000,3));
+ assert(table_frees==range_frame_frees+5U);
+ (void)intact_first;(void)intact_second;(void)intact_third;
+ assert(!vmm_map_user_page(meta.root,(void*)0x400000,first,PTE_USER));assert(table_allocations==10);assert_mutex_unlocked(&meta.operation_lock);
+ assert(!vmm_map_user_page(meta.root,(void*)0x402000,first,PTE_USER));assert_mutex_unlocked(&meta.operation_lock);
+ fail_after=1;u64 frame=(u64)(uintptr_t)aligned_alloc(4096,4096);assert(!vmm_map_user_page(meta.root,(void*)(2ULL<<39),frame,PTE_USER));assert(table_allocations==11&&table_frees==range_frame_frees+6U);assert_mutex_unlocked(&meta.operation_lock);free((void*)(uintptr_t)frame);fail_after=-1;
+ meta.root->entries[3]=vmm_table_phys(kernel_pml4)|PTE_PRESENT;frame=(u64)(uintptr_t)aligned_alloc(4096,4096);assert(!vmm_map_user_page(meta.root,(void*)(3ULL<<39),frame,PTE_USER));free((void*)(uintptr_t)frame);assert(table_allocations==11);
  for(unsigned i=0;i<512;i++)assert(kernel_pml4->entries[i]==0);
  while(meta.leaves){vmm_owned_frame_t*n=meta.leaves;meta.leaves=n->next;free((void*)(uintptr_t)n->physical);free(n);}
  while(meta.tables){vmm_owned_frame_t*n=meta.tables;meta.tables=n->next;free((void*)(uintptr_t)n->physical);free(n);}free(meta.root);free(kernel_pml4);

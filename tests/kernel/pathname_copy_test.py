@@ -31,6 +31,7 @@ def extract_function(text, name):
 
 vfs_functions = extract_function(vfs_source, "vfs_path_cstr_length") + "\n" + \
                 extract_function(vfs_source, "vfs_path_validate_n")
+syscall_copy_byte = extract_function(source, "syscall_copy_from_user_byte")
 fixture = r'''
 #include <assert.h>
 #include <stdbool.h>
@@ -44,14 +45,37 @@ fixture = r'''
 #include <vfs.h>
 static uintptr_t readable_start, readable_end;
 static bool fail_alloc;
-static bool vmm_user_range_valid(const void *pointer, usize length) {
+typedef struct { void *address_space; } process_t;
+typedef struct { process_t *process; void *syscall_user_access_context; }
+    kernel_thread_t;
+typedef struct {
+    void *address_space; uintptr_t first_page; usize page_count; bool active;
+} vmm_user_range_lease_t;
+static process_t test_process;
+static kernel_thread_t test_thread={.process=&test_process};
+static unsigned live_leases, lease_acquisitions, lease_releases;
+static kernel_thread_t *thread_current(void) { return &test_thread; }
+static bool vmm_user_range_lease(void *address_space,const void *pointer,
+                                 usize length,bool writable,
+                                 vmm_user_range_lease_t *lease) {
+    (void)writable;
     uintptr_t start=(uintptr_t)pointer;
-    if (!length || start < readable_start || start > readable_end) return false;
-    return length <= readable_end - start;
+    if (!length || start < readable_start || start > readable_end ||
+        length > readable_end-start) return false;
+    lease->address_space=address_space;
+    lease->first_page=start & ~(uintptr_t)4095U;
+    lease->page_count=1;
+    lease->active=true;
+    live_leases++; lease_acquisitions++;
+    return true;
+}
+static void vmm_user_range_release(vmm_user_range_lease_t *lease) {
+    assert(lease && lease->active && live_leases);
+    lease->active=false; live_leases--; lease_releases++;
 }
 static void *kmalloc(usize n) { return fail_alloc ? NULL : malloc(n); }
 static void kfree(void *p) { free(p); }
-'''+function+r'''
+'''+syscall_copy_byte+'\n'+function+r'''
 int main(void) {
     char *source = malloc(MG_PATH_MAX_BYTES + 2U), *copied = NULL;
     assert(source); usize length=99;
@@ -59,14 +83,17 @@ int main(void) {
     readable_start=(uintptr_t)source; readable_end=readable_start+MG_PATH_MAX_BYTES+2U;
     assert(syscall_copy_path(source,&copied,&length) == VFS_OK);
     assert(length==1 && !strcmp(copied,"x"));
+    assert(!live_leases && lease_acquisitions==lease_releases);
     kfree(copied); copied=NULL;
     memset(source,'b',MG_PATH_MAX_BYTES); source[MG_PATH_MAX_BYTES]=0; length=0;
     assert(syscall_copy_path(source,&copied,&length) == VFS_OK);
     assert(length==MG_PATH_MAX_BYTES && copied[MG_PATH_MAX_BYTES]==0);
+    assert(!live_leases && lease_acquisitions==lease_releases);
     kfree(copied); copied=NULL;
     memset(source,'c',MG_PATH_MAX_BYTES + 1U); source[MG_PATH_MAX_BYTES + 1U]=0; length=73;
     assert(syscall_copy_path(source,&copied,&length) == VFS_ERR_NAME_TOO_LONG);
     assert(!copied && length==0); /* Overlong input is rejected, never truncated. */
+    assert(!live_leases && lease_acquisitions==lease_releases);
     source[0]=0;
     assert(syscall_copy_path(source,&copied,&length) == VFS_ERR_INVALID_PARAM);
     assert(syscall_copy_path(NULL,&copied,&length) == VFS_ERR_INVALID_PARAM);
@@ -74,8 +101,10 @@ int main(void) {
     assert(syscall_copy_path(source,&copied,NULL) == VFS_ERR_INVALID_PARAM);
     assert(syscall_copy_path((const char *)(uintptr_t)(~(uintptr_t)0-1U),
                              &copied,&length) == VFS_ERR_INVALID_PARAM);
+    assert(!live_leases && lease_acquisitions==lease_releases);
     source[0]='x'; source[1]=0; fail_alloc=true;
     assert(syscall_copy_path(source,&copied,&length) == VFS_ERR_NO_MEM && !copied);
+    assert(!live_leases && lease_acquisitions==lease_releases);
     fail_alloc=false;
     puts("dynamic pathname copy: 65535-byte admission, no truncation, pointer and allocation failures PASS");
     free(source);

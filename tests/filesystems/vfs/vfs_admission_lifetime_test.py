@@ -41,7 +41,7 @@ process_parts = [
     function('kernel/src/process.c', name)
     for name in ('handle_slots', 'encode_handle', 'decode_handle',
                  'process_handle_install', 'process_handle_lookup_reference',
-                 'process_handle_lookup_retain', 'process_handle_close',
+                 'process_handle_lookup', 'process_handle_close',
                  'process_handle_close_all')
 ]
 object_parts = [
@@ -64,6 +64,7 @@ typedef enum { OBJECT_TYPE_INVALID = 0, OBJECT_TYPE_FILE = 3,
 typedef struct kernel_object kernel_object_t;
 typedef struct process process_t;
 typedef struct { pthread_mutex_t native; } spinlock_t;
+typedef struct { pthread_mutex_t native; } mutex_t;
 typedef struct {
     kernel_object_t *object; u32 rights; u16 generation; bool active, reserved;
 } process_handle_slot_t;
@@ -75,7 +76,7 @@ struct kernel_object {
 struct process {
     process_state_t state; void *handle_table; usize handle_capacity;
     u64 handle_revision; usize next_handle_slot;
-    spinlock_t handle_lock;
+    spinlock_t handle_lock; mutex_t handle_growth_mutex;
 };
 #define OBJECT_RIGHT_READ (1U << 0)
 #define OBJECT_RIGHT_WRITE (1U << 1)
@@ -98,6 +99,12 @@ static u64 spin_lock_irqsave(spinlock_t *lock) {
 }
 static void spin_unlock_irqrestore(spinlock_t *lock, u64 flags) {
     (void)flags; assert(pthread_mutex_unlock(&lock->native) == 0);
+}
+static bool mutex_lock(mutex_t *mutex) {
+    return pthread_mutex_lock(&mutex->native) == 0;
+}
+static void mutex_unlock(mutex_t *mutex) {
+    assert(pthread_mutex_unlock(&mutex->native) == 0);
 }
 static unsigned destroyed;
 static void tracked_destroy(kernel_object_t *object) {
@@ -127,21 +134,22 @@ int main(void) {
     test_process.handle_table = slots;
     test_process.handle_capacity = PROCESS_HANDLE_SLOTS;
     assert(pthread_mutex_init(&test_process.handle_lock.native, NULL) == 0);
+    assert(pthread_mutex_init(&test_process.handle_growth_mutex.native, NULL) == 0);
     assert(process_handle_install(&test_process, file,
                                   OBJECT_RIGHT_READ | OBJECT_RIGHT_WRITE,
                                   &first));
     object_release(file); /* Drop the creator's reference, as open does. */
     assert((first & 0xffffU) == 1U && (first >> 16) == 1U);
-    retained = process_handle_lookup_retain(&test_process, first,
+    retained = process_handle_lookup(&test_process, first,
                                             OBJECT_TYPE_FILE,
                                             OBJECT_RIGHT_READ);
     assert(retained && retained->ref_count == 2U);
-    assert(!process_handle_lookup_retain(&test_process, first,
+    assert(!process_handle_lookup(&test_process, first,
                                         OBJECT_TYPE_DIRECTORY, 0));
-    assert(!process_handle_lookup_retain(&test_process, first,
+    assert(!process_handle_lookup(&test_process, first,
                                         OBJECT_TYPE_FILE,
                                         OBJECT_RIGHT_READ | (1U << 8)));
-    assert(!process_handle_lookup_retain(&test_process, 0,
+    assert(!process_handle_lookup(&test_process, 0,
                                         OBJECT_TYPE_INVALID, 0));
     assert(!process_handle_close(&test_process, first ^ 0x10000U));
 
@@ -150,7 +158,7 @@ int main(void) {
     assert(pthread_join(closer, NULL) == 0);
     assert(destroyed == 0U && retained->type == OBJECT_TYPE_FILE &&
            retained->ref_count == 1U);
-    assert(!process_handle_lookup_retain(&test_process, first,
+    assert(!process_handle_lookup(&test_process, first,
                                         OBJECT_TYPE_FILE, 0));
     assert(!process_handle_close(&test_process, first));
     object_release(retained);
@@ -163,9 +171,9 @@ int main(void) {
     object_release(file);
     assert((second & 0xffffU) == (first & 0xffffU));
     assert((second >> 16) != (first >> 16));
-    assert(!process_handle_lookup_retain(&test_process, first,
+    assert(!process_handle_lookup(&test_process, first,
                                         OBJECT_TYPE_FILE, 0));
-    kernel_object_t *second_pin = process_handle_lookup_retain(
+    kernel_object_t *second_pin = process_handle_lookup(
         &test_process, second, OBJECT_TYPE_FILE, OBJECT_RIGHT_READ);
     assert(second_pin);
     process_handle_close_all(&test_process);
@@ -173,20 +181,21 @@ int main(void) {
     assert(!process_handle_close(&test_process, second));
     test_process.handle_table = NULL;
     free(slots); /* Model process teardown while the operation still owns a pin. */
-    assert(!process_handle_lookup_retain(&test_process, second,
+    assert(!process_handle_lookup(&test_process, second,
                                         OBJECT_TYPE_FILE, 0));
     object_release(second_pin);
     assert(destroyed == 2U);
-    assert(!process_handle_lookup_retain(&test_process, second,
+    assert(!process_handle_lookup(&test_process, second,
                                         OBJECT_TYPE_FILE, 0));
     test_process.state = PROCESS_STATE_TERMINATED;
-    assert(!process_handle_lookup_retain(&test_process, second,
+    assert(!process_handle_lookup(&test_process, second,
                                         OBJECT_TYPE_FILE, 0));
     file = new_object();
     assert(!process_handle_install(&test_process, file,
                                    OBJECT_RIGHT_READ, &second));
     object_release(file);
     pthread_mutex_destroy(&test_process.handle_lock.native);
+    pthread_mutex_destroy(&test_process.handle_growth_mutex.native);
     puts("production process handle lifetime: passed");
 }
 '''

@@ -31,6 +31,16 @@ typedef struct page_table {
     u64 entries[512];
 } __attribute__((aligned(4096))) page_table_t;
 
+/* Keeps a userspace mapping present with its requested access until release.
+ * A lease does not hold a VMM lock across the operation; unmap refuses to
+ * remove any leased page, and address-space teardown waits for all leases. */
+typedef struct vmm_user_range_lease {
+    page_table_t *address_space;
+    uintptr_t first_page;
+    usize page_count;
+    bool active;
+} vmm_user_range_lease_t;
+
 /* Exclusive lease on an unmapped subrange of either the dedicated kernel VMM
  * arena or an explicitly leased heap-tail range. Reserving space allocates
  * neither page tables nor physical frames. The generation rejects stale
@@ -82,6 +92,11 @@ bool vmm_map_user_page(page_table_t *pml4, void *virtual_addr,
                        phys_addr_t physical_addr, u64 flags);
 bool vmm_unmap_user_page(page_table_t *pml4, void *virtual_addr,
                          phys_addr_t *out_physical_addr);
+/* Atomically unmaps a contiguous user range after confirming every mapped
+ * page is owned by the address space and has no active user-memory lease.
+ * Owned frames are released after the required address-space TLB flush. */
+bool vmm_unmap_user_range(page_table_t *pml4, void *virtual_addr,
+                          usize page_count);
 /* CPU online-state transitions share the kernel TLB-shootdown gate. These
  * hooks are used by cpu_mark_online/offline to keep shootdown target sets
  * stable and flush a CPU before it joins the online set. */
@@ -117,6 +132,10 @@ void vmm_destroy_address_space(page_table_t *pml4);
 bool vmm_switch_address_space(page_table_t *pml4);
 bool vmm_user_range_valid(const void *address, usize length);
 bool vmm_user_range_writable(const void *address, usize length);
+bool vmm_user_range_lease(page_table_t *pml4, const void *address,
+                          usize length, bool writable,
+                          vmm_user_range_lease_t *out_lease);
+void vmm_user_range_release(vmm_user_range_lease_t *lease);
 phys_addr_t vmm_virtual_to_physical(void *virtual_addr);
 
 /* Stage-4 ownership checks.  These are intentionally independent from

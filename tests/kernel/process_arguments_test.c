@@ -21,10 +21,25 @@ typedef struct {int unused;} process_credentials_t;
 typedef u64 mg_session_id_t;
 typedef u32 process_handle_t;
 typedef struct {int type;} kernel_object_t;
+static void object_release(kernel_object_t *object) {(void)object;}
+typedef struct process_spawn_object_refs {
+    kernel_object_t *console;
+    kernel_object_t *separate_output;
+} process_spawn_object_refs_t;
+static void process_spawn_object_refs_release(process_spawn_object_refs_t *refs)
+{
+    if (!refs) return;
+    if (refs->separate_output) object_release(refs->separate_output);
+    if (refs->console) object_release(refs->console);
+}
+#define PROCESS_SPAWN_OBJECT_REFS_AUTO \
+    __attribute__((cleanup(process_spawn_object_refs_release)))
 typedef struct {
     void *address_space;
     int state;
     bool system_service, credentials_initialized, session_shell;
+    bool launch_ready;
+    kernel_thread_t *main_thread;
     u32 service_id;
     mg_session_id_t session_id;
     process_credentials_t credentials;
@@ -225,6 +240,11 @@ static void boundaries(void)
 #define VFS_ERR_BAD_FORMAT (-5)
 #define VFS_LOCATION_AUTO
 static unsigned stage, failed_stage;
+static u32 process_registry_lock;
+static u64 spin_lock_irqsave(u32 *lock)
+{assert(!*lock);*lock=1;return 0;}
+static void spin_unlock_irqrestore(u32 *lock,u64 flags)
+{(void)flags;assert(*lock);*lock=0;}
 static bool thread_live, child_live, parent_handle_live;
 static unsigned child_handles;
 static process_t spawned;
@@ -263,7 +283,7 @@ static kernel_thread_t *thread_create_suspended(const char *n,void (*entry)(void
 static void process_user_thread_entry(void *arg){(void)arg;}
 static bool thread_destroy(kernel_thread_t *t){(void)t;assert(thread_live);thread_live=false;return true;}
 static process_t *process_create(const char *n,process_t *p,kernel_thread_t *t)
-{(void)n;(void)p;(void)t;if(!stage_ok())return NULL;memset(&spawned,0,sizeof(spawned));child_live=true;return &spawned;}
+{(void)n;(void)p;if(!stage_ok())return NULL;memset(&spawned,0,sizeof(spawned));spawned.main_thread=t;child_live=true;return &spawned;}
 static int process_chdir_result(process_t *p,const char *n){(void)p;(void)n;return VFS_OK;}
 static int elf_load_process_node_result(process_t *p,void *n,uintptr_t *entry,uintptr_t *stack)
 {(void)n;if(!stage_ok())return VFS_ERR_NO_MEM;*entry=1;*stack=PROCESS_USER_STACK_TOP;p->user_stack_top=*stack;return VFS_OK;}
@@ -306,7 +326,8 @@ static void lifecycle(void)
     }
     stage=failed_stage=0;process_handle_t handle=0;
     assert(process_spawn_args_with_context_internal(&parent,&args,NULL,0,false,NULL,false,0,true,0,&handle)==VFS_OK);
-    assert(handle==77 && parent_handle_live && child_live && thread_live);
+    assert(handle==77 && parent_handle_live && child_live && thread_live &&
+           spawned.launch_ready && !process_registry_lock);
     verify_child(&spawned,argv,3);
     process_handle_close(&parent,handle);process_abort(&spawned);
     process_arguments_destroy(&args);assert(!live_allocations);

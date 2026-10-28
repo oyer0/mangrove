@@ -36,6 +36,21 @@ static void process_string_release(char **text)
 
 #define PROCESS_STRING_AUTO __attribute__((cleanup(process_string_release)))
 
+typedef struct process_spawn_object_refs {
+    kernel_object_t *console;
+    kernel_object_t *separate_output;
+} process_spawn_object_refs_t;
+
+static void process_spawn_object_refs_release(process_spawn_object_refs_t *refs)
+{
+    if (!refs) return;
+    if (refs->separate_output) object_release(refs->separate_output);
+    if (refs->console) object_release(refs->console);
+}
+
+#define PROCESS_SPAWN_OBJECT_REFS_AUTO \
+    __attribute__((cleanup(process_spawn_object_refs_release)))
+
 static u64 next_pid;
 static process_t *all_processes;
 static spinlock_t process_registry_lock;
@@ -125,6 +140,9 @@ static bool process_handle_grow(process_t *process)
         if (new_capacity > (usize)-1 / sizeof(*new_slots)) break;
         new_slots = kmalloc(new_capacity * sizeof(*new_slots));
         if (!new_slots) break;
+        /* Every slot writer holds handle_growth_mutex. The slot lock protects
+         * pointer publication and readers, while this mutex makes the copy a
+         * stable snapshot without keeping interrupts disabled for the copy. */
         memcpy(new_slots, old_slots, old_capacity * sizeof(*new_slots));
         memset(new_slots + old_capacity, 0,
                (new_capacity - old_capacity) * sizeof(*new_slots));
@@ -192,6 +210,9 @@ static void process_object_destroy(kernel_object_t *object)
     process_t *process = object_process(object);
     process_t *child;
     process_t *next;
+
+    if (process->active_syscalls)
+        panic("process: destruction with active syscall references");
 
     process_cwd_clear(process);
     process_unlink_all(process);
@@ -280,9 +301,9 @@ process_t *process_create_with_failure(const char *name, process_t *parent,
     process->session_shell = false;
     process->owner_reference_held = true;
     terminal_output_state_init(&process->terminal_output);
-    if (parent && parent->credentials_initialized &&
-        identity_credentials_effective(&parent->credentials,
-                                       &process->credentials)) {
+    process_credentials_t inherited_credentials;
+    if (parent && process_get_credentials(parent, &inherited_credentials)) {
+        process->credentials = inherited_credentials;
         process->credentials_initialized = true;
     }
     process->main_thread = main_thread;
@@ -344,10 +365,18 @@ process_t *process_create(const char *name, process_t *parent,
 
 bool process_assign_system_credentials(process_t *process)
 {
-    if (!process || process->state != PROCESS_STATE_ACTIVE || process->parent ||
-        process->credentials_initialized) return false;
-    process->credentials = identity_system_credentials();
+    u64 flags;
+    if (!process) return false;
+    process_credentials_t credentials = identity_system_credentials();
+    flags = spin_lock_irqsave(&process_registry_lock);
+    if (process->state != PROCESS_STATE_ACTIVE || process->parent ||
+        process->credentials_initialized) {
+        spin_unlock_irqrestore(&process_registry_lock, flags);
+        return false;
+    }
+    process->credentials = credentials;
     process->credentials_initialized = true;
+    spin_unlock_irqrestore(&process_registry_lock, flags);
     return true;
 }
 
@@ -355,30 +384,42 @@ bool process_assign_system_service(process_t *process, u32 service_id)
 {
     const kernel_service_definition_t *definition;
     process_credentials_t credentials;
+    u64 flags;
 
-    if (!process || process->state != PROCESS_STATE_ACTIVE || process->parent ||
-        process->credentials_initialized ||
-        !service_definition_lookup(service_id, &definition) || !definition)
+    if (!process || !service_definition_lookup(service_id, &definition) ||
+        !definition)
         return false;
     credentials = identity_system_credentials();
     credentials.service_privileges = definition->privileges;
     if (!identity_credentials_valid(&credentials)) return false;
+    flags = spin_lock_irqsave(&process_registry_lock);
+    if (process->state != PROCESS_STATE_ACTIVE || process->parent ||
+        process->credentials_initialized) {
+        spin_unlock_irqrestore(&process_registry_lock, flags);
+        return false;
+    }
     process->credentials = credentials;
     process->credentials_initialized = true;
     process->system_service = true;
     process->service_id = service_id;
+    spin_unlock_irqrestore(&process_registry_lock, flags);
     return true;
 }
 
 bool process_get_credentials(const process_t *process,
                              process_credentials_t *credentials)
 {
-    if (!process || !credentials || process->state != PROCESS_STATE_ACTIVE ||
-        !process->credentials_initialized ||
-        !identity_credentials_valid(&process->credentials)) {
-        return false;
-    }
-    return identity_credentials_effective(&process->credentials, credentials);
+    process_credentials_t snapshot;
+    u64 flags;
+
+    if (!process || !credentials) return false;
+    flags = spin_lock_irqsave(&process_registry_lock);
+    bool available = process->state == PROCESS_STATE_ACTIVE &&
+                     process->credentials_initialized;
+    if (available) snapshot = process->credentials;
+    spin_unlock_irqrestore(&process_registry_lock, flags);
+    if (!available || !identity_credentials_valid(&snapshot)) return false;
+    return identity_credentials_effective(&snapshot, credentials);
 }
 
 bool process_attach_thread(process_t *process, struct kernel_thread *thread)
@@ -729,7 +770,6 @@ i64 process_memory_unmap(process_t *process, uintptr_t address)
 {
     process_memory_mapping_t **cursor;
     process_memory_mapping_t *mapping;
-    bool released;
 
     if (!process || process->state != PROCESS_STATE_ACTIVE ||
         (address & (VMM_PAGE_SIZE - 1))) {
@@ -744,11 +784,16 @@ i64 process_memory_unmap(process_t *process, uintptr_t address)
         return MG_ERR_NOT_FOUND;
     }
     mapping = *cursor;
+    if (!vmm_unmap_user_range(process->address_space,
+                              (void *)mapping->address,
+                              mapping->page_count)) {
+        mutex_unlock(&process->memory_lock);
+        return MG_ERR_BUSY;
+    }
     *cursor = mapping->next;
     mutex_unlock(&process->memory_lock);
-    released = process_memory_release_mapping(process, mapping);
     kfree(mapping);
-    return released ? MG_OK : MG_ERR_IO;
+    return MG_OK;
 }
 
 bool process_exit(process_t *process, i32 status)
@@ -760,12 +805,13 @@ bool process_exit(process_t *process, i32 status)
         return false;
     }
     flags = spin_lock_irqsave(&process_registry_lock);
-    if (process->state != PROCESS_STATE_ACTIVE) {
+    if (process->state != PROCESS_STATE_ACTIVE || process->active_syscalls) {
         spin_unlock_irqrestore(&process_registry_lock, flags);
         return false;
     }
     process->exit_status = status;
     process->state = PROCESS_STATE_TERMINATED;
+    process->termination_pending = false;
     if (process->parent && process->parent->state == PROCESS_STATE_ACTIVE &&
         process->parent->waiting_child == process &&
         process->parent->waiting_thread) {
@@ -797,6 +843,82 @@ bool process_exit(process_t *process, i32 status)
         (void)scheduler_unblock(waiter);
     }
     return true;
+}
+
+bool process_publish_launch(process_t *process)
+{
+    u64 flags;
+
+    if (!process) return false;
+    flags = spin_lock_irqsave(&process_registry_lock);
+    if (process->launch_ready || !process->main_thread) {
+        spin_unlock_irqrestore(&process_registry_lock, flags);
+        return false;
+    }
+    /* The creator calls this only after all process resources are installed
+     * and the thread is enqueued (or PID 1's image is fully prepared). */
+    process->launch_ready = true;
+    spin_unlock_irqrestore(&process_registry_lock, flags);
+    return true;
+}
+
+bool process_syscall_enter(process_t *process)
+{
+    bool admitted = false;
+    u64 flags;
+
+    if (!process) return false;
+    flags = spin_lock_irqsave(&process_registry_lock);
+    if (process->state == PROCESS_STATE_ACTIVE &&
+        !process->termination_pending &&
+        process->active_syscalls != ~(u32)0 &&
+        object_reference(&process->object)) {
+        process->active_syscalls++;
+        admitted = true;
+    }
+    spin_unlock_irqrestore(&process_registry_lock, flags);
+    return admitted;
+}
+
+void process_syscall_leave(process_t *process)
+{
+    u64 flags;
+
+    if (!process) return;
+    flags = spin_lock_irqsave(&process_registry_lock);
+    if (!process->active_syscalls)
+        panic("process: syscall admission underflow");
+    process->active_syscalls--;
+    spin_unlock_irqrestore(&process_registry_lock, flags);
+    object_release(&process->object);
+}
+
+static bool process_termination_begin(process_t *process)
+{
+    u64 flags;
+    bool admitted = false;
+
+    if (!process) return false;
+    flags = spin_lock_irqsave(&process_registry_lock);
+    if (process->state == PROCESS_STATE_ACTIVE && process->main_thread &&
+        process->launch_ready && !process->active_syscalls &&
+        !process->termination_pending) {
+        process->termination_pending = true;
+        admitted = true;
+    }
+    spin_unlock_irqrestore(&process_registry_lock, flags);
+    return admitted;
+}
+
+static void process_termination_cancel(process_t *process)
+{
+    u64 flags;
+
+    if (!process) return;
+    flags = spin_lock_irqsave(&process_registry_lock);
+    if (process->state == PROCESS_STATE_ACTIVE)
+        process->termination_pending = false;
+    spin_unlock_irqrestore(&process_registry_lock, flags);
 }
 
 bool process_terminate_current_exception(i32 status)
@@ -883,21 +1005,20 @@ static void process_abort(process_t *process)
 bool process_terminate_external(process_t *process, i32 status)
 {
     kernel_thread_t *main_thread;
-    u64 flags;
 
     if (!process || process == process_current()) {
         return false;
     }
-    flags = spin_lock_irqsave(&process_registry_lock);
-    if (process->state != PROCESS_STATE_ACTIVE || !process->main_thread) {
-        spin_unlock_irqrestore(&process_registry_lock, flags);
+    if (!process_termination_begin(process)) return false;
+    main_thread = process->main_thread;
+    if (!scheduler_terminate_thread(main_thread)) {
+        process_termination_cancel(process);
         return false;
     }
-    main_thread = process->main_thread;
-    spin_unlock_irqrestore(&process_registry_lock, flags);
-    if (!scheduler_terminate_thread(main_thread)) return false;
     console_cancel_waiter(main_thread);
-    return process_exit(process, status);
+    if (process_exit(process, status)) return true;
+    process_termination_cancel(process);
+    return false;
 }
 
 bool process_terminate_session_members(mg_session_id_t session_id)
@@ -936,7 +1057,8 @@ void process_reap_session_members(mg_session_id_t session_id)
         u64 flags = spin_lock_irqsave(&process_registry_lock);
 
         for (process = all_processes; process; process = process->next_all) {
-            if (process->session_id == session_id &&
+            if (process->launch_ready &&
+                process->session_id == session_id &&
                 process->state == PROCESS_STATE_TERMINATED &&
                 process->owner_reference_held &&
                 scheduler_thread_exit_complete(process->main_thread) &&
@@ -981,7 +1103,8 @@ bool process_interrupt_foreground_session(void)
     for (process_t *process = all_processes; process;
          process = process->next_all) {
         process_count++;
-        if (process->state != PROCESS_STATE_ACTIVE ||
+        if (!process->launch_ready ||
+            process->state != PROCESS_STATE_ACTIVE ||
             !process->session_shell || !process->waiting_child ||
             process->waiting_child->state != PROCESS_STATE_ACTIVE)
             continue;
@@ -1045,6 +1168,10 @@ static bool process_matches_shutdown_phase(const process_t *process,
                                            bool services)
 {
     if (!process || process == requester) return false;
+    /* A process that was already under construction when shutdown started is
+     * a quiescence dependency even before its service/session metadata is
+     * published. The caller waits for publication, then classifies it. */
+    if (!process->launch_ready) return true;
     if (!services) return !process->system_service;
     /* PID 1 and the session coordinators remain alive through the final
      * transition. Sprout restarts leaf services if sync/timeout aborts; the
@@ -1386,6 +1513,7 @@ static int process_spawn_args_with_context_internal(
 {
     kernel_thread_t *thread;
     process_t *child;
+    PROCESS_SPAWN_OBJECT_REFS_AUTO process_spawn_object_refs_t refs = {0};
     kernel_object_t *console;
     kernel_object_t *output;
     process_handle_t child_handle;
@@ -1431,6 +1559,7 @@ static int process_spawn_args_with_context_internal(
                                         OBJECT_RIGHT_READ | OBJECT_RIGHT_WRITE);
     }
     if (!console) return VFS_ERR_BAD_FORMAT;
+    refs.console = console;
     output = console;
     if (inherit_output) {
         output = process_handle_lookup_any(parent,
@@ -1438,13 +1567,21 @@ static int process_spawn_args_with_context_internal(
                                            OBJECT_TYPE_INVALID,
                                            OBJECT_RIGHT_WRITE);
         if (!output || (output->type != OBJECT_TYPE_FILE &&
-                        output->type != OBJECT_TYPE_CONSOLE)) return VFS_ERR_BAD_FORMAT;
+                        output->type != OBJECT_TYPE_CONSOLE)) {
+            if (output) object_release(output);
+            return VFS_ERR_BAD_FORMAT;
+        }
+        refs.separate_output = output;
     } else if (output_handle != 0) {
         output = process_handle_lookup_any(parent, output_handle,
                                            OBJECT_TYPE_INVALID,
                                            OBJECT_RIGHT_WRITE);
         if (!output || (output->type != OBJECT_TYPE_FILE &&
-                        output->type != OBJECT_TYPE_CONSOLE)) return VFS_ERR_BAD_FORMAT;
+                        output->type != OBJECT_TYPE_CONSOLE)) {
+            if (output) object_release(output);
+            return VFS_ERR_BAD_FORMAT;
+        }
+        refs.separate_output = output;
     }
 
     process_name_source = bin_path;
@@ -1464,6 +1601,7 @@ static int process_spawn_args_with_context_internal(
         return VFS_ERR_BAD_FORMAT;
     }
     thread->entry_argument = child;
+    u64 child_flags = spin_lock_irqsave(&process_registry_lock);
     if (resolved_path[0]) {
         strncpy(child->executable_path, resolved_path,
                 sizeof(child->executable_path) - 1U);
@@ -1484,12 +1622,12 @@ static int process_spawn_args_with_context_internal(
     if (session_id != PROCESS_NO_SESSION) {
         child->session_id = session_id;
         child->session_shell = session_shell;
-        if (initial_cwd) {
-            if (process_chdir_result(child, initial_cwd) != VFS_OK) {
-                process_abort(child);
-                return VFS_ERR_BAD_FORMAT;
-            }
-        }
+    }
+    spin_unlock_irqrestore(&process_registry_lock, child_flags);
+    if (session_id != PROCESS_NO_SESSION && initial_cwd &&
+        process_chdir_result(child, initial_cwd) != VFS_OK) {
+        process_abort(child);
+        return VFS_ERR_BAD_FORMAT;
     }
     
     int load_result=elf_load_process_node_result(child,vfs_location_node(executable),
@@ -1525,6 +1663,8 @@ static int process_spawn_args_with_context_internal(
         process_abort(child);
         return VFS_ERR_BAD_FORMAT;
     }
+    if (!process_publish_launch(child))
+        panic("process: failed to publish completed child launch");
     *out_handle = parent_handle;
     return VFS_OK;
 }
@@ -1655,11 +1795,18 @@ bool process_redirect_output(process_t *process, process_handle_t output_handle,
         return false;
     }
 
+    if (!mutex_lock(&process->handle_growth_mutex)) {
+        (void)process_handle_close(process, saved);
+        object_release(output);
+        object_release(current);
+        return false;
+    }
     flags = spin_lock_irqsave(&process->handle_lock);
     slots = handle_slots(process);
     if (process->output_redirected || !slots[0].active ||
         !slots[0].object) {
         spin_unlock_irqrestore(&process->handle_lock, flags);
+        mutex_unlock(&process->handle_growth_mutex);
         (void)process_handle_close(process, saved);
         object_release(output);
         object_release(current);
@@ -1673,6 +1820,7 @@ bool process_redirect_output(process_t *process, process_handle_t output_handle,
     process->redirected_output_saved_handle = saved;
     *saved_handle = saved;
     spin_unlock_irqrestore(&process->handle_lock, flags);
+    mutex_unlock(&process->handle_growth_mutex);
     object_release(old_output);
     object_release(current);
     return true;
@@ -1695,9 +1843,14 @@ bool process_restore_output(process_t *process, process_handle_t saved_handle)
                                             OBJECT_TYPE_CONSOLE,
                                             OBJECT_RIGHT_WRITE);
     if (!saved) return false;
+    if (!mutex_lock(&process->handle_growth_mutex)) {
+        object_release(saved);
+        return false;
+    }
     flags = spin_lock_irqsave(&process->handle_lock);
     if (!process->handle_table || saved_index >= process->handle_capacity) {
         spin_unlock_irqrestore(&process->handle_lock, flags);
+        mutex_unlock(&process->handle_growth_mutex);
         object_release(saved);
         return false;
     }
@@ -1709,6 +1862,7 @@ bool process_restore_output(process_t *process, process_handle_t saved_handle)
         slots[saved_index].generation != saved_generation ||
         slots[saved_index].object != saved) {
         spin_unlock_irqrestore(&process->handle_lock, flags);
+        mutex_unlock(&process->handle_growth_mutex);
         object_release(saved);
         return false;
     }
@@ -1723,6 +1877,7 @@ bool process_restore_output(process_t *process, process_handle_t saved_handle)
     process->redirected_output_saved_handle = 0;
     process_handle_revision_advance(process);
     spin_unlock_irqrestore(&process->handle_lock, flags);
+    mutex_unlock(&process->handle_growth_mutex);
     object_release(old_output);
     object_release(saved_handle_object);
     return true;
@@ -1745,7 +1900,6 @@ int process_spawn_service_result(process_t *parent, u32 service_id,
 {
     const kernel_service_definition_t *definition;
     kernel_object_t *object;
-    process_t *child;
     process_credentials_t credentials;
 
     if (!parent || parent->pid != 1U || parent->state != PROCESS_STATE_ACTIVE ||
@@ -1771,7 +1925,7 @@ int process_spawn_service_result(process_t *parent, u32 service_id,
         (void)process_handle_close(parent, *out_handle);
         return MG_ERR_IO;
     }
-    child = object_process(object);
+    object_release(object);
     return MG_OK;
 }
 
@@ -1790,7 +1944,9 @@ u64 process_handle_pid(process_t *process, process_handle_t handle)
     object = process_handle_lookup_any(process, handle, OBJECT_TYPE_PROCESS, 0);
     if (!object) return 0;
     child = object_process(object);
-    return child->pid;
+    u64 pid = child->pid;
+    object_release(object);
+    return pid;
 }
 
 int process_poll(process_t *parent, process_handle_t handle, i32 *out_status)
@@ -1806,18 +1962,22 @@ int process_poll(process_t *parent, process_handle_t handle, i32 *out_status)
     u64 flags = spin_lock_irqsave(&process_registry_lock);
     if (child == parent || child->parent != parent || child->wait_collected) {
         spin_unlock_irqrestore(&process_registry_lock, flags);
+        object_release(object);
         return MG_ERR_NOT_CHILD;
     }
     if (child->state == PROCESS_STATE_ACTIVE) {
         spin_unlock_irqrestore(&process_registry_lock, flags);
+        object_release(object);
         return MG_ERR_WOULD_BLOCK;
     }
     if (!scheduler_thread_exit_complete(child->main_thread)) {
         spin_unlock_irqrestore(&process_registry_lock, flags);
+        object_release(object);
         return MG_ERR_WOULD_BLOCK;
     }
     *out_status = child->exit_status;
     spin_unlock_irqrestore(&process_registry_lock, flags);
+    object_release(object);
     return MG_OK;
 }
 
@@ -1836,10 +1996,13 @@ int process_terminate_child(process_t *parent, process_handle_t handle,
     if (child == parent || child->parent != parent ||
         child->state != PROCESS_STATE_ACTIVE) {
         spin_unlock_irqrestore(&process_registry_lock, flags);
+        object_release(object);
         return MG_ERR_NOT_CHILD;
     }
     spin_unlock_irqrestore(&process_registry_lock, flags);
-    return process_terminate_external(child, status) ? MG_OK : MG_ERR_BUSY;
+    bool terminated = process_terminate_external(child, status);
+    object_release(object);
+    return terminated ? MG_OK : MG_ERR_BUSY;
 }
 
 int process_wait(process_t *parent, process_handle_t handle,
@@ -1860,6 +2023,7 @@ int process_wait(process_t *parent, process_handle_t handle,
     if (child == parent || child->parent != parent || child->wait_collected) {
         spin_unlock(&process_registry_lock);
         process_cli_restore(wait_flags);
+        object_release(object);
         return MG_ERR_INVALID_HANDLE;
     }
     if (child->state == PROCESS_STATE_ACTIVE) {
@@ -1867,6 +2031,7 @@ int process_wait(process_t *parent, process_handle_t handle,
         if (parent->waiting_child || !thread) {
             spin_unlock(&process_registry_lock);
             process_cli_restore(wait_flags);
+            object_release(object);
             return MG_ERR_BUSY;
         }
         parent->waiting_child = child;
@@ -1881,6 +2046,7 @@ int process_wait(process_t *parent, process_handle_t handle,
             }
             spin_unlock(&process_registry_lock);
             process_cli_restore(wait_flags);
+            object_release(object);
             return process_shutdown_requested(parent) ? MG_ERR_SHUTDOWN :
                 MG_ERR_BUSY;
         }
@@ -1893,6 +2059,7 @@ int process_wait(process_t *parent, process_handle_t handle,
         if (child->state != PROCESS_STATE_TERMINATED) {
             spin_unlock(&process_registry_lock);
             process_cli_restore(wait_flags);
+            object_release(object);
             return process_shutdown_requested(parent) ? MG_ERR_SHUTDOWN :
                 MG_ERR_BUSY;
         }
@@ -1905,6 +2072,7 @@ int process_wait(process_t *parent, process_handle_t handle,
         spin_unlock(&process_registry_lock);
         if (process_shutdown_requested(parent) || !scheduler_sleep(1U)) {
             process_cli_restore(wait_flags);
+            object_release(object);
             return process_shutdown_requested(parent) ? MG_ERR_SHUTDOWN :
                 MG_ERR_BUSY;
         }
@@ -1917,6 +2085,7 @@ int process_wait(process_t *parent, process_handle_t handle,
     spin_unlock(&process_registry_lock);
     process_cli_restore(wait_flags);
     object_release(&child->object); /* drop the process's owner reference */
+    object_release(object);
     return MG_OK;
 }
 
@@ -1927,6 +2096,7 @@ bool process_handle_install(process_t *process, kernel_object_t *object,
         !__atomic_load_n(&object->ref_count, __ATOMIC_ACQUIRE) || !out_handle ||
         (rights & ~(OBJECT_RIGHT_READ | OBJECT_RIGHT_WRITE))) return false;
     for (;;) {
+        if (!mutex_lock(&process->handle_growth_mutex)) return false;
         u64 flags = spin_lock_irqsave(&process->handle_lock);
         process_handle_slot_t *slots = handle_slots(process);
         usize capacity = process->handle_capacity;
@@ -1938,6 +2108,7 @@ bool process_handle_install(process_t *process, kernel_object_t *object,
                 if (!generation) generation = 1;
                 if (!object_reference(object)) {
                     spin_unlock_irqrestore(&process->handle_lock, flags);
+                    mutex_unlock(&process->handle_growth_mutex);
                     return false;
                 }
                 slots[i].object = object;
@@ -1948,10 +2119,12 @@ bool process_handle_install(process_t *process, kernel_object_t *object,
                 process_handle_revision_advance(process);
                 *out_handle = encode_handle((u32)i, generation);
                 spin_unlock_irqrestore(&process->handle_lock, flags);
+                mutex_unlock(&process->handle_growth_mutex);
                 return true;
             }
         }
         spin_unlock_irqrestore(&process->handle_lock, flags);
+        mutex_unlock(&process->handle_growth_mutex);
         if (!process_handle_grow(process)) return false;
     }
 }
@@ -1965,6 +2138,7 @@ bool process_handle_reserve(process_t *process, kernel_object_t *object,
         !out_handle || (rights & ~(OBJECT_RIGHT_READ | OBJECT_RIGHT_WRITE)))
         return false;
     for (;;) {
+        if (!mutex_lock(&process->handle_growth_mutex)) return false;
         u64 flags = spin_lock_irqsave(&process->handle_lock);
         process_handle_slot_t *slots = handle_slots(process);
         usize capacity = process->handle_capacity;
@@ -1982,9 +2156,11 @@ bool process_handle_reserve(process_t *process, kernel_object_t *object,
             process_handle_revision_advance(process);
             *out_handle = encode_handle((u32)i, generation);
             spin_unlock_irqrestore(&process->handle_lock, flags);
+            mutex_unlock(&process->handle_growth_mutex);
             return true;
         }
         spin_unlock_irqrestore(&process->handle_lock, flags);
+        mutex_unlock(&process->handle_growth_mutex);
         if (!process_handle_grow(process)) return false;
     }
 }
@@ -1997,21 +2173,25 @@ bool process_handle_activate(process_t *process, process_handle_t handle)
     process_handle_slot_t *slot;
 
     if (!process || !decode_handle(handle, &index, &generation)) return false;
+    if (!mutex_lock(&process->handle_growth_mutex)) return false;
     flags = spin_lock_irqsave(&process->handle_lock);
     if (!process->handle_table || index >= process->handle_capacity) {
         spin_unlock_irqrestore(&process->handle_lock, flags);
+        mutex_unlock(&process->handle_growth_mutex);
         return false;
     }
     slot = &handle_slots(process)[index];
     if (process->state != PROCESS_STATE_ACTIVE || !slot->reserved ||
         slot->active || slot->generation != generation || !slot->object) {
         spin_unlock_irqrestore(&process->handle_lock, flags);
+        mutex_unlock(&process->handle_growth_mutex);
         return false;
     }
     slot->active = true;
     slot->reserved = false;
     process_handle_revision_advance(process);
     spin_unlock_irqrestore(&process->handle_lock, flags);
+    mutex_unlock(&process->handle_growth_mutex);
     return true;
 }
 
@@ -2024,14 +2204,17 @@ bool process_handle_cancel(process_t *process, process_handle_t handle)
     process_handle_slot_t *slot;
 
     if (!process || !decode_handle(handle, &index, &generation)) return false;
+    if (!mutex_lock(&process->handle_growth_mutex)) return false;
     flags = spin_lock_irqsave(&process->handle_lock);
     if (!process->handle_table || index >= process->handle_capacity) {
         spin_unlock_irqrestore(&process->handle_lock, flags);
+        mutex_unlock(&process->handle_growth_mutex);
         return false;
     }
     slot = &handle_slots(process)[index];
     if (!slot->reserved || slot->active || slot->generation != generation) {
         spin_unlock_irqrestore(&process->handle_lock, flags);
+        mutex_unlock(&process->handle_growth_mutex);
         return false;
     }
     object = slot->object;
@@ -2041,6 +2224,7 @@ bool process_handle_cancel(process_t *process, process_handle_t handle)
     if (index < process->next_handle_slot) process->next_handle_slot = index;
     process_handle_revision_advance(process);
     spin_unlock_irqrestore(&process->handle_lock, flags);
+    mutex_unlock(&process->handle_growth_mutex);
     if (object) object_release(object);
     return true;
 }
@@ -2050,26 +2234,8 @@ kernel_object_t *process_handle_lookup_any(process_t *process,
                                            kernel_object_type_t type,
                                            u32 required_rights)
 {
-    u32 index;
-    u16 generation;
-    u64 flags;
-    if (!process || !decode_handle(handle, &index, &generation)) return NULL;
-    flags = spin_lock_irqsave(&process->handle_lock);
-    if (!process->handle_table || index >= process->handle_capacity) {
-        spin_unlock_irqrestore(&process->handle_lock, flags);
-        return NULL;
-    }
-    process_handle_slot_t *slots = handle_slots(process);
-    if (!slots[index].active || slots[index].generation != generation ||
-        !slots[index].object ||
-        (type != OBJECT_TYPE_INVALID && slots[index].object->type != type) ||
-        (slots[index].rights & required_rights) != required_rights) {
-        spin_unlock_irqrestore(&process->handle_lock, flags);
-        return NULL;
-    }
-    kernel_object_t *object = slots[index].object;
-    spin_unlock_irqrestore(&process->handle_lock, flags);
-    return object;
+    return process_handle_lookup_reference(process, handle, type,
+                                           required_rights);
 }
 
 static kernel_object_t *process_handle_lookup_reference(
@@ -2107,15 +2273,6 @@ kernel_object_t *process_handle_lookup(process_t *process,
                                        u32 required_rights)
 {
     if (!process || process->state != PROCESS_STATE_ACTIVE) return NULL;
-    return process_handle_lookup_any(process, handle, type, required_rights);
-}
-
-kernel_object_t *process_handle_lookup_retain(process_t *process,
-                                              process_handle_t handle,
-                                              kernel_object_type_t type,
-                                              u32 required_rights)
-{
-    if (!process || process->state != PROCESS_STATE_ACTIVE) return NULL;
     return process_handle_lookup_reference(process, handle, type,
                                            required_rights);
 }
@@ -2127,14 +2284,17 @@ bool process_handle_close(process_t *process, process_handle_t handle)
     kernel_object_t *object;
     u64 flags;
     if (!process || !decode_handle(handle, &index, &generation)) return false;
+    if (!mutex_lock(&process->handle_growth_mutex)) return false;
     flags = spin_lock_irqsave(&process->handle_lock);
     if (!process->handle_table || index >= process->handle_capacity) {
         spin_unlock_irqrestore(&process->handle_lock, flags);
+        mutex_unlock(&process->handle_growth_mutex);
         return false;
     }
     process_handle_slot_t *slots = handle_slots(process);
     if (!slots[index].active || slots[index].generation != generation) {
         spin_unlock_irqrestore(&process->handle_lock, flags);
+        mutex_unlock(&process->handle_growth_mutex);
         return false;
     }
     object = slots[index].object;
@@ -2144,6 +2304,7 @@ bool process_handle_close(process_t *process, process_handle_t handle)
     if (index < process->next_handle_slot) process->next_handle_slot = index;
     process_handle_revision_advance(process);
     spin_unlock_irqrestore(&process->handle_lock, flags);
+    mutex_unlock(&process->handle_growth_mutex);
     object_release(object);
     return true;
 }
@@ -2152,6 +2313,7 @@ void process_handle_close_all(process_t *process)
 {
     usize capacity;
     if (!process || !process->handle_table) return;
+    if (!mutex_lock(&process->handle_growth_mutex)) return;
     capacity = process->handle_capacity;
     process->next_handle_slot = 0;
     for (usize i = 0; i < capacity; i++) {
@@ -2169,6 +2331,7 @@ void process_handle_close_all(process_t *process)
         spin_unlock_irqrestore(&process->handle_lock, flags);
         if (object) object_release(object);
     }
+    mutex_unlock(&process->handle_growth_mutex);
 }
 
 const char *process_state_name(process_state_t state)
@@ -2195,6 +2358,7 @@ void process_dump(void)
 
     kprint("Processes:\n");
     for (process = all_processes; process; process = process->next_all) {
+        if (!process->launch_ready) continue;
         process_credentials_t credentials = process->credentials;
         if (process->state == PROCESS_STATE_ACTIVE &&
             process->credentials_initialized) {
@@ -2243,6 +2407,7 @@ u32 process_snapshot_read(u32 offset, mg_process_info_t *output,
         !out_total) return 0;
     u64 flags = spin_lock_irqsave(&process_registry_lock);
     for (process = all_processes; process; process = process->next_all) {
+        if (!process->launch_ready) continue;
         process_credentials_t credentials = process->credentials;
         mg_process_info_t info;
         user_identity_t account;

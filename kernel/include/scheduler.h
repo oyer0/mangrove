@@ -77,6 +77,9 @@ struct kernel_thread {
      * be redirected into the deferred same-ring preemption trampoline. */
     bool syscall_active;
     u32 syscall_nesting;
+    /* Points to the active syscall's stack-owned list of VMM user-range
+     * leases. It is per thread because a blocked syscall retains its stack. */
+    void *syscall_user_access_context;
     /* An entered kernel thread may have a suspended C frame even without a
      * userspace syscall.  External destruction may only discard its initial
      * prepared frame or a self-terminated thread. */

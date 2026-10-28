@@ -67,7 +67,8 @@ typedef struct process process_t;
 typedef struct {unsigned ref_count; process_t *process;} kernel_object_t;
 struct process {
  int state; bool wait_collected, owner_reference_held, shutdown_requested;
- i32 exit_status; u64 session_id;
+ bool launch_ready;
+ i32 exit_status; u64 session_id; u32 active_syscalls;
  process_t *parent, *waiting_child, *next_all, *first_child, *next_sibling;
  kernel_thread_t *main_thread, *waiting_thread; kernel_object_t object;
  void *address_space, *handle_table;
@@ -95,7 +96,7 @@ static bool process_shutdown_requested(const process_t *p)
 static kernel_object_t *process_handle_lookup_any(process_t *p,
  process_handle_t h,int type,u32 rights)
 {(void)rights;assert(p==&parent && h==7 && type==OBJECT_TYPE_PROCESS);
- return &child.object;}
+ child.object.ref_count++; return &child.object;}
 static process_t *object_process(kernel_object_t *object)
 {return object->process;}
 static bool object_reference(kernel_object_t *object)
@@ -106,7 +107,7 @@ static void object_release(kernel_object_t *object)
  if(!child.owner_reference_held || object->ref_count==1)
    assert(scheduler_thread_exit_complete(child.main_thread));
  assert(object->ref_count);object->ref_count--;
- if(!child.owner_reference_held)owner_releases++;
+ if(!child.owner_reference_held && !owner_releases)owner_releases++;
  if(!object->ref_count)all_processes=NULL;}
 static void process_unlink_locked(process_t *p)
 {assert(process_registry_lock && p==&child);p->parent=NULL;}
@@ -169,6 +170,7 @@ static void reset(bool active)
  parent.state=PROCESS_STATE_ACTIVE;
  child.state=active?PROCESS_STATE_ACTIVE:PROCESS_STATE_TERMINATED;
  child.parent=&parent;child.main_thread=&child_thread;child.session_id=42;
+ child.launch_ready=true;
  child.owner_reference_held=true;child.exit_status=23;
  child.object=(kernel_object_t){.ref_count=2,.process=&child};
  child_thread=(kernel_thread_t){.state=THREAD_STATE_READY,

@@ -14,6 +14,7 @@
 #include <cpu_relax.h>
 #include <mutex.h>
 #include <stddef.h>
+#include <string.h>
 
 #define VMM_MAX_PROCESS_METADATA 64U
 #define VMM_CPU_MASK_WORDS ((CPU_MAX_COUNT + 63U) / 64U)
@@ -43,6 +44,7 @@ _Static_assert(((KERNEL_VMM_RANGE_LIMIT - 1ULL) >> 39 & 0x1ffULL) ==
 
 typedef struct vmm_owned_frame {
     phys_addr_t physical;
+    u32 user_pin_count;
     struct vmm_owned_frame *next;
 } vmm_owned_frame_t;
 
@@ -52,6 +54,7 @@ typedef struct vmm_address_space_metadata {
     vmm_owned_frame_t *leaves;
     mutex_t operation_lock;
     volatile u64 active_cpu_mask[VMM_CPU_MASK_WORDS];
+    u64 active_user_leases;
     bool destroy_pending;
     bool shootdown_pending;
 } vmm_address_space_metadata_t;
@@ -212,6 +215,7 @@ static vmm_address_space_metadata_t *vmm_metadata_create(page_table_t *root)
             mutex_init(&address_space_metadata[i].operation_lock);
             for (u32 word = 0; word < VMM_CPU_MASK_WORDS; word++)
                 address_space_metadata[i].active_cpu_mask[word] = 0;
+            address_space_metadata[i].active_user_leases = 0;
             address_space_metadata[i].destroy_pending = false;
             address_space_metadata[i].shootdown_pending = false;
             return &address_space_metadata[i];
@@ -592,6 +596,16 @@ static bool vmm_owned_contains(const vmm_owned_frame_t *frames,
     return false;
 }
 
+static vmm_owned_frame_t *vmm_owned_find(vmm_owned_frame_t *frames,
+                                         phys_addr_t physical)
+{
+    physical &= PTE_FRAME_MASK;
+    for (; frames; frames = frames->next) {
+        if (frames->physical == physical) return frames;
+    }
+    return 0;
+}
+
 static bool vmm_owned_add(vmm_owned_frame_t **frames, phys_addr_t physical)
 {
     vmm_owned_frame_t *node;
@@ -601,6 +615,7 @@ static bool vmm_owned_add(vmm_owned_frame_t **frames, phys_addr_t physical)
     node = (vmm_owned_frame_t *)kmalloc(sizeof(*node));
     if (!node) return false;
     node->physical = physical;
+    node->user_pin_count = 0;
     node->next = *frames;
     *frames = node;
     return true;
@@ -611,11 +626,13 @@ static void vmm_owned_insert(vmm_owned_frame_t **frames,
                              phys_addr_t physical)
 {
     node->physical = physical & PTE_FRAME_MASK;
+    node->user_pin_count = 0;
     node->next = *frames;
     *frames = node;
 }
 
-static bool vmm_owned_remove(vmm_owned_frame_t **frames, phys_addr_t physical)
+static vmm_owned_frame_t *vmm_owned_detach(vmm_owned_frame_t **frames,
+                                            phys_addr_t physical)
 {
     vmm_owned_frame_t **cursor = frames;
     physical &= PTE_FRAME_MASK;
@@ -623,12 +640,12 @@ static bool vmm_owned_remove(vmm_owned_frame_t **frames, phys_addr_t physical)
         if ((*cursor)->physical == physical) {
             vmm_owned_frame_t *node = *cursor;
             *cursor = node->next;
-            kfree(node);
-            return true;
+            node->next = NULL;
+            return node;
         }
         cursor = &(*cursor)->next;
     }
-    return false;
+    return NULL;
 }
 
 /* Page-table entries and CR3 always contain physical addresses.  All C
@@ -1294,6 +1311,7 @@ void vmm_init(void) {
         mutex_init(&address_space_metadata[i].operation_lock);
         for (u32 word = 0; word < VMM_CPU_MASK_WORDS; word++)
             address_space_metadata[i].active_cpu_mask[word] = 0;
+        address_space_metadata[i].active_user_leases = 0;
         address_space_metadata[i].destroy_pending = false;
         address_space_metadata[i].shootdown_pending = false;
     }
@@ -1726,6 +1744,7 @@ bool vmm_unmap_user_page(page_table_t *pml4, void *virtual_addr,
     u64 *pte;
     vmm_address_space_metadata_t *metadata;
     u64 shootdown_targets[VMM_CPU_MASK_WORDS] = {0};
+    vmm_owned_frame_t *detached_leaf;
 
     if (!pml4 || pml4 == kernel_pml4 || !out_physical_addr ||
         (virtual_value & (VMM_PAGE_SIZE - 1)) ||
@@ -1785,7 +1804,16 @@ bool vmm_unmap_user_page(page_table_t *pml4, void *virtual_addr,
         return false;
     }
     *out_physical_addr = *pte & PTE_FRAME_MASK;
-    if (!vmm_owned_remove(&metadata->leaves, *out_physical_addr)) {
+    vmm_owned_frame_t *leaf = vmm_owned_find(metadata->leaves,
+                                              *out_physical_addr);
+    if (!leaf || leaf->user_pin_count) {
+        spin_unlock_irqrestore(&vmm_metadata_lock, saved_flags);
+        mutex_unlock(&metadata->operation_lock);
+        return false;
+    }
+    detached_leaf = vmm_owned_detach(&metadata->leaves,
+                                     *out_physical_addr);
+    if (!detached_leaf) {
         spin_unlock_irqrestore(&vmm_metadata_lock, saved_flags);
         mutex_unlock(&metadata->operation_lock);
         return false;
@@ -1797,6 +1825,7 @@ bool vmm_unmap_user_page(page_table_t *pml4, void *virtual_addr,
     }
     vmm_capture_active_targets_locked(metadata, shootdown_targets);
     spin_unlock_irqrestore(&vmm_metadata_lock, saved_flags);
+    kfree(detached_leaf);
     vmm_tlb_shootdown(shootdown_targets, pml4);
     saved_flags = spin_lock_irqsave(&vmm_metadata_lock);
     metadata = vmm_metadata_find(pml4);
@@ -1805,6 +1834,131 @@ bool vmm_unmap_user_page(page_table_t *pml4, void *virtual_addr,
     spin_unlock_irqrestore(&vmm_metadata_lock, saved_flags);
     mutex_unlock(&operation_metadata->operation_lock);
     return true;
+}
+
+bool vmm_unmap_user_range(page_table_t *pml4, void *virtual_addr,
+                          usize page_count)
+{
+    uintptr_t start = (uintptr_t)virtual_addr;
+    uintptr_t end;
+    vmm_address_space_metadata_t *metadata;
+    vmm_address_space_metadata_t *operation_metadata;
+    vmm_owned_frame_t *detached_leaves = NULL;
+    u64 shootdown_targets[VMM_CPU_MASK_WORDS] = {0};
+
+    if (!pml4 || pml4 == kernel_pml4 || !virtual_addr || !page_count ||
+        (start & (VMM_PAGE_SIZE - 1U)) ||
+        start >= VMM_USER_ADDRESS_LIMIT ||
+        page_count > (VMM_USER_ADDRESS_LIMIT - start) / VMM_PAGE_SIZE ||
+        ((start >> 39) & 0x1ffU) >= 256U)
+        return false;
+    end = start + page_count * VMM_PAGE_SIZE;
+
+    u64 flags = spin_lock_irqsave(&vmm_metadata_lock);
+    metadata = vmm_metadata_find(pml4);
+    if (!metadata || metadata->destroy_pending) {
+        spin_unlock_irqrestore(&vmm_metadata_lock, flags);
+        return false;
+    }
+    operation_metadata = metadata;
+    spin_unlock_irqrestore(&vmm_metadata_lock, flags);
+    if (!mutex_lock(&operation_metadata->operation_lock))
+        return false;
+
+    flags = spin_lock_irqsave(&vmm_metadata_lock);
+    metadata = vmm_metadata_find(pml4);
+    if (!metadata || metadata->destroy_pending) {
+        spin_unlock_irqrestore(&vmm_metadata_lock, flags);
+        mutex_unlock(&operation_metadata->operation_lock);
+        return false;
+    }
+
+    /* Validate the entire extent before removing any leaf.  Range leases use
+     * the same metadata lock, so no new syscall can pin a page between this
+     * check and the following unmap pass. */
+    for (uintptr_t address = start; address < end;
+         address += VMM_PAGE_SIZE) {
+        u64 entry = pml4->entries[(address >> 39) & 0x1ffU];
+        page_table_t *pdpt;
+        page_table_t *pd;
+        page_table_t *pt;
+        vmm_owned_frame_t *leaf;
+
+        if ((entry & (PTE_PRESENT | PTE_USER)) !=
+                (PTE_PRESENT | PTE_USER) || (entry & PTE_HUGE) ||
+            !vmm_owned_contains(metadata->tables, entry & PTE_FRAME_MASK))
+            goto range_invalid;
+        pdpt = vmm_table_from_phys(entry);
+        entry = pdpt->entries[(address >> 30) & 0x1ffU];
+        if ((entry & (PTE_PRESENT | PTE_USER)) !=
+                (PTE_PRESENT | PTE_USER) || (entry & PTE_HUGE) ||
+            !vmm_owned_contains(metadata->tables, entry & PTE_FRAME_MASK))
+            goto range_invalid;
+        pd = vmm_table_from_phys(entry);
+        entry = pd->entries[(address >> 21) & 0x1ffU];
+        if ((entry & (PTE_PRESENT | PTE_USER)) !=
+                (PTE_PRESENT | PTE_USER) || (entry & PTE_HUGE) ||
+            !vmm_owned_contains(metadata->tables, entry & PTE_FRAME_MASK))
+            goto range_invalid;
+        pt = vmm_table_from_phys(entry);
+        entry = pt->entries[(address >> 12) & 0x1ffU];
+        if ((entry & (PTE_PRESENT | PTE_USER)) !=
+                (PTE_PRESENT | PTE_USER))
+            goto range_invalid;
+        leaf = vmm_owned_find(metadata->leaves, entry & PTE_FRAME_MASK);
+        if (!leaf || leaf->user_pin_count)
+            goto range_invalid;
+    }
+
+    metadata->shootdown_pending = true;
+    for (usize index = 0; index < page_count; index++) {
+        uintptr_t address = start + index * VMM_PAGE_SIZE;
+        u64 entry = pml4->entries[(address >> 39) & 0x1ffU];
+        page_table_t *pdpt = vmm_table_from_phys(entry);
+        entry = pdpt->entries[(address >> 30) & 0x1ffU];
+        page_table_t *pd = vmm_table_from_phys(entry);
+        entry = pd->entries[(address >> 21) & 0x1ffU];
+        page_table_t *pt = vmm_table_from_phys(entry);
+        u64 *pte = &pt->entries[(address >> 12) & 0x1ffU];
+
+        phys_addr_t physical = *pte & PTE_FRAME_MASK;
+        vmm_owned_frame_t *detached = vmm_owned_detach(
+            &metadata->leaves, physical);
+        if (!detached)
+            panic("vmm: validated user leaf ownership disappeared");
+        detached->next = detached_leaves;
+        detached_leaves = detached;
+        *pte = 0;
+    }
+    vmm_capture_active_targets_locked(metadata, shootdown_targets);
+    spin_unlock_irqrestore(&vmm_metadata_lock, flags);
+
+    if (pml4 == active_pml4)
+        vmm_reload_current_cr3();
+    /* A full address-space flush handles arbitrarily large mapped ranges
+     * without the bounded per-page shootdown limit used by kernel leases. */
+    vmm_tlb_shootdown(shootdown_targets, pml4);
+    flags = spin_lock_irqsave(&vmm_metadata_lock);
+    metadata = vmm_metadata_find(pml4);
+    if (metadata)
+        metadata->shootdown_pending = false;
+    spin_unlock_irqrestore(&vmm_metadata_lock, flags);
+    mutex_unlock(&operation_metadata->operation_lock);
+
+    /* Detached leaf records retain the physical frames until every CPU that
+     * could have cached this address space has completed its full flush. */
+    while (detached_leaves) {
+        vmm_owned_frame_t *next = detached_leaves->next;
+        pmm_free_frame(detached_leaves->physical);
+        kfree(detached_leaves);
+        detached_leaves = next;
+    }
+    return true;
+
+range_invalid:
+    spin_unlock_irqrestore(&vmm_metadata_lock, flags);
+    mutex_unlock(&operation_metadata->operation_lock);
+    return false;
 }
 
 static bool vmm_map_with_owner(page_table_t *pml4, void *virtual_addr,
@@ -2546,7 +2700,8 @@ void vmm_destroy_address_space(page_table_t *pml4)
             spin_unlock_irqrestore(&vmm_metadata_lock, saved_flags);
             panic("vmm: attempted to destroy the active address space");
         }
-        if (!vmm_cpu_mask_empty(metadata->active_cpu_mask)) {
+        if (!vmm_cpu_mask_empty(metadata->active_cpu_mask) ||
+            metadata->active_user_leases != 0) {
             spin_unlock_irqrestore(&vmm_metadata_lock, saved_flags);
             if (wait_ticks++ >= 5000U || !scheduler_sleep(1))
                 panic("vmm: address-space teardown did not quiesce");
@@ -2640,49 +2795,62 @@ bool vmm_switch_address_space(page_table_t *pml4)
     return true;
 }
 
+static vmm_owned_frame_t *vmm_user_range_leaf_locked(
+    vmm_address_space_metadata_t *metadata, page_table_t *pml4,
+    uintptr_t page, bool writable)
+{
+    u64 entry = pml4->entries[(page >> 39) & 0x1ff];
+    page_table_t *pdpt, *pd, *pt;
+
+    if (!(entry & PTE_PRESENT) || !(entry & PTE_USER) ||
+        (writable && !(entry & PTE_READWRITE))) return 0;
+    pdpt = vmm_table_from_phys(entry);
+    entry = pdpt->entries[(page >> 30) & 0x1ff];
+    if (!(entry & PTE_PRESENT) || !(entry & PTE_USER) ||
+        (writable && !(entry & PTE_READWRITE)) || (entry & PTE_HUGE))
+        return 0;
+    pd = vmm_table_from_phys(entry);
+    entry = pd->entries[(page >> 21) & 0x1ff];
+    if (!(entry & PTE_PRESENT) || !(entry & PTE_USER) ||
+        (writable && !(entry & PTE_READWRITE)) || (entry & PTE_HUGE))
+        return 0;
+    pt = vmm_table_from_phys(entry);
+    entry = pt->entries[(page >> 12) & 0x1ff];
+    if (!(entry & PTE_PRESENT) || !(entry & PTE_USER) ||
+        (writable && !(entry & PTE_READWRITE))) return 0;
+    return vmm_owned_find(metadata->leaves, entry & PTE_FRAME_MASK);
+}
+
 static bool vmm_user_range_accessible(const void *address, usize length,
                                       bool writable)
 {
     uintptr_t start = (uintptr_t)address;
     uintptr_t end;
-    uintptr_t page;
-
+    uintptr_t first_page;
+    bool accessible = true;
     if (!active_pml4 || (!address && length) ||
         length > ~(uintptr_t)0 - start) return false;
-    end = start + length;
-    if (length == 0) return true;
+    if (!length) return true;
     if (start >= VMM_USER_ADDRESS_LIMIT ||
         length > VMM_USER_ADDRESS_LIMIT - start) return false;
+    end = start + length;
+    first_page = start & ~(uintptr_t)(VMM_PAGE_SIZE - 1U);
 
-    for (page = start & ~(uintptr_t)0xfff; page < end; ) {
-        u64 pml4e = active_pml4->entries[(page >> 39) & 0x1ff];
-        page_table_t *pdpt;
-        page_table_t *pd;
-        page_table_t *pt;
-        u64 pdpte;
-        u64 pde;
-        u64 pte;
-
-        if (!(pml4e & PTE_PRESENT) || !(pml4e & PTE_USER) ||
-            (writable && !(pml4e & PTE_READWRITE))) return false;
-        pdpt = vmm_table_from_phys(pml4e);
-        pdpte = pdpt->entries[(page >> 30) & 0x1ff];
-        if (!(pdpte & PTE_PRESENT) || !(pdpte & PTE_USER) ||
-            (writable && !(pdpte & PTE_READWRITE)) ||
-            (pdpte & PTE_HUGE)) return false;
-        pd = vmm_table_from_phys(pdpte);
-        pde = pd->entries[(page >> 21) & 0x1ff];
-        if (!(pde & PTE_PRESENT) || !(pde & PTE_USER) ||
-            (writable && !(pde & PTE_READWRITE)) ||
-            (pde & PTE_HUGE)) return false;
-        pt = vmm_table_from_phys(pde);
-        pte = pt->entries[(page >> 12) & 0x1ff];
-        if (!(pte & PTE_PRESENT) || !(pte & PTE_USER) ||
-            (writable && !(pte & PTE_READWRITE))) return false;
-        if (page > ~(uintptr_t)0 - 0x1000) break;
-        page += 0x1000;
+    u64 flags = spin_lock_irqsave(&vmm_metadata_lock);
+    vmm_address_space_metadata_t *metadata = vmm_metadata_find(active_pml4);
+    if (!metadata || metadata->destroy_pending) {
+        spin_unlock_irqrestore(&vmm_metadata_lock, flags);
+        return false;
     }
-    return true;
+    for (uintptr_t page = first_page; page < end; page += VMM_PAGE_SIZE) {
+        if (!vmm_user_range_leaf_locked(metadata, active_pml4, page,
+                                        writable)) {
+            accessible = false;
+            break;
+        }
+    }
+    spin_unlock_irqrestore(&vmm_metadata_lock, flags);
+    return accessible;
 }
 
 bool vmm_user_range_valid(const void *address, usize length)
@@ -2693,4 +2861,108 @@ bool vmm_user_range_valid(const void *address, usize length)
 bool vmm_user_range_writable(const void *address, usize length)
 {
     return vmm_user_range_accessible(address, length, true);
+}
+
+bool vmm_user_range_lease(page_table_t *pml4, const void *address,
+                          usize length, bool writable,
+                          vmm_user_range_lease_t *out_lease)
+{
+    uintptr_t start = (uintptr_t)address;
+    uintptr_t end;
+    uintptr_t first_page;
+    usize page_count;
+    vmm_address_space_metadata_t *metadata;
+    vmm_address_space_metadata_t *operation_metadata;
+
+    if (!out_lease) return false;
+    memset(out_lease, 0, sizeof(*out_lease));
+    if (!pml4 || (!address && length) ||
+        length > ~(uintptr_t)0 - start) return false;
+    if (!length) return true;
+    if (start >= VMM_USER_ADDRESS_LIMIT ||
+        length > VMM_USER_ADDRESS_LIMIT - start) return false;
+    end = start + length;
+    first_page = start & ~(uintptr_t)(VMM_PAGE_SIZE - 1U);
+    page_count = (usize)(((end - 1U) - first_page) / VMM_PAGE_SIZE + 1U);
+
+    u64 flags = spin_lock_irqsave(&vmm_metadata_lock);
+    metadata = vmm_metadata_find(pml4);
+    if (!metadata || metadata->destroy_pending) {
+        spin_unlock_irqrestore(&vmm_metadata_lock, flags);
+        return false;
+    }
+    operation_metadata = metadata;
+    spin_unlock_irqrestore(&vmm_metadata_lock, flags);
+    if (!mutex_lock(&operation_metadata->operation_lock))
+        return false;
+
+    /* Mapping changes use operation_lock. Pin one page at a time so a large
+     * valid range never holds the interrupt-disabled metadata lock for the
+     * duration of a full-address scan. If a page is invalid, roll back the
+     * prefix before returning and do not publish an incomplete lease. */
+    usize pinned_pages = 0;
+    for (uintptr_t page = first_page; page < end; page += VMM_PAGE_SIZE) {
+        flags = spin_lock_irqsave(&vmm_metadata_lock);
+        metadata = vmm_metadata_find(pml4);
+        vmm_owned_frame_t *leaf = metadata && !metadata->destroy_pending
+            ? vmm_user_range_leaf_locked(metadata, pml4, page, writable)
+            : NULL;
+        if (!leaf || leaf->user_pin_count == ~(u32)0 ||
+            metadata->active_user_leases == ~(u64)0) {
+            spin_unlock_irqrestore(&vmm_metadata_lock, flags);
+            break;
+        }
+        leaf->user_pin_count++;
+        metadata->active_user_leases++;
+        pinned_pages++;
+        spin_unlock_irqrestore(&vmm_metadata_lock, flags);
+    }
+    if (pinned_pages != page_count) {
+        for (usize i = 0; i < pinned_pages; i++) {
+            uintptr_t page = first_page + i * VMM_PAGE_SIZE;
+            flags = spin_lock_irqsave(&vmm_metadata_lock);
+            metadata = vmm_metadata_find(pml4);
+            vmm_owned_frame_t *leaf = metadata
+                ? vmm_user_range_leaf_locked(metadata, pml4, page, false)
+                : NULL;
+            if (!metadata || !leaf || !leaf->user_pin_count ||
+                !metadata->active_user_leases)
+                panic("vmm: partial user-range lease lost its mapping");
+            leaf->user_pin_count--;
+            metadata->active_user_leases--;
+            spin_unlock_irqrestore(&vmm_metadata_lock, flags);
+        }
+        mutex_unlock(&operation_metadata->operation_lock);
+        return false;
+    }
+    out_lease->address_space = pml4;
+    out_lease->first_page = first_page;
+    out_lease->page_count = page_count;
+    out_lease->active = true;
+    mutex_unlock(&operation_metadata->operation_lock);
+    return true;
+}
+
+void vmm_user_range_release(vmm_user_range_lease_t *lease)
+{
+    vmm_address_space_metadata_t *metadata;
+    if (!lease || !lease->active) return;
+    u64 flags = spin_lock_irqsave(&vmm_metadata_lock);
+    metadata = vmm_metadata_find(lease->address_space);
+    if (!metadata || metadata->active_user_leases < lease->page_count)
+        panic("vmm: invalid user-range lease release");
+    for (usize i = 0; i < lease->page_count; i++) {
+        uintptr_t page = lease->first_page + i * VMM_PAGE_SIZE;
+        vmm_owned_frame_t *leaf = vmm_user_range_leaf_locked(
+            metadata, lease->address_space, page, false);
+        if (!leaf || !leaf->user_pin_count)
+            panic("vmm: user-range lease lost its mapping");
+        leaf->user_pin_count--;
+    }
+    metadata->active_user_leases -= lease->page_count;
+    lease->active = false;
+    lease->address_space = 0;
+    lease->first_page = 0;
+    lease->page_count = 0;
+    spin_unlock_irqrestore(&vmm_metadata_lock, flags);
 }

@@ -129,8 +129,19 @@ leaf ownership record, not three spare page-table frames.
 ELF `PT_LOAD` pages are mapped according to their write and execute flags. The
 loader rejects segments below page one, beyond the user limit, outside the
 file, or with invalid ranges or alignment. Anonymous mappings are page-rounded
-and placed in the dedicated anonymous region. Syscalls validate every user
-buffer against the current user mappings before dereferencing it.
+and placed in the dedicated anonymous region. Syscall buffer access uses
+scoped VMM page leases, not a validate-then-use probe: VMM checks user/write
+permissions and pins each covered owned leaf before the kernel dereferences it.
+The syscall releases those leases on return, including after blocking
+operations and error paths. Concurrent unmap cannot reclaim a leased frame;
+anonymous multi-page unmap validates its full range before removing any page.
+Address-space destruction waits for leases and cross-CPU active-root references
+before freeing page tables or leaves. Large requests pin only their declared
+buffer ranges and can fail cleanly if syscall lease bookkeeping cannot be
+allocated; the kernel does not copy the entire buffer just to validate it.
+There is no userspace protection-change syscall today; any future change to a
+leased page's permissions must use the same address-space operation lock and
+wait for or reject active leases before changing its PTE.
 
 ## Kernel stacks
 

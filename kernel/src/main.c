@@ -981,6 +981,10 @@ static void start_pid1(void)
         kprint("[FAIL] Could not construct /core/sprout arguments\n");
         for (;;) __asm__ volatile("cli; hlt");
     }
+    if (!process_publish_launch(ring3_process)) {
+        kprint("[FAIL] PID 1 process publication failed\n");
+        for (;;) __asm__ volatile("cli; hlt");
+    }
 
     /* Create terminal workers while the kernel address space is active and
      * interrupts are enabled.  Their allocations may grow the heap, which

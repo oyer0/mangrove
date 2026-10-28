@@ -75,6 +75,7 @@ typedef enum {OBJECT_TYPE_INVALID, OBJECT_TYPE_FILE} kernel_object_type_t;
 typedef struct kernel_object kernel_object_t;
 typedef struct process process_t;
 typedef struct {pthread_mutex_t native;} spinlock_t;
+typedef struct {pthread_mutex_t native;} mutex_t;
 typedef struct {kernel_object_t *object; u32 rights; u16 generation;
                 bool active, reserved;} process_handle_slot_t;
 typedef struct {u64 offset, save_generation;} vfs_file_handle_t;
@@ -93,7 +94,7 @@ typedef struct {kernel_object_t base; vfs_file_handle_t *handle;} file_object_t;
 struct process {
     process_state_t state; void *handle_table; usize handle_capacity;
     u64 handle_revision; usize next_handle_slot;
-    spinlock_t handle_lock;
+    spinlock_t handle_lock; mutex_t handle_growth_mutex;
 };
 static void process_handle_revision_advance(process_t *process) {
     process->handle_revision++;
@@ -120,7 +121,6 @@ static mg_file_lines_state_t snapshot_state;
 static mg_file_snapshot_request_t snapshot_request;
 static usize writable_bytes=TEST_CONTENT_BYTES;
 static usize snapshot_bytes;
-static bool snapshot_fail_after_first;
 static bool snapshot_state_fail_late;
 static unsigned snapshot_state_checks;
 static usize readable_bytes = TEST_CONTENT_BYTES;
@@ -137,6 +137,12 @@ static u64 spin_lock_irqsave(spinlock_t *lock) {
 static void spin_unlock_irqrestore(spinlock_t *lock, u64 flags) {
     (void)flags; assert(!pthread_mutex_unlock(&lock->native));
 }
+static bool mutex_lock(mutex_t *mutex) {
+    return pthread_mutex_lock(&mutex->native)==0;
+}
+static void mutex_unlock(mutex_t *mutex) {
+    assert(!pthread_mutex_unlock(&mutex->native));
+}
 static bool vmm_user_range_valid(const void *address, usize length) {
     uintptr_t start=(uintptr_t)address, base=(uintptr_t)user_bytes;
     if (address==&snapshot_request) return length==sizeof(snapshot_request);
@@ -150,9 +156,17 @@ static bool vmm_user_range_writable(const void *address,usize length) {
         return length==sizeof(snapshot_state) &&
                (!snapshot_state_fail_late || snapshot_state_checks==1);
     }
-    if (snapshot_fail_after_first && start>base) return false;
     return start>=base && start-base<=writable_bytes &&
            length<=writable_bytes-(start-base);
+}
+/* This transaction fixture exercises file replacement, not syscall admission.
+ * The production syscall buffer-lifetime lease is covered separately by
+ * syscall_user_memory_test.py. */
+static bool syscall_user_buffer_valid(const void *address,u64 length) {
+    return length==0 || vmm_user_range_valid(address,(usize)length);
+}
+static bool syscall_user_buffer_writable(void *address,u64 length) {
+    return length==0 || vmm_user_range_writable(address,(usize)length);
 }
 static void *kmalloc(usize size) {
     if (allocation_budget==0) return NULL;
@@ -191,13 +205,12 @@ parts = "".join(function(path, name) for path, name in (
     ("kernel/src/process.c", "decode_handle"),
     ("kernel/src/process.c", "process_handle_install"),
     ("kernel/src/process.c", "process_handle_lookup_reference"),
-    ("kernel/src/process.c", "process_handle_lookup_retain"),
+    ("kernel/src/process.c", "process_handle_lookup"),
     ("kernel/src/process.c", "process_handle_close"),
     ("kernel/src/object.c", "object_init"),
     ("kernel/src/object.c", "object_reference"),
     ("kernel/src/object.c", "object_release"),
     ("kernel/src/object.c", "object_file_replace"),
-    ("kernel/src/syscall.c", "syscall_user_buffer_valid"),
     ("kernel/src/syscall.c", "syscall_vfs_error"),
     ("kernel/src/syscall.c", "syscall_replace_input_release"),
     ("kernel/src/syscall.c", "syscall_replace_input_copy"),
@@ -287,6 +300,7 @@ int main(void) {
     process.state=PROCESS_STATE_ACTIVE; process.handle_table=slots;
     process.handle_capacity=PROCESS_HANDLE_SLOTS;
     assert(!pthread_mutex_init(&process.handle_lock.native,NULL));
+    assert(!pthread_mutex_init(&process.handle_growth_mutex.native,NULL));
     process_handle_t readonly=install_file(new_file(),OBJECT_RIGHT_READ);
     input(73);
     assert(syscall_file_replace(&process,readonly,user_bytes,73)==
@@ -304,16 +318,18 @@ int main(void) {
     assert(snapshot_state.length==snapshot_bytes &&
            user_bytes[0]=='q' && user_bytes[snapshot_bytes-1]=='q' &&
            reader->handle->save_generation==2);
-    snapshot_bytes=8192; snapshot_fail_after_first=true;
+    snapshot_bytes=8192; writable_bytes=4096;
     snapshot_state.length=123;
     assert(syscall_file_snapshot(&process,read_handle,&snapshot_request)==
            MG_ERR_BAD_ARGUMENT);
     assert(snapshot_state.length==123 && reader->handle->save_generation==2);
-    snapshot_fail_after_first=false;
+    writable_bytes=TEST_CONTENT_BYTES;
     snapshot_state_checks=0; snapshot_state_fail_late=true;
-    assert(syscall_file_snapshot(&process,read_handle,&snapshot_request)==
-           MG_ERR_BAD_ARGUMENT);
-    assert(snapshot_state.length==123 && reader->handle->save_generation==2);
+    /* Production syscall admission pins both output ranges before entering
+     * this operation, so the callback does not re-probe writability. */
+    assert(syscall_file_snapshot(&process,read_handle,&snapshot_request)==MG_OK);
+    assert(snapshot_state_checks==1 && snapshot_state.length==snapshot_bytes &&
+           reader->handle->save_generation==3);
     snapshot_state_fail_late=false; snapshot_state_checks=0;
     snapshot_request.capacity=4096;
     assert(syscall_file_snapshot(&process,read_handle,&snapshot_request)==
@@ -398,10 +414,11 @@ int main(void) {
     destroyed=0;
     assert(syscall_file_replace(&process,handle,user_bytes,4101)==MG_OK);
     assert(destroyed==1 && !live_chunks &&
-           !process_handle_lookup_retain(&process,handle,OBJECT_TYPE_FILE,0));
+           !process_handle_lookup(&process,handle,OBJECT_TYPE_FILE,0));
     assert((handle & 0xffffU)==(reused_handle & 0xffffU));
     assert(process_handle_close(&process,reused_handle) && destroyed==2);
     assert(!pthread_mutex_destroy(&process.handle_lock.native));
+    assert(!pthread_mutex_destroy(&process.handle_growth_mutex.native));
     puts("file replace syscall: production handles, chunk source, bridge and errors passed");
     return 0;
 }

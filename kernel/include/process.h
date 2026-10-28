@@ -42,6 +42,13 @@ typedef enum {
 struct process {
     u64 pid;
     process_state_t state;
+    /* Protected by the process registry lock. A syscall admission retains
+     * the process object until its syscall-stack leases have been released. */
+    u32 active_syscalls;
+    bool termination_pending;
+    /* False while a newly created process is still being populated. Registry
+     * scans and external termination treat it as in-flight construction. */
+    bool launch_ready;
     process_t *parent;
     process_t *first_child;
     process_t *next_sibling;
@@ -93,12 +100,10 @@ struct process {
     struct ipc_request *ipc_outstanding;
     bool owner_reference_held;
     process_t *next_all;
-    /* Protects this process's handle-table slots.  Lookups return the
-     * existing borrowed object reference, so callers retain the current
-     * handle/object lifetime contract. */
+    /* Protects handle-table publication and slot snapshots. */
     spinlock_t handle_lock;
-    /* Serializes rare table growth while allocation and table copying happen
-     * outside the interrupt-disabled slot lock. */
+    /* Serializes slot mutation against table growth. Lookups retain objects
+     * under handle_lock and never keep a table pointer after unlocking. */
     mutex_t handle_growth_mutex;
     u64 handle_revision;
     usize next_handle_slot;
@@ -125,6 +130,11 @@ bool process_attach_thread(process_t *process, struct kernel_thread *thread);
 process_t *process_current(void);
 u64 process_current_pid(void);
 bool process_exit(process_t *process, i32 status);
+/* Publishes a fully prepared process to session/shutdown scans and external
+ * termination. Creators call after setup and scheduler publication. */
+bool process_publish_launch(process_t *process);
+bool process_syscall_enter(process_t *process);
+void process_syscall_leave(process_t *process);
 /* Terminates the currently executing Ring 3 process after a CPU exception.
  * On a successful scheduler handoff this does not return on the faulting
  * thread's stack. */
@@ -241,12 +251,9 @@ kernel_object_t *process_handle_lookup(process_t *process,
                                        process_handle_t handle,
                                        kernel_object_type_t type,
                                        u32 required_rights);
-/* Returns a retained object reference that remains valid across concurrent
- * close; the caller must object_release() it after the operation. */
-kernel_object_t *process_handle_lookup_retain(process_t *process,
-                                              process_handle_t handle,
-                                              kernel_object_type_t type,
-                                              u32 required_rights);
+/* Both successful lookup forms return a retained object reference that
+ * remains valid across concurrent close. The caller must object_release()
+ * after its operation. lookup_any permits querying a terminated process. */
 bool process_handle_close(process_t *process, process_handle_t handle);
 void process_handle_close_all(process_t *process);
 const char *process_state_name(process_state_t state);

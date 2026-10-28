@@ -15,6 +15,13 @@
 #define NULL ((void *)0)
 #endif
 
+static void ipc_object_release_auto(kernel_object_t **object)
+{
+    if (object && *object) object_release(*object);
+}
+
+#define IPC_OBJECT_AUTO __attribute__((cleanup(ipc_object_release_auto)))
+
 typedef enum {
     IPC_REQUEST_FREE = 0,
     IPC_REQUEST_PENDING,
@@ -561,7 +568,7 @@ int ipc_kernel_request(process_t *process, process_handle_t endpoint_handle,
                        const mg_ipc_message_t *message,
                        mg_ipc_message_t *reply)
 {
-    kernel_object_t *object;
+    IPC_OBJECT_AUTO kernel_object_t *object = NULL;
     ipc_endpoint_t *endpoint;
     ipc_request_t *request;
     process_credentials_t credentials;
@@ -717,7 +724,7 @@ static int ipc_kernel_receive_internal(process_t *process,
                                        bool wait, bool timed,
                                        u32 timeout_ms)
 {
-    kernel_object_t *object;
+    IPC_OBJECT_AUTO kernel_object_t *object = NULL;
     ipc_endpoint_t *endpoint;
     ipc_request_t *request;
     ipc_request_object_t *context;
@@ -936,7 +943,7 @@ int ipc_kernel_try_receive(process_t *process, process_handle_t endpoint_handle,
 int ipc_kernel_reply(process_t *process, process_handle_t request_handle,
                      const mg_ipc_message_t *message)
 {
-    kernel_object_t *object;
+    IPC_OBJECT_AUTO kernel_object_t *object = NULL;
     ipc_request_object_t *context;
     ipc_request_t *request;
     int validation_result;
@@ -974,7 +981,7 @@ bool ipc_request_context_claim(process_t *service,
                                char *requester_name,
                                usize requester_name_size)
 {
-    kernel_object_t *object;
+    IPC_OBJECT_AUTO kernel_object_t *object = NULL;
     ipc_request_object_t *context;
     ipc_request_t *request;
 
@@ -1011,7 +1018,7 @@ bool ipc_request_context_origin(process_t *service,
                                 u32 expected_service_id,
                                 u64 *origin_pid)
 {
-    kernel_object_t *object;
+    IPC_OBJECT_AUTO kernel_object_t *object = NULL;
     ipc_request_object_t *context;
     ipc_request_t *request;
 
@@ -1090,7 +1097,7 @@ int ipc_kernel_event_subscribe(process_t *process,
                                process_handle_t endpoint_handle,
                                u32 event_classes)
 {
-    kernel_object_t *object;
+    IPC_OBJECT_AUTO kernel_object_t *object = NULL;
     ipc_endpoint_t *endpoint;
     u64 saved_flags;
 
@@ -1115,7 +1122,7 @@ int ipc_kernel_event_subscribe(process_t *process,
 int ipc_kernel_event_unsubscribe(process_t *process,
                                  process_handle_t endpoint_handle)
 {
-    kernel_object_t *object;
+    IPC_OBJECT_AUTO kernel_object_t *object = NULL;
     ipc_endpoint_t *endpoint;
     u64 saved_flags;
 

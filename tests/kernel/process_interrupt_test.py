@@ -42,7 +42,7 @@ typedef struct kernel_thread { unsigned wakes; } kernel_thread_t;
 struct process {
     u64 session_id;
     int state;
-    bool session_shell;
+    bool session_shell, launch_ready;
     volatile bool interrupt_requested;
     process_t *waiting_child, *parent, *next_all;
     kernel_thread_t *main_thread;
@@ -71,13 +71,13 @@ static void clear_fixture(void)
 int main(void)
 {
     process_t shell = {.state=PROCESS_STATE_ACTIVE, .session_shell=true,
-                       .session_id=4, .object={1}};
+                       .session_id=4, .launch_ready=true, .object={1}};
     process_t wrapper = {.state=PROCESS_STATE_ACTIVE, .session_id=4,
-                         .parent=&shell, .object={1}};
+                         .parent=&shell, .launch_ready=true, .object={1}};
     process_t child = {.state=PROCESS_STATE_ACTIVE, .session_id=4,
-                       .parent=&wrapper, .object={1}};
+                       .parent=&wrapper, .launch_ready=true, .object={1}};
     process_t unrelated = {.state=PROCESS_STATE_ACTIVE, .session_id=9,
-                           .object={1}};
+                           .launch_ready=true, .object={1}};
     kernel_thread_t wrapper_thread={0}, child_thread={0};
 
     shell.waiting_child = &wrapper;
@@ -99,10 +99,10 @@ int main(void)
     /* An ambiguous console session is rejected rather than interrupting a
        process belonging to an arbitrary second session. */
     process_t other_shell = {.state=PROCESS_STATE_ACTIVE, .session_shell=true,
-                             .session_id=9, .object={1}};
+                             .session_id=9, .launch_ready=true, .object={1}};
     process_t other_child = {.state=PROCESS_STATE_ACTIVE, .session_id=9,
                              .parent=&other_shell, .main_thread=&wrapper_thread,
-                             .object={1}};
+                             .launch_ready=true, .object={1}};
     other_shell.waiting_child = &other_child;
     unrelated.next_all = &other_shell;
     other_shell.next_all = &other_child;
