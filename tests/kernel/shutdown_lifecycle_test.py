@@ -56,7 +56,8 @@ process_prefix = r'''
 typedef uint64_t u64;
 typedef uint32_t u32;
 typedef int32_t i32;
-enum { PROCESS_STATE_ACTIVE = 1, PROCESS_STATE_TERMINATED = 2 };
+enum { PROCESS_STATE_ACTIVE = 1, PROCESS_STATE_EXITING = 2,
+       PROCESS_STATE_TERMINATED = 3 };
 enum { MG_SERVICE_SPROUT = 1, MG_SERVICE_SESSIOND = 2,
        MG_SERVICE_LOGIND = 3, MG_SERVICE_LEAF = 4 };
 enum { MG_OK = 0, MG_ERR_BAD_ARGUMENT = -4, MG_ERR_BUSY = -14,
@@ -64,12 +65,17 @@ enum { MG_OK = 0, MG_ERR_BAD_ARGUMENT = -4, MG_ERR_BUSY = -14,
 #define PROCESS_SHUTDOWN_GRACE_MS 5000U
 #define PROCESS_SHUTDOWN_FORCE_MS 5000U
 typedef struct { unsigned references; } kernel_object_t;
-typedef struct kernel_thread { bool pending_wake,running,exit_pending; } kernel_thread_t;
+typedef struct kernel_thread {
+ bool pending_wake,running,exit_pending;
+ struct kernel_thread *process_next;
+} kernel_thread_t;
 typedef struct process process_t;
 struct process {
  int state; bool system_service, shutdown_requested, shutdown_wake_sent;
- bool launch_ready;
- u32 service_id; u64 pid; char name[32]; kernel_thread_t *main_thread;
+ bool launch_ready, exit_cleanup_complete;
+ u32 service_id,thread_count; u64 pid; char name[32];
+ kernel_thread_t *main_thread,*threads;
+ u32 thread_list_readers; bool thread_reap_in_progress;
  kernel_object_t object; process_t *next_all;
 };
 static process_t *all_processes;
@@ -87,20 +93,28 @@ static bool object_reference(kernel_object_t *object)
 { if (!object || !object->references) return false; object->references++; return true; }
 static void object_release(kernel_object_t *object)
 { assert(object && object->references > 1); object->references--; }
+static void panic(const char *message)
+{ (void)message; assert(!"unexpected process panic"); }
+static bool process_finish_termination(process_t *process)
+{ (void)process; return false; }
 static bool scheduler_wake_waiter(kernel_thread_t *thread)
 { assert(thread); wake_calls++; thread->pending_wake=true; return true; }
-static bool scheduler_thread_exit_complete(const kernel_thread_t *thread)
-{return thread && !thread->running && !thread->exit_pending;}
 static bool process_terminate_external(process_t *process, i32 status)
 { (void)status; terminate_calls++; if (!terminate_allowed) return false;
- process->state=PROCESS_STATE_TERMINATED; return true; }
+ process->state=PROCESS_STATE_TERMINATED;
+ for(kernel_thread_t *t=process->threads;t;t=t->process_next) {
+   t->running=false;t->exit_pending=false;
+ }
+ return true; }
 static u64 timer_uptime_ms(void) { return now_ms; }
 static bool scheduler_sleep(u64 ms)
 { (void)ms; sleep_calls++; now_ms += 1000;
  if (cooperative_exit) for (process_t *p=all_processes; p; p=p->next_all)
-   if (p != requester && p->state==PROCESS_STATE_TERMINATED &&
-       p->main_thread && (p->main_thread->running || p->main_thread->exit_pending)) {
-     p->main_thread->running=false;p->main_thread->exit_pending=false;break;
+   if (p != requester && p->state==PROCESS_STATE_EXITING) {
+     for(kernel_thread_t *t=p->threads;t;t=t->process_next) {
+       t->running=false;t->exit_pending=false;
+     }
+     p->state=PROCESS_STATE_TERMINATED;break;
    }
  if (cooperative_exit) for (process_t *p=all_processes; p; p=p->next_all)
    if (p != requester && p->shutdown_requested &&
@@ -119,7 +133,9 @@ static int process_shutdown_wait_phase(process_t *,bool);
 static void process_shutdown_abort(void);
 '''
 process_functions = "".join(function("kernel/src/process.c", name) for name in (
-    "process_shutdown_requested", "process_matches_shutdown_phase",
+    "process_thread_list_read_acquire_locked",
+    "process_thread_list_read_release", "process_shutdown_requested",
+    "process_matches_shutdown_phase",
     "process_in_shutdown_phase", "process_shutdown_mark_phase",
     "process_shutdown_next_work",
     "process_shutdown_wait_phase", "process_shutdown_quiesce",
@@ -129,14 +145,17 @@ static void init_process(process_t *p,u64 pid,const char *name,bool service,
                          u32 service_id,kernel_thread_t *thread)
 { memset(p,0,sizeof(*p)); p->state=PROCESS_STATE_ACTIVE; p->pid=pid;
   strncpy(p->name,name,sizeof(p->name)-1); p->system_service=service;
-  p->service_id=service_id; p->main_thread=thread; p->object.references=1;
+  p->service_id=service_id; p->main_thread=thread; p->threads=thread;
+  p->thread_count=thread?1U:0U; p->object.references=1;
   p->launch_ready=true; }
 int main(void)
 {
  process_t caller,app,leaf,sprout,sessiond,logind;
- kernel_thread_t caller_thread={0},app_thread={0},leaf_thread={0};
+ kernel_thread_t caller_thread={0},app_thread={0},app_worker_thread={0},
+                 leaf_thread={0};
  init_process(&caller,20,"shutdown",false,0,&caller_thread); requester=&caller;
  init_process(&app,21,"shoot",false,0,&app_thread);
+ app.thread_count=2;app_thread.process_next=&app_worker_thread;
  init_process(&leaf,22,"logd",true,MG_SERVICE_LEAF,&leaf_thread);
  init_process(&sprout,1,"sprout",true,MG_SERVICE_SPROUT,NULL);
  init_process(&sessiond,2,"sessiond",true,MG_SERVICE_SESSIOND,NULL);
@@ -150,35 +169,41 @@ int main(void)
  assert(!app_state_active_for_test);
  assert(sprout.state==PROCESS_STATE_ACTIVE && sessiond.state==PROCESS_STATE_ACTIVE &&
         logind.state==PROCESS_STATE_ACTIVE && caller.state==PROCESS_STATE_ACTIVE);
- assert(app_thread.pending_wake && leaf_thread.pending_wake && wake_calls==2);
+ assert(app_thread.pending_wake && app_worker_thread.pending_wake &&
+        leaf_thread.pending_wake && wake_calls==3);
  assert(app.object.references==1 && leaf.object.references==1);
  process_shutdown_abort();
  assert(!process_shutdown_pending() && !app.shutdown_requested &&
         !leaf.shutdown_requested && !caller.shutdown_requested);
 
- /* TERMINATED is published before the final exit syscall returns. Shutdown
-  * must wait for that live frame to finish before filesystem sync. */
+ /* An exiting process remains shutdown work until every owned thread has
+  * completed its final syscall and scheduler handoff. */
  all_processes=&caller;caller.next_all=&app;app.next_all=NULL;
- app.state=PROCESS_STATE_TERMINATED;app.shutdown_requested=false;
- app_thread.running=true;cooperative_exit=true;app_state_active_for_test=true;
+ app.state=PROCESS_STATE_EXITING;app.shutdown_requested=false;
+ app_thread.running=true;app_worker_thread.exit_pending=true;
+ cooperative_exit=true;app_state_active_for_test=true;
  wake_calls=0;now_ms=0;process_shutdown_active=false;
  assert(process_shutdown_quiesce(&caller)==MG_OK);
- assert(!app_thread.running && wake_calls==0 && app.object.references==1);
+ assert(app.state==PROCESS_STATE_TERMINATED && !app_thread.running &&
+        !app_worker_thread.exit_pending && wake_calls==0 &&
+        app.object.references==1);
  process_shutdown_abort();
 
  /* A non-running thread can still be suspended inside exit cleanup. */
- app.state=PROCESS_STATE_TERMINATED;app_thread.running=false;
- app_thread.exit_pending=true;now_ms=0;
+ app.state=PROCESS_STATE_EXITING;app_thread.running=false;
+ app_worker_thread.exit_pending=true;now_ms=0;
  assert(process_shutdown_quiesce(&caller)==MG_OK);
- assert(now_ms>0 && !app_thread.exit_pending);
+ assert(now_ms>0 && !app_worker_thread.exit_pending &&
+        app.state==PROCESS_STATE_TERMINATED);
  process_shutdown_abort();
 
  /* A cleanup frame that never completes cancels shutdown, even off-CPU. */
- app_thread.exit_pending=true;cooperative_exit=false;terminate_allowed=false;
+ app.state=PROCESS_STATE_EXITING;app_worker_thread.exit_pending=true;
+ cooperative_exit=false;terminate_allowed=false;
  now_ms=0;
  assert(process_shutdown_quiesce(&caller)==MG_ERR_TIMEOUT);
- assert(app_thread.exit_pending && !process_shutdown_pending());
- app_thread.exit_pending=false;
+ assert(app_worker_thread.exit_pending && !process_shutdown_pending());
+ app_worker_thread.exit_pending=false;
 
  /* Safe forced termination is attempted only after the cooperative grace. */
  app.state=PROCESS_STATE_ACTIVE; app.shutdown_requested=false;

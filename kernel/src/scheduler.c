@@ -194,6 +194,13 @@ static void thread_entry_trampoline(void)
         thread->entry(thread->entry_argument);
     }
 
+    /* A process's initial entry requests process-wide exit; a future
+     * process-owned worker entry retires only itself. Process lifecycle state
+     * is published before the scheduler switches away from this stack. */
+    if (thread && thread->process)
+        process_thread_entry_completed(thread,
+            thread->process_initial ? -1 : 0);
+
     /* Termination uses the same dispatch path as yield and future preemption. */
     if (thread && scheduler_terminate()) {
         return;
@@ -331,6 +338,7 @@ void scheduler_context_restore_current(void)
 void scheduler_context_switch_complete(uintptr_t *outgoing_rsp_slot)
 {
     kernel_thread_t *outgoing = NULL;
+    bool terminated = false;
     u64 flags;
 
     if (outgoing_rsp_slot) {
@@ -341,6 +349,7 @@ void scheduler_context_switch_complete(uintptr_t *outgoing_rsp_slot)
     if (outgoing) {
         outgoing->running_cpu = THREAD_CPU_NONE;
         outgoing->context_switch_pending = false;
+        terminated = outgoing->state == THREAD_STATE_TERMINATED;
         if (outgoing->state == THREAD_STATE_READY && !outgoing->queued &&
             outgoing != &bootstrap_thread &&
             outgoing != scheduler_cpu_local()->scheduler_idle_thread &&
@@ -352,6 +361,8 @@ void scheduler_context_switch_complete(uintptr_t *outgoing_rsp_slot)
     /* Assembly calls here on the incoming stack with IF still clear. */
     scheduler_context_switch_in_progress = 0;
     spin_unlock_irqrestore(&scheduler_lock, flags);
+    if (terminated && outgoing->process)
+        process_scheduler_handoff_complete(outgoing);
 }
 
 static void scheduler_validate_saved_context(const kernel_thread_t *thread)
@@ -1187,7 +1198,9 @@ bool thread_destroy(kernel_thread_t *thread)
 {
     u64 flags;
 
-    if (!thread)
+    if (!thread || thread->process ||
+        thread->process_state != THREAD_PROCESS_UNATTACHED ||
+        thread->process_reference_held)
         return false;
 
     /* Do not unlink a thread if the VMM's synchronous SMP teardown cannot
@@ -1478,6 +1491,76 @@ bool scheduler_terminate_thread(kernel_thread_t *thread)
     return true;
 }
 
+bool scheduler_terminate_thread_group(kernel_thread_t *head,
+                                      usize expected_count)
+{
+    kernel_thread_t *thread;
+    usize count = 0;
+    u64 saved_flags;
+
+    if (!head || !expected_count) return false;
+    saved_flags = spin_lock_irqsave(&scheduler_lock);
+
+    /* Preflight the complete stable process-owned list before mutating any
+     * member. In particular, one running syscall or pending handoff rejects
+     * the whole external termination request. */
+    for (thread = head; thread && count < expected_count;
+         thread = thread->process_next, count++) {
+        bool already_stopped = thread->state == THREAD_STATE_TERMINATED &&
+            thread->running_cpu == THREAD_CPU_NONE &&
+            !thread->context_switch_pending && !thread->preempt_return_rip &&
+            !thread->sleeping;
+        if (!thread->process ||
+            (!already_stopped &&
+             (thread->state == THREAD_STATE_TERMINATED ||
+              (thread->state != THREAD_STATE_READY &&
+               thread->state != THREAD_STATE_BLOCKED) ||
+              thread->running_cpu != THREAD_CPU_NONE ||
+              thread->context_switch_pending || thread->preempt_return_rip ||
+              thread->syscall_active || thread->syscall_nesting ||
+              thread->sleeping)) ||
+            thread == &bootstrap_thread) {
+            spin_unlock_irqrestore(&scheduler_lock, saved_flags);
+            return false;
+        }
+        for (u32 i = 0; i < cpu_count(); i++) {
+            cpu_local_t *cpu = cpu_by_index(i);
+            if (cpu && cpu->scheduler_idle_thread == thread) {
+                spin_unlock_irqrestore(&scheduler_lock, saved_flags);
+                return false;
+            }
+        }
+    }
+    if (count != expected_count || thread != NULL) {
+        spin_unlock_irqrestore(&scheduler_lock, saved_flags);
+        return false;
+    }
+
+    for (thread = head; thread; thread = thread->process_next) {
+        if (thread->state == THREAD_STATE_TERMINATED) continue;
+        if (thread->queued) scheduler_remove_queued_locked(thread);
+        if (thread->sleeping) {
+            sleeping_remove(thread);
+            if (scheduler_stats.sleeping_threads)
+                scheduler_stats.sleeping_threads--;
+        }
+        if (thread->state == THREAD_STATE_BLOCKED &&
+            scheduler_stats.blocked_threads)
+            scheduler_stats.blocked_threads--;
+        thread->state = THREAD_STATE_TERMINATED;
+    }
+    spin_unlock_irqrestore(&scheduler_lock, saved_flags);
+
+    /* Waiter removal and process accounting can take their own locks, so they
+     * run only after scheduler_lock is released. */
+    for (thread = head; thread; thread = thread->process_next) {
+        mutex_cancel_waiter(thread);
+        if (thread->process)
+            process_scheduler_handoff_complete(thread);
+    }
+    return true;
+}
+
 static bool scheduler_unblock_locked(kernel_thread_t *thread)
 {
     bool was_sleeping;
@@ -1635,6 +1718,40 @@ bool scheduler_thread_exit_complete(const kernel_thread_t *thread)
     return complete;
 }
 
+bool scheduler_thread_process_attachable(const kernel_thread_t *thread)
+{
+    bool attachable;
+    u64 flags;
+
+    if (!thread) return false;
+    flags = spin_lock_irqsave(&scheduler_lock);
+    attachable = thread->state == THREAD_STATE_READY && !thread->queued &&
+        thread->running_cpu == THREAD_CPU_NONE &&
+        !thread->context_switch_pending && !thread->entry_started &&
+        !thread->syscall_active && !thread->syscall_nesting &&
+        !thread->sleeping && !thread->preempt_return_rip &&
+        !thread->stack_external;
+    spin_unlock_irqrestore(&scheduler_lock, flags);
+    return attachable;
+}
+
+bool scheduler_thread_initial_process_attachable(
+    const kernel_thread_t *thread)
+{
+    bool attachable;
+    u64 flags;
+
+    if (!thread) return false;
+    flags = spin_lock_irqsave(&scheduler_lock);
+    attachable = thread == current_thread &&
+        thread->state == THREAD_STATE_RUNNING && !thread->queued &&
+        !thread->context_switch_pending && !thread->syscall_active &&
+        !thread->syscall_nesting && !thread->preempt_return_rip &&
+        thread->stack_external;
+    spin_unlock_irqrestore(&scheduler_lock, flags);
+    return attachable;
+}
+
 u32 scheduler_thread_running_cpu(const kernel_thread_t *thread)
 {
     u32 cpu_index = THREAD_CPU_NONE;
@@ -1646,6 +1763,18 @@ u32 scheduler_thread_running_cpu(const kernel_thread_t *thread)
     cpu_index = thread->running_cpu;
     spin_unlock_irqrestore(&scheduler_lock, flags);
     return cpu_index;
+}
+
+thread_state_t scheduler_thread_state_snapshot(const kernel_thread_t *thread)
+{
+    thread_state_t state = THREAD_STATE_TERMINATED;
+    u64 flags;
+
+    if (!thread) return state;
+    flags = spin_lock_irqsave(&scheduler_lock);
+    state = thread->state;
+    spin_unlock_irqrestore(&scheduler_lock, flags);
+    return state;
 }
 
 bool scheduler_block(void)

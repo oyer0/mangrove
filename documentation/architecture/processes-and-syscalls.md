@@ -2,8 +2,9 @@
 
 Mangrove separates execution scheduling from process ownership. A kernel
 thread is the scheduler object; a process owns a userspace address space,
-credentials, current directory, handles, executable state, and its main
-thread. A newly spawned program begins with one main userspace thread.
+credentials, current directory, handles, executable state, and its attached
+threads. A newly spawned program still begins with one initial thread; public
+userspace thread creation is not available.
 
 ## Process lifetime and inheritance
 
@@ -37,14 +38,55 @@ ceiling; actual capacity depends on kernel memory and other live objects.
 Handle generation tags also remain 16-bit for ABI compatibility.
 
 The process object owns its address space, credentials, session membership,
-CWD, handle table, child relationships, and process-wide terminal and service
-state. The scheduler thread owns the saved CPU context, kernel stack, and
-current syscall frame. Each process currently has one main thread; native
-userspace threads, per-thread TLS, and thread-specific libc state are not yet
-implemented.
+CWD, handle table, child relationships, process-wide terminal and service
+state, and a registry of attached scheduler threads. The scheduler thread owns
+its saved CPU context, kernel stack, and current syscall frame. The registry
+retains the process object once per attached thread. `thread_count` includes
+attached threads through final reap; `live_thread_count` counts those that
+have not completed their scheduler handoff. `main_thread` is only an alias for
+the initial thread, used for initial launch and rollback; it is not the
+process's thread collection.
+
+Thread completion is separate from process completion. Returning from the
+initial entry requests process-wide exit. A later worker entry return records
+that worker's status (zero for a normal return from today's `void` kernel
+entry contract) and retires only that thread. An unhandled user exception
+from any attached thread requests process-wide termination. While a process is
+exiting, new syscalls are refused and its exit request is visible to each
+attached thread. Returning syscalls release their user-memory leases and
+process admission before the syscall boundary terminates the calling thread.
+Sibling threads are woken and must reach a safe exit boundary; resources are
+not partially torn down while any sibling remains live.
+
+Process-owned handles, mappings, IPC state, CWD, and terminal/session state
+are released only after admitted syscalls have unwound and every owned thread,
+including the initiating thread, has completed its scheduler/CR3 handoff. The
+handoff completion path performs shared-resource cleanup on a different live
+stack; it never frees the stack whose handoff it is acknowledging. Process
+state then becomes terminated. Wait, poll, session retirement, and shutdown
+finalize the retained thread records before releasing the process owner
+reference. The PID 1 BSP bootstrap record is scheduler-owned static state: its
+process reference is detached at final reap, while the permanent record and
+linker-backed stack are not freed. Interrupt and shutdown wake walks, and
+external termination's scheduler-group walk, pin the thread-list reader count
+before dropping the registry lock. Final publication and reaping wait for
+those walks; reaping also closes reader admission before detaching records.
+Process inspection aggregates attached thread states. Its CPU field
+uses `MG_PROCESS_CPU_MULTIPLE` if sequential per-thread reads observe distinct
+CPUs; that value is diagnostic and does not promise a simultaneous sample.
+
+This is an internal ownership foundation, not a usable multithreading API.
+Thread creation, public thread IDs or handles, join/detach semantics, per-thread
+TLS and libc state, and user synchronization primitives remain prerequisites
+before userspace can create multiple threads. The current parent wait slot and
+IPC outstanding-request slot are still process-wide, so concurrent waits and
+independent blocking IPC calls from sibling threads also need per-thread
+ownership or explicit serialization before threads can be exposed.
 
 Process credentials and launch/session metadata are published under the
-process registry lock. A newly constructed process is not visible in process
+process registry lock. Lifecycle state is atomically readable outside that
+lock, but state transitions and their related admission decisions are still
+serialized by it. A newly constructed process is not visible in process
 snapshots or eligible for session/shutdown termination until its image,
 arguments, and handles are ready and its thread has been enqueued. In-flight
 launches remain shutdown work; session retirement reports busy rather than
@@ -63,6 +105,14 @@ handoff completion before final destruction. The non-returning exit syscall
 uses its ordinary thread ownership and scheduler handoff rather than retaining
 a returning-syscall admission.
 
+The active-syscall count remains held through syscall-frame cleanup, including
+release of all user-memory leases. Thus the final thread handoff cannot publish
+process completion while a blocked or returning syscall still owns a lease.
+The handoff-completion predicate validates the owned-list count, process
+references, initial-thread alias, and each stopped scheduler record before
+shared cleanup begins. Unpublished launch rollback is separate: its creator
+performs rollback cleanup after the prepared initial thread has stopped.
+
 Syscall input and output buffers are leased page ranges in the current
 address space. The syscall context retains range descriptors, rather than a
 separate bookkeeping allocation per page; VMM validates and pins each covered
@@ -79,14 +129,16 @@ leases before reclaiming page tables or leaf frames. This protects memory
 lifetime; it does not serialize application writes to shared bytes between
 future threads.
 
-External termination fails with `MG_ERR_BUSY` while the target has an admitted
-syscall, is in a scheduler handoff, or is executing on a CPU. It does not
-unwind that frame or release process resources on this failure. A suspended
-kernel thread with an entered C frame likewise cannot be externally discarded.
-Self-exit still completes through the thread's normal termination path. A
-session whose backend disappears stays visible in ENDING state if a member is
-busy; an authorized replacement backend can retry ending the same session ID.
-There is no forced cancellation of a syscall that remains blocked indefinitely.
+External termination preflights the complete process thread list before
+changing any member. It fails with `MG_ERR_BUSY` if any thread has an admitted
+syscall, is in a scheduler handoff, or is executing on a CPU; no subset is
+terminated. Safe ready or blocked threads are stopped as a group, then their
+wait registrations and process accounting are retired outside the scheduler
+lock. This path never unwinds a live frame or releases process resources while
+a sibling remains active. A session whose backend disappears stays visible
+in ENDING state if a member is busy; an authorized replacement backend can
+retry ending the same session ID. There is no forced cancellation of a syscall
+that remains blocked indefinitely.
 
 ## Foreground interruption
 
@@ -104,16 +156,18 @@ session, and no live syscall frame is forcibly discarded. Applications must
 handle interruption at their own cleanup boundary; Reed uses its ordinary
 save/discard/cancel prompt before leaving a modified buffer.
 
-Publishing `PROCESS_STATE_TERMINATED` starts exit cleanup; it does not authorize
-collection. Cleanup can still own a running, ready, or blocked kernel frame.
-Wait, poll, session retirement, and shutdown require
-`scheduler_thread_exit_complete()`: terminal thread state, no running CPU,
-no pending stack handoff, and no sleeping or preemption continuation.
-`process_wait()` retains the process owner reference while waiting for this
-condition; shutdown can interrupt that wait without collecting the child.
-`process_poll()` returns `MG_ERR_WOULD_BLOCK` until exit is complete. A final
-process destructor must successfully destroy its main thread before releasing
-the address space; refusal is an invariant failure, not permission to continue
+Publishing `PROCESS_STATE_TERMINATED` means shared-resource cleanup and every
+attached thread's scheduler handoff are complete; it does not mean thread
+records have already been collected. Wait, poll, session retirement, and
+shutdown require `scheduler_thread_exit_complete()` for every attached thread:
+terminal thread state, no running CPU, no pending stack handoff, and no
+sleeping or preemption continuation. `process_wait()` retains the process
+reference while it claims and finalizes the child; shutdown can interrupt that
+wait without collecting the child. `process_poll()` returns
+`MG_ERR_WOULD_BLOCK` until process termination is published. Final reaping
+detaches every thread and releases its process reference before the process
+object destructor can release the address space. Refusal to release an
+ordinary thread record is an invariant failure, not permission to continue
 teardown.
 
 ## Orderly shutdown and reboot

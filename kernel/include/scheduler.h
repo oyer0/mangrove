@@ -23,6 +23,15 @@ typedef enum {
     THREAD_STATE_TERMINATED,
 } thread_state_t;
 
+/* Process ownership is distinct from scheduler state. A completed thread
+ * remains process-owned until a join/reap path detaches its record. */
+typedef enum {
+    THREAD_PROCESS_UNATTACHED = 0,
+    THREAD_PROCESS_ATTACHED,
+    THREAD_PROCESS_EXIT_REQUESTED,
+    THREAD_PROCESS_HANDOFF_COMPLETE,
+} thread_process_state_t;
+
 typedef enum {
     THREAD_PRIORITY_HIGH = 0,
     THREAD_PRIORITY_NORMAL,
@@ -121,6 +130,13 @@ struct kernel_thread {
     kernel_thread_t *previous;
     char name[32];
     struct process *process;
+    struct kernel_thread *process_next;
+    thread_process_state_t process_state;
+    bool process_initial;
+    bool process_reference_held;
+    volatile bool process_exit_requested;
+    i32 process_exit_status;
+    bool process_exit_status_valid;
 };
 
 bool scheduler_init(void);
@@ -166,13 +182,27 @@ bool scheduler_wake_waiter(kernel_thread_t *thread);
 void scheduler_clear_event_wake(kernel_thread_t *thread);
 /* Terminates a non-current thread from a trusted kernel lifecycle path. */
 bool scheduler_terminate_thread(kernel_thread_t *thread);
+/* Atomically terminate an entire stable process-owned list. The caller must
+ * retain a process thread-list reader pin through return. No member is changed
+ * unless every member is already stopped or safely terminable. */
+bool scheduler_terminate_thread_group(kernel_thread_t *head,
+                                      usize expected_count);
 /* Snapshot whether a thread is currently executing on any CPU. */
 bool scheduler_thread_is_running(const kernel_thread_t *thread);
 /* True only after self/external termination and the final stack handoff.
  * A merely blocked or preempted exit syscall is not reclaimable. */
 bool scheduler_thread_exit_complete(const kernel_thread_t *thread);
+/* True only for a privately owned, prepared thread context that has not been
+ * queued, run, or published to a process yet. The creator must keep it private
+ * until process_attach_thread() succeeds and must enqueue it afterward. */
+bool scheduler_thread_process_attachable(const kernel_thread_t *thread);
+/* Boot-only case: the already-running bootstrap context becomes PID 1's
+ * initial process thread before entering the first userspace image. */
+bool scheduler_thread_initial_process_attachable(
+    const kernel_thread_t *thread);
 /* Return the stable CPU index currently owning a thread, or UINT32_MAX. */
 u32 scheduler_thread_running_cpu(const kernel_thread_t *thread);
+thread_state_t scheduler_thread_state_snapshot(const kernel_thread_t *thread);
 bool scheduler_sleep(u64 milliseconds);
 void scheduler_syscall_enter(void);
 void scheduler_syscall_leave(void);

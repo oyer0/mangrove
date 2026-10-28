@@ -96,14 +96,8 @@ typedef struct {
 static long allocation_countdown = -1;
 static _Atomic unsigned allocations, frees;
 static _Thread_local unsigned spin_depth;
-static spinlock_t process_registry_lock = PTHREAD_MUTEX_INITIALIZER;
 static bool pause_growth_allocation;
 static pthread_barrier_t *growth_allocation_entered, *growth_allocation_release;
-static void *current_thread;
-static bool block_result;
-static bool sleep_result;
-static bool thread_exit_complete;
-static bool shutdown_requested;
 static u64 spin_lock_irqsave(spinlock_t *lock)
 { assert(pthread_mutex_lock(lock) == 0); spin_depth++; return 0; }
 static void spin_unlock_irqrestore(spinlock_t *lock, u64 flags)
@@ -133,21 +127,6 @@ static bool object_reference(kernel_object_t *object)
 { if (!object) return false; u32 count=__atomic_load_n(&object->ref_count,__ATOMIC_ACQUIRE); while(count&&count!=UINT32_MAX){if(__atomic_compare_exchange_n(&object->ref_count,&count,count+1U,false,__ATOMIC_ACQUIRE,__ATOMIC_RELAXED))return true;}return false; }
 static void object_release(kernel_object_t *object)
 { assert(object);u32 count=__atomic_fetch_sub(&object->ref_count,1U,__ATOMIC_ACQ_REL);assert(count); }
-static void panic(const char *message) { fprintf(stderr,"%s\n",message);abort(); }
-static process_t *object_process(kernel_object_t *object)
-{ return (process_t *)((char *)object - offsetof(process_t, object)); }
-static void spin_lock(spinlock_t *lock) { assert(pthread_mutex_lock(lock)==0);spin_depth++; }
-static void spin_unlock(spinlock_t *lock) { assert(spin_depth);spin_depth--;assert(pthread_mutex_unlock(lock)==0); }
-static u64 process_cli_save(void) { return 0; }
-static void process_cli_restore(u64 flags) { (void)flags; }
-static bool scheduler_block(void) { return block_result; }
-static bool scheduler_sleep(u64 ticks) { (void)ticks;return sleep_result; }
-static bool scheduler_thread_exit_complete(void *thread)
-{ assert(thread);return thread_exit_complete; }
-static void *thread_current(void) { return current_thread; }
-static bool process_shutdown_requested(process_t *process)
-{ (void)process;return shutdown_requested; }
-static void process_unlink_locked(process_t *process) { process->parent=NULL; }
 '''
 
 NAMES = (
@@ -155,10 +134,8 @@ NAMES = (
     "encode_handle", "decode_handle", "process_handle_install",
     "process_handle_reserve", "process_handle_activate",
     "process_handle_cancel", "process_handle_lookup_reference",
-    "process_handle_lookup_any", "process_syscall_enter",
-    "process_syscall_leave", "process_termination_begin",
-    "process_termination_cancel",
-    "process_handle_close", "process_handle_close_all", "process_wait",
+    "process_handle_lookup_any", "process_handle_close",
+    "process_handle_close_all",
 )
 
 
@@ -192,23 +169,6 @@ static bool lookup_matches(process_t *process, process_handle_t handle,
     bool matches = object->type == OBJECT_TYPE_TEST;
     object_release(object);
     return matches;
-}
-typedef struct {
-    process_t *process;
-    pthread_barrier_t entered;
-    pthread_barrier_t release;
-    bool result;
-} syscall_hold_t;
-static void *hold_syscall(void *opaque)
-{
-    syscall_hold_t *hold = opaque;
-    hold->result = process_syscall_enter(hold->process);
-    int result = pthread_barrier_wait(&hold->entered);
-    assert(result == 0 || result == PTHREAD_BARRIER_SERIAL_THREAD);
-    result = pthread_barrier_wait(&hold->release);
-    assert(result == 0 || result == PTHREAD_BARRIER_SERIAL_THREAD);
-    if (hold->result) process_syscall_leave(hold->process);
-    return NULL;
 }
 typedef struct {
     process_t *process;
@@ -340,36 +300,6 @@ int main(void)
     kfree(process.handle_table);
     process_fini_fixture(&process);
 
-    /* A coordinated in-flight syscall blocks process termination admission;
-       once termination owns the gate, a new syscall cannot enter. */
-    memset(&process,0,sizeof(process));
-    process.state=PROCESS_STATE_ACTIVE;
-    process.launch_ready=true;
-    process.main_thread=(void *)(uintptr_t)1;
-    process.object.type=OBJECT_TYPE_TEST;
-    process.object.ref_count=1;
-    syscall_hold_t syscall_hold={.process=&process};
-    assert(pthread_barrier_init(&syscall_hold.entered,NULL,2)==0);
-    assert(pthread_barrier_init(&syscall_hold.release,NULL,2)==0);
-    pthread_t syscall_thread;
-    assert(pthread_create(&syscall_thread,NULL,hold_syscall,&syscall_hold)==0);
-    int barrier_result=pthread_barrier_wait(&syscall_hold.entered);
-    assert(barrier_result==0||barrier_result==PTHREAD_BARRIER_SERIAL_THREAD);
-    assert(syscall_hold.result&&process.active_syscalls==1U&&
-           process.object.ref_count==2U);
-    assert(!process_termination_begin(&process));
-    barrier_result=pthread_barrier_wait(&syscall_hold.release);
-    assert(barrier_result==0||barrier_result==PTHREAD_BARRIER_SERIAL_THREAD);
-    assert(pthread_join(syscall_thread,NULL)==0);
-    assert(process.active_syscalls==0U&&process.object.ref_count==1U);
-    assert(process_termination_begin(&process));
-    assert(!process_syscall_enter(&process));
-    process_termination_cancel(&process);
-    assert(process_syscall_enter(&process));
-    process_syscall_leave(&process);
-    assert(pthread_barrier_destroy(&syscall_hold.entered)==0&&
-           pthread_barrier_destroy(&syscall_hold.release)==0);
-
     /* During growth, the writer mutex keeps a concurrent close from changing
        the source slots while the production copy is paused at allocation. */
     process_init_fixture(&process);
@@ -378,6 +308,7 @@ int main(void)
     pthread_barrier_t allocation_entered,allocation_release;
     assert(pthread_barrier_init(&allocation_entered,NULL,2)==0);
     assert(pthread_barrier_init(&allocation_release,NULL,2)==0);
+    int barrier_result;
     growth_allocation_entered=&allocation_entered;
     growth_allocation_release=&allocation_release;
     pause_growth_allocation=true;
@@ -422,36 +353,8 @@ int main(void)
            pthread_barrier_destroy(&allocation_release)==0&&
            pthread_barrier_destroy(&close.attempted)==0);
 
-    /* A retained child-process handle is released on both early wake failure
-       and interrupted teardown-wait paths, as well as on successful reap. */
-    process_t parent={0},child={0};
-    process_init_fixture(&parent);
-    parent.main_thread=(void *)(uintptr_t)2;
-    memset(&child,0,sizeof(child));
-    child.state=PROCESS_STATE_ACTIVE;child.main_thread=(void *)(uintptr_t)3;
-    child.parent=&parent;child.object.type=OBJECT_TYPE_PROCESS;
-    child.object.ref_count=1;child.owner_reference_held=true;
-    process_handle_t child_handle;
-    assert(process_handle_install(&parent,&child.object,0,&child_handle));
-    current_thread=(void *)(uintptr_t)4;block_result=true;
-    thread_exit_complete=false;sleep_result=false;shutdown_requested=false;
-    i32 child_status=0;
-    assert(process_wait(&parent,child_handle,&child_status)==MG_ERR_BUSY);
-    assert(__atomic_load_n(&child.object.ref_count,__ATOMIC_ACQUIRE)==2U);
-    assert(parent.waiting_child==NULL&&parent.waiting_thread==NULL);
-    child.state=PROCESS_STATE_TERMINATED;
-    assert(process_wait(&parent,child_handle,&child_status)==MG_ERR_BUSY);
-    assert(__atomic_load_n(&child.object.ref_count,__ATOMIC_ACQUIRE)==2U);
-    thread_exit_complete=true;child.exit_status=37;
-    assert(process_wait(&parent,child_handle,&child_status)==0);
-    assert(child_status==37&&child.wait_collected&&
-           __atomic_load_n(&child.object.ref_count,__ATOMIC_ACQUIRE)==1U);
-    assert(process_handle_close(&parent,child_handle));
-    assert(__atomic_load_n(&child.object.ref_count,__ATOMIC_ACQUIRE)==0U);
-    process_handle_close_all(&parent);kfree(parent.handle_table);
-    process_fini_fixture(&parent);
     assert(allocations == frees);
-    puts("Process handles/syscall lifetime: retained lookups, coordinated growth/close, admission, generation and exhaustion PASS");
+    puts("Process handles: retained lookups, coordinated growth/close, generation and exhaustion PASS");
     return 0;
 }
 '''

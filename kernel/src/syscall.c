@@ -3982,11 +3982,9 @@ static void syscall_dispatch_inner(syscall_frame_t *frame)
             frame->rax = scheduler_yield() ? (u64)MG_OK : (u64)MG_ERR_BUSY;
             return;
         case SYSCALL_EXIT:
-            /* The current process has one userspace thread in this phase.
-             * Mark it terminated, then hand execution to the scheduler.
-             * Force-end any active terminal batch so output is not
-             * permanently suppressed if the process dies mid-batch. */
-            terminal_force_end_batch();
+            /* Exit closes process-wide syscall admission and requests every
+             * owned thread to unwind. Shared resources remain until all
+             * threads have released their leases and completed handoff. */
             if (!process_exit(process_current(), (i32)frame->rdi)) {
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
@@ -4017,6 +4015,12 @@ void syscall_dispatch(void *raw_frame)
     process = thread->process;
     tracked = frame->rax != SYSCALL_EXIT;
     if (tracked && !process_syscall_enter(process)) {
+        if (process_thread_exit_requested(thread)) {
+            process_thread_entry_completed(thread, -1);
+            if (!scheduler_terminate())
+                panic("syscall: failed to stop exiting process thread");
+            return;
+        }
         syscall_fail(frame, MG_ERR_BUSY);
         return;
     }
@@ -4030,4 +4034,9 @@ void syscall_dispatch(void *raw_frame)
     if (tracked) process_syscall_leave(process);
     if (context.allocation_failed && (i64)frame->rax == MG_ERR_BAD_ARGUMENT)
         syscall_fail(frame, MG_ERR_NO_MEMORY);
+    if (tracked && process_thread_exit_requested(thread)) {
+        process_thread_entry_completed(thread, -1);
+        if (!scheduler_terminate())
+            panic("syscall: failed to stop exiting process thread");
+    }
 }

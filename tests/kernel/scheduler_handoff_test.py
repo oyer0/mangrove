@@ -40,12 +40,14 @@ enum {THREAD_STATE_READY,THREAD_STATE_RUNNING,THREAD_STATE_BLOCKED,THREAD_STATE_
 enum {KERNEL_STACK_USAGE_BOOTSTRAP};
 #define THREAD_CPU_NONE ((u32)-1)
 typedef struct {bool active;} kernel_stack_t;
+typedef struct process {unsigned handoffs;} process_t;
 typedef struct kernel_thread {
  struct kernel_thread *next; uintptr_t saved_stack_pointer;
  unsigned state,running_cpu,effective_priority,base_priority,last_selected_priority,ready_wait_ticks;
  bool queued,context_switch_pending,saved_context_valid,wakeup_boosted,last_selection_was_wakeup_boost;
  bool stack_external; uintptr_t kernel_stack_base; size_t kernel_stack_size;
  kernel_stack_t kernel_stack;
+ process_t *process;
  unsigned fpu_state;
 } kernel_thread_t;
 typedef struct {kernel_thread_t *scheduler_idle_thread;} cpu_local_t;
@@ -62,6 +64,9 @@ static void kernel_stack_usage_sample(unsigned kind, uintptr_t top, uintptr_t rs
 static u64 spin_lock_irqsave(unsigned *p){assert(!*p);*p=1;return 0;}
 static void spin_unlock_irqrestore(unsigned *p,u64 f){(void)f;assert(*p);*p=0;}
 static void panic(const char *s){puts(s);abort();}
+static void process_scheduler_handoff_complete(kernel_thread_t *thread)
+{assert(thread && thread->process && !scheduler_lock &&
+        !scheduler_context_switch_in_progress);thread->process->handoffs++;}
 static cpu_local_t *scheduler_cpu_local(void){return &cpu;}
 static void fpu_state_save(unsigned *s){(void)s;}
 static void fpu_state_restore(unsigned *s){(void)s;}
@@ -74,7 +79,9 @@ static void scheduler_remove_queued_locked(kernel_thread_t *t){assert(ready_queu
 '''
 post = r'''
 int main(void){
+ process_t process={0};
  kernel_thread_t outgoing={.state=THREAD_STATE_READY,.running_cpu=0,.context_switch_pending=true,.saved_stack_pointer=0x1000,.stack_external=true,.kernel_stack_base=0x4000,.kernel_stack_size=0x4000};
+ outgoing.process=&process;
  kernel_thread_t incoming={.state=THREAD_STATE_RUNNING,.running_cpu=0,.saved_context_valid=true,.saved_stack_pointer=0x2000};
  current_thread=&incoming;scheduler_context_switch_in_progress=1;
  scheduler_context_switch_saved(&outgoing.saved_stack_pointer,incoming.saved_stack_pointer);
@@ -100,6 +107,7 @@ int main(void){
   scheduler_context_switch_complete(&outgoing.saved_stack_pointer);
   assert(!outgoing.queued && outgoing.running_cpu==THREAD_CPU_NONE && !outgoing.context_switch_pending);
  }
+ assert(process.handoffs==1);
  kernel_thread_t guarded={.state=THREAD_STATE_READY,.running_cpu=0,
    .saved_stack_pointer=0x3000,.kernel_stack={.active=true}};
  incoming.saved_stack_pointer=0x3000;current_thread=&incoming;

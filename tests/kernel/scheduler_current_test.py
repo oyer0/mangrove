@@ -58,7 +58,7 @@ typedef struct kernel_thread {
  bool queued, sleeping, entry_started, wakeup_boosted;
  void *process; const char *name; void (*entry)(void *); void *entry_argument;
  uintptr_t saved_stack_pointer; u64 wakeup_deadline_ms; struct kernel_thread *next;
- kernel_stack_t kernel_stack;
+ kernel_stack_t kernel_stack; bool process_initial;
 } kernel_thread_t;
 typedef struct {
  unsigned index; bool bsp;
@@ -86,6 +86,8 @@ __asm__(".pushsection .rodata\n"
         ".space 1\n"
         ".popsection\n");
 static unsigned stack_samples;
+static unsigned process_completion_calls;
+static int process_completion_status;
 static void kernel_stack_sample_rsp(kernel_stack_t *stack, uintptr_t rsp)
 {assert(stack && stack->active && rsp); stack_samples++;}
 static bool kernel_stack_guard_contains(const kernel_stack_t *stack,
@@ -129,6 +131,9 @@ static void sleeping_remove(kernel_thread_t *t) {assert(sleeping_threads==t);sle
 static bool scheduler_enqueue_locked(kernel_thread_t *t) {assert(scheduler_lock);if(!enqueue_allowed)return false;t->queued=true;return true;}
 static bool scheduler_age_ready_threads_locked(void) {assert(scheduler_lock);return false;}
 static void panic(const char *s) {(void)s;assert(!"unexpected scheduler panic");}
+static void process_thread_entry_completed(kernel_thread_t *thread,int status)
+{assert(thread && thread->process);process_completion_calls++;
+ process_completion_status=status;}
 static bool scheduler_handoff(kernel_thread_t *out,kernel_thread_t *in,u64 flags) {
  assert(out==&caller && in==&target && active_cpu==1);
  handoffs++; spin_unlock_irqrestore(&scheduler_lock,flags);return true;
@@ -161,6 +166,20 @@ static void entered(void *argument) {
  assert(!scheduler_lock && interrupts_enabled);
  longjmp(entry_return,1);
 }
+static void returning(void *argument) {(void)argument;}
+static void check_entry_completion(bool initial,int expected_status)
+{
+ int process_identity=1;
+ reset(true);
+ caller.process=&process_identity;caller.process_initial=initial;
+ caller.entry=returning;caller.entry_argument=NULL;
+ process_completion_calls=0;process_completion_status=99;
+ thread_entry_trampoline();
+ assert(process_completion_calls==1 &&
+        process_completion_status==expected_status &&
+        caller.state==THREAD_STATE_TERMINATED &&
+        caller.running_cpu==THREAD_CPU_NONE);
+}
 int main(int argc,char **argv) {
  assert(argc==2);
 #ifdef __linux__
@@ -187,6 +206,9 @@ int main(int argc,char **argv) {
   other.entry=entered;other.entry_argument=&other;
   caller.name="caller";other.name="other";
   if(!setjmp(entry_return))thread_entry_trampoline();
+ } else if(!strcmp(argv[1],"entry-completion")) {
+  check_entry_completion(true,-1);
+  check_entry_completion(false,0);
  } else if(!strcmp(argv[1],"deadline")) {
   reset(false);migrate_armed=false;
   cpus[0].scheduler_current_thread=&idle[0];
@@ -237,6 +259,7 @@ with tempfile.TemporaryDirectory(prefix='mangrove-scheduler-current-') as tmp:
     binary = Path(tmp) / 'test'
     subprocess.run(['cc', '-std=c11', '-Wall', '-Wextra', '-Werror', '-fsanitize=address,undefined', str(path), '-o', str(binary)], check=True)
     results = [subprocess.run([str(binary), case]).returncode
-               for case in ('block', 'sleep', 'terminate', 'snapshot', 'entry', 'deadline')]
+               for case in ('block', 'sleep', 'terminate', 'snapshot', 'entry',
+                            'entry-completion', 'deadline')]
     if any(results):
         raise SystemExit(f'scheduler migration regressions failed: {results}')
