@@ -901,7 +901,10 @@ def main():
     try:
         report['binary_sha256']={name:guest.digest(a.build_dir/path) for name,path in [('fstest','fstest/fstest.elf'),('reed','reed/reed.elf'),('shoot','shoot/shoot.elf'),('kernel','Mangrove/pith.elf'),('boot','EFI/BOOT/BOOTX64.EFI')]}
         if a.run_id and (not re.fullmatch('[0-9a-f]{16}',a.run_id) or a.repetitions!=1 or a.backend=='all'):raise ValueError('exact run requires one backend/campaign')
-        if shutil.disk_usage(a.output).free<3*1024**3*a.repetitions*(3 if a.backend=='all' else 1):raise ValueError('insufficient disposable artifact capacity')
+        artifacts.check_free_space(
+            a.output, 3 * 1024**3 * a.repetitions *
+            (3 if a.backend == 'all' else 1),
+            'safe-file guest images and failure evidence')
         for backend in ('mgfs','fat32','exfat') if a.backend=='all' else (a.backend,):
             for rep in range(a.repetitions):
                 run=a.run_id or secrets.token_hex(8);folder=a.output/f'{backend}-{rep}';folder.mkdir()

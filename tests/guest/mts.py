@@ -316,8 +316,11 @@ def main():
         ["git", "status", "--porcelain=v1"], cwd=ROOT, text=True).splitlines()
     required_gib = {"host": 8, "guest": 8, "all": 64}[args.profile]
     unavailable = ""
-    if shutil.disk_usage(output).free < required_gib * 1024**3:
-        unavailable = f"insufficient artifact capacity: require {required_gib} GiB free"
+    try:
+        workspace.require_free_space(required_gib * 1024**3,
+                                     f"MTS {args.profile} profile")
+    except artifacts.InsufficientArtifactSpace as error:
+        unavailable = str(error)
     guest_unavailable = ""
     if args.profile != "host" and any(not p.is_file() for p in (args.ovmf_code, args.ovmf_vars)):
         guest_unavailable = "missing OVMF firmware; select --ovmf-code and --ovmf-vars"

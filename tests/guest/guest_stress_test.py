@@ -276,7 +276,9 @@ def main():
     report=dict(status='FAIL',profiles=[],seeds=seeds,operations=a.operations,accel=a.accel);started=time.monotonic();cpu=time.process_time()
     try:
         campaigns=len(seeds)*(3 if a.backend=='all' else 1)+(6 if a.extra_controls else 0)
-        if shutil.disk_usage(a.output).free<2*1024**3*campaigns:raise ValueError('insufficient artifact capacity')
+        artifacts.check_free_space(
+            a.output, 2 * 1024**3 * campaigns,
+            'filesystem stress images and independent-check evidence')
         report['binaries']={path:guest.digest(a.build_dir/path) for path in ('Mangrove/pith.elf','fstest/fstest.elf','fsstress/fsstress.elf')}
         for backend in ('mgfs','fat32','exfat') if a.backend=='all' else (a.backend,):
             for i,s in enumerate(seeds):report['profiles'].append(campaign(a,backend,int(s,16),i))

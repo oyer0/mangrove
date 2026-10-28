@@ -48,14 +48,31 @@ make test-mts                    # Cheap orchestration controls only
 
 `MTS_OUTPUT` must name a new directory and explicitly retains the complete
 aggregate evidence. Without it, MTS uses a unique temporary workspace under
-`build/test-workspaces`; completed output is removed after the final summary
-is recorded to stdout. Use `MTS_RETAIN_ARTIFACTS=1` to keep the complete run
+the selected temporary root (`build/test-tmp` for Make's default; an explicitly
+configured `TMPDIR` is honored); completed output is removed after the final
+summary is recorded to stdout. Direct Python invocation without `TMPDIR` uses
+`build/test-workspaces`. Use `MTS_RETAIN_ARTIFACTS=1` to keep the complete run
 under `build/test-retained`. Aggregate runs set `TMPDIR` to their private
 `tmp` subdirectory. Free-space admission is 8 GiB for host
 or standard guest, 64 GiB for comprehensive execution. These are conservative
 admission budgets, not measured peak usage or guarantees against other writers
 exhausting the disk. Individual runners also enforce their existing budgets.
 Do not run independent campaigns concurrently against the same build or media.
+
+Make host-test executables are generated under the ignored `build/host-tests/`
+directory, and compiler/Python scratch defaults to `build/test-tmp/`. Set
+`TMPDIR` explicitly to select another scratch filesystem; Make requires at
+least 64 MiB free there before starting and does not clean that caller-selected
+directory. Named host-test executables are bounded build outputs, not scratch;
+`make clean` removes them. Guest build caches use separate named
+directories under `build/guest-builds/`, while disposable guest images and
+firmware-variable copies use unique runner-owned workspaces. Standalone guest
+workflows check available space before creating large media. Successful runs
+remove owned disposable media after shutdown and independent checking; failure
+bundles are written to `build/test-failures/`. A workspace left with
+`.mangrove-test-workspace.json` is an interrupted run: check that its recorded
+process and any child QEMU instance have stopped before manually removing it.
+Never use broad `/tmp` cleanup to recover space.
 
 The aggregate CLI is `python3 tests/guest/mts.py host|guest|all`. It also accepts
 `--make`, `--output`, `--retain-artifacts`, `--accel`, `--ovmf-code` and
@@ -80,7 +97,7 @@ explicit build targets and are absent from the normal payload manifest.
 | `tests/filesystems/mfqs/` and `tests/filesystems/mfqs/mfqs_test.py` | MFQS: independent Python expected-content/namespace model, generated and fixed traces, evidence witnesses and complete production VFS/MGFS/FAT32/exFAT units with controlled host dependencies. Includes real teardown/remount and historical bad-driver controls, not a guest boot. | `make test-mfqs`; [MFQS guide](filesystem-qualification.md). |
 | `tests/filesystems/stress/` and `tests/shared/fsstress_oracle.py` | Host C known-answer/model and actual POSIX-adapter tests, controlled transport failures, separate Python oracle and strict trace/result validation. | `make test-fsstress`. |
 | `tests/{kernel,memory,network,storage,filesystems,userspace,terminal}/` and related C fixtures | Focused production-path host regressions, often ASan/UBSan and deterministic failure/concurrency injection. Some compile complete production units; others extract functions with controlled dependencies. | Subsystem targets below; [fixture boundaries](tests.md). |
-| `tests/guest/*_evidence_test.py`, `tests/guest/mts_test.py` | Controlled negative tests of qualification infrastructure: reject malformed/missing evidence, wrong results, timeouts, omitted work or synthetic completion. These tests themselves are not guest execution. | `test-dev-tools`, `test-fsstress`, `test-mts`. |
+| `tests/guest/*_evidence_test.py`, `tests/guest/artifact_lifecycle_test.py`, `tests/guest/mts_test.py` | Controlled regressions for qualification evidence, owned-workspace cleanup, failure retention, interruption, concurrency and orchestration controls. These tests themselves are not guest execution. | `test-dev-tools`, `test-fsstress`, `test-mts`. |
 | `tests/userspace/libc_string_test.py`, `tests/userspace/runtime_foundations_test.py`, `tests/userspace/runtime_stdio_test.py`, `tests/userspace/libm_accuracy_test.py`, `tests/userspace/libm_complex_accuracy_test.py`, `tests/userspace/libm_complex_probe.c`, `tests/userspace/tgmath_probe.c`, `tests/userspace/runtime_api_link_probe.c` and related probes | Host production-libc checks with private symbols: 49,716 bounded `strncat` cases and historical ASan control, string API references, strict header/ABI probes, independent format/conversion references, ASCII ctype, aligned allocation, allocator failure, errno, streams and termination callbacks. The original Mangrove math group checks 63,235 deterministic real results against MPFR and 27,689 complex results against MPC/MPFR, then repeats production sources under ASan/UBSan; type-generic dispatch plus unsupported-symbol, corrupted-result/quotient, per-family coverage and incomplete-record controls are included. A target-ABI executable links the implemented standard API surface against the actual libc and libm archives. The MPFR comparison requires x86-64 host execution and the MPFR and MPC shared libraries. Development-only; not a hosted C17 certification suite. | `make test-libc` (also in `make test`), `make test-math`. |
 | `tools/mgfsck.c` | Independent, read-only host MGFS format, checksum, extent/allocation and namespace checker. Does not execute the runtime driver or repair media. | `make mgfsck`; run `build/mgfsck IMAGE`. |
 | dosfstools, mtools, exfatprogs | External host `fsck.fat -n`, `mdir`/`mcopy`/`mtype`, `fsck.exfat -n`; independent formatting/extraction/checking. Not repository implementations or OS payloads. | Existing fixtures and guest runners. |

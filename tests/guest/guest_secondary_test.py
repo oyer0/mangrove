@@ -175,6 +175,9 @@ class ExfatReader:
 
 
 def create_secondary(folder, build, backend):
+    artifacts.check_free_space(
+        folder, SECONDARY_SIZE + 2 * PART_SIZE + 128 * 1024 * 1024,
+        'secondary filesystem, disk image, and checker workspace')
     image=folder/'initial-secondary.img'; label=LABELS[backend]; log=folder/'secondary-image.log'
     if backend=='mgfs':
         guest.command([build/'mkmgfs','--blocks','16384','--uuid',
@@ -667,8 +670,9 @@ def main():
     report={'status':'FAIL','accel':args.accel,'profiles':[]}
     try:
         profiles=(3 if args.backend=='all' else 1)*args.repetitions + (1 if args.hotplug_negative_control else 0)
-        if shutil.disk_usage(args.output).free < profiles*2*1024**3:
-            raise ValueError('qualification requires 2 GiB free artifact capacity per profile; use disk-backed output')
+        artifacts.check_free_space(
+            args.output, profiles * 2 * 1024**3,
+            'secondary-volume qualification profiles')
         report['binaries']={str(name):guest.digest(args.build_dir/name) for name in
             (Path('Mangrove/pith.elf'),Path('fstest/fstest.elf'),Path('volumed/volumed.elf'))}
         for backend in (LABELS if args.backend=='all' else [args.backend]):

@@ -2,14 +2,17 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Ownership-safe lifecycle for generated QEMU test artifacts."""
 from datetime import datetime, timezone
+import atexit
 import fcntl
 import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import tempfile
 import secrets
+import threading
 
 ROOT = Path(__file__).resolve().parents[2]
 MARKER = ".mangrove-test-workspace.json"
@@ -19,9 +22,37 @@ MAX_DIAGNOSTIC_FILE = 8 * 1024 * 1024
 MAX_DIAGNOSTIC_TOTAL = 32 * 1024 * 1024
 MAX_FAILURE_MEDIA = 2
 MAX_FAILURE_MEDIA_TOTAL = 256 * 1024 * 1024
+MAX_FAILURE_SCREENSHOT_BYTES = 16 * 1024 * 1024
 MAX_FAILURE_BUNDLES = 12
 MAX_FAILURE_EVIDENCE_TOTAL = 1024 * 1024 * 1024
 FAILURE_MARKER = ".mangrove-failure-evidence.json"
+ORPHAN_REPORT = "orphaned-workspace.json"
+
+_ACTIVE_WORKSPACES = set()
+_PREVIOUS_SIGTERM = None
+
+
+class InsufficientArtifactSpace(RuntimeError):
+    """A test workspace cannot safely hold its declared disposable artifacts."""
+
+
+def _workspace_sigterm(signum, frame):
+    raise KeyboardInterrupt(f"received signal {signum}; stopping owned test workflow")
+
+
+def check_free_space(path, required_bytes, purpose="test artifacts"):
+    """Fail before allocation when the selected filesystem cannot fit the workload."""
+    target = Path(path)
+    target.mkdir(parents=True, exist_ok=True)
+    available = shutil.disk_usage(target).free
+    if required_bytes < 0:
+        raise ValueError("required free space must not be negative")
+    if available < required_bytes:
+        raise InsufficientArtifactSpace(
+            f"insufficient space for {purpose} in {target}: "
+            f"need {required_bytes} bytes, have {available} bytes; "
+            "select a disk-backed TMPDIR or build workspace with sufficient free space")
+    return available
 
 
 def add_retention_argument(parser):
@@ -61,18 +92,47 @@ class ArtifactWorkspace:
         self.retain = bool(retain or output is not None)
         self.token = secrets.token_hex(16)
         if self.temporary:
-            base = ROOT / "build" / "test-workspaces"
+            configured_tmp = os.environ.get("TMPDIR")
+            base = (Path(configured_tmp).expanduser() if configured_tmp else
+                    ROOT / "build" / "test-workspaces")
             base.mkdir(parents=True, exist_ok=True)
-            self.path = Path(tempfile.mkdtemp(prefix=f"{name}-", dir=base)).resolve()
+            self.path = Path(tempfile.mkdtemp(
+                prefix=f"mangrove-{name}-", dir=base)).resolve()
         else:
             self.path = Path(output).expanduser().resolve()
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self.path.mkdir(exist_ok=False)
         self.marker = self.path / MARKER
         with self.marker.open("x", encoding="utf-8") as stream:
-            json.dump({"schema": 1, "token": self.token, "name": name}, stream)
+            json.dump({"schema": 1, "token": self.token, "name": name,
+                       "pid": os.getpid(),
+                       "created_utc": datetime.now(timezone.utc).isoformat()}, stream)
             stream.write("\n")
         self._failure_media = []
+        self._finished = False
+        _register_workspace(self)
+
+    def require_free_space(self, required_bytes, purpose="test artifacts"):
+        """Check capacity on the workspace's filesystem before a large workload."""
+        return check_free_space(self.path, required_bytes, purpose)
+
+    def _record_unfinished(self):
+        """Leave a small, explicit recovery marker; never reap an unknown guest."""
+        if self._finished:
+            return
+        try:
+            self._verify_owner()
+            (self.path / ORPHAN_REPORT).write_text(json.dumps({
+                "status": "INCOMPLETE",
+                "reason": "runner exited before artifact cleanup completed",
+                "workspace": str(self.path),
+                "pid": os.getpid(),
+                "safe_action": "inspect the owner marker and ensure child processes are stopped before manual removal",
+            }, indent=2, sort_keys=True) + "\n")
+        except (OSError, RuntimeError):
+            # The marker itself still identifies the workspace if this small
+            # best-effort report cannot be written.
+            pass
 
     def set_failure_media(self, *paths):
         """Select only exact media needed to inspect the current failed phase."""
@@ -111,7 +171,9 @@ class ArtifactWorkspace:
             owner = json.loads(self.marker.read_text())
         except (OSError, ValueError) as error:
             raise RuntimeError("test output ownership marker is invalid") from error
-        if owner != {"schema": 1, "token": self.token, "name": self.name}:
+        if (not isinstance(owner, dict) or owner.get("schema") != 1 or
+                owner.get("token") != self.token or
+                owner.get("name") != self.name):
             raise RuntimeError("test output ownership marker changed")
 
     def _is_disposable(self, path):
@@ -154,7 +216,17 @@ class ArtifactWorkspace:
                 total += size
         kept_media = 0
         copied_media = []
-        for source in keep:
+        media_candidates = list(keep)
+        # Preserve a small number of runner-captured framebuffer images on
+        # failure even when a runner did not explicitly select one. QMP
+        # screenshots are bounded by the guest runner; larger media remains
+        # opt-in through set_failure_media().
+        for screenshot in sorted(self.path.rglob("*.ppm")):
+            if (screenshot.is_file() and not screenshot.is_symlink() and
+                    screenshot.stat().st_size <= MAX_FAILURE_SCREENSHOT_BYTES and
+                    screenshot not in media_candidates):
+                media_candidates.append(screenshot)
+        for source in media_candidates:
             if not source.is_file() or source.is_symlink():
                 continue
             size = source.stat().st_size
@@ -224,6 +296,12 @@ class ArtifactWorkspace:
             candidate = self._owned_path(name)
             if candidate not in keep:
                 keep.append(candidate)
+        if not completed:
+            for screenshot in sorted(self.path.rglob("*.ppm")):
+                if (screenshot.is_file() and not screenshot.is_symlink() and
+                        screenshot.stat().st_size <= MAX_FAILURE_SCREENSHOT_BYTES and
+                        screenshot not in keep):
+                    keep.append(screenshot)
         # Parent orchestrators own nested child workspaces. Honor child
         # reports that identify exact media needed to diagnose uncertainty.
         for child_report in self.path.rglob("report.json"):
@@ -325,4 +403,31 @@ class ArtifactWorkspace:
             shutil.rmtree(self.path)
         else:
             self.marker.unlink(missing_ok=True)
+        self._finished = True
+        _unregister_workspace(self)
         return report
+
+
+def _register_workspace(workspace):
+    global _PREVIOUS_SIGTERM
+    _ACTIVE_WORKSPACES.add(workspace)
+    atexit.register(workspace._record_unfinished)
+    # Only the main Python thread may install signal handlers. A workspace
+    # created by a worker thread is still uniquely owned and cleaned normally.
+    if threading.current_thread() is threading.main_thread():
+        if _PREVIOUS_SIGTERM is None:
+            _PREVIOUS_SIGTERM = signal.getsignal(signal.SIGTERM)
+            signal.signal(signal.SIGTERM, _workspace_sigterm)
+
+
+def _unregister_workspace(workspace):
+    global _PREVIOUS_SIGTERM
+    if workspace not in _ACTIVE_WORKSPACES:
+        return
+    _ACTIVE_WORKSPACES.remove(workspace)
+    atexit.unregister(workspace._record_unfinished)
+    if not _ACTIVE_WORKSPACES and _PREVIOUS_SIGTERM is not None:
+        if (threading.current_thread() is threading.main_thread() and
+                signal.getsignal(signal.SIGTERM) is _workspace_sigterm):
+            signal.signal(signal.SIGTERM, _PREVIOUS_SIGTERM)
+        _PREVIOUS_SIGTERM = None

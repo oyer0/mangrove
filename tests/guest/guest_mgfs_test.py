@@ -237,6 +237,12 @@ def create_disk(folder, build, run, relative_launch=False,
                 random_smoke=False, ca_store_smoke=False,
                 mgtls_smoke=False, mgtls_tls_smoke=False,
                 fetch_https_smoke=False, kernel_override=None):
+    # The disposable image is sparse on common host filesystems, but reserve
+    # enough room for a fully allocated image, extracted root partition, and
+    # bounded checker/firmware evidence before starting image construction.
+    artifacts.check_free_space(
+        folder, DISK_BYTES + PART_BYTES + 64 * 1024 * 1024,
+        "MGFS guest image and independent-check workspace")
     log = folder / 'image.log'
     root = folder / 'initial-root.img'
     command([build / 'mkmgfs', '--blocks', '16384', '--uuid',

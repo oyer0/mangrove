@@ -97,6 +97,29 @@ endif
 QEMU_PLATFORM_ARGS := -accel $(QEMU_ACCEL) -cpu $(QEMU_CPU)
 
 BUILD_DIR    := build
+HOST_TEST_DIR ?= $(abspath $(BUILD_DIR))/host-tests
+# Keep compiler and Python scratch files off a full tmpfs by default. An
+# explicitly configured TMPDIR remains authoritative for local workflows.
+TMPDIR ?= $(abspath $(BUILD_DIR))/test-tmp
+export TMPDIR
+MAKE_WORKFLOW_GOALS := $(filter-out clean help,$(MAKECMDGOALS))
+ifeq ($(strip $(MAKECMDGOALS)),)
+HOST_TMP_SETUP := $(shell python3 -c 'import os,shutil,sys; p=os.environ["TMPDIR"]; os.makedirs(p,exist_ok=True); sys.exit(0 if shutil.disk_usage(p).free >= 64*1024*1024 else 1)' || echo failed)
+ifneq ($(HOST_TMP_SETUP),)
+$(error Could not prepare TMPDIR=$(TMPDIR): require a writable scratch directory with at least 64 MiB free; select a disk-backed workspace, for example TMPDIR=$(abspath $(BUILD_DIR))/test-tmp)
+endif
+else ifneq ($(strip $(MAKE_WORKFLOW_GOALS)),)
+HOST_TMP_SETUP := $(shell python3 -c 'import os,shutil,sys; p=os.environ["TMPDIR"]; os.makedirs(p,exist_ok=True); sys.exit(0 if shutil.disk_usage(p).free >= 64*1024*1024 else 1)' || echo failed)
+ifneq ($(HOST_TMP_SETUP),)
+$(error Could not prepare TMPDIR=$(TMPDIR): require a writable scratch directory with at least 64 MiB free; select a disk-backed workspace, for example TMPDIR=$(abspath $(BUILD_DIR))/test-tmp)
+endif
+endif
+ifneq ($(filter test test-%,$(MAKECMDGOALS)),)
+HOST_TEST_SETUP := $(shell mkdir -p "$(HOST_TEST_DIR)" || echo failed)
+ifneq ($(HOST_TEST_SETUP),)
+$(error Could not create host test workspace under HOST_TEST_DIR=$(HOST_TEST_DIR), TMPDIR=$(TMPDIR))
+endif
+endif
 EFI_DIR      := $(BUILD_DIR)/EFI/BOOT
 MANGROVE_DIR := $(BUILD_DIR)/Mangrove
 STATE_DIR    ?= .mangrove
@@ -869,35 +892,35 @@ test-time:
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -pthread \
 		-fsanitize=address,undefined -fno-builtin \
 		-Ikernel/include -Iinclude -idirafter libc/include \
-		tests/kernel/clocksource_test.c -o /tmp/mangrove-clocksource-test
-	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-clocksource-test
+		tests/kernel/clocksource_test.c -o $(HOST_TEST_DIR)/mangrove-clocksource-test
+	ASAN_OPTIONS=detect_leaks=0 $(HOST_TEST_DIR)/mangrove-clocksource-test
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -pthread \
 		-fsanitize=address,undefined -ffunction-sections -fdata-sections \
 		-Wl,--gc-sections -fno-builtin -Ikernel/include \
 		-Ikernel/include/usb -Ikernel/include/pci -Ikernel/include/storage \
 		-Iinclude -idirafter libc/include \
 		tests/kernel/clocksource_timer_test.c kernel/src/clocksource.c \
-		-o /tmp/mangrove-clocksource-timer-test
-	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-clocksource-timer-test
+		-o $(HOST_TEST_DIR)/mangrove-clocksource-timer-test
+	ASAN_OPTIONS=detect_leaks=0 $(HOST_TEST_DIR)/mangrove-clocksource-timer-test
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
 		-Ilibc/include -Iinclude tests/kernel/timekeeping_test.c \
-		libc/src/time_convert.c -o /tmp/mangrove-timekeeping-test
-	/tmp/mangrove-timekeeping-test
+		libc/src/time_convert.c -o $(HOST_TEST_DIR)/mangrove-timekeeping-test
+	$(HOST_TEST_DIR)/mangrove-timekeeping-test
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
 		-Ilibc/include -Iinclude tests/userspace/time_status_api_test.c \
-		-o /tmp/mangrove-time-status-api-test
-	/tmp/mangrove-time-status-api-test
+		-o $(HOST_TEST_DIR)/mangrove-time-status-api-test
+	$(HOST_TEST_DIR)/mangrove-time-status-api-test
 	python3 tests/userspace/time_libc_test.py "$(HOST_CC)"
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
 		-Ikernel/include -Iinclude tests/kernel/rtc_decode_test.c \
-		kernel/src/rtc_decode.c -o /tmp/mangrove-rtc-decode-test
-	/tmp/mangrove-rtc-decode-test
+		kernel/src/rtc_decode.c -o $(HOST_TEST_DIR)/mangrove-rtc-decode-test
+	$(HOST_TEST_DIR)/mangrove-rtc-decode-test
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -pthread \
 		-fsanitize=address,undefined -fno-builtin \
 		-Ikernel/include -Iinclude -idirafter libc/include \
 		tests/kernel/system_clock_test.c kernel/src/rtc_decode.c \
-		libc/src/time_convert.c -o /tmp/mangrove-system-clock-test
-	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-system-clock-test
+		libc/src/time_convert.c -o $(HOST_TEST_DIR)/mangrove-system-clock-test
+	ASAN_OPTIONS=detect_leaks=0 $(HOST_TEST_DIR)/mangrove-system-clock-test
 	@echo timekeeping tests passed
 
 TIME_QMP_BUILD_DIR ?= $(BUILD_DIR)/time-qmp
@@ -919,10 +942,10 @@ test-ca-store: $(MKMGFS) $(BUILD_DIR)/mgfsck
 	python3 tests/userspace/ca_store_test.py "$(MKMGFS)" "$(BUILD_DIR)/mgfsck"
 
 .PHONY: test-guest-mgtls test-guest-mgtls-tls test-guest-fetch-https
-GUEST_MGTLS_BUILD ?= /tmp/mangrove-mgtls-build
+GUEST_MGTLS_BUILD ?= $(abspath $(BUILD_DIR))/guest-builds/mgtls
 GUEST_MGTLS_OUTPUT ?=
 GUEST_MGTLS_ACCEL ?= $(NATIVE_GUEST_ACCEL)
-GUEST_FETCH_HTTPS_BUILD ?= /tmp/mangrove-fetch-https-build
+GUEST_FETCH_HTTPS_BUILD ?= $(abspath $(BUILD_DIR))/guest-builds/fetch-https
 GUEST_FETCH_HTTPS_OUTPUT ?=
 GUEST_FETCH_HTTPS_ACCEL ?= $(NATIVE_GUEST_ACCEL)
 test-guest-mgtls:
@@ -947,8 +970,8 @@ test-terminal-api:
 		-Ilibc/include -Iinclude tests/terminal/terminal_stream_api_test.c \
 		libc/src/mangrove_syscall.c libc/src/line_editor.c libc/src/utf8.c \
 		-Wl,--gc-sections \
-		-o /tmp/mangrove-terminal-stream-api-test
-	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-terminal-stream-api-test
+		-o $(HOST_TEST_DIR)/mangrove-terminal-stream-api-test
+	ASAN_OPTIONS=detect_leaks=0 $(HOST_TEST_DIR)/mangrove-terminal-stream-api-test
 
 .PHONY: test-terminal
 test-terminal: test-terminal-api test-table-literal-output
@@ -957,20 +980,20 @@ test-terminal: test-terminal-api test-table-literal-output
 		-fsanitize=address,undefined -ffunction-sections -fdata-sections \
 		-Dmain=say_main -I. -Iinclude -Iuserspace/common \
 		-idirafter libc/include -c userspace/say/main.c \
-		-o /tmp/mangrove-say-main-render-test.o
+		-o $(HOST_TEST_DIR)/mangrove-say-main-render-test.o
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
 		-Ikernel/include -Iinclude tests/terminal/utf8_decode_test.c \
-		kernel/src/utf8.c libc/src/utf8.c -o /tmp/mangrove-utf8-test
-	/tmp/mangrove-utf8-test
+		kernel/src/utf8.c libc/src/utf8.c -o $(HOST_TEST_DIR)/mangrove-utf8-test
+	$(HOST_TEST_DIR)/mangrove-utf8-test
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -Wno-unused-function \
 		-pthread -fno-builtin -fsanitize=address,undefined -ffunction-sections \
 		-fdata-sections $(HOST_TERMINAL_RENDER_INCLUDES) \
 		tests/terminal/terminal_render_test.c kernel/src/utf8.c libc/src/utf8.c \
 		libc/src/line_editor.c libc/src/string.c userspace/say/escape.c \
-		userspace/common/cli_options.c /tmp/mangrove-say-main-render-test.o \
+		userspace/common/cli_options.c $(HOST_TEST_DIR)/mangrove-say-main-render-test.o \
 		-Wl,--gc-sections \
-		-o /tmp/mangrove-terminal-render-test
-	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-terminal-render-test
+		-o $(HOST_TEST_DIR)/mangrove-terminal-render-test
+	ASAN_OPTIONS=detect_leaks=0 $(HOST_TEST_DIR)/mangrove-terminal-render-test
 	python3 tests/terminal/terminal_overlay_test.py "$(HOST_CC)"
 	python3 tests/terminal/terminal_write_owner_test.py "$(HOST_CC)"
 	python3 tests/terminal/console_input_smp_test.py "$(HOST_CC)"
@@ -979,14 +1002,14 @@ test-terminal: test-terminal-api test-table-literal-output
 		-fsanitize=address,undefined -ffunction-sections -fdata-sections \
 		-Ilibc/include -Iinclude tests/terminal/line_editor_prompt_render_test.c \
 		libc/src/utf8.c libc/src/string.c -Wl,--gc-sections \
-		-o /tmp/mangrove-line-editor-prompt-render-test
-	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-line-editor-prompt-render-test
+		-o $(HOST_TEST_DIR)/mangrove-line-editor-prompt-render-test
+	ASAN_OPTIONS=detect_leaks=0 $(HOST_TEST_DIR)/mangrove-line-editor-prompt-render-test
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
 		-fsanitize=address,undefined -ffunction-sections -fdata-sections \
 		-Ilibc/include -Iinclude tests/terminal/line_editor_key_event_test.c \
 		libc/src/utf8.c libc/src/string.c -Wl,--gc-sections \
-		-o /tmp/mangrove-line-editor-key-event-test
-	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-line-editor-key-event-test
+		-o $(HOST_TEST_DIR)/mangrove-line-editor-key-event-test
+	ASAN_OPTIONS=detect_leaks=0 $(HOST_TEST_DIR)/mangrove-line-editor-key-event-test
 	@echo terminal renderer, ESC parser, UTF-8, overlay, input synchronization and ownership tests passed
 
 .PHONY: test-say
@@ -994,20 +1017,20 @@ test-say:
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
 		-fsanitize=address,undefined -I. -Iinclude \
 		-idirafter libc/include tests/userspace/say_escape_test.c \
-		userspace/say/escape.c -o /tmp/mangrove-say-escape-test
-	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-say-escape-test
+		userspace/say/escape.c -o $(HOST_TEST_DIR)/mangrove-say-escape-test
+	ASAN_OPTIONS=detect_leaks=0 $(HOST_TEST_DIR)/mangrove-say-escape-test
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
 		-fsanitize=address,undefined -ffunction-sections -fdata-sections \
 		-Dmain=say_main -I. -Iinclude -Iuserspace/common \
 		-idirafter libc/include \
-		-c userspace/say/main.c -o /tmp/mangrove-say-main-test.o
+		-c userspace/say/main.c -o $(HOST_TEST_DIR)/mangrove-say-main-test.o
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
 		-fsanitize=address,undefined -ffunction-sections -fdata-sections \
 		-I. -Iinclude -Iuserspace/common -idirafter libc/include \
 		userspace/say/escape.c userspace/common/cli_options.c \
-		/tmp/mangrove-say-main-test.o tests/userspace/say_cli_test.c \
-		-Wl,--gc-sections -o /tmp/mangrove-say-test
-	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-say-test
+		$(HOST_TEST_DIR)/mangrove-say-main-test.o tests/userspace/say_cli_test.c \
+		-Wl,--gc-sections -o $(HOST_TEST_DIR)/mangrove-say-test
+	ASAN_OPTIONS=detect_leaks=0 $(HOST_TEST_DIR)/mangrove-say-test
 
 .PHONY: test-font
 test-font: $(FONT_ASSET) $(BUILD_DIR)/tests/terminal/font_asset_blob.o
@@ -1019,8 +1042,8 @@ test-font: $(FONT_ASSET) $(BUILD_DIR)/tests/terminal/font_asset_blob.o
 		-idirafter libc/include tests/terminal/font_render_test.c \
 		kernel/src/font.c libc/src/utf8.c \
 		$(BUILD_DIR)/tests/terminal/font_asset_blob.o \
-		-o /tmp/mangrove-font-render-test
-	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-font-render-test
+		-o $(HOST_TEST_DIR)/mangrove-font-render-test
+	ASAN_OPTIONS=detect_leaks=0 $(HOST_TEST_DIR)/mangrove-font-render-test
 	@echo production UNSCII-16 font tests passed
 
 $(BUILD_DIR)/tests/terminal/font_asset_blob.o: tests/terminal/font_asset_blob.S $(FONT_ASSET)
@@ -1032,27 +1055,27 @@ test-unicode:
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
 		-fsanitize=address,undefined -Ilibc/include -Iinclude \
 		tests/terminal/unicode_conversion_test.c libc/src/utf8.c libc/src/wchar.c \
-		libc/src/string.c libc/src/errno.c -o /tmp/mangrove-unicode-test
-	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-unicode-test
+		libc/src/string.c libc/src/errno.c -o $(HOST_TEST_DIR)/mangrove-unicode-test
+	ASAN_OPTIONS=detect_leaks=0 $(HOST_TEST_DIR)/mangrove-unicode-test
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
 		-fsanitize=address,undefined -ffunction-sections -fdata-sections \
 		-Ilibc/include -Iinclude tests/terminal/line_editor_unicode_test.c \
 		libc/src/line_editor.c libc/src/utf8.c libc/src/string.c \
-		-Wl,--gc-sections -o /tmp/mangrove-line-editor-unicode-test
-	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-line-editor-unicode-test
+		-Wl,--gc-sections -o $(HOST_TEST_DIR)/mangrove-line-editor-unicode-test
+	ASAN_OPTIONS=detect_leaks=0 $(HOST_TEST_DIR)/mangrove-line-editor-unicode-test
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
 		-fsanitize=address,undefined -ffunction-sections -fdata-sections \
 		-Ilibc/include -Iinclude tests/terminal/line_editor_history_test.c \
 		libc/src/line_editor.c libc/src/utf8.c libc/src/string.c \
-		-Wl,--gc-sections -o /tmp/mangrove-line-editor-history-test
-	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-line-editor-history-test
+		-Wl,--gc-sections -o $(HOST_TEST_DIR)/mangrove-line-editor-history-test
+	ASAN_OPTIONS=detect_leaks=0 $(HOST_TEST_DIR)/mangrove-line-editor-history-test
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -Wno-unused-function \
 		-Wno-unused-variable \
 		-fno-builtin -fsanitize=address,undefined -ffunction-sections \
 		-fdata-sections -Ilibc/include -Iinclude \
 		tests/terminal/text_metrics_test.c libc/src/utf8.c \
-		-Wl,--gc-sections -o /tmp/mangrove-text-metrics-test
-	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-text-metrics-test
+		-Wl,--gc-sections -o $(HOST_TEST_DIR)/mangrove-text-metrics-test
+	ASAN_OPTIONS=detect_leaks=0 $(HOST_TEST_DIR)/mangrove-text-metrics-test
 
 test-password:
 	python3 tests/userspace/password_test.py "$(HOST_CC)"
@@ -1064,32 +1087,32 @@ test-random:
 		-idirafter libc/include tests/kernel/random_test.c \
 		kernel/src/crypto/sha256.c kernel/src/crypto/hmac_drbg_sha256.c \
 		kernel/src/entropy.c kernel/src/csprng.c \
-		-o /tmp/mangrove-random-test
-	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-random-test
+		-o $(HOST_TEST_DIR)/mangrove-random-test
+	ASAN_OPTIONS=detect_leaks=0 $(HOST_TEST_DIR)/mangrove-random-test
 	$(HOST_CC) -std=gnu11 -Wall -Wextra -Werror -fno-builtin \
 		-fsanitize=address,undefined -fno-sanitize-recover=all \
 		-Itests/kernel/random_host \
 		-Ikernel/include -Iinclude -idirafter libc/include \
 		tests/kernel/random_syscall_test.c kernel/src/random_syscall.c \
-		-o /tmp/mangrove-random-syscall-test
-	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-random-syscall-test
+		-o $(HOST_TEST_DIR)/mangrove-random-syscall-test
+	ASAN_OPTIONS=detect_leaks=0 $(HOST_TEST_DIR)/mangrove-random-syscall-test
 	$(HOST_CC) -std=gnu11 -Wall -Wextra -Werror -fno-builtin \
 		-fsanitize=address,undefined -fno-sanitize-recover=all \
 		-Ilibc/include -Iinclude \
 		tests/userspace/random_api_test.c libc/src/random.c \
-		-o /tmp/mangrove-random-api-test
-	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-random-api-test
+		-o $(HOST_TEST_DIR)/mangrove-random-api-test
+	ASAN_OPTIONS=detect_leaks=0 $(HOST_TEST_DIR)/mangrove-random-api-test
 
 test-reed:
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin -fsanitize=address,undefined \
-		-Ilibc/include -Iinclude tests/userspace/command_path_test.c userspace/common/path.c -o /tmp/mangrove-command-path-test
-	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-command-path-test
+		-Ilibc/include -Iinclude tests/userspace/command_path_test.c userspace/common/path.c -o $(HOST_TEST_DIR)/mangrove-command-path-test
+	ASAN_OPTIONS=detect_leaks=0 $(HOST_TEST_DIR)/mangrove-command-path-test
 	$(HOST_CC) -std=gnu17 -Wall -Wextra -Werror -fno-builtin \
 		-fsanitize=address,undefined -ffunction-sections -fdata-sections \
 		-Ilibc/include -Iinclude -Iuserspace/reed -Iuserspace/common \
 		tests/userspace/reed_keymap_test.c -Wl,--gc-sections \
-		-o /tmp/mangrove-reed-keymap-test
-	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-reed-keymap-test
+		-o $(HOST_TEST_DIR)/mangrove-reed-keymap-test
+	ASAN_OPTIONS=detect_leaks=0 $(HOST_TEST_DIR)/mangrove-reed-keymap-test
 	$(HOST_CC) -std=gnu17 -Wall -Wextra -Werror -Wno-unused-function \
 		-Wno-unused-variable -fno-builtin -fsanitize=address,undefined \
 		-ffunction-sections -fdata-sections \
@@ -1097,38 +1120,38 @@ test-reed:
 		tests/userspace/reed_interaction_test.c libc/src/clipboard.c userspace/clipd/clipboard.c userspace/reed/buffer.c \
 		userspace/reed/config.c libc/src/string.c libc/src/utf8.c \
 		$(HOST_REED_TEST_FLAGS) \
-		-o /tmp/mangrove-reed-interaction-test
-	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-reed-interaction-test
+		-o $(HOST_TEST_DIR)/mangrove-reed-interaction-test
+	ASAN_OPTIONS=detect_leaks=0 $(HOST_TEST_DIR)/mangrove-reed-interaction-test
 	$(HOST_CC) -std=gnu17 -Wall -Wextra -Werror -Wno-unused-function \
 		-fno-builtin -fsanitize=address,undefined -ffunction-sections \
 		-fdata-sections -DTEST_REED_RENDER $(HOST_TERMINAL_RENDER_INCLUDES) \
 		tests/terminal/fullscreen_render_test.c libc/src/clipboard.c userspace/clipd/clipboard.c userspace/reed/buffer.c \
 		userspace/reed/config.c kernel/src/utf8.c libc/src/utf8.c \
 		libc/src/line_editor.c libc/src/string.c -Wl,--gc-sections \
-		-o /tmp/mangrove-reed-render-test
-	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-reed-render-test
+		-o $(HOST_TEST_DIR)/mangrove-reed-render-test
+	ASAN_OPTIONS=detect_leaks=0 $(HOST_TEST_DIR)/mangrove-reed-render-test
 	$(HOST_CC) -std=gnu17 -Wall -Wextra -Werror -fno-builtin \
 		-fsanitize=address,undefined -ffunction-sections -fdata-sections \
 		-Ilibc/include -Iinclude -Iuserspace/reed \
 		tests/userspace/reed_config_test.c userspace/reed/config.c \
 		userspace/common/app_directory.c libc/src/string.c -Wl,--gc-sections \
 		-Wl,--wrap=realloc \
-		-o /tmp/mangrove-reed-config-test
-	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-reed-config-test
+		-o $(HOST_TEST_DIR)/mangrove-reed-config-test
+	ASAN_OPTIONS=detect_leaks=0 $(HOST_TEST_DIR)/mangrove-reed-config-test
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
 		-fsanitize=address,undefined -Ilibc/include -Iinclude -Iuserspace/reed \
 		tests/userspace/reed_buffer_test.c userspace/reed/buffer.c libc/src/string.c \
 		libc/src/utf8.c \
-		-o /tmp/mangrove-reed-buffer-test
-	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-reed-buffer-test
+		-o $(HOST_TEST_DIR)/mangrove-reed-buffer-test
+	ASAN_OPTIONS=detect_leaks=0 $(HOST_TEST_DIR)/mangrove-reed-buffer-test
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
 		-ffunction-sections -fdata-sections \
 		-Ilibc/include -Iinclude -Iuserspace/reed \
 		tests/userspace/reed_safe_save_test.c userspace/reed/buffer.c libc/src/string.c \
 		libc/src/utf8.c userspace/common/path.c \
 		$(HOST_REED_TEST_FLAGS) \
-		-o /tmp/mangrove-reed-safe-save-test
-	/tmp/mangrove-reed-safe-save-test
+		-o $(HOST_TEST_DIR)/mangrove-reed-safe-save-test
+	$(HOST_TEST_DIR)/mangrove-reed-safe-save-test
 	@echo Reed buffer and safe-save tests passed
 
 .PHONY: test-shoot test-shoot-config
@@ -1141,50 +1164,50 @@ test-shoot-config:
 		userspace/shoot/config.c userspace/common/app_directory.c \
 		userspace/common/path.c libc/src/string.c \
 		-Wl,--wrap=malloc \
-		-o /tmp/mangrove-shoot-config-migration-test
-	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-shoot-config-migration-test
+		-o $(HOST_TEST_DIR)/mangrove-shoot-config-migration-test
+	ASAN_OPTIONS=detect_leaks=0 $(HOST_TEST_DIR)/mangrove-shoot-config-migration-test
 
 test-shoot:
 	$(HOST_CC) -std=gnu17 -Wall -Wextra -Werror -fno-builtin \
 		-fsanitize=address,undefined -I. -Iuserspace/shoot -Iinclude \
 		-idirafter libc/include tests/userspace/shoot_exit_test.c \
-		userspace/shoot/commands/exit.c -o /tmp/mangrove-shoot-exit-test
-	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-shoot-exit-test
+		userspace/shoot/commands/exit.c -o $(HOST_TEST_DIR)/mangrove-shoot-exit-test
+	ASAN_OPTIONS=detect_leaks=0 $(HOST_TEST_DIR)/mangrove-shoot-exit-test
 	$(HOST_CC) -std=gnu17 -Wall -Wextra -Werror -fno-builtin \
 		-fsanitize=address,undefined -ffunction-sections -fdata-sections \
 		-I. -Iuserspace/shoot -Iinclude -idirafter libc/include \
 		-Dmalloc=shoot_glob_test_malloc -Dfree=shoot_glob_test_free \
-		-c userspace/shoot/glob.c -o /tmp/mangrove-shoot-glob-test.o
+		-c userspace/shoot/glob.c -o $(HOST_TEST_DIR)/mangrove-shoot-glob-test.o
 	$(HOST_CC) -std=gnu17 -Wall -Wextra -Werror -fno-builtin \
 		-fsanitize=address,undefined -ffunction-sections -fdata-sections \
 		-I. -Iinclude -Iuserspace/common -idirafter libc/include \
 		-Dmain=del_command_main -c userspace/del/main.c \
-		-o /tmp/mangrove-shoot-del-test.o
+		-o $(HOST_TEST_DIR)/mangrove-shoot-del-test.o
 	$(HOST_CC) -std=gnu17 -Wall -Wextra -Werror -fno-builtin \
 		-fsanitize=address,undefined -ffunction-sections -fdata-sections \
 		-I. -Iuserspace/shoot -Iinclude -idirafter libc/include \
 		-Dmalloc=shoot_language_test_malloc \
 		-Drealloc=shoot_language_test_realloc \
-		-c userspace/shoot/language.c -o /tmp/mangrove-shoot-language-test.o
+		-c userspace/shoot/language.c -o $(HOST_TEST_DIR)/mangrove-shoot-language-test.o
 	$(HOST_CC) -std=gnu17 -Wall -Wextra -Werror -fno-builtin \
 		-fsanitize=address,undefined -ffunction-sections -fdata-sections \
 		-I. -Iuserspace/shoot -Iinclude -idirafter libc/include \
 		-Dmalloc=shoot_language_test_malloc \
 		-Drealloc=shoot_language_test_realloc \
-		-c userspace/shoot/script.c -o /tmp/mangrove-shoot-script-test.o
+		-c userspace/shoot/script.c -o $(HOST_TEST_DIR)/mangrove-shoot-script-test.o
 	$(HOST_CC) -std=gnu17 -Wall -Wextra -Werror -fno-builtin \
 		-fsanitize=address,undefined -ffunction-sections -fdata-sections \
 		-I. -Iuserspace/shoot -Iinclude -idirafter libc/include \
 		tests/userspace/shoot_language_test.c \
-		/tmp/mangrove-shoot-language-test.o \
-		/tmp/mangrove-shoot-script-test.o userspace/shoot/shell.c \
+		$(HOST_TEST_DIR)/mangrove-shoot-language-test.o \
+		$(HOST_TEST_DIR)/mangrove-shoot-script-test.o userspace/shoot/shell.c \
 		userspace/shoot/builtin.c userspace/common/path.c \
 		userspace/common/cli_options.c \
 		userspace/say/escape.c \
 		libc/src/utf8.c \
-		/tmp/mangrove-shoot-glob-test.o /tmp/mangrove-shoot-del-test.o \
-		-Wl,--gc-sections -o /tmp/mangrove-shoot-language-test
-	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-shoot-language-test
+		$(HOST_TEST_DIR)/mangrove-shoot-glob-test.o $(HOST_TEST_DIR)/mangrove-shoot-del-test.o \
+		-Wl,--gc-sections -o $(HOST_TEST_DIR)/mangrove-shoot-language-test
+	ASAN_OPTIONS=detect_leaks=0 $(HOST_TEST_DIR)/mangrove-shoot-language-test
 
 test-launch: test-vmm test-heap test-history
 
@@ -1204,8 +1227,8 @@ test-pmm:
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin -pthread \
 		-fsanitize=address,undefined -Ikernel/include -Iinclude \
 		-idirafter libc/include tests/memory/pmm_test.c \
-		-o /tmp/mangrove-pmm-test
-	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-pmm-test
+		-o $(HOST_TEST_DIR)/mangrove-pmm-test
+	ASAN_OPTIONS=detect_leaks=0 $(HOST_TEST_DIR)/mangrove-pmm-test
 
 .PHONY: test-preemption-accounting
 test-preemption-accounting:
@@ -1288,8 +1311,8 @@ test-tcp:
 		-Ikernel/include -Iinclude -idirafter libc/include \
 		tests/network/tcp_stream_test.c kernel/src/net/tcp.c \
 		kernel/src/net/tcp_wire.c -Wl,--gc-sections \
-		-o /tmp/mangrove-tcp-stream-test
-	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-tcp-stream-test
+		-o $(HOST_TEST_DIR)/mangrove-tcp-stream-test
+	ASAN_OPTIONS=detect_leaks=0 $(HOST_TEST_DIR)/mangrove-tcp-stream-test
 
 .PHONY: test-net
 test-net: test-fetch test-e1000 test-tcp
@@ -1298,55 +1321,55 @@ test-net: test-fetch test-e1000 test-tcp
 		-Iinclude -Iuserspace/common -idirafter libc/include tests/network/ping_destination_test.c \
 		userspace/ping/ping_args.c userspace/common/cli_options.c \
 		libc/src/net.c -Wl,--gc-sections \
-		-o /tmp/mangrove-ping-destination-test
-	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-ping-destination-test
+		-o $(HOST_TEST_DIR)/mangrove-ping-destination-test
+	ASAN_OPTIONS=detect_leaks=0 $(HOST_TEST_DIR)/mangrove-ping-destination-test
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
 		-fsanitize=address,undefined -pthread -ffunction-sections -fdata-sections \
 		-Ikernel/include -Iinclude -idirafter libc/include \
 		tests/network/ipv4_arp_test.c -Wl,--gc-sections \
-		-o /tmp/mangrove-ipv4-arp-test
-	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-ipv4-arp-test
+		-o $(HOST_TEST_DIR)/mangrove-ipv4-arp-test
+	ASAN_OPTIONS=detect_leaks=0 $(HOST_TEST_DIR)/mangrove-ipv4-arp-test
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
 		-fsanitize=address,undefined -pthread -Ikernel/include -Iinclude \
 		-idirafter libc/include tests/network/udp_concurrency_test.c \
-		-o /tmp/mangrove-udp-concurrency-test
-	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-udp-concurrency-test
+		-o $(HOST_TEST_DIR)/mangrove-udp-concurrency-test
+	ASAN_OPTIONS=detect_leaks=0 $(HOST_TEST_DIR)/mangrove-udp-concurrency-test
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
 		-fsanitize=address,undefined -pthread -Ikernel/include -Iinclude \
 		-idirafter libc/include tests/network/icmp_state_test.c \
-		-o /tmp/mangrove-icmp-state-test
-	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-icmp-state-test
+		-o $(HOST_TEST_DIR)/mangrove-icmp-state-test
+	ASAN_OPTIONS=detect_leaks=0 $(HOST_TEST_DIR)/mangrove-icmp-state-test
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
 		-fsanitize=address,undefined -pthread -ffunction-sections -fdata-sections \
 		-Ikernel/include -Iinclude -idirafter libc/include \
 		tests/network/net_user_table_test.c -Wl,--gc-sections \
-		-o /tmp/mangrove-net-user-table-test
-	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-net-user-table-test
+		-o $(HOST_TEST_DIR)/mangrove-net-user-table-test
+	ASAN_OPTIONS=detect_leaks=0 $(HOST_TEST_DIR)/mangrove-net-user-table-test
 
 .PHONY: test-fetch
 test-fetch: test-fetch-http test-fetch-args test-fetch-transport test-fetch-sink
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
 		-fsanitize=address,undefined -Iinclude -Iuserspace/fetch \
 		-idirafter libc/include tests/userspace/fetch_url_test.c \
-		userspace/fetch/fetch_url.c -o /tmp/mangrove-fetch-url-test
-	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-fetch-url-test
+		userspace/fetch/fetch_url.c -o $(HOST_TEST_DIR)/mangrove-fetch-url-test
+	ASAN_OPTIONS=detect_leaks=0 $(HOST_TEST_DIR)/mangrove-fetch-url-test
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
 		-fsanitize=address,undefined -Iinclude -Iuserspace/fetch \
 		-idirafter libc/include tests/userspace/fetch_display_test.c \
-		userspace/fetch/fetch_display.c -o /tmp/mangrove-fetch-display-test
-	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-fetch-display-test
+		userspace/fetch/fetch_display.c -o $(HOST_TEST_DIR)/mangrove-fetch-display-test
+	ASAN_OPTIONS=detect_leaks=0 $(HOST_TEST_DIR)/mangrove-fetch-display-test
 
 .PHONY: test-fetch-sink
 test-fetch-sink:
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -Wframe-larger-than=8192 \
 		-Iinclude -Iuserspace/fetch -idirafter libc/include \
 		-c userspace/fetch/fetch_sink_buffer.c \
-		-o /tmp/mangrove-fetch-sink-stack.o
+		-o $(HOST_TEST_DIR)/mangrove-fetch-sink-stack.o
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
 		-fsanitize=address,undefined -Iinclude -Iuserspace/fetch \
 		-idirafter libc/include tests/userspace/fetch_sink_buffer_test.c \
-		userspace/fetch/fetch_sink_buffer.c -o /tmp/mangrove-fetch-sink-test
-	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-fetch-sink-test
+		userspace/fetch/fetch_sink_buffer.c -o $(HOST_TEST_DIR)/mangrove-fetch-sink-test
+	ASAN_OPTIONS=detect_leaks=0 $(HOST_TEST_DIR)/mangrove-fetch-sink-test
 
 .PHONY: test-fetch-args
 test-fetch-args:
@@ -1354,24 +1377,24 @@ test-fetch-args:
 		-fsanitize=address,undefined -Iinclude -Iuserspace/fetch \
 		-Iuserspace/common -idirafter libc/include \
 		tests/userspace/fetch_args_test.c userspace/fetch/fetch_args.c \
-		userspace/common/cli_options.c -o /tmp/mangrove-fetch-args-test
-	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-fetch-args-test
+		userspace/common/cli_options.c -o $(HOST_TEST_DIR)/mangrove-fetch-args-test
+	ASAN_OPTIONS=detect_leaks=0 $(HOST_TEST_DIR)/mangrove-fetch-args-test
 
 .PHONY: test-fetch-http
 test-fetch-http:
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
 		-fsanitize=address,undefined -Iinclude -Iuserspace/fetch \
 		-idirafter libc/include tests/userspace/fetch_http_test.c \
-		userspace/fetch/http_response.c -o /tmp/mangrove-fetch-http-test
-	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-fetch-http-test
+		userspace/fetch/http_response.c -o $(HOST_TEST_DIR)/mangrove-fetch-http-test
+	ASAN_OPTIONS=detect_leaks=0 $(HOST_TEST_DIR)/mangrove-fetch-http-test
 
 .PHONY: test-fetch-transport
 test-fetch-transport:
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
 		-fsanitize=address,undefined -Iinclude -Iuserspace/fetch \
 		-idirafter libc/include tests/userspace/fetch_transport_test.c \
-		userspace/fetch/fetch_transport.c -o /tmp/mangrove-fetch-transport-test
-	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-fetch-transport-test
+		userspace/fetch/fetch_transport.c -o $(HOST_TEST_DIR)/mangrove-fetch-transport-test
+	ASAN_OPTIONS=detect_leaks=0 $(HOST_TEST_DIR)/mangrove-fetch-transport-test
 
 .PHONY: test-libc
 test-libc: test-unicode test-libc-link test-math
@@ -1746,9 +1769,12 @@ test-help:
 test-qmp-client:
 	python3 tests/guest/qmp_client_test.py
 
-test-dev-tools: test-qmp-client
-	python3 tests/guest/guest_reed_watchdog_test.py
+.PHONY: test-artifact-lifecycle
+test-artifact-lifecycle:
 	python3 tests/guest/artifact_lifecycle_test.py
+
+test-dev-tools: test-qmp-client test-artifact-lifecycle
+	python3 tests/guest/guest_reed_watchdog_test.py
 	python3 tests/guest/qemu_accel_test.py
 	python3 tests/guest/reed_input_diagnostic_test.py
 	python3 tests/guest/guest_mgfs_evidence_test.py
@@ -1808,8 +1834,8 @@ test-storage:
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -Werror=address-of-packed-member \
 		-Ikernel/include -Ikernel/include/usb -Iinclude \
 		tests/storage/xhci_regs_layout_test.c \
-		-o /tmp/mangrove-xhci-regs-layout-test
-	/tmp/mangrove-xhci-regs-layout-test
+		-o $(HOST_TEST_DIR)/mangrove-xhci-regs-layout-test
+	$(HOST_TEST_DIR)/mangrove-xhci-regs-layout-test
 	python3 tests/storage/ahci_signature_test.py "$(HOST_CC)"
 	python3 tests/storage/storage_coherency_test.py "$(HOST_CC)"
 	python3 tests/filesystems/exfat/storage_format_test.py "$(HOST_CC)"
@@ -3055,7 +3081,7 @@ $(BUILD_DIR)/libc/%.o: libc/src/%.c
 # Explicitly opt in: isolated UTC-trusted QEMU build, firmware variables and
 # media. No canonical image target is invoked and fstest is absent from normal
 # payloads.
-GUEST_MGFS_BUILD ?= /tmp/mangrove-guest-build
+GUEST_MGFS_BUILD ?= $(abspath $(BUILD_DIR))/guest-builds/mgfs
 GUEST_MGFS_OUTPUT ?=
 GUEST_MGFS_ACCEL ?= $(NATIVE_GUEST_ACCEL)
 .PHONY: test-guest-mgfs
@@ -3066,7 +3092,7 @@ test-guest-mgfs:
 
 # Build a diagnostic-only kernel that deliberately overflows one ordinary
 # guarded stack, then require the two-vCPU guest to fail-stop on the guard.
-GUEST_KERNEL_STACK_BUILD ?= $(abspath $(BUILD_DIR))/kernel-stack-overflow
+GUEST_KERNEL_STACK_BUILD ?= $(abspath $(BUILD_DIR))/guest-builds/kernel-stack-overflow
 GUEST_KERNEL_STACK_OUTPUT ?=
 GUEST_KERNEL_STACK_ACCEL ?= $(NATIVE_GUEST_ACCEL)
 .PHONY: test-guest-kernel-stack
@@ -3083,7 +3109,7 @@ test-guest-kernel-stack:
 
 # Verify the system-managed Mozilla-derived CA store in a disposable image,
 # including read-only access and exact contents after a native reboot.
-GUEST_CA_STORE_BUILD ?= /tmp/mangrove-ca-store-build
+GUEST_CA_STORE_BUILD ?= $(abspath $(BUILD_DIR))/guest-builds/ca-store
 GUEST_CA_STORE_OUTPUT ?=
 GUEST_CA_STORE_ACCEL ?= $(NATIVE_GUEST_ACCEL)
 .PHONY: test-guest-ca-store
@@ -3093,7 +3119,7 @@ test-guest-ca-store:
 	python3 tests/guest/guest_mgfs_test.py --build-dir "$(GUEST_CA_STORE_BUILD)" $(if $(GUEST_CA_STORE_OUTPUT),--output "$(GUEST_CA_STORE_OUTPUT)") --accel "$(GUEST_CA_STORE_ACCEL)" --cpus 2 --ca-store-smoke
 
 # Bounded shutdown/reboot/readback guest lifecycle for active Shoot history.
-GUEST_SHUTDOWN_BUILD ?= /tmp/mangrove-shutdown-build
+GUEST_SHUTDOWN_BUILD ?= $(abspath $(BUILD_DIR))/guest-builds/shutdown
 GUEST_SHUTDOWN_OUTPUT ?=
 GUEST_SHUTDOWN_ACCEL ?= $(NATIVE_GUEST_ACCEL)
 .PHONY: test-guest-shutdown
@@ -3103,7 +3129,7 @@ test-guest-shutdown:
 	python3 tests/guest/guest_mgfs_test.py --build-dir "$(GUEST_SHUTDOWN_BUILD)" $(if $(GUEST_SHUTDOWN_OUTPUT),--output "$(GUEST_SHUTDOWN_OUTPUT)") --accel "$(GUEST_SHUTDOWN_ACCEL)" --cpus 2 --power-history-smoke
 
 # Exercise manual login and repeated session exits on isolated two-vCPU media.
-GUEST_LOGOUT_BUILD ?= /tmp/mangrove-logout-build
+GUEST_LOGOUT_BUILD ?= $(abspath $(BUILD_DIR))/guest-builds/logout
 GUEST_LOGOUT_OUTPUT ?=
 GUEST_LOGOUT_ACCEL ?= $(NATIVE_GUEST_ACCEL)
 .PHONY: test-guest-logout
@@ -3113,7 +3139,7 @@ test-guest-logout:
 	python3 tests/guest/guest_logout_test.py --build-dir "$(GUEST_LOGOUT_BUILD)" $(if $(GUEST_LOGOUT_OUTPUT),--output "$(GUEST_LOGOUT_OUTPUT)") --accel "$(GUEST_LOGOUT_ACCEL)" --cpus 2
 
 # Disposable secondary USB volumes; explicit UTC trust applies only to these guests.
-GUEST_SECONDARY_BUILD ?= /tmp/mangrove-secondary-build
+GUEST_SECONDARY_BUILD ?= $(abspath $(BUILD_DIR))/guest-builds/secondary
 GUEST_SECONDARY_OUTPUT ?=
 GUEST_SECONDARY_ACCEL ?= $(NATIVE_GUEST_ACCEL)
 GUEST_SECONDARY_REPETITIONS ?= 2
@@ -3124,7 +3150,7 @@ test-guest-secondary:
 	python3 tests/guest/guest_secondary_test.py --build-dir "$(GUEST_SECONDARY_BUILD)" $(if $(GUEST_SECONDARY_OUTPUT),--output "$(GUEST_SECONDARY_OUTPUT)") --accel "$(GUEST_SECONDARY_ACCEL)" --repetitions "$(GUEST_SECONDARY_REPETITIONS)"
 
 # Idle physical unplug/reattach, with explicit deferred-lifetime exclusions.
-GUEST_HOTPLUG_BUILD ?= $(abspath $(BUILD_DIR))/guest-hotplug-build
+GUEST_HOTPLUG_BUILD ?= $(abspath $(BUILD_DIR))/guest-builds/hotplug
 GUEST_HOTPLUG_OUTPUT ?=
 .PHONY: test-guest-hotplug
 test-guest-hotplug:
@@ -3134,7 +3160,7 @@ test-guest-hotplug:
 	python3 tests/guest/guest_secondary_test.py --hotplug --hotplug-handles --backend mgfs --repetitions 2 --build-dir "$(GUEST_HOTPLUG_BUILD)" $(if $(GUEST_HOTPLUG_OUTPUT),--output "$(GUEST_HOTPLUG_OUTPUT)/references") --accel "$(GUEST_SECONDARY_ACCEL)"
 
 # Actual native safe-file/Reed/Shoot paths on isolated disposable USB volumes.
-GUEST_SAFE_BUILD ?= $(abspath $(BUILD_DIR))/guest-safe-build
+GUEST_SAFE_BUILD ?= $(abspath $(BUILD_DIR))/guest-builds/safe
 GUEST_SAFE_OUTPUT ?=
 .PHONY: test-guest-safe
 test-guest-safe:
@@ -3149,7 +3175,7 @@ test-guest-safe:
 
 # Native Reed edit/save/restore without the host UDP rendezvous used only by
 # the separate stale-save conflict workflow.
-GUEST_REED_BUILD ?= $(abspath $(BUILD_DIR))/guest-reed-build
+GUEST_REED_BUILD ?= $(abspath $(BUILD_DIR))/guest-builds/reed
 GUEST_REED_ACCEL ?= $(NATIVE_GUEST_ACCEL)
 # The native Reed workflow includes MGFS preparation plus several hundred
 # state-verified USB keyboard actions and framebuffer captures. The controller
@@ -3167,7 +3193,7 @@ test-guest-reed:
 
 # Native stale-save qualification uses a bounded guest-side file rendezvous:
 # fstest replaces the opened file through VFS before Reed enters its screen.
-GUEST_REED_CONFLICT_BUILD ?= $(abspath $(BUILD_DIR))/guest-reed-conflict-build
+GUEST_REED_CONFLICT_BUILD ?= $(abspath $(BUILD_DIR))/guest-builds/reed-conflict
 .PHONY: test-guest-reed-conflict
 test-guest-reed-conflict:
 	$(QEMU_ACCEL_PREFLIGHT) "$(GUEST_REED_ACCEL)"
@@ -3180,7 +3206,7 @@ test-guest-reed-conflict:
 		--accel "$(GUEST_REED_ACCEL)" --reed-guest-conflict-sync
 
 # Standalone Ring 3 model-based workloads; test binaries remain opt-in.
-GUEST_STRESS_BUILD ?= $(abspath $(BUILD_DIR))/guest-stress-build
+GUEST_STRESS_BUILD ?= $(abspath $(BUILD_DIR))/guest-builds/stress
 GUEST_STRESS_OUTPUT ?=
 .PHONY: test-guest-stress
 test-guest-stress:
@@ -3208,8 +3234,8 @@ test-clipboard: $(MKMGFS) $(BUILD_DIR)/mgfsck
 	$(HOST_CC) -std=gnu17 -Wall -Wextra -Werror -fno-builtin -fsanitize=address,undefined \
 		-ffunction-sections -fdata-sections -Iinclude -idirafter libc/include tests/userspace/clipboard_test.c \
 		userspace/clipd/clipboard.c libc/src/clipboard.c libc/src/utf8.c \
-		$(HOST_REED_TEST_FLAGS) -o /tmp/mangrove-clipboard-test
-	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-clipboard-test
+		$(HOST_REED_TEST_FLAGS) -o $(HOST_TEST_DIR)/mangrove-clipboard-test
+	ASAN_OPTIONS=detect_leaks=0 $(HOST_TEST_DIR)/mangrove-clipboard-test
 	python3 tests/userspace/clipboard_image_test.py $(MKMGFS) $(BUILD_DIR)/mgfsck
 
 .PHONY: cliptest
@@ -3225,10 +3251,10 @@ test-reed: test-reed-range-edit
 test-reed-range-edit:
 	$(HOST_CC) -std=gnu17 -Wall -Wextra -Werror -fno-builtin -fsanitize=address,undefined \
 		-Iinclude -idirafter libc/include tests/userspace/reed_range_edit_test.c \
-		libc/src/utf8.c -o /tmp/mangrove-reed-range-edit-test
-	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-reed-range-edit-test
+		libc/src/utf8.c -o $(HOST_TEST_DIR)/mangrove-reed-range-edit-test
+	ASAN_OPTIONS=detect_leaks=0 $(HOST_TEST_DIR)/mangrove-reed-range-edit-test
 
-GUEST_CLIPBOARD_BUILD ?= $(abspath $(BUILD_DIR))/guest-clipboard-build
+GUEST_CLIPBOARD_BUILD ?= $(abspath $(BUILD_DIR))/guest-builds/clipboard
 GUEST_CLIPBOARD_OUTPUT ?=
 GUEST_CLIPBOARD_ACCEL ?= $(NATIVE_GUEST_ACCEL)
 .PHONY: test-guest-clipboard
@@ -3253,8 +3279,8 @@ test-process-arguments:
 	python3 tests/kernel/process_arguments_test.py "$(HOST_CC)"
 	$(HOST_CC) -std=gnu17 -Wall -Wextra -Werror -fno-builtin \
 		-fsanitize=address,undefined -I. -Iinclude -idirafter libc/include \
-		tests/userspace/time_arguments_test.c -o /tmp/mangrove-time-arguments-test
-	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-time-arguments-test
+		tests/userspace/time_arguments_test.c -o $(HOST_TEST_DIR)/mangrove-time-arguments-test
+	ASAN_OPTIONS=detect_leaks=0 $(HOST_TEST_DIR)/mangrove-time-arguments-test
 
 .PHONY: test-process-handles
 test-process-handles:
@@ -3280,7 +3306,7 @@ $(BUILD_DIR)/argvtest/argvtest.o: tests/userspace/process_arguments_guest.c $(US
 $(BUILD_DIR)/argvtest/argvtest.elf: $(BUILD_DIR)/argvtest/argvtest.o $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ $(USER_CRT) $< $(USER_LIBC)
 
-GUEST_ARGUMENTS_BUILD ?= $(abspath $(BUILD_DIR))/guest-arguments-build
+GUEST_ARGUMENTS_BUILD ?= $(abspath $(BUILD_DIR))/guest-builds/arguments
 GUEST_ARGUMENTS_OUTPUT ?=
 GUEST_ARGUMENTS_ACCEL ?= $(NATIVE_GUEST_ACCEL)
 test-guest-arguments:
@@ -3298,7 +3324,7 @@ $(BUILD_DIR)/randomtest/randomtest.o: tests/userspace/random_guest.c $(USER_LIBC
 $(BUILD_DIR)/randomtest/randomtest.elf: $(BUILD_DIR)/randomtest/randomtest.o $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ $(USER_CRT) $< $(USER_LIBC)
 
-GUEST_RANDOM_BUILD ?= $(abspath $(BUILD_DIR))/guest-random-build
+GUEST_RANDOM_BUILD ?= $(abspath $(BUILD_DIR))/guest-builds/random
 GUEST_RANDOM_OUTPUT ?=
 GUEST_RANDOM_ACCEL ?= $(NATIVE_GUEST_ACCEL)
 test-guest-random:
