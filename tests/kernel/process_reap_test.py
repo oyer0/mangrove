@@ -91,6 +91,7 @@ static bool block_success, sleep_success, request_shutdown;
 static bool cancel_initial, expected_panic;
 static unsigned destroyed_roots, released_memory, frees, external_terminations;
 static unsigned block_calls, exit_notifications, thread_reaps;
+static unsigned user_region_metadata_releases;
 static jmp_buf panic_environment;
 static bool scheduler_thread_exit_complete(const kernel_thread_t *thread);
 static void process_scheduler_handoff_complete(kernel_thread_t *thread);
@@ -170,6 +171,8 @@ static void process_memory_release_all(process_t *p)
 {assert(p==&child);released_memory++;}
 static void vmm_destroy_address_space(void *root)
 {assert(root==child.address_space);destroyed_roots++;}
+static void process_user_region_metadata_release(process_t *p)
+{assert(p==&child && destroyed_roots==1);user_region_metadata_releases++;}
 static void kfree(void *p){(void)p;frees++;}
 static bool kernel_stack_release_context_valid(void){return true;}
 static void session_process_exited(process_t *p)
@@ -220,6 +223,7 @@ static void reset(bool active)
  all_processes=&child;parent_thread=(kernel_thread_t){0};
  process_registry_lock=scheduler_lock=sleep_calls=owner_releases=step=0;
  block_calls=exit_notifications=thread_reaps=0;
+ user_region_metadata_releases=0;
  cancel_initial=expected_panic=false;
  destroyed_roots=released_memory=frees=external_terminations=0;
  block_success=sleep_success=true;request_shutdown=false;
@@ -289,11 +293,13 @@ int main(void)
    process_object_destroy(&child.object);
    assert(!"live-thread destruction did not fail closed");
  }
- assert(!destroyed_roots && !released_memory && !frees);
+ assert(!destroyed_roots && !released_memory && !frees &&
+        !user_region_metadata_releases);
  reset(false);
  assert(process_finalize_exit(&child));
  process_object_destroy(&child.object);
- assert(destroyed_roots==1 && released_memory==1 && frees==2);
+ assert(destroyed_roots==1 && released_memory==1 && frees==2 &&
+        user_region_metadata_releases==1);
  puts("process reaping: wake-before-exit, suspended cleanup, remote handoff, poll, session collection, and shutdown cancellation passed");
 }
 '''

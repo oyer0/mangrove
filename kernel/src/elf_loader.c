@@ -24,6 +24,7 @@
 #define ELF_TYPE_EXEC      2
 #define ELF_MACHINE_X86_64 62
 #define ELF_PT_LOAD        1
+#define ELF_PT_TLS         7
 #define ELF_PF_X           1U
 #define ELF_PF_W           2U
 #define ELF_PF_R           4U
@@ -160,6 +161,7 @@ static bool elf_load_process_node_impl(struct process *process, vfs_node_t *node
     elf64_phdr_t *phdrs = NULL;
     u64 file_size;
     u64 phdr_bytes;
+    elf64_phdr_t *tls_phdr = NULL;
     bool entry_valid = false;
     u16 i;
     int open_result;
@@ -205,6 +207,95 @@ static bool elf_load_process_node_impl(struct process *process, vfs_node_t *node
         if (phdrs) kfree(phdrs);
         vfs_close(handle);
         return elf_load_fail("program header read");
+    }
+
+    /* A native executable has one static TLS image at most. Require its
+     * initialized and zero-fill extents to describe bytes owned by a readable
+     * PT_LOAD segment, with matching file/virtual offsets. */
+    for (i = 0; i < header.phnum; i++) {
+        elf64_phdr_t *tls = &phdrs[i];
+        u64 tls_end;
+        u64 file_end;
+        bool contained = false;
+        if (tls->type != ELF_PT_TLS) continue;
+        if (tls_phdr ||
+            (tls->align && (tls->align & (tls->align - 1U)))) {
+            kfree(phdrs);
+            vfs_close(handle);
+            return elf_load_fail("TLS segment validation");
+        }
+        /* GNU ld emits a zero-sized PT_TLS header when the linker script
+         * declares that program header but the executable has no TLS input
+         * sections. Accept only that all-zero extent as absence of a module. */
+        if (!tls->filesz && !tls->memsz) {
+            if (tls->offset || tls->vaddr || tls->paddr) {
+                kfree(phdrs);
+                vfs_close(handle);
+                return elf_load_fail("empty TLS segment has an address");
+            }
+            tls_phdr = tls;
+            continue;
+        }
+        if (!tls->memsz || tls->filesz > tls->memsz ||
+            !add_ok(tls->offset, tls->filesz, &file_end) ||
+            file_end > file_size ||
+            !add_ok(tls->vaddr, tls->memsz, &tls_end) ||
+            tls->vaddr < 0x1000 || tls_end > ELF_USER_LIMIT ||
+            (tls->filesz && tls->align > 1U &&
+             ((tls->offset & (tls->align - 1U)) !=
+              (tls->vaddr & (tls->align - 1U))))) {
+            kfree(phdrs);
+            vfs_close(handle);
+            return elf_load_fail("TLS segment validation");
+        }
+        for (u16 j = 0; j < header.phnum; j++) {
+            elf64_phdr_t *load = &phdrs[j];
+            u64 load_vend;
+            u64 load_fend;
+            if (load->type != ELF_PT_LOAD || !(load->flags & ELF_PF_R) ||
+                !add_ok(load->vaddr, load->memsz, &load_vend) ||
+                (tls->filesz &&
+                 !add_ok(load->offset, load->filesz, &load_fend)))
+                continue;
+            if (tls->vaddr >= load->vaddr && tls_end <= load_vend &&
+                (!tls->filesz ||
+                 (add_ok(load->offset, load->filesz, &load_fend) &&
+                  tls->offset >= load->offset && file_end <= load_fend &&
+                  tls->vaddr - load->vaddr == tls->offset - load->offset))) {
+                contained = true;
+                break;
+            }
+        }
+        if (!contained || tls->filesz > (u64)~(usize)0 ||
+            tls->memsz > (u64)~(usize)0 ||
+            (tls->align > (u64)~(usize)0)) {
+            kfree(phdrs);
+            vfs_close(handle);
+            return elf_load_fail("TLS segment is not in a readable load segment");
+        }
+        tls_phdr = tls;
+    }
+
+    if (tls_phdr && tls_phdr->memsz) {
+        usize tls_file_size = (usize)tls_phdr->filesz;
+        usize tls_alignment = tls_phdr->align > 1U
+            ? (usize)tls_phdr->align : 1U;
+        u8 *tls_image = tls_file_size ? kmalloc(tls_file_size) : NULL;
+        if (tls_file_size && !tls_image) {
+            *error = VFS_ERR_NO_MEM;
+            kfree(phdrs);
+            vfs_close(handle);
+            return elf_load_fail("TLS template allocation");
+        }
+        if ((tls_file_size && !read_at(handle, tls_phdr->offset, tls_image,
+                                       tls_file_size, error)) ||
+            !process_user_tls_template_adopt(process, tls_image,
+                tls_file_size, (usize)tls_phdr->memsz, tls_alignment)) {
+            if (tls_image) kfree(tls_image);
+            kfree(phdrs);
+            vfs_close(handle);
+            return elf_load_fail("TLS template initialization");
+        }
     }
 
     for (i = 0; i < header.phnum; i++) {
@@ -290,6 +381,12 @@ static bool elf_load_process_node_impl(struct process *process, vfs_node_t *node
         }
     }
 
+    if (!process_user_register_initial_stack(process, ELF_STACK_TOP,
+                                             ELF_STACK_PAGES)) {
+        kfree(phdrs);
+        vfs_close(handle);
+        return elf_load_fail("stack reservation");
+    }
     process->entry_point = (uintptr_t)header.entry;
     process->user_stack_top = ELF_STACK_TOP;
     process->image_loaded = true;

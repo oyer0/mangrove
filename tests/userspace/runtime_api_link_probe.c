@@ -12,6 +12,14 @@
 #include <tgmath.h>
 #include <wchar.h>
 
+/* Ensures the native executable link preserves the compiler's static TLS
+ * relocation and emits a PT_TLS image for the kernel loader. */
+static _Thread_local int runtime_tls_probe = 7;
+volatile int *runtime_tls_probe_address(void)
+{
+    return &runtime_tls_probe;
+}
+
 /* Each typed relocation checks that a public declaration has a target symbol. */
 #define API(name) __typeof__(&name) volatile runtime_api_##name = &name
 

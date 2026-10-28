@@ -17,6 +17,7 @@
 #include <spinlock.h>
 #include <mutex.h>
 #include <fpu.h>
+#include <msr.h>
 
 
 #ifndef NULL
@@ -290,6 +291,11 @@ void scheduler_context_switch_saved(uintptr_t *outgoing_rsp_slot,
     }
     if (outgoing)
         fpu_state_save(&outgoing->fpu_state);
+    /* FS_BASE is not part of the integer interrupt frame. Capture it while
+     * this CPU still owns the outgoing context so migration restores the
+     * same userspace TLS pointer on whichever CPU resumes it. */
+    if (outgoing)
+        outgoing->user_fs_base = (uintptr_t)rdmsr(MSR_IA32_FS_BASE);
 #if defined(KERNEL_STACK_DIAGNOSTICS)
     __asm__ volatile("movq %%rsp, %0" : "=r"(stack_pointer));
     if (outgoing && outgoing->kernel_stack.active) {
@@ -329,6 +335,7 @@ void scheduler_context_restore_current(void)
     if (!current_thread)
         panic("scheduler: no current thread for FPU restore");
     fpu_state_restore(&current_thread->fpu_state);
+    wrmsr(MSR_IA32_FS_BASE, current_thread->user_fs_base);
 }
 
 /* The saved outgoing frame is complete when scheduler_context_switch_saved()
@@ -361,6 +368,11 @@ void scheduler_context_switch_complete(uintptr_t *outgoing_rsp_slot)
     /* Assembly calls here on the incoming stack with IF still clear. */
     scheduler_context_switch_in_progress = 0;
     spin_unlock_irqrestore(&scheduler_lock, flags);
+    /* This helper runs on the incoming stack, after ownership of the
+     * outgoing stack has transferred. Restore architectural thread state
+     * here, before the saved syscall/interrupt frame can return to Ring 3. */
+    if (current_thread)
+        wrmsr(MSR_IA32_FS_BASE, current_thread->user_fs_base);
     if (terminated && outgoing->process)
         process_scheduler_handoff_complete(outgoing);
 }

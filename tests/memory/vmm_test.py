@@ -90,6 +90,7 @@ vmm = r'''
 #define PTE_READWRITE 2ULL
 #define PTE_PRESENT 1ULL
 #define PTE_HUGE 128ULL
+#define PTE_NX (1ULL << 63)
 #define PTE_FRAME_MASK 0x000ffffffffff000ULL
 #define PMM_OWNED_FRAME_CAPACITY 1024U
 typedef u64 phys_addr_t;
@@ -136,7 +137,10 @@ static void invalidate_page(void *p){(void)p;}
 for name in ['vmm_framebuffer_page','vmm_user_child_reserved','vmm_user_path_available',
              'vmm_map_user_page','vmm_user_range_leaf_locked',
              'vmm_user_range_accessible','vmm_user_range_valid',
-             'vmm_user_range_writable','vmm_user_range_lease',
+             'vmm_user_range_writable','vmm_user_subrange_unmapped_locked',
+             'vmm_user_range_unmapped',
+             'vmm_user_page_executable_locked','vmm_user_range_executable',
+             'vmm_user_range_lease',
              'vmm_user_range_release','vmm_unmap_user_page',
              'vmm_unmap_user_range']:
     code = function('kernel/src/vmm.c', name)
@@ -158,6 +162,10 @@ int main(void){
  assert(table_allocations==0&&!meta.leaves);free((void*)(uintptr_t)owned_frame_physical);owned_frame_physical=0;
  u64 first=map(0x400000);assert(table_allocations==3&&table_frees==0);map(0x401000);assert(table_allocations==3);map(0x600000);assert(table_allocations==4);map(0x40000000);assert(table_allocations==6);map(1ULL<<39);assert(table_allocations==9);
  assert(vmm_user_range_writable((void*)0x400000,4096));
+ assert(vmm_user_range_executable(meta.root,0x400000,4096));
+ assert(!vmm_user_range_unmapped(meta.root,0x400000,4096));
+ assert(vmm_user_range_unmapped(meta.root,0x404000,4096));
+ assert(!vmm_user_range_unmapped(meta.root,0x404000,8192-1));
  assert(!vmm_user_range_writable((void*)(uintptr_t)(0x100000000000000ULL+0x400000ULL),4));
  assert(!vmm_user_range_writable((void*)(uintptr_t)(VMM_USER_ADDRESS_LIMIT-2),4));
  assert(!vmm_user_range_writable((void*)0x400000,8192+1));
@@ -165,6 +173,10 @@ int main(void){
  assert(vmm_map_user_page(meta.root,(void*)0x402000,read_only,PTE_USER));
  assert(vmm_user_range_valid((void*)0x402000,4));
  assert(!vmm_user_range_writable((void*)0x402000,4));
+ u64 nx=(u64)(uintptr_t)aligned_alloc(4096,4096);assert(nx);
+ assert(vmm_map_user_page(meta.root,(void*)0x403000,nx,PTE_USER|PTE_NX));
+ assert(!vmm_user_range_executable(meta.root,0x403000,1));
+ assert(!vmm_user_range_executable(meta.root,VMM_USER_ADDRESS_LIMIT-1,2));
  assert(!vmm_user_range_writable((void*)0x401fff,2));
  assert(vmm_user_range_writable((void*)0x401fff,1));
  /* A syscall lease prevents unmap until the final kernel access is done. The

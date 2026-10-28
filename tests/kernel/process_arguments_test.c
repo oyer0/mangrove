@@ -43,11 +43,14 @@ typedef struct {
     u32 service_id;
     mg_session_id_t session_id;
     process_credentials_t credentials;
+    bool image_loaded;
     uintptr_t entry_point;
     char executable_path[512];
     kernel_object_t object;
     uintptr_t user_stack_top, user_stack_sp, user_argc, user_argv;
 } process_t;
+bool process_user_context_prepare_initial(process_t *process)
+{ return process != NULL; }
 static usize allocations, live_allocations, live_bytes, peak_bytes, fail_allocation = (usize)-1;
 void *kmalloc(usize size)
 {

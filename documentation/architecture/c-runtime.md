@@ -21,8 +21,14 @@ starts 16-byte aligned. The compatibility `process_spawn()` and
 256-byte input bound; in-tree applications use the argv interfaces. See
 [process argument ownership and limits](processes-and-syscalls.md) for
 admission, copying and failure contracts. There is no environment vector,
-ELF PT_TLS (C thread-local storage), dynamic linker, or C++
-constructor/finalizer walk. Normal `exit` runs registered callbacks and then
+dynamic linker, or C++ constructor/finalizer walk. Native ET_EXEC files may
+contain one ELF `PT_TLS` image. Each Ring 3 context receives a private instance
+with initialized bytes copied and the remainder zero-filled. The x86-64 FS
+thread pointer addresses a self-pointer TCB followed by an empty DTV; static
+TLS symbols use the compiler's negative `local-exec` offsets before that TCB.
+Native userspace is built with `-ftls-model=local-exec`; general-dynamic,
+local-dynamic, initial-exec, dynamic TLS modules, and a dynamic linker are
+unsupported. Normal `exit` runs registered callbacks and then
 attempts to flush open output streams; `_Exit` does not flush. Static initialized
 objects and zero-filled storage are supplied by ELF load segments. GNU
 initialization-array attributes are not part of the supported startup contract.
@@ -39,9 +45,10 @@ User threads have eager FXSAVE/FXRSTOR state (`kernel/src/fpu.c` and
 original Mangrove math primitive library and an x87/SSE floating-point
 environment interface. Target `long double` occupies 16 bytes but has a
 64-bit significand, not IEEE binary128.
-The loader accepts ET_EXEC and maps PT_LOAD segments; it does not instantiate
-PT_TLS or a dynamic linker. TLS, unwinding and dynamic initialization are
-unsupported, not established merely because GCC can emit them.
+The loader accepts ET_EXEC and maps PT_LOAD segments. It validates and
+instantiates at most one `PT_TLS` template using the native static local-exec
+model. Dynamic TLS, unwinding and dynamic initialization are unsupported, not
+established merely because GCC can emit them.
 
 ## Library inventory and known gaps
 
@@ -62,12 +69,12 @@ are not Mangrove facilities.
 | Formatted I/O and conversion | Output supports integer, pointer, character, string and floating conversions (`aAeEfFgG`), flags, width, precision, `*`, and `hh/h/l/ll/j/z/t/L` where meaningful. Input supports integer, pointer, floating, character, string, scanset, `%n`, assignment suppression, width, and `hh/h/l/ll/j/z/t/L`; wide and locale-sensitive conversions are unsupported. The float converter uses bounded-precision integer arithmetic and the target's binary32, binary64 and x87 extended formats. Decimal formatting uses about 72 KiB of temporary heap workspace; string-to-float conversion uses about 46 KiB. Allocation failure returns failure with `ENOMEM`. `snprintf` reports the required length, NUL-terminates when capacity is nonzero, and accepts `(NULL, 0)`. Malformed or unsupported format syntax returns failure and sets errno. |
 | Stream semantics and limits | `fopen` supports `r`, `w`, `a`, `+`, `b`, and exclusive `x` with `w`. Native files are seekable; standard streams are not. A stream retains handle ownership until close/reopen/process teardown. Additional stream records are allocated per `fopen`; each open file stream allocates a 4096-byte default buffer. Process handle slots grow geometrically from 16 as needed; the existing 32-bit handle encoding permits at most 65,535 indexed handles per process, and practical capacity is lower when memory or other live objects are exhausted. Stream and handle allocation failures are reported without imposing a separate loam stream-table limit. `fflush` transfers buffered output bytes to the native object interface; it is not a filesystem durability barrier. Uncertain writes poison that stream to prevent retries. `rename` returns `EEXIST` when another entry already occupies the destination; replacing an existing destination is not supported. `tmpfile` and `tmpnam` return `ENOSYS`. `fpos_t` is a `long`, so positions beyond `LONG_MAX` are not representable. `%s` input without a field width retains the standard caller-buffer responsibility. Floating `scanf` input items are limited to 65,536 bytes to bound temporary storage; longer items return a matching failure with `EOVERFLOW`. |
 | Output/error boundary | Formatted output writes through `FILE`; standard output is buffered and normal `exit` attempts to flush open output streams after `atexit` callbacks. Reads from standard input flush pending line-buffered `stdout`; the shared interactive console-line helper also flushes `stdout` before blocking through the native input API, which bypasses stdio. Flush failures cannot change the exit status. `quick_exit` and `_Exit` do not flush streams. Flush means bytes were accepted by native I/O, not durable media persistence. `strerror` supplies fixed C-locale text for each published errno value and returns `Unknown error` for other values; `perror` writes that text to `stderr` while preserving the reported errno. Native `mg_result_t` remains distinct and `mg_error_to_errno` is an explicit, potentially lossy mapping. EOF is handled before mapping because it is a separate native result. |
-| `ctype.h`, `errno.h`, `assert.h`, termination | ctype implements the ASCII C locale; errno is one process cell because user processes currently have one user thread. `atexit` and `at_quick_exit` retain up to 32 callbacks each, in reverse registration order; normal CRT return runs `exit`, which invokes callbacks and attempts to flush stdio before native process teardown. `_Exit` skips callbacks and flushing; abort traps because signals are unavailable. Assertions print a diagnostic then abort. There is no C thread-local-storage or multi-thread errno contract. |
+| `ctype.h`, `errno.h`, `assert.h`, termination | ctype implements the ASCII C locale; errno is a static thread-local cell. Kernel-internal worker contexts receive independent TLS instances, but public userspace thread creation is not exposed. `atexit` and `at_quick_exit` retain up to 32 callbacks each, in reverse registration order; normal CRT return runs `exit`, which invokes callbacks and attempts to flush stdio before native process teardown. `_Exit` skips callbacks and flushing; abort traps because signals are unavailable. Assertions print a diagnostic then abort. Other loam mutable state is not yet thread-safe. |
 | `libmgtls.a`, `<mg/tls.h>` | `make binaries` builds the wolfSSL 5.9.4-derived mgTLS library with a TLS 1.3 client/X.509 profile and Mangrove secure-random adapter. The current API provides library initialization, cleanup, and secure random bytes; it does not provide a socket transport, handshake, trust-store loading, or certificate/hostname policy. See [mgTLS foundation](../security/mgtls.md). |
 | `wchar.h`, `src/wchar.c`, `src/utf8.c` | Strict UTF-8 multibyte conversions (`MB_LEN_MAX == MB_CUR_MAX == 4`), restartable and nonrestartable conversion APIs, `mbstate_t`, compiler `wint_t`, `WCHAR_*`/`WINT_*` limits, `WEOF`, and common wide-string/memory routines. The multibyte encoding is fixed; there is no `setlocale` or locale database. `wchar_t` uses the signed 32-bit compiler ABI. `wcscoll`/`wcsxfrm` use code-unit order; conversion rejects invalid scalars with `EILSEQ`, while wide-string routines do not validate their inputs. Wide I/O, Unicode classification and several other wide/locale interfaces are absent. |
 | `time.h`, `src/time_standard.c`, `src/time_convert.c` | `time_t` and `clock_t` are signed 64-bit values. C wall time and `TIME_UTC` use Unix seconds; the native clock remains signed Mangrove-epoch seconds. Checked conversions preserve fractions and reject overflow. UTC breakdown, UTC-only `localtime`/`mktime`, C-locale `strftime`, `asctime`/`ctime`, `difftime`, and `timespec_get` are implemented. Reentrant `_r` forms are Mangrove extensions. `clock()` reports process scheduler CPU ticks at nominal 1 ms resolution, not uptime. Realtime is unavailable unless the deployment explicitly trusts its RTC as UTC; `time()` returns -1 and `timespec_get` returns zero on failure. There is no timezone database, clock setting, DST, or subsecond source precision. |
 | Other ISO facilities | `locale.h`, `setjmp.h`, `signal.h`, `stdatomic.h`, `threads.h`, `uchar.h` and `wctype.h` are not supplied. Locale remains fixed: byte `ctype` and collation use C-locale rules, while multibyte conversion uses Mangrove's fixed UTF-8 policy. Signals, nonlocal jumps, atomics, threads, Unicode classification and UTF-16/UTF-32 conversion therefore have no public library contract. |
-| Toolchain/runtime helpers | Native links use GNU ld and explicit Mangrove archives, without host CRT/default libraries. Programs using math link objects, `libm.a`, `libc.a`, then the target compiler's `libgcc.a` for compiler-generated helpers. Programs not using math do not pull math objects into their image. The kernel shares only explicitly listed freestanding `string.c`, `units.c`, and `utf8.c`, so userspace math and runtime objects cannot enter the kernel build through discovery. ELF PT_TLS (C thread-local-storage) images remain unsupported; this is distinct from the mgTLS network-security library. |
+| Toolchain/runtime helpers | Native links use GNU ld and explicit Mangrove archives, without host CRT/default libraries. Programs using math link objects, `libm.a`, `libc.a`, then the target compiler's `libgcc.a` for compiler-generated helpers. Programs not using math do not pull math objects into their image. The kernel shares only explicitly listed freestanding `string.c`, `units.c`, and `utf8.c`, so userspace math and runtime objects cannot enter the kernel build through discovery. Native ET_EXEC images may carry one static local-exec `PT_TLS` template; dynamic TLS models remain unsupported. This is distinct from the mgTLS network-security library. |
 
 The kernel separately compiles shared string, units, and UTF-8 codec sources;
 calendar conversion remains in its own kernel source. The Makefile lists the
@@ -200,8 +207,10 @@ Mangrove's canonical `ESC{...}` output-control stream.
   has a separate fixed UTF-8 encoding policy. There is no `setlocale`, locale
   database, Unicode `ctype`, normalization, or locale collation service.
   This fixed conversion policy does not provide general locale support.
-- The errno cell is process-local for the current single-user-thread process
-  model. This does not establish TLS or concurrent user-thread semantics.
+- The supported executable TLS model is x86-64 static `local-exec`; errno
+  uses that TLS. Kernel-internal contexts have separate instances, but public
+  user-thread creation is unavailable and other loam operations have no
+  concurrent-use contract yet.
 - Normal `exit` runs registered callbacks, attempts to flush open writable streams, then
   delegates to native process teardown. This does not provide global VFS sync,
   disk quiescence or crash durability. `quick_exit` and `_Exit` skip stream
@@ -211,7 +220,7 @@ Mangrove's canonical `ESC{...}` output-control stream.
   and filesystem-specific text rules are documented at their owning interfaces.
 - Mangrove supplies a useful C library subset, not a complete hosted C17 or
   POSIX environment. Stream rename replacement, temporary files, wide I/O,
-  locale selection, signals, nonlocal jumps, atomics and threads are
+  locale selection, signals, nonlocal jumps, atomics and public thread APIs are
   unsupported as described above. Real and complex math provide the families
   in the inventory above. Numerical bounds are based on deterministic samples;
   they do not establish universal correct rounding or complete IEC 60559 Annex

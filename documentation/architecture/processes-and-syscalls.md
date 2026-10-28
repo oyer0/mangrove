@@ -75,13 +75,44 @@ Process inspection aggregates attached thread states. Its CPU field
 uses `MG_PROCESS_CPU_MULTIPLE` if sequential per-thread reads observe distinct
 CPUs; that value is diagnostic and does not promise a simultaneous sample.
 
-This is an internal ownership foundation, not a usable multithreading API.
-Thread creation, public thread IDs or handles, join/detach semantics, per-thread
-TLS and libc state, and user synchronization primitives remain prerequisites
-before userspace can create multiple threads. The current parent wait slot and
-IPC outstanding-request slot are still process-wide, so concurrent waits and
-independent blocking IPC calls from sibling threads also need per-thread
-ownership or explicit serialization before threads can be exposed.
+Per-thread Ring 3 entry records now hold the initial registers, instruction
+pointer, stack pointer, FS base, and process-owned stack/TLS reservation
+references. The initial program entry still receives argc/argv in RDI/RSI.
+An internal worker-context preparer allocates an independent stack and TLS
+instance, places a private CRT worker-return target at the initial stack top,
+and publishes its valid bit only after every resource is ready. It does not
+attach or enqueue the context and is not a userspace API. Returning from that
+worker target retires only the worker; the initial CRT `exit` path remains
+process-wide.
+
+Each user stack has the existing 32 KiB usable size and one unmapped low guard
+page. The initial stack reservation is recorded alongside worker reservations.
+Reservations share the process address-space lock and first-fit anonymous
+range search, which also checks existing VMM leaves so ELF mappings cannot be
+overlapped. Stack and TLS pages are not ordinary anonymous-mapping records and
+cannot be removed through the process unmap syscall. The process retains these
+reservations until final address-space destruction; worker return does not
+reuse them because a per-thread reap/join lifetime contract is not available.
+This is safe but means a future API must add bounded thread retirement before
+supporting repeated worker creation in long-lived processes.
+
+The ELF loader accepts at most one validated nonempty `PT_TLS` segment; an
+all-zero `PT_TLS` emitted by the linker for an image without TLS sections means
+no TLS module. It creates an independent zero-filled instance for each prepared
+context, copies the file image, honors power-of-two alignment, and installs the
+x86-64 self-pointer TCB and empty DTV expected by Mangrove's compiler output. Native userspace is
+compiled for static `local-exec` TLS only; dynamic TLS models and modules are
+not supported. FS base is saved per scheduler thread and restored on the
+incoming stack after context switches, including migration, while kernel GS
+and syscall-entry stack state retain their existing ownership.
+
+This remains an internal execution foundation, not a usable multithreading
+API. Public thread creation, IDs/handles, join/detach semantics, thread
+reaping, and user synchronization primitives remain outstanding. The parent
+wait slot and IPC outstanding-request slot are process-wide, so concurrent
+waits and independent blocking IPC calls also need per-thread ownership or
+explicit serialization. loam's `errno` is now TLS, but its allocator, stdio,
+streams, and other mutable state do not yet have a concurrent-use contract.
 
 Process credentials and launch/session metadata are published under the
 process registry lock. Lifecycle state is atomically readable outside that
@@ -215,7 +246,8 @@ power operation to preserve screen output.
 
 Executables are 64-bit little-endian x86-64 `ET_EXEC` ELF files. The kernel
 validates every load segment, maps it into a fresh lower-half address space,
-creates an eight-page non-executable user stack, installs a separate owned
+creates an eight-page non-executable user stack with an unmapped low guard,
+validates and initializes an optional static PT_TLS image, installs a separate owned
 argument mapping, and enters Ring 3. Process exit closes handles and mappings, records
 the status, and wakes a waiting parent.
 

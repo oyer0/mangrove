@@ -16,6 +16,7 @@
 struct kernel_thread;
 struct page_table;
 struct process_memory_mapping;
+struct process_user_region;
 struct ipc_request;
 struct vfs_location;
 struct vfs_node;
@@ -38,6 +39,25 @@ typedef enum {
     PROCESS_STATE_EXITING,
     PROCESS_STATE_TERMINATED,
 } process_state_t;
+
+typedef enum {
+    PROCESS_USER_REGION_INITIAL_STACK = 1,
+    PROCESS_USER_REGION_WORKER_STACK,
+    PROCESS_USER_REGION_THREAD_TLS,
+} process_user_region_kind_t;
+
+/* Process-owned reservation metadata. The complete reservation includes the
+ * unmapped guard pages; only [mapping_base, mapping_base + mapping_pages)
+ * has user leaves. Reservations outlive individual thread completion and are
+ * released with the address space after all scheduler handoffs. */
+typedef struct process_user_region {
+    uintptr_t reservation_base;
+    usize reservation_pages;
+    uintptr_t mapping_base;
+    usize mapping_pages;
+    process_user_region_kind_t kind;
+    struct process_user_region *next;
+} process_user_region_t;
 
 /* A process owns userspace execution; scheduling remains thread-based. */
 struct process {
@@ -89,6 +109,12 @@ struct process {
     void *handle_table;
     usize handle_capacity;
     struct process_memory_mapping *memory_mappings;
+    process_user_region_t *user_regions;
+    u8 *tls_image;
+    usize tls_file_size;
+    usize tls_memory_size;
+    usize tls_alignment;
+    bool tls_present;
     char name[32];
     char executable_path[PROCESS_EXECUTABLE_PATH_CAPACITY];
     /* One increment per scheduler timer tick while a process thread runs. */
@@ -154,6 +180,10 @@ void process_scheduler_handoff_complete(struct kernel_thread *thread);
 /* Called when a process-owned kernel entry returns, before scheduler exit. */
 void process_thread_entry_completed(struct kernel_thread *thread,
                                     i32 status);
+/* Internal Ring 3 entry preparation used by the initial loader path and the
+ * future kernel-only worker constructor. This is not a userspace syscall. */
+bool process_user_context_prepare_initial(process_t *process);
+void process_user_context_enter(void) __attribute__((noreturn));
 /* True when this thread must leave userspace after its current syscall. */
 bool process_thread_exit_requested(const struct kernel_thread *thread);
 process_t *process_current(void);
@@ -170,6 +200,20 @@ void process_syscall_leave(process_t *process);
 bool process_terminate_current_exception(i32 status);
 bool process_setup_argv(process_t *process, const char *const *argv,
                         u32 argc);
+bool process_user_register_initial_stack(process_t *process,
+                                         uintptr_t stack_top,
+                                         usize stack_pages);
+/* Takes ownership of image on success; caller retains it on failure. */
+bool process_user_tls_template_adopt(process_t *process, u8 *image,
+                                     usize file_size, usize memory_size,
+                                     usize alignment);
+/* Internal preparation only: the caller must keep process syscall admission
+ * through attachment and scheduler publication. It is not a userspace API. */
+bool process_user_context_prepare_worker(process_t *process,
+                                         struct kernel_thread *thread,
+                                         uintptr_t entry, uintptr_t argument);
+bool process_user_context_discard_worker(process_t *process,
+                                         struct kernel_thread *thread);
 int process_spawn_result(process_t *parent, const char *cmdline,
                            process_handle_t *out_handle);
 /* Consumes no ownership: the caller retains and destroys the snapshot after

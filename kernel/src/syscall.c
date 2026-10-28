@@ -77,6 +77,18 @@ extern void syscall_entry(void);
 static void syscall_fail(syscall_frame_t *frame, i64 error);
 static void syscall_dispatch_inner(syscall_frame_t *frame);
 
+static bool syscall_finish_worker_return(void)
+{
+    kernel_thread_t *thread = thread_current();
+
+    if (!thread || !thread->process || thread->process_initial)
+        return false;
+    process_thread_entry_completed(thread, 0);
+    if (!scheduler_terminate())
+        panic("syscall: failed to retire returned worker thread");
+    return true;
+}
+
 void syscall_init_cpu(void)
 {
     u64 efer = rdmsr(MSR_EFER);
@@ -3992,6 +4004,16 @@ static void syscall_dispatch_inner(syscall_frame_t *frame)
             frame->rax = scheduler_terminate() ? (u64)MG_OK :
                                                   (u64)MG_ERR_BUSY;
             return;
+        case SYSCALL_THREAD_RETURN: {
+            /* Private CRT worker-return operation. It is restricted to a
+             * non-initial process thread; explicit process_exit() stays
+             * process-wide for every thread. */
+            if (!syscall_finish_worker_return()) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            return;
+        }
         default:
             syscall_fail(frame, MG_ERR_UNSUPPORTED);
             return;
@@ -4013,7 +4035,8 @@ void syscall_dispatch(void *raw_frame)
         return;
     }
     process = thread->process;
-    tracked = frame->rax != SYSCALL_EXIT;
+    tracked = frame->rax != SYSCALL_EXIT &&
+              frame->rax != SYSCALL_THREAD_RETURN;
     if (tracked && !process_syscall_enter(process)) {
         if (process_thread_exit_requested(thread)) {
             process_thread_entry_completed(thread, -1);
