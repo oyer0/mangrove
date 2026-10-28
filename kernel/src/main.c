@@ -799,14 +799,6 @@ static bool early_bootstrap(BOOT_INFO *source_boot_info)
     acpi_init(BootInfo);
     if (!acpi_present())
         kprint("[WARN] ACPI platform unavailable\n");
-#if defined(RTC_UTC_TRUST) && RTC_UTC_TRUST == 1
-    timekeeping_init(true);
-#else
-    timekeeping_init(false);
-#endif
-    if (!timekeeping_realtime_available())
-        kprint("[WARN] realtime clock unavailable\n");
-
     if (!x86_cache_init_bsp()) {
         kprint("[BOOT] CPU cache policy cannot be established safely\n");
         return false;
@@ -892,9 +884,16 @@ static bool early_bootstrap(BOOT_INFO *source_boot_info)
     KERNEL_BOOT_DEBUG_LOG("[BOOT] memory, permanent VMM, and heap ready\n");
     if (timer_monotonic_init())
         KERNEL_BOOT_DEBUG_LOG(
-            "[BOOT] interrupt-independent monotonic clock ready\n");
+            "[BOOT] monotonic clocksource ready\n");
     else
-        kprint("[WARN] monotonic platform timing unavailable\n");
+        kprint("[WARN] degraded PIT clocksource active\n");
+#if defined(RTC_UTC_TRUST) && RTC_UTC_TRUST == 1
+    timekeeping_init(true);
+#else
+    timekeeping_init(false);
+#endif
+    if (!timekeeping_realtime_available())
+        kprint("[WARN] realtime clock unavailable\n");
     (void)ec_init();
     return true;
 }
@@ -1005,6 +1004,39 @@ static void start_pid1(void)
     }
 }
 
+#ifdef TIMEKEEPING_QMP_TEST
+/* Dedicated test-kernel probe. The host stops the VM after the first marker,
+ * waits a controlled interval, then resumes it. The bounded guest interval
+ * distinguishes RTC policy from the monotonic hardware clock. */
+static void timekeeping_qmp_probe(void)
+{
+    timekeeping_realtime_sample_t before_wall;
+    timekeeping_realtime_sample_t after_wall;
+    mg_monotonic_info_t source;
+    u64 before_ms;
+    u64 after_ms;
+    bool before_valid;
+    bool after_valid;
+
+    timer_monotonic_info(&source);
+    before_ms = timer_uptime_ms();
+    before_valid = timekeeping_realtime_sample(&before_wall);
+    kprint("[CLOCK-QMP] before mono=%llu wall_valid=%u wall=%lld source=%u quality=%u\n",
+           (unsigned long long)before_ms, before_valid ? 1U : 0U,
+           (long long)(before_valid ? before_wall.time.seconds : 0),
+           source.source, source.quality);
+
+    while (timer_uptime_ms() - before_ms < 5000U)
+        __asm__ volatile("pause");
+
+    after_ms = timer_uptime_ms();
+    after_valid = timekeeping_realtime_sample(&after_wall);
+    kprint("[CLOCK-QMP] after mono=%llu wall_valid=%u wall=%lld\n",
+           (unsigned long long)after_ms, after_valid ? 1U : 0U,
+           (long long)(after_valid ? after_wall.time.seconds : 0));
+}
+#endif
+
 void kmain_high(BOOT_INFO *source_boot_info)
 {
     if (!early_bootstrap(source_boot_info))
@@ -1013,5 +1045,8 @@ void kmain_high(BOOT_INFO *source_boot_info)
         kprint("[FAIL] Required kernel bring-up phase failed\n");
         for (;;) __asm__ volatile("cli; hlt");
     }
+#ifdef TIMEKEEPING_QMP_TEST
+    timekeeping_qmp_probe();
+#endif
     start_pid1();
 }

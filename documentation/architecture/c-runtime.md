@@ -117,13 +117,16 @@ or power-loss behavior.
 
 See [timekeeping](../kernel/timekeeping.md) for the source contract. Native
 realtime is signed seconds plus a canonical nanosecond fraction from UTC
-**2000-01-01**. Monotonic time is boot-local milliseconds. The kernel samples a
-validated CMOS calendar only under explicit RTC-as-UTC deployment trust;
-untrusted or invalid clocks remain unavailable. Whole-second advancement does
-not manufacture subsecond precision or prove clock accuracy. The monotonic clock
-supports elapsed durations. A separate syscall returns scheduler-accounted CPU
-ticks for the calling process; this is the source for C `clock()`, not uptime.
-There is no clock setting, timezone, DST database or synchronization service.
+**2000-01-01**. Monotonic time is boot-local milliseconds from the selected
+hardware clocksource (with a reported degraded PIT-count fallback). The kernel
+samples a validated CMOS calendar only under explicit RTC-as-UTC deployment
+trust, and reads it afresh for each realtime query; untrusted, unavailable, or
+invalid clocks remain unavailable. Whole-second resolution does not prove RTC
+accuracy. The monotonic clock supports elapsed durations and excludes time
+while an external VM pause stops guest counters. A separate syscall returns
+scheduler-accounted CPU ticks for the calling process; this is the source for C
+`clock()`, not uptime. There is no clock setting, timezone, DST database or
+network time synchronization service.
 Security-sensitive users can query `mg_clock_realtime_info` to distinguish an
 untrusted deployment, unavailable RTC, invalid sample, and trusted sample.
 Its timestamp is usable only in the trusted state; monotonic time is never a

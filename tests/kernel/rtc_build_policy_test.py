@@ -31,6 +31,9 @@ def main_compile_line(output):
 run_plan = make("-n", "-B", "run")
 run_line = main_compile_line(run_plan)
 assert run_line and "-DRTC_UTC_TRUST=1" in run_line, run_line
+assert "-rtc base=utc,clock=host" in run_plan, run_plan[-5000:]
+deterministic_plan = make("-n", "QEMU_RTC_CLOCK=vm", "run")
+assert "-rtc base=utc,clock=vm" in deterministic_plan, deterministic_plan[-5000:]
 
 default_plan = make("-n", "-B", "binaries")
 default_line = main_compile_line(default_plan)

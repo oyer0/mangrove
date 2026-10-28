@@ -236,7 +236,7 @@ def create_disk(folder, build, run, relative_launch=False,
                 network_ping_smoke=False, manual_login=False,
                 random_smoke=False, ca_store_smoke=False,
                 mgtls_smoke=False, mgtls_tls_smoke=False,
-                fetch_https_smoke=False):
+                fetch_https_smoke=False, kernel_override=None):
     log = folder / 'image.log'
     root = folder / 'initial-root.img'
     command([build / 'mkmgfs', '--blocks', '16384', '--uuid',
@@ -245,7 +245,8 @@ def create_disk(folder, build, run, relative_launch=False,
     for _, key, _ in manifest.PAYLOAD_MANIFEST:
         directory = {'pith': 'Mangrove', 'sprout_core': 'sprout', 'sprout': 'sproutcmd'}.get(key, key)
         filename = 'pith.elf' if key == 'pith' else 'sprout.elf' if key == 'sprout_core' else key + '.elf'
-        paths.append(build / directory / filename)
+        paths.append((Path(kernel_override) if key == 'pith' and kernel_override
+                      else build / directory / filename))
     populate = [sys.executable, ROOT / 'tools/populate_mgfs.py', root, *paths,
                 *[ROOT / path for _, _, path in manifest.DATA_MANIFEST]]
     if not manual_login:

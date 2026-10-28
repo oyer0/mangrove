@@ -1,53 +1,95 @@
 # Mangrove timekeeping
 
-Mangrove has two independent clocks.
+Mangrove keeps elapsed time, wall time, and scheduler accounting distinct.
 
 - The monotonic clock is elapsed milliseconds from a boot-local origin. It is
-  used for scheduler deadlines, sleeps, timeouts, and uptime. It does not
-  change when realtime is corrected.
+  used for scheduler sleep deadlines, timeouts, and uptime. It does not change
+  when realtime is corrected.
 - The realtime clock is UTC and is represented by signed seconds plus
   nanoseconds from the **Mangrove Epoch**, `2000-01-01 00:00:00 UTC`. The
   timestamp `0` is therefore that instant; dates before it have negative
   seconds.
+- Scheduler tick and process CPU accounting count delivered timer events. They
+  are not wall-clock or elapsed-time sources.
 
-Pith can read and validate the x86 CMOS RTC once during boot and record that
-calendar alongside a monotonic synchronization point. CMOS contains no timezone
-provenance. Realtime is **unavailable by default**: a deployment must explicitly
-establish that its RTC contains UTC and build with `RTC_UTC_TRUST=1`. Physical
-hardware must not inherit that assertion merely because QEMU uses UTC. An
-untrusted, invalid, or unavailable RTC does not prevent boot or affect monotonic
-time.
+The monotonic source is selected after ACPI discovery and permanent MMIO setup:
+64-bit HPET, 32-bit ACPI PM timer, narrower HPET, narrower ACPI PM timer, then
+the degraded delivered-PIT-tick fallback. HPET is enabled only when selected;
+its firmware legacy-route setting is preserved. PM timer GAS reads use the
+declared I/O or system-memory location and the FADT's 24/32-bit width. KVM
+paravirtual clocks and TSC are not selected: their cross-CPU frequency and
+pause/resume behavior have not been qualified on Mangrove's supported targets.
+Invalid or unavailable hardware counters fall through without fabricating a
+frequency.
 
-Use a forced rebuild when changing this deployment setting, for example
-`make -B -j4 RTC_UTC_TRUST=1 binaries`. The repository's QEMU launch arguments
-explicitly use `-rtc base=utc,clock=vm`, which permits that assertion for those
-guests. The development-image targets (`make`, `make image`, `make run`, and
-their fresh-image variants) build with `RTC_UTC_TRUST=1`; this is scoped to the
-QEMU development environment. Ordinary `make binaries` and hardware-image
-builds retain the untrusted default unless the caller explicitly opts in.
-Kernel C objects depend on a build-local RTC-trust stamp, so changing
-`RTC_UTC_TRUST` in an existing build directory recompiles them before relinking
-Pith. This prevents an incremental build from reusing `main.o` compiled under
-the opposite trust policy. Changing an RTC's convention, clock setting,
-synchronization, and timezone controls are not yet implemented.
+The hardware clock is sampled from one origin, converted directly from its
+declared femtosecond period, and published through an SMP atomic maximum. Narrow
+counters are extended under a shared lock; sampling and extension are ordered
+together so a delayed CPU cannot turn an older sample into a false wrap. A
+narrow counter can only account for wraps that are observed; the periodic PIT
+path samples it even when no caller requests uptime. The status API reports the
+source, one-millisecond public resolution, and whether the source is full-range,
+wrap-bounded, or degraded. If no qualified source exists, boot continues with
+the nominal 1 ms PIT event count and reports the degraded source. That fallback
+can drift and cannot recover interrupts that were never delivered.
 
-The CMOS source has **one-second resolution**. Realtime advances by complete
-elapsed seconds; nanoseconds remain zero. Timer ticks do not establish the RTC
-sample's fractional phase, accuracy, or synchronization. The kernel's
-`timekeeping_realtime_sample()` returns a coherent validated UTC timestamp and
-source resolution; failure leaves its output unchanged. Short IRQ-safe locking
-protects the clock synchronization state, and uptime ticks use atomic access.
-No device I/O occurs under that lock. Realtime rejects backwards monotonic
-observations and arithmetic overflow. The interface leaves room for future
-sources and correction without conflating wall-clock time with monotonic time.
+Hardware-source monotonic time accounts for counter elapsed time rather than
+PIT delivery count, so delayed/coalesced PIT interrupts do not permanently lose
+elapsed time. PIT/LAPIC interrupts remain scheduler notifications and
+preemption inputs. Sleeping threads keep absolute monotonic millisecond
+deadlines and the BSP's next PIT notification checks those deadlines; late
+notification may delay a wake, but it does not change the deadline. Process CPU
+time remains scheduler-accounted and tick-resolution.
+
+The clock is boot-local and does not advance while an external virtual-machine
+pause stops the guest's virtual counters. Physical CPU idle time is included
+while the selected platform counter continues running. Mangrove has no system
+suspend/resume implementation; hardware sleep states that stop/reset the
+selected source are not qualified. Counter wrap observation limits for narrow
+sources are described above.
+
+CMOS contains no timezone provenance. Realtime is **unavailable by default**:
+a deployment must explicitly establish that its RTC contains UTC and build with
+`RTC_UTC_TRUST=1`. Physical hardware must not inherit that assertion merely
+because QEMU uses UTC. An untrusted, invalid, or unavailable RTC does not
+prevent boot or affect monotonic time. The trusted-RTC policy stamp invalidates
+kernel objects on incremental policy changes.
+
+`timekeeping_init()` runs after the monotonic source has been initialized. It
+uses a boot RTC sample only for boot identity material; it does not anchor
+realtime to uptime. Every trusted realtime status/query obtains a fresh stable
+CMOS sample. The RTC access lock serializes index/data port transactions across
+CPUs. Each sample is validated and returned at one-second resolution; the
+kernel does not interpolate subsecond time. If the configured source is
+unavailable or invalid at query time, realtime fails closed even if an earlier
+sample was valid. Valid backward or forward corrections are exposed as wall
+time; they never change monotonic values or scheduler deadlines. `TRUSTED`
+means the deployment asserted UTC and the current sample is stable and
+calendar-valid; it is not independent proof of RTC accuracy or freshness beyond
+the current read. Mangrove has no NTP or other network time synchronization.
+
+Ordinary QEMU development launches use `-rtc base=utc,clock=host`, allowing the
+RTC to reflect host wall time across a QEMU process pause or host suspension.
+`QEMU_RTC_CLOCK=vm` selects deterministic virtual-time behavior for explicit
+tests; `rt` is also available when a test needs QEMU's host monotonic RTC clock.
+These RTC options do not select or alter the kernel monotonic source. The
+development-image targets build with `RTC_UTC_TRUST=1`; ordinary `make
+binaries` and hardware-image builds retain the untrusted default. Changing an
+RTC's UTC convention remains an explicit deployment decision.
+
+The CMOS source has **one-second resolution**; nanoseconds remain zero. The
+kernel's `timekeeping_realtime_sample()` returns a freshly validated UTC
+timestamp and source resolution; failure leaves its output unchanged. RTC I/O
+does not occur under the small lock that protects deployment trust and boot
+identity. No stale sample is extrapolated using uptime.
 
 `mg_clock_realtime_info()` is the explicit quality interface for security
 consumers. One syscall returns a coherent `mg_realtime_info_t` with one of
 four states: `MG_REALTIME_UNTRUSTED` (the build/deployment did not assert an
 UTC RTC convention and CMOS is not read), `MG_REALTIME_UNAVAILABLE` (UTC was
 trusted but no stable RTC sample was available), `MG_REALTIME_INVALID` (a
-stable sample failed calendar validation, conversion failed, or a later
-monotonic/arithmetic check failed), or `MG_REALTIME_TRUSTED`. A timestamp and
+stable sample failed calendar validation or conversion), or
+`MG_REALTIME_TRUSTED`. A timestamp and
 resolution are populated only in the trusted state; the other fields are zero.
 The status call itself returns `MG_OK` when the query succeeds, so callers can
 distinguish a clock-quality result from a syscall failure. Existing
@@ -98,9 +140,9 @@ clock remains the source for elapsed durations.
 
 The native clock syscalls are 61 (monotonic milliseconds), 62 (strict
 validated Mangrove-epoch realtime), 63 (boot identifier), 94 (current-process
-CPU ticks), and 102 (realtime status plus timestamp). Their fixed-width
-request/result structures are in `include/mg/time.h`; libc converts only at
-the public C wall-time boundary.
+CPU ticks), 102 (realtime status plus timestamp), and 104 (monotonic sample,
+source, and quality). Their fixed-width request/result structures are in
+`include/mg/time.h`; libc converts only at the public C wall-time boundary.
 
 Filesystem timestamps retain their format-specific meanings. exFAT mutations
 convert the native UTC calendar directly and write a valid zero UTC offset;

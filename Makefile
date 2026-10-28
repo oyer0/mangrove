@@ -340,6 +340,12 @@ ifeq ($(NETWORK_BOOT_DIAG),1)
 KERNEL_CFLAGS += -DNETWORK_BOOT_DIAG=1
 endif
 
+# Test-only early-boot clock markers for a bounded QMP pause/resume check.
+# Build this in a dedicated BUILD_DIR; it must not become the normal kernel.
+ifeq ($(TIMEKEEPING_QMP_TEST),1)
+KERNEL_CFLAGS += -DTIMEKEEPING_QMP_TEST=1
+endif
+
 # Opt-in detailed ELF loader tracing.  Normal images do not print successful
 # per-read or per-segment loader activity.
 ifeq ($(ELF_LOADER_DEBUG),1)
@@ -365,6 +371,14 @@ ifneq ($(RTC_UTC_TRUST),0)
 ifneq ($(RTC_UTC_TRUST),1)
 $(error RTC_UTC_TRUST must be 0 or 1)
 endif
+endif
+
+# Interactive QEMU runs should follow the host UTC clock, including time while
+# the host is suspended. Deterministic guest workflows select clock=vm in
+# their explicit QEMU arguments.
+QEMU_RTC_CLOCK ?= host
+ifeq ($(filter $(QEMU_RTC_CLOCK),host rt vm),)
+$(error QEMU_RTC_CLOCK must be host, rt, or vm)
 endif
 
 # Keep the time-source assertion attached to kernel objects so changing it in
@@ -885,6 +899,20 @@ test-time:
 		libc/src/time_convert.c -o /tmp/mangrove-system-clock-test
 	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-system-clock-test
 	@echo timekeeping tests passed
+
+TIME_QMP_BUILD_DIR ?= $(BUILD_DIR)/time-qmp
+TIME_QMP_ACCEL ?= kvm
+.PHONY: test-guest-time-pause
+test-guest-time-pause: $(EFI) $(MKMGFS) $(MGFSCK)
+	$(MAKE) -j4 BUILD_DIR=$(TIME_QMP_BUILD_DIR) RTC_UTC_TRUST=1 \
+		NETWORK_BOOT_DIAG=1 TIMEKEEPING_QMP_TEST=1 \
+		$(TIME_QMP_BUILD_DIR)/Mangrove/pith.elf
+	python3 tests/guest/guest_time_pause_test.py \
+		--build-dir "$(BUILD_DIR)" \
+		--test-kernel "$(TIME_QMP_BUILD_DIR)/Mangrove/pith.elf" \
+		--mgfsck "$(BUILD_DIR)/mgfsck" --ovmf-code "$(OVMF_CODE_SOURCE)" \
+		--ovmf-vars "$(OVMF_VARS_SOURCE)" --qemu "$(QEMU)" \
+		--accel "$(TIME_QMP_ACCEL)"
 
 .PHONY: test-ca-store
 test-ca-store: $(MKMGFS) $(BUILD_DIR)/mgfsck
@@ -1950,7 +1978,7 @@ QEMU_RUN_ARGS = \
 	$(QEMU_DISPLAY_ARGS) \
 	$(QEMU_SMP_ARGS) \
 	-m 512M \
-	-rtc base=utc,clock=vm \
+	-rtc base=utc,clock=$(QEMU_RTC_CLOCK) \
 	-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 	-drive if=pflash,format=raw,file=$(OVMF_VARS) \
 	-drive id=usb,file=$(DEV_IMAGE),format=raw,if=none \

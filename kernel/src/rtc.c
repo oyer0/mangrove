@@ -3,6 +3,7 @@
 
 #include <acpi.h>
 #include <io.h>
+#include <spinlock.h>
 #if defined(RTC_DEBUG)
 #include <kprint.h>
 #endif
@@ -21,6 +22,10 @@
 
 #define RTC_UIP_RETRIES       100000U
 #define RTC_STABLE_RETRIES         8U
+
+/* CMOS index/data ports are global to the machine. Runtime wall-clock
+ * samples may come from multiple CPUs, so serialize the complete transaction. */
+static spinlock_t rtc_access_lock;
 
 static u8 cmos_read(u8 saved_index, u8 reg)
 {
@@ -88,6 +93,7 @@ rtc_calendar_result_t rtc_read_calendar_status(rtc_calendar_t *out)
     if (!out)
         return RTC_CALENDAR_INVALID;
 
+    spin_lock(&rtc_access_lock);
     saved_index = inb(CMOS_INDEX_PORT);
     century_valid = acpi_fadt_has_rtc_century(&century_register);
     for (u32 attempt = 0; attempt < RTC_STABLE_RETRIES; attempt++) {
@@ -108,6 +114,7 @@ rtc_calendar_result_t rtc_read_calendar_status(rtc_calendar_t *out)
                    first.century_valid, valid);
 #endif
             outb(CMOS_INDEX_PORT, saved_index);
+            spin_unlock(&rtc_access_lock);
             return valid ? RTC_CALENDAR_VALID : RTC_CALENDAR_INVALID;
         }
     }
@@ -115,6 +122,7 @@ rtc_calendar_result_t rtc_read_calendar_status(rtc_calendar_t *out)
     kprint("[RTC] no stable validated sample\n");
 #endif
     outb(CMOS_INDEX_PORT, saved_index);
+    spin_unlock(&rtc_access_lock);
     return RTC_CALENDAR_UNAVAILABLE;
 }
 

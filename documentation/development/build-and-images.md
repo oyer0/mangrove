@@ -76,9 +76,11 @@ The persistent development state is kept separately in:
 
 The QEMU development-image targets (`make`, `make image`, `make run`,
 `make fresh-image`, and `make fresh-run`) use `RTC_UTC_TRUST=1` because their
-Q35/OVMF launch explicitly supplies `-rtc base=utc,clock=vm`. Ordinary
-`make binaries` and the hardware `make usb-image` path keep the untrusted RTC
-default. A build-local RTC policy stamp makes changes to `RTC_UTC_TRUST`
+Q35/OVMF launch uses `-rtc base=utc,clock=host` by default. Set
+`QEMU_RTC_CLOCK=vm` for deterministic virtual-time runs; this controls the
+guest RTC, not the kernel monotonic source. Ordinary `make binaries` and the
+hardware `make usb-image` path keep the untrusted RTC default. A build-local
+RTC policy stamp makes changes to `RTC_UTC_TRUST`
 invalidate kernel C objects in incremental builds; use separate `BUILD_DIR`
 values when building both policies concurrently.
 

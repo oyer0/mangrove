@@ -9,11 +9,7 @@
 #include <kprint.h>
 #endif
 
-#define TIME_I64_MAX ((i64)0x7fffffffffffffffLL)
-
-static mg_mangrove_time_t realtime_sync;
-static u64 realtime_sync_monotonic_ms;
-static mg_realtime_state_t realtime_state;
+static bool realtime_rtc_utc_trusted;
 static u64 boot_id;
 static spinlock_t clock_lock;
 
@@ -92,14 +88,11 @@ void timekeeping_init(bool rtc_utc_trusted)
     /* The identifier is generated once by the kernel, not by logd, so a
      * daemon restart cannot split one boot into multiple logical boots.  It
      * is boot-local rather than a globally persistent UUID. */
-    u64 anchor = timer_uptime_ms();
     u64 identifier = timekeeping_boot_identifier(
         state == MG_REALTIME_TRUSTED ? &calendar :
         (const rtc_calendar_t *)0);
     u64 flags = spin_lock_irqsave(&clock_lock);
-    realtime_sync = sync;
-    realtime_sync_monotonic_ms = anchor;
-    realtime_state = state;
+    realtime_rtc_utc_trusted = rtc_utc_trusted;
     boot_id = identifier;
     spin_unlock_irqrestore(&clock_lock, flags);
 }
@@ -125,40 +118,46 @@ bool timekeeping_realtime_sample(timekeeping_realtime_sample_t *out)
 bool timekeeping_realtime_info(mg_realtime_info_t *out)
 {
     mg_realtime_info_t info = {0};
-    mg_mangrove_time_t sync;
-    u64 anchor;
-    u64 now;
-    mg_realtime_state_t state;
+    rtc_calendar_t calendar;
+    mg_calendar_time_t public_calendar;
+    mg_mangrove_time_t sample;
+    bool trusted;
+    rtc_calendar_result_t rtc_result;
     if (!out) return false;
 
-    /* Snapshot the synchronization point, status, and monotonic observation
-     * under the same short lock. No RTC I/O or conversion occurs here. */
     u64 flags = spin_lock_irqsave(&clock_lock);
-    sync = realtime_sync;
-    anchor = realtime_sync_monotonic_ms;
-    state = realtime_state;
-    now = timer_uptime_ms();
+    trusted = realtime_rtc_utc_trusted;
     spin_unlock_irqrestore(&clock_lock, flags);
 
-    info.state = (u32)state;
-    if (state == MG_REALTIME_TRUSTED) {
-        if (now < anchor) {
+    if (!trusted) {
+        info.state = MG_REALTIME_UNTRUSTED;
+        *out = info;
+        return true;
+    }
+
+    /* Re-read the explicitly trusted UTC source for each API sample. The
+     * source may have advanced while a VM was paused even when its guest
+     * monotonic clock did not. RTC I/O is serialized by rtc.c and occurs
+     * outside clock_lock; no elapsed-time deadline depends on this sample. */
+    rtc_result = rtc_read_calendar_status(&calendar);
+    if (rtc_result == RTC_CALENDAR_UNAVAILABLE) {
+        info.state = MG_REALTIME_UNAVAILABLE;
+    } else if (rtc_result != RTC_CALENDAR_VALID) {
+        info.state = MG_REALTIME_INVALID;
+    } else {
+        public_calendar = (mg_calendar_time_t){
+            calendar.year, calendar.month, calendar.day,
+            calendar.hour, calendar.minute, calendar.second, 0
+        };
+        if (mangrove_time_from_calendar(&public_calendar, &sample) != MG_OK) {
             info.state = MG_REALTIME_INVALID;
         } else {
-            u64 elapsed_seconds = (now - anchor) / 1000U;
-            if (elapsed_seconds > (u64)TIME_I64_MAX ||
-                sync.seconds > TIME_I64_MAX - (i64)elapsed_seconds) {
-                info.state = MG_REALTIME_INVALID;
-            } else {
-                /* Timer advancement supplies whole seconds only; it does not
-                 * establish the CMOS sample's fractional phase. */
-                info.time = (mg_mangrove_time_t){
-                    sync.seconds + (i64)elapsed_seconds, 0, 0
-                };
-                info.resolution_ns = MG_TIME_NANOSECONDS_PER_SEC;
-            }
+            info.state = MG_REALTIME_TRUSTED;
+            info.time = sample;
+            info.resolution_ns = MG_TIME_NANOSECONDS_PER_SEC;
         }
     }
+
     *out = info;
     return true;
 }
