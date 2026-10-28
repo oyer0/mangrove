@@ -4,6 +4,7 @@
 #include <mg/thread.h>
 #include <mg/sync.h>
 #include <mg/inspection.h>
+#include <mg/memory.h>
 #include <mg/process_status.h>
 #include <stdatomic.h>
 #include <errno.h>
@@ -37,6 +38,12 @@ static atomic_uint cpu_witness_workers;
 static atomic_uint wait_ready;
 static atomic_uint termination_wait_ready;
 static _Thread_local unsigned worker_tls;
+
+extern u64 threadtest_syscall_with_rsp(uintptr_t selected_rsp,
+                                      u64 *out_rflags);
+extern void threadtest_syscall_then_touch_rsp(uintptr_t selected_rsp);
+
+#define SYSCALL_PROBE_UNMAPPED_RSP ((uintptr_t)0x0000700000000000ULL)
 
 static int save_log(const char *text)
 {
@@ -162,6 +169,15 @@ static mg_thread_result_t worker(void *raw)
      * is a failure bound, not a sleep used to manufacture overlap. */
     witness_deadline = uptime_ms() + 5000U;
     while (!atomic_load_explicit(&cpu_overlap_seen, memory_order_acquire)) {
+        u64 flags = 0;
+        uintptr_t selected_rsp = SYSCALL_PROBE_UNMAPPED_RSP +
+                                 (uintptr_t)argument->index * 0x1000U;
+        if ((i64)threadtest_syscall_with_rsp(selected_rsp, &flags) < 0 ||
+            !(flags & (1ULL << 9)) || (flags & (1ULL << 10)) ||
+            (flags & (1ULL << 18)))
+            return 0x105U + argument->index;
+        if (errno != 31 + (int)argument->index)
+            return 0x107U + argument->index;
         if (own_process_is_running_on_multiple_cpus())
             atomic_store_explicit(&cpu_overlap_seen, 1U,
                                   memory_order_release);
@@ -258,6 +274,20 @@ static int child_mode(const char *mode)
         (void)mg_thread_join(thread.handle, &result);
         for (;;) (void)process_yield();
     }
+    if (!strcmp(mode, "bad-rsp")) {
+        /* SYSRET must not run with a supervisor stack pointer. Correct entry
+         * code terminates this child as a user-context fault before SYSRET. */
+        u64 flags = 0;
+        (void)threadtest_syscall_with_rsp(
+            (uintptr_t)0xffff800000000000ULL, &flags);
+        return 44;
+    }
+    if (!strcmp(mode, "exhausted-rsp")) {
+        /* Entry and return tolerate an unmapped lower-half RSP, but the
+         * first real stack write must fault in Ring 3, not corrupt the kernel. */
+        threadtest_syscall_then_touch_rsp(SYSCALL_PROBE_UNMAPPED_RSP);
+        return 45;
+    }
     return 40;
 }
 
@@ -266,9 +296,18 @@ static int verify_process_termination(void)
     const char *spin_argv[] = {"/bin/threadtest", "exit-spin"};
     const char *wait_argv[] = {"/bin/threadtest", "exit-wait"};
     const char *fault_argv[] = {"/bin/threadtest", "fault"};
-    const char *const *commands[] = {spin_argv, wait_argv, fault_argv};
-    const i32 expected[] = {23, 24, MG_PROCESS_STATUS_CRASHED};
-    for (unsigned i = 0; i < 3; i++) {
+    const char *bad_rsp_argv[] = {"/bin/threadtest", "bad-rsp"};
+    const char *exhausted_rsp_argv[] = {
+        "/bin/threadtest", "exhausted-rsp"
+    };
+    const char *const *commands[] = {
+        spin_argv, wait_argv, fault_argv, bad_rsp_argv, exhausted_rsp_argv
+    };
+    const i32 expected[] = {
+        23, 24, MG_PROCESS_STATUS_CRASHED, MG_PROCESS_STATUS_CRASHED,
+        MG_PROCESS_STATUS_CRASHED
+    };
+    for (unsigned i = 0; i < 5; i++) {
         mg_result_t spawned = process_spawn_argv(commands[i], 2U);
         if (spawned <= 0) {
             printf("THREADS1 FAIL termination spawn_case=%u result=%lld\n",
@@ -289,10 +328,79 @@ static int verify_process_termination(void)
     return 0;
 }
 
+static int verify_syscall_entry_stack(void)
+{
+    const usize bytes = 4096U;
+    const usize marker_bytes = 128U;
+    u8 *mapping = NULL;
+    u64 observed_flags = 0;
+
+    if (memory_map(bytes, (void **)&mapping) != MG_OK || !mapping)
+        return 1;
+    for (usize index = 0; index < marker_bytes; index++)
+        mapping[bytes - marker_bytes + index] = (u8)(0x5aU ^ index);
+
+    /* The writable mapping makes the prior entry's user-stack pushes
+     * observable as deterministic corruption of these bytes. */
+    if ((i64)threadtest_syscall_with_rsp((uintptr_t)(mapping + bytes),
+                                        &observed_flags) < 0) {
+        (void)memory_unmap(mapping);
+        return 2;
+    }
+    for (usize index = 0; index < marker_bytes; index++) {
+        if (mapping[bytes - marker_bytes + index] != (u8)(0x5aU ^ index)) {
+            (void)memory_unmap(mapping);
+            return 3;
+        }
+    }
+    if (!(observed_flags & (1ULL << 9)) ||
+        (observed_flags & ((1ULL << 10) | (1ULL << 18)))) {
+        (void)memory_unmap(mapping);
+        return 4;
+    }
+
+    /* Text is user-readable but not writable; using it as RSP proves entry
+     * does not attempt to save any register through the caller's stack. */
+    if ((i64)threadtest_syscall_with_rsp(
+            (uintptr_t)threadtest_syscall_with_rsp,
+            &observed_flags) < 0) {
+        (void)memory_unmap(mapping);
+        return 5;
+    }
+
+    /* A stack pointer at the low edge of a mapped region behaves like an
+     * exhausted stack adjacent to an unmapped guard page. */
+    if ((i64)threadtest_syscall_with_rsp((uintptr_t)mapping,
+                                        &observed_flags) < 0) {
+        (void)memory_unmap(mapping);
+        return 6;
+    }
+
+    /* A pointer immediately below the mapping is a guard-adjacent candidate;
+     * entry itself must not touch it even when it is not mapped. */
+    if ((i64)threadtest_syscall_with_rsp((uintptr_t)mapping - bytes,
+                                        &observed_flags) < 0) {
+        (void)memory_unmap(mapping);
+        return 7;
+    }
+
+    /* An unmapped, lower-half user RSP remains safe when the caller restores
+     * its real stack without touching the selected pointer after SYSRET. */
+    if ((i64)threadtest_syscall_with_rsp(SYSCALL_PROBE_UNMAPPED_RSP,
+                                        &observed_flags) < 0) {
+        (void)memory_unmap(mapping);
+        return 8;
+    }
+    if (memory_unmap(mapping) != MG_OK) return 9;
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 2) return child_mode(argv[1]);
     REQUIRE(argc == 1, "arguments");
+    REQUIRE(verify_syscall_entry_stack() == 0,
+            "trusted syscall stack, user-memory isolation, and flags");
     worker_arg_t arguments[WORKERS] = {{.index = 0U}, {.index = 1U}};
     mg_thread_created_t threads[WORKERS];
     mg_thread_id_t initial_id = 0;

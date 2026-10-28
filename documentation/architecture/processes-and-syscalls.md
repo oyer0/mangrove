@@ -372,6 +372,10 @@ RDX = arg2
 RAX = result
 ```
 
+`SYSCALL` also places the user return instruction address and flags in `RCX`
+and `R11`; both are caller-clobbered by the native ABI. Pith sanitizes the
+returned flags rather than promising their preservation.
+
 The complete numeric ABI is the `enum syscall_number` in
 `kernel/include/syscall.h`; number zero is reserved. Public libc wrappers and
 their request structures are the userspace-facing interface. Results use
@@ -392,11 +396,34 @@ untrusted file, network, or log bytes. See the
 [terminal control contract](terminal.md) for the command grammar and process
 ownership rules.
 
-On entry the assembly path saves the user return state and general registers,
-switches to the current thread's kernel stack, and calls `syscall_dispatch`.
-The kernel masks interrupt, trap, and direction flags during entry and returns
-with `SYSRET`. A syscall may block because every schedulable thread has its own
-kernel stack and saved syscall frame.
+On entry, `SYSCALL` leaves `RSP` unchanged. The first entry instructions use
+`SWAPGS` to access the per-CPU record, save user `RSP` in a per-CPU scratch
+slot, and load the scheduler-published kernel-stack top. No push, user-stack
+read, or C call occurs before this stack transition. Assembly then saves the
+complete register frame, including user `RSP`, on that thread's guarded kernel
+stack. Dispatch verifies that the frame lies within the current thread's
+stack. Consequently, a blocked syscall retains a kernel-owned frame even when
+another thread in the same address space can modify its user stack.
+
+The scheduler publishes the selected thread's kernel-stack top to both the
+TSS `RSP0` field and the per-CPU syscall-entry field whenever it activates a
+thread, including after migration. NMI and machine-check entry account for the
+short interval between the architectural CPL transition and `SWAPGS`: if a
+kernel-CS NMI arrives while the current GS base is still the Mangrove user
+value (currently zero), the stub switches GS and records that transition so
+the interrupted state is restored on return. This check relies on the current
+contract that userspace cannot change GS base; enabling FSGSBASE or adding a
+userspace GS-base API requires revisiting it.
+
+Before `SYSRET`, Pith validates that the captured return RIP and RSP are in the
+lower user address range. An unmapped but in-range RSP is allowed; any later
+stack access faults as a userspace exception, not as a kernel-stack access.
+Invalid return context terminates the process instead of executing `SYSRET`.
+Captured flags are reduced to the supported arithmetic/ID bits with reserved
+bit 1 and IF set; TF, DF, IOPL, NT, RF, VM, AC, VIF, and VIP are cleared. The
+kernel masks these privileged or unsafe flags during entry as well. A syscall
+may block because every schedulable thread has its own kernel stack and saved
+syscall frame.
 
 Pointer arguments are not trusted. Dispatch leases mapped user ranges before
 using them and copies bounded strings or request records into kernel-owned

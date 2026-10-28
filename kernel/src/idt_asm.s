@@ -110,20 +110,47 @@ common_isr_stub:
     pushq %r14
     pushq %r15
 
-    /* The saved CS is 144 bytes above the register frame.  Only a Ring 3
-     * origin has the user GS base active; kernel-origin and nested entries
-     * must not swap it. */
-    testq $3, 144(%rsp)
+    /* Keep an explicit transition marker below the saved frame. A Ring 3
+     * entry always needs SWAPGS. NMI and machine-check can also arrive in the
+     * tiny SYSCALL window after CPL changes but before its first SWAPGS; in
+     * that case CS is kernel while GS_BASE still contains the user value
+     * (zero under Mangrove's current user-GS contract). */
+    subq $8, %rsp
+    movq $0, (%rsp)
+    testq $3, 152(%rsp)          /* saved CS after marker and register frame */
     jz .Lisr_kernel_gs
     swapgs
+    movq $1, (%rsp)
+    jmp .Lisr_gs_ready
 .Lisr_kernel_gs:
-    movq %rsp, %rdi
-    movq %rsp, %rbx
+    movq 128(%rsp), %rax         /* saved vector number */
+    cmpq $2, %rax                /* NMI */
+    je .Lisr_check_gs_base
+    cmpq $18, %rax               /* machine check */
+    jne .Lisr_gs_ready
+.Lisr_check_gs_base:
+    movl $0xC0000101, %ecx       /* IA32_GS_BASE; registers are already saved */
+    rdmsr
+    orl %edx, %eax
+    jnz .Lisr_gs_ready
+    swapgs
+    movq $1, (%rsp)
+.Lisr_gs_ready:
+    leaq 8(%rsp), %rdi           /* exception_handler sees the native frame */
+    movq %rsp, %rbx              /* retain marker address across the C call */
     andq $-16, %rsp
     subq $8, %rsp
     pushq %rbx
     call exception_handler
     popq %rsp
+
+    /* Restore the GS orientation that was active at the interrupted point,
+     * including a kernel-CS NMI before syscall-entry SWAPGS. */
+    cmpq $0, (%rsp)
+    je .Lisr_restore_registers
+    swapgs
+.Lisr_restore_registers:
+    addq $8, %rsp
 
     popq %r15
     popq %r14
@@ -141,12 +168,6 @@ common_isr_stub:
     popq %rbx
     popq %rax
 
-    /* The register frame has been popped; the saved CS is now 24 bytes
-     * above the vector/error stub area. */
-    testq $3, 24(%rsp)
-    jz .Lisr_return_kernel_gs
-    swapgs
-.Lisr_return_kernel_gs:
     addq $16, %rsp
     iretq
 
