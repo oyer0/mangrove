@@ -86,7 +86,10 @@ those walks; reaping also closes reader admission before detaching records.
 Process inspection aggregates attached thread states. Its CPU field uses
 `MG_PROCESS_CPU_MULTIPLE` only when a scheduler-locked point-in-time sample sees
 the process executing on distinct CPUs; this is an observation, not a CPU
-reservation.
+reservation. Snapshot flags also report transient worker-reap pending,
+user-region-reap pending, and active worker-reaper state. These copied flags
+are diagnostic observations, not lifecycle controls; region-reap pending means
+revoked user mappings remain reserved while existing syscall leases drain.
 
 Per-thread Ring 3 entry records hold independent registers, instruction and
 stack pointers, FS base, FPU state, guarded user-stack mapping, and TLS

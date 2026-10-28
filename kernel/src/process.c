@@ -4331,6 +4331,22 @@ static u32 process_inspection_state(const process_t *process)
     return ready ? MG_PROCESS_INSPECTION_READY : MG_PROCESS_INSPECTION_BLOCKED;
 }
 
+/* Caller holds process_registry_lock. These copied flags help distinguish a
+ * transient worker/mapping cleanup from a stable process memory snapshot. */
+static u32 process_snapshot_reap_flags_locked(const process_t *process)
+{
+    u32 flags = 0;
+    if (!process) return 0;
+    if (__atomic_load_n(&process->worker_reap_pending, __ATOMIC_ACQUIRE))
+        flags |= MG_PROCESS_FLAG_WORKER_REAP_PENDING;
+    if (__atomic_load_n(&process->user_region_reap_pending,
+                        __ATOMIC_ACQUIRE))
+        flags |= MG_PROCESS_FLAG_USER_REGION_REAP_PENDING;
+    if (process->worker_reapers)
+        flags |= MG_PROCESS_FLAG_WORKER_REAPER_ACTIVE;
+    return flags;
+}
+
 u32 process_snapshot_read(u32 offset, mg_process_info_t *output,
                           u32 capacity, u32 *out_total)
 {
@@ -4359,7 +4375,8 @@ u32 process_snapshot_read(u32 offset, mg_process_info_t *output,
             info.flags = (process->system_service
                           ? MG_PROCESS_FLAG_SYSTEM_SERVICE : 0U) |
                          (process->session_shell
-                          ? MG_PROCESS_FLAG_SESSION_SHELL : 0U);
+                          ? MG_PROCESS_FLAG_SESSION_SHELL : 0U) |
+                         process_snapshot_reap_flags_locked(process);
             if (process->credentials_initialized &&
                 identity_credentials_effective(&process->credentials,
                                                &credentials)) {
