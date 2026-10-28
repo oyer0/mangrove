@@ -44,13 +44,21 @@ guest.validate_time_transcript(time_transcript, run, epoch - 1, later + 1, 180)
 
 shoot_v1_report = guest.SHOOT_V1_REPORT
 shoot_v1_transcript = ('Shoot scripting test for Mangrove\n'
+                       '\x1b{fg:green}ESC OUTPUT PASS\x1b{reset}\n'
+                       '{fg:red}ESC LITERAL PASS{reset}\n'
+                       '\x1b{fg:yellow}raw redirected bytes\x1b{reset}\n'
                        'report created\n' + shoot_v1_report)
 shoot_v1_completion = f'child-exit-0-shoot-v1-{run}\n'
 shoot_v1_evidence = guest.validate_shoot_v1_evidence(
     shoot_v1_transcript, shoot_v1_report, shoot_v1_completion, run)
-assert shoot_v1_evidence['external_child_commands'] == 15
+assert shoot_v1_evidence['external_child_commands'] == 19
 assert shoot_v1_evidence['child_status'] == 0
 for invalid in (
+        (shoot_v1_transcript.replace('\x1b{fg:green}ESC OUTPUT PASS\x1b{reset}\n', ''),
+         shoot_v1_report, shoot_v1_completion),
+        (shoot_v1_transcript.replace('{fg:red}ESC LITERAL PASS{reset}',
+                                     '\x1b{fg:red}ESC LITERAL PASS\x1b{reset}'),
+         shoot_v1_report, shoot_v1_completion),
         (shoot_v1_transcript.replace('round 3\n', ''), shoot_v1_report,
          shoot_v1_completion),
         (shoot_v1_transcript, shoot_v1_report.replace('round 2\n', ''),
