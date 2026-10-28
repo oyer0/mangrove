@@ -6,19 +6,23 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
-import tempfile
 sys.dont_write_bytecode=True
 ROOT=Path(__file__).resolve().parents[3]
+sys.path.insert(0,str(ROOT/'tests'/'shared'))
 sys.path.insert(0,str(ROOT/'tests/filesystems/mfqs'))
+import artifact_lifecycle as artifacts
 from runner import build,encode,response,FORMAT_ARGS
 from images import create,external_tools,check
 compiler=sys.argv[1] if len(sys.argv)>1 else 'gcc'
-folder=Path(tempfile.mkdtemp(prefix='mangrove-fat-handoff-'))
+workspace=artifacts.ArtifactWorkspace(name='fat-handoff')
+folder=workspace.path
 flags=[compiler,'-std=gnu11','-O1','-Wall','-Wextra','-Werror','-Wno-unused-function','-Wno-type-limits',
        '-fsanitize=address,undefined','-fno-sanitize-recover=all','-pthread','-DMFQS_ADMISSION_TEST',
        '-Ikernel/include','-Iinclude','-idirafter','libc/include','-Itests/filesystems']
 env={**os.environ,'ASAN_OPTIONS':'detect_leaks=0','PYTHONDONTWRITEBYTECODE':'1'}
 try:
+    workspace.require_free_space(128*1024*1024,
+                                 'FAT32/exFAT handoff regression artifacts')
     renames=['mutex_init','mutex_lock','mutex_try_lock','mutex_unlock','spinlock_init','spin_lock_irqsave','spin_unlock_irqrestore','thread_current','kmalloc','kfree','mfqs_heap_contains']
     subprocess.run(flags+['-D'+n+'=mfqs_'+n for n in renames]+['-c','tests/filesystems/mfqs/host.c','-o',str(folder/'host.o')],cwd=ROOT,check=True)
     for backend in ('fat32','exfat'):
@@ -44,6 +48,15 @@ try:
                 print(run.stdout,end='')
                 if case=='success':check(image,backend,tools)
                 image.unlink()
-except BaseException:
-    print('Failure artifacts:',folder,file=sys.stderr);raise
-else:print('Fat handoff artifacts:',folder)
+except BaseException as error:
+    try:
+        report=workspace.finish({'status':'FAIL',
+                                 'error':f'{type(error).__name__}: {error}'},
+                                verified=False)
+        print('Failure evidence:',report.get('failure_evidence',folder),file=sys.stderr)
+    except BaseException as cleanup_error:
+        print(f'Owned workspace retained for review: {folder} ({cleanup_error})',file=sys.stderr)
+    raise
+else:
+    workspace.finish({'status':'PASS'},verified=True)
+    print('FAT32/exFAT handoff temporary artifacts removed after verification')
