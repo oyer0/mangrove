@@ -91,6 +91,12 @@ pre += without_includes((ROOT / 'userspace/shoot/history.c').read_text())
 pre += r'''
 #include <setjmp.h>
 typedef struct {shoot_history_t *history;} shell_state_t;
+/* shell_exit is extracted from production source; keep its public cleanup
+ * dependency visible just as shell.c's inclusion of shell.h does. */
+void shell_state_destroy(shell_state_t *state);
+static unsigned shell_state_destroy_calls;
+void shell_state_destroy(shell_state_t *state)
+{ assert(state); shell_state_destroy_calls++; }
 static jmp_buf exit_environment;
 static int exit_status, exit_messages;
 static void console_write_string(const char *text)
@@ -145,11 +151,13 @@ int main(void){
  shell_state_t state={.history=&h};
  if(setjmp(exit_environment)==0)shell_exit(&state,0);
  assert(state.history==NULL&&exit_status==0&&exit_messages==0);
+ assert(shell_state_destroy_calls==1);
  expect("shutdown command\n");assert(save_calls==saves+1);
  assert(shoot_history_init(&h,&config));shoot_history_record(&h,"unsaved on error");
  state.history=&h;failure=1;exit_messages=0;
  if(setjmp(exit_environment)==0)shell_exit(&state,1);
  assert(state.history==NULL&&exit_status==1&&exit_messages==1);
+ assert(shell_state_destroy_calls==2);
  failure=0;
  config.history_limit=8;
  // A legacy-only file is read without creating ~/.state. It moves on the
