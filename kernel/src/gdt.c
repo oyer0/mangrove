@@ -260,7 +260,11 @@ void gdt_set_kernel_stack(uintptr_t stack_top)
 {
     cpu_local_t *cpu = cpu_current();
 
-    if (stack_top && cpu && cpu->descriptor) {
-        cpu->descriptor->tss.rsp0 = (u64)stack_top;
-    }
+    if (!stack_top || !cpu || !cpu->descriptor)
+        panic("gdt: cannot publish missing current-thread kernel stack");
+    /* SYSCALL uses a GS-relative stack pointer because it does not perform
+     * the privilege-stack switch that hardware interrupts do. Publish both
+     * entry mechanisms while the scheduler holds the executing CPU's context. */
+    cpu->syscall_kernel_stack_top = stack_top;
+    cpu->descriptor->tss.rsp0 = (u64)stack_top;
 }

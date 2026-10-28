@@ -3335,6 +3335,10 @@ test-process-handles:
 test-syscall-user-memory:
 	python3 tests/kernel/syscall_user_memory_test.py "$(HOST_CC)"
 
+.PHONY: test-syscall-entry
+test-syscall-entry:
+	python3 tests/kernel/syscall_entry_test.py
+
 .PHONY: test-process-memory-unmap
 test-process-memory-unmap:
 	python3 tests/kernel/process_memory_unmap_test.py "$(HOST_CC)"
@@ -3368,9 +3372,15 @@ threadtest: $(THREADTEST)
 $(THREADTEST_DIR)/main.o: tests/userspace/thread_lifecycle_guest.c $(USER_LIBC)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -std=c17 -c $< -o $@
-$(THREADTEST): $(THREADTEST_DIR)/main.o $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+$(THREADTEST_DIR)/syscall_entry_probe.o: tests/userspace/syscall_entry_probe.s
+	@mkdir -p $(dir $@)
+	$(ELF_AS) $(KERNEL_ASFLAGS) -c $< -o $@
+$(THREADTEST): $(THREADTEST_DIR)/main.o \
+		$(THREADTEST_DIR)/syscall_entry_probe.o \
+		$(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
-		$(USER_CRT) $< $(USER_LIBC)
+		$(USER_CRT) $(THREADTEST_DIR)/main.o \
+		$(THREADTEST_DIR)/syscall_entry_probe.o $(USER_LIBC)
 
 GUEST_THREADS_BUILD ?= $(abspath $(BUILD_DIR))/guest-builds/threads
 GUEST_THREADS_OUTPUT ?=

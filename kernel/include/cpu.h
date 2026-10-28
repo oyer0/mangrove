@@ -15,6 +15,12 @@ typedef struct cpu_local
     /* GS.base points at this record while the CPU is executing in the
      * kernel.  Keep self at offset zero for the GS load in cpu_current(). */
     struct cpu_local *self;
+    /* SYSCALL does not load RSP from the TSS. The scheduler publishes the
+     * selected thread's guarded kernel-stack top here before it can run in
+     * Ring 3. The adjacent scratch slot is used only until entry copies the
+     * user RSP into its kernel-owned syscall frame. */
+    volatile uintptr_t syscall_kernel_stack_top;
+    volatile uintptr_t syscall_user_rsp;
     u32 index;
     u8 apic_id;
     bool present;
@@ -40,6 +46,13 @@ typedef struct cpu_local
     volatile u64 scheduler_accounted_ticks;
     volatile u64 scheduler_busy_ticks;
 } cpu_local_t;
+
+_Static_assert(__builtin_offsetof(cpu_local_t, self) == 0U,
+               "cpu_local self must remain GS offset zero");
+_Static_assert(__builtin_offsetof(cpu_local_t, syscall_kernel_stack_top) == 8U,
+               "syscall entry assembly stack offset changed");
+_Static_assert(__builtin_offsetof(cpu_local_t, syscall_user_rsp) == 16U,
+               "syscall entry assembly user-RSP offset changed");
 
 /* Used only by early descriptor setup, before authoritative MADT-backed CPU
  * storage can be allocated. */

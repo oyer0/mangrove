@@ -44,6 +44,16 @@ stack enables reliable fatal reporting, not recovery. The IDT is immutable and
 syscall MSRs are initialized for each CPU. AP startup checks NX support before
 loading the shared page-table root and leaves unsupported CPUs offline.
 
+The scheduler publishes the current thread's guarded kernel-stack top both to
+TSS `rsp0` and to a per-CPU field used by `SYSCALL`, which does not switch
+stacks itself. The syscall stub saves user `rsp` in per-CPU scratch, switches
+to that stack before pushing registers or calling C, then keeps the full
+syscall frame on the thread's kernel stack. The exception stub handles the
+NMI/machine-check window before `swapgs` by checking whether GS still has the
+current user value and recording whether it swapped. This depends on the
+current userspace GS-base contract (zero, with FSGSBASE unavailable); changing
+that contract requires revisiting paranoid entry.
+
 The BSP initially points its TSS at three static early exception stacks;
 after permanent paging and heap setup, Pith installs guarded leases. The BSP
 prepares each AP's descriptor and guarded exception stacks before SIPI, so

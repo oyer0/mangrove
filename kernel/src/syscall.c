@@ -61,7 +61,15 @@ typedef struct syscall_frame {
     u64 r15, r14, r13, r12, r10, r9, r8;
     u64 rbp, rdi, rsi, rdx, rbx, rax;
     u64 rcx, r11;
+    u64 user_rsp;
 } syscall_frame_t;
+
+_Static_assert(sizeof(syscall_frame_t) == 128U,
+               "syscall entry assembly frame size changed");
+_Static_assert(__builtin_offsetof(syscall_frame_t, rcx) == 104U &&
+               __builtin_offsetof(syscall_frame_t, r11) == 112U &&
+               __builtin_offsetof(syscall_frame_t, user_rsp) == 120U,
+               "syscall entry assembly frame offsets changed");
 
 typedef struct syscall_user_lease_entry {
     bool writable;
@@ -78,6 +86,40 @@ typedef struct syscall_user_access_context {
 extern void syscall_entry(void);
 static void syscall_fail(syscall_frame_t *frame, i64 error);
 static void syscall_dispatch_inner(syscall_frame_t *frame);
+
+static bool syscall_frame_on_thread_stack(const kernel_thread_t *thread,
+                                          const syscall_frame_t *frame)
+{
+    uintptr_t base;
+    uintptr_t end;
+    uintptr_t address = (uintptr_t)frame;
+
+    if (!thread || !frame || !thread->kernel_stack_base ||
+        thread->kernel_stack_size < sizeof(*frame))
+        return false;
+    base = thread->kernel_stack_base;
+    if (thread->kernel_stack_size > ~(uintptr_t)0 - base)
+        return false;
+    end = base + thread->kernel_stack_size;
+    return address >= base && address <= end - sizeof(*frame);
+}
+
+static bool syscall_return_context_valid(const syscall_frame_t *frame)
+{
+    /* SYSRET faults in CPL0 for a noncanonical RCX. Keep both return
+     * addresses in Mangrove's lower user half; an unmapped but in-range user
+     * RSP is allowed so a guarded/exhausted userspace stack faults in Ring 3. */
+    return frame && frame->rcx > 0U &&
+           frame->rcx < VMM_USER_ADDRESS_LIMIT && frame->user_rsp > 0U &&
+           frame->user_rsp < VMM_USER_ADDRESS_LIMIT;
+}
+
+static void syscall_terminate_invalid_return_context(void)
+{
+    if (!process_terminate_current_exception(MG_PROCESS_STATUS_CRASHED))
+        panic("syscall: invalid return context could not terminate process");
+    panic("syscall: process termination returned for invalid context");
+}
 
 static bool syscall_finish_worker_return(u64 result)
 {
@@ -99,8 +141,11 @@ void syscall_init_cpu(void)
     /* STAR selects kernel CS=0x08 and SYSRET user CS=0x3B/data SS=0x33. */
     wrmsr(MSR_STAR, (0x2BULL << 48) | (0x08ULL << 32));
     wrmsr(MSR_LSTAR, (u64)(uintptr_t)&syscall_entry);
-    /* Mask IF, TF and DF while executing the entry path. */
-    wrmsr(MSR_FMASK, (1ULL << 9) | (1ULL << 8) | (1ULL << 10));
+    /* Do not let user RFLAGS control kernel interrupt, stepping, direction,
+     * alignment-check, task, or virtualization state during syscall dispatch. */
+    wrmsr(MSR_FMASK, (1ULL << 9) | (1ULL << 8) | (1ULL << 10) |
+                     (3ULL << 12) | (1ULL << 14) | (1ULL << 16) |
+                     (1ULL << 17) | (1ULL << 18) | (3ULL << 19));
     wrmsr(MSR_EFER, efer | EFER_SCE);
 }
 
@@ -4142,11 +4187,18 @@ void syscall_dispatch(void *raw_frame)
     void *previous_context;
     bool tracked;
 
-    if (!frame) return;
+    if (!frame) panic("syscall: missing kernel-owned register frame");
+    if (!syscall_frame_on_thread_stack(thread, frame))
+        panic("syscall: register frame outside current thread stack");
     if (!thread || !thread->process) {
         syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
         return;
     }
+    /* Validate the hardware-captured SYSRET state before any admission path
+     * can return early, and check it again after dispatch before assembly
+     * restores the frame. */
+    if (!syscall_return_context_valid(frame))
+        syscall_terminate_invalid_return_context();
     process = thread->process;
     tracked = frame->rax != SYSCALL_EXIT &&
               frame->rax != SYSCALL_THREAD_RETURN &&
@@ -4184,5 +4236,11 @@ void syscall_dispatch(void *raw_frame)
         process_thread_entry_completed(thread, -1);
         if (!scheduler_terminate())
             panic("syscall: failed to stop exiting process thread");
+    }
+    if (!syscall_return_context_valid(frame)) {
+        /* Never execute SYSRET with an invalid user return target or a
+         * supervisor/noncanonical user stack. Treat it as a user fault only
+         * after leases and syscall admission have been released. */
+        syscall_terminate_invalid_return_context();
     }
 }

@@ -170,8 +170,6 @@ kernel_thread_t *thread_current(void);
 /* Used by the fatal page-fault path to classify a faulting kernel stack
  * guard without taking the scheduler lock from exception context. */
 bool scheduler_current_stack_guard_fault(uintptr_t fault_address);
-/* Top of the current thread's kernel stack for syscall entry. */
-uintptr_t scheduler_kernel_stack_top(void);
 kernel_thread_t *scheduler_idle_thread(void);
 kernel_thread_t *thread_create(const char *name, thread_entry_t entry,
                                void *argument);
