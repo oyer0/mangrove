@@ -11,6 +11,7 @@ ELF_AS      := x86_64-elf-gcc
 ELF_LD      := x86_64-elf-ld
 ELF_AR      := x86_64-elf-ar
 ELF_OBJCOPY := x86_64-elf-objcopy
+ELF_NM      := x86_64-elf-nm
 
 # Homebrew keeps native GNU GCC versioned so it does not replace Apple's
 # compiler.  Host tools run on macOS and therefore use this native compiler;
@@ -24,6 +25,7 @@ ELF_AS      := gcc
 ELF_LD      := ld.bfd
 ELF_AR      := ar
 ELF_OBJCOPY := objcopy
+ELF_NM      := nm
 HOST_CC     := gcc
 HOST_REED_TEST_FLAGS := -Wl,--gc-sections -Wl,--wrap=malloc
 endif
@@ -1398,10 +1400,44 @@ test-fetch-transport:
 	ASAN_OPTIONS=detect_leaks=0 $(HOST_TEST_DIR)/mangrove-fetch-transport-test
 
 .PHONY: test-libc
-test-libc: test-unicode test-libc-link test-math test-user-tls
+test-libc: test-unicode test-libc-link test-math test-user-tls test-atomics
 	python3 tests/userspace/libc_string_test.py "$(HOST_CC)"
 	python3 tests/userspace/runtime_foundations_test.py "$(HOST_CC)"
 	python3 tests/userspace/runtime_stdio_test.py "$(HOST_CC)"
+
+.PHONY: test-atomics
+test-atomics: $(USER_CRT) $(USER_LIBC) $(USER_LIBGCC)
+	@mkdir -p "$(BUILD_DIR)/tests"
+	$(HOST_CC) -std=gnu17 -Wall -Wextra -Werror -O1 -g -fno-builtin \
+		-fsanitize=address,undefined -fno-sanitize-recover=all -pthread \
+		tests/userspace/stdatomic_test.c -o "$(BUILD_DIR)/tests/stdatomic-test"
+	ASAN_OPTIONS=detect_leaks=0 "$(BUILD_DIR)/tests/stdatomic-test"
+	$(CC) $(USER_CFLAGS) -c tests/userspace/stdatomic_native_probe.c \
+		-o "$(BUILD_DIR)/tests/stdatomic-native-probe.o"
+	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) \
+		-o "$(BUILD_DIR)/tests/stdatomic-native-probe.elf" $(USER_CRT) \
+		"$(BUILD_DIR)/tests/stdatomic-native-probe.o" $(USER_LIBC) $(USER_LIBGCC)
+	@if $(ELF_NM) -u "$(BUILD_DIR)/tests/stdatomic-native-probe.o" | \
+		grep -Eq '__atomic_|__sync_'; then \
+		echo "atomic probe unexpectedly requires an atomic runtime" >&2; exit 1; \
+	fi
+	@echo "C17 atomic host and native-link probes: PASS"
+
+.PHONY: test-user-sync
+test-user-sync:
+	@mkdir -p "$(BUILD_DIR)/tests/user-sync-host"
+	$(HOST_CC) -std=gnu17 -Wall -Wextra -Werror -O1 -g -fno-builtin \
+		-fsanitize=address,undefined -fno-sanitize-recover=all \
+		-Ilibc/include -Iinclude -c libc/src/sync.c -o \
+		"$(BUILD_DIR)/tests/user-sync-host/loam-sync.o"
+	$(HOST_CC) -std=gnu17 -Wall -Wextra -Werror -O1 -g -fno-builtin \
+		-fsanitize=address,undefined -fno-sanitize-recover=all -pthread \
+		-Itests/kernel/user_sync_stubs -Iinclude \
+		-idirafter libc/include tests/kernel/user_sync_test.c \
+		kernel/src/user_sync.c \
+		"$(BUILD_DIR)/tests/user-sync-host/loam-sync.o" -o \
+		"$(BUILD_DIR)/tests/user-sync-host/user-sync-test"
+	ASAN_OPTIONS=detect_leaks=0 "$(BUILD_DIR)/tests/user-sync-host/user-sync-test"
 
 RUNTIME_API_LINK_OBJ := $(BUILD_DIR)/tests/runtime-api-link-probe.o
 RUNTIME_API_LINK_ELF := $(BUILD_DIR)/tests/runtime-api-link-probe.elf
@@ -1798,7 +1834,7 @@ test-ipc-capacity:
 	ASAN_OPTIONS=detect_leaks=0 "$(BUILD_DIR)/tests/ipc_capacity_test"
 
 test-sync: test-spinlock-context test-ipc-capacity test-preemption-accounting \
-		test-irq-lifecycle
+		test-irq-lifecycle test-atomics test-user-sync
 	python3 tests/filesystems/mgfs/mgfs_handoff_test.py "$(HOST_CC)"
 	python3 tests/filesystems/fat32/fat_handoff_test.py "$(HOST_CC)"
 	python3 tests/filesystems/vfs/vfs_location_test.py "$(HOST_CC)"
@@ -2137,6 +2173,7 @@ USER_C_OBJS := $(SPROUT_DIR)/sprout.o \
                $(USER_CMD_DIR)/user.o \
                $(USER_LIBC_DIR)/syscall_c.o \
                $(USER_LIBC_DIR)/random.o \
+               $(USER_LIBC_DIR)/sync.o \
                $(USER_LIBC_DIR)/string.o \
                $(USER_LIBC_DIR)/allocator.o \
                $(USER_LIBC_DIR)/clipboard.o \
@@ -2918,6 +2955,11 @@ $(USER_LIBC_DIR)/random.o: libc/src/random.c libc/include/mg/random.h
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
+$(USER_LIBC_DIR)/sync.o: libc/src/sync.c libc/include/mg/sync.h \
+		libc/include/stdatomic.h libc/include/mg/process.h
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
 $(USER_LIBC_DIR)/string.o: libc/src/string.c libc/include/string.h libc/include/stdint.h libc/include/stddef.h
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
@@ -2936,7 +2978,7 @@ $(USER_LIBC_DIR)/wchar.o: libc/src/wchar.c libc/include/wchar.h libc/include/std
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
-$(USER_LIBC): $(USER_LIBC_DIR)/syscall.o $(USER_LIBC_DIR)/syscall_c.o $(USER_LIBC_DIR)/random.o $(USER_LIBC_DIR)/string.o $(USER_LIBC_DIR)/strtok.o $(USER_LIBC_DIR)/utf8.o $(USER_LIBC_DIR)/wchar.o $(USER_LIBC_DIR)/allocator.o $(USER_LIBC_DIR)/clipboard.o $(USER_LIBC_DIR)/stdio.o $(USER_LIBC_DIR)/stdio_stream.o $(USER_LIBC_DIR)/floatconv.o $(USER_LIBC_DIR)/scanf.o $(USER_LIBC_DIR)/native.o $(USER_LIBC_DIR)/line_editor.o $(USER_LIBC_DIR)/net.o $(USER_LIBC_DIR)/time.o $(USER_LIBC_DIR)/time_convert.o $(USER_LIBC_DIR)/time_standard.o $(USER_LIBC_DIR)/log.o $(USER_LIBC_DIR)/ctype.o $(USER_LIBC_DIR)/errno.o $(USER_LIBC_DIR)/error.o $(USER_LIBC_DIR)/exit.o $(USER_LIBC_DIR)/stdlib.o $(USER_LIBC_DIR)/assert.o
+$(USER_LIBC): $(USER_LIBC_DIR)/syscall.o $(USER_LIBC_DIR)/syscall_c.o $(USER_LIBC_DIR)/random.o $(USER_LIBC_DIR)/sync.o $(USER_LIBC_DIR)/string.o $(USER_LIBC_DIR)/strtok.o $(USER_LIBC_DIR)/utf8.o $(USER_LIBC_DIR)/wchar.o $(USER_LIBC_DIR)/allocator.o $(USER_LIBC_DIR)/clipboard.o $(USER_LIBC_DIR)/stdio.o $(USER_LIBC_DIR)/stdio_stream.o $(USER_LIBC_DIR)/floatconv.o $(USER_LIBC_DIR)/scanf.o $(USER_LIBC_DIR)/native.o $(USER_LIBC_DIR)/line_editor.o $(USER_LIBC_DIR)/net.o $(USER_LIBC_DIR)/time.o $(USER_LIBC_DIR)/time_convert.o $(USER_LIBC_DIR)/time_standard.o $(USER_LIBC_DIR)/log.o $(USER_LIBC_DIR)/ctype.o $(USER_LIBC_DIR)/errno.o $(USER_LIBC_DIR)/error.o $(USER_LIBC_DIR)/exit.o $(USER_LIBC_DIR)/stdlib.o $(USER_LIBC_DIR)/assert.o
 	@mkdir -p $(dir $@)
 	$(AR) rcs $@ $^
 

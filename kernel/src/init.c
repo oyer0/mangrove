@@ -30,6 +30,7 @@
 #include <platform_power.h>
 #include <process.h>
 #include <scheduler.h>
+#include <user_sync.h>
 #include <kernel_stack.h>
 #include <timer.h>
 #include <net/udp.h>
@@ -96,6 +97,7 @@ static void init_acpi_sci_handler(struct cpu_registers *regs)
 
 static init_result_t init_process(const char **reason)
 {
+    user_sync_init();
     if (!identity_init() || !process_init() || !session_init() ||
         !ipc_init()) {
         *reason = "process registry initialization failed";

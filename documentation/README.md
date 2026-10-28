@@ -60,6 +60,8 @@ procedures. Source code is authoritative for implementation details.
 - [DHCP lifecycle](network/dhcp-lease.md): lease ownership and timers.
 - [C runtime, time, and text](architecture/c-runtime.md): loam interfaces,
   ABI, supported behavior, and limitations.
+- [Userspace synchronization](architecture/userspace-synchronization.md): C17
+  atomics, process-local wait/wake, mutexes, condition variables, and limits.
 - [Kernel timekeeping](kernel/timekeeping.md): monotonic and realtime clocks.
 
 ## Design proposals
