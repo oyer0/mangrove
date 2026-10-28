@@ -77,7 +77,7 @@ static bool own_process_is_running_on_multiple_cpus(void)
     return false;
 }
 
-static bool own_process_memory_bytes(u64 *out_bytes)
+static bool own_process_memory_bytes(u64 *out_bytes, u32 *out_flags)
 {
     if (!out_bytes) return false;
     mg_process_info_t entries[MG_PROCESS_SNAPSHOT_PAGE_MAX];
@@ -92,9 +92,13 @@ static bool own_process_memory_bytes(u64 *out_bytes)
             .out_total = &total,
         };
         if (process_snapshot(&request) != MG_OK) return false;
-        for (u32 i = 0; i < count; i++)
-            if (entries[i].pid == pid)
-                {*out_bytes = entries[i].memory_bytes; return true;}
+        for (u32 i = 0; i < count; i++) {
+            if (entries[i].pid == pid) {
+                *out_bytes = entries[i].memory_bytes;
+                if (out_flags) *out_flags = entries[i].flags;
+                return true;
+            }
+        }
         offset += count;
     } while (count && offset < total);
     return false;
@@ -111,7 +115,7 @@ static bool own_process_memory_stable(u64 deadline, u64 *out_bytes)
     if (!out_bytes) return false;
     while (uptime_ms() < deadline) {
         u64 current = 0;
-        if (own_process_memory_bytes(&current)) {
+        if (own_process_memory_bytes(&current, NULL)) {
             if (consecutive && current == previous) {
                 if (++consecutive == 2U) {
                     *out_bytes = current;
@@ -133,18 +137,22 @@ static bool own_process_memory_stable(u64 deadline, u64 *out_bytes)
  * mapping baseline instead. Snapshot syscalls also provide opportunities for
  * the kernel's deferred reaper to run after releasing their own user leases. */
 static bool own_process_memory_wait_for(u64 expected, u64 deadline,
-                                        u64 *out_last, u32 *out_samples)
+                                        u64 *out_last, u32 *out_flags,
+                                        u32 *out_samples)
 {
     u64 current = 0;
     u32 samples = 0;
+    u32 flags = 0;
     bool sampled = false;
 
     while (uptime_ms() < deadline) {
-        if (own_process_memory_bytes(&current)) {
+        if (own_process_memory_bytes(&current, &flags)) {
             sampled = true;
             samples++;
-            if (current == expected) {
+            if (current == expected &&
+                !(flags & MG_PROCESS_FLAG_REAP_STATE_MASK)) {
                 if (out_last) *out_last = current;
+                if (out_flags) *out_flags = flags;
                 if (out_samples) *out_samples = samples;
                 return true;
             }
@@ -152,6 +160,7 @@ static bool own_process_memory_wait_for(u64 expected, u64 deadline,
         (void)process_yield();
     }
     if (out_last) *out_last = sampled ? current : 0;
+    if (out_flags) *out_flags = sampled ? flags : 0;
     if (out_samples) *out_samples = samples;
     return false;
 }
@@ -485,20 +494,30 @@ int main(int argc, char **argv)
             "simultaneous two-CPU execution");
     u64 settled_user_bytes = 0;
     u32 joined_reclaim_samples = 0;
+    u32 joined_reclaim_flags = 0;
     u64 joined_reclaim_start = uptime_ms();
     bool joined_memory_reclaimed = own_process_memory_wait_for(
         persistent_user_bytes, joined_reclaim_start + 5000U,
-        &settled_user_bytes, &joined_reclaim_samples);
+        &settled_user_bytes, &joined_reclaim_flags,
+        &joined_reclaim_samples);
     if (!joined_memory_reclaimed) {
         u64 excess = settled_user_bytes > persistent_user_bytes
             ? settled_user_bytes - persistent_user_bytes : 0;
         printf("THREADS1 FAIL joined reclaim expected=%llu current=%llu "
                "excess=%llu excess_pages=%llu workers=%u joined=%u "
-               "samples=%u wait_ms=%llu\n",
+               "reap_flags=0x%08x worker_reap=%u region_reap=%u "
+               "reaper_active=%u samples=%u wait_ms=%llu\n",
                (unsigned long long)persistent_user_bytes,
                (unsigned long long)settled_user_bytes,
                (unsigned long long)excess,
                (unsigned long long)(excess / 4096U), WORKERS, WORKERS,
+               joined_reclaim_flags,
+               (unsigned)!!(joined_reclaim_flags &
+                    MG_PROCESS_FLAG_WORKER_REAP_PENDING),
+               (unsigned)!!(joined_reclaim_flags &
+                    MG_PROCESS_FLAG_USER_REGION_REAP_PENDING),
+               (unsigned)!!(joined_reclaim_flags &
+                    MG_PROCESS_FLAG_WORKER_REAPER_ACTIVE),
                joined_reclaim_samples,
                (unsigned long long)(uptime_ms() - joined_reclaim_start));
         return 1;
@@ -566,20 +585,29 @@ int main(int argc, char **argv)
     u64 reap_start = uptime_ms();
     u64 current_user_bytes = 0;
     u32 detached_reclaim_samples = 0;
+    u32 detached_reclaim_flags = 0;
     bool detached_memory_reclaimed = own_process_memory_wait_for(
         baseline_user_bytes, reap_start + 5000U, &current_user_bytes,
-        &detached_reclaim_samples);
+        &detached_reclaim_flags, &detached_reclaim_samples);
     if (!detached_memory_reclaimed) {
         u64 excess = current_user_bytes > baseline_user_bytes
             ? current_user_bytes - baseline_user_bytes : 0;
         printf("THREADS1 FAIL detached reclaim expected=%llu current=%llu "
                "excess=%llu excess_pages=%llu workers=%u completed=%u "
-               "samples=%u wait_ms=%llu\n",
+               "reap_flags=0x%08x worker_reap=%u region_reap=%u "
+               "reaper_active=%u samples=%u wait_ms=%llu\n",
                (unsigned long long)baseline_user_bytes,
                (unsigned long long)current_user_bytes,
                (unsigned long long)excess,
                (unsigned long long)(excess / 4096U), REPEAT_WORKERS,
                atomic_load_explicit(&detached_count, memory_order_acquire),
+               detached_reclaim_flags,
+               (unsigned)!!(detached_reclaim_flags &
+                    MG_PROCESS_FLAG_WORKER_REAP_PENDING),
+               (unsigned)!!(detached_reclaim_flags &
+                    MG_PROCESS_FLAG_USER_REGION_REAP_PENDING),
+               (unsigned)!!(detached_reclaim_flags &
+                    MG_PROCESS_FLAG_WORKER_REAPER_ACTIVE),
                detached_reclaim_samples,
                (unsigned long long)(uptime_ms() - reap_start));
         return 1;

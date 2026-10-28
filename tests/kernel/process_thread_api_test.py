@@ -66,6 +66,10 @@ typedef enum { OBJECT_TYPE_INVALID, OBJECT_TYPE_PROCESS, OBJECT_TYPE_THREAD }
 enum { MG_OK=0, MG_ERR_INVALID_HANDLE=-3, MG_ERR_BAD_ARGUMENT=-4,
        MG_ERR_NO_MEMORY=-6, MG_ERR_BUSY=-14, MG_ERR_INVALID_EXEC=-15,
        MG_ERR_SHUTDOWN=-38, MG_ERR_INTERRUPTED=-39 };
+enum { MG_PROCESS_FLAG_WORKER_REAP_PENDING=1U<<2,
+       MG_PROCESS_FLAG_USER_REGION_REAP_PENDING=1U<<3,
+       MG_PROCESS_FLAG_WORKER_REAPER_ACTIVE=1U<<4,
+       MG_PROCESS_FLAG_REAP_STATE_MASK=(1U<<2)|(1U<<3)|(1U<<4) };
 enum { PROCESS_USER_REGION_INITIAL_STACK=1,
        PROCESS_USER_REGION_WORKER_STACK,
        PROCESS_USER_REGION_THREAD_TLS };
@@ -363,6 +367,7 @@ names = (
     ("kernel/src/process.c", "process_thread_register_locked"),
     ("kernel/src/process.c", "process_thread_list_complete_locked"),
     ("kernel/src/process.c", "process_thread_record_destroy"),
+    ("kernel/src/process.c", "process_snapshot_reap_flags_locked"),
     ("kernel/src/process.c", "process_user_region_release"),
     ("kernel/src/process.c", "process_user_regions_reap_pending"),
     ("kernel/src/process.c", "process_user_region_set_worker_owned"),
@@ -457,6 +462,12 @@ int main(void)
 {
  process_t p;kernel_thread_t main_thread;mg_thread_created_t made;
  u64 result=0;init(&p,&main_thread);
+ assert(process_snapshot_reap_flags_locked(&p)==0);
+ p.worker_reap_pending=true;p.user_region_reap_pending=true;
+ p.worker_reapers=1;
+ assert(process_snapshot_reap_flags_locked(&p)==MG_PROCESS_FLAG_REAP_STATE_MASK);
+ p.worker_reap_pending=false;p.user_region_reap_pending=false;
+ p.worker_reapers=0;
  fixture_eflags=0;
  assert(!process_worker_reclaim_context_valid()&&fixture_eflags==0);
  fixture_eflags=1ULL<<9;

@@ -29,6 +29,15 @@ typedef enum {
 
 #define MG_PROCESS_FLAG_SYSTEM_SERVICE ((u32)1U << 0)
 #define MG_PROCESS_FLAG_SESSION_SHELL  ((u32)1U << 1)
+/* Transient cleanup state in a copied process snapshot. Region-reap pending
+ * means revoked mappings remain reserved until existing syscall leases drain. */
+#define MG_PROCESS_FLAG_WORKER_REAP_PENDING       ((u32)1U << 2)
+#define MG_PROCESS_FLAG_USER_REGION_REAP_PENDING  ((u32)1U << 3)
+#define MG_PROCESS_FLAG_WORKER_REAPER_ACTIVE      ((u32)1U << 4)
+#define MG_PROCESS_FLAG_REAP_STATE_MASK \
+    (MG_PROCESS_FLAG_WORKER_REAP_PENDING | \
+     MG_PROCESS_FLAG_USER_REGION_REAP_PENDING | \
+     MG_PROCESS_FLAG_WORKER_REAPER_ACTIVE)
 
 /* The SYSTEM role is intentionally separate from human regular/admin roles. */
 #define MG_INSPECTION_ROLE_SYSTEM ((u32)2U)
