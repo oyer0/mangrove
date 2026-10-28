@@ -127,6 +127,35 @@ static bool own_process_memory_stable(u64 deadline, u64 *out_bytes)
     return false;
 }
 
+/* Reaping is asynchronous with respect to the worker's user-level return and
+ * join completion. A pair of identical non-baseline snapshots is not proof
+ * that stack/TLS mappings were reclaimed; wait for the exact pre-worker
+ * mapping baseline instead. Snapshot syscalls also provide opportunities for
+ * the kernel's deferred reaper to run after releasing their own user leases. */
+static bool own_process_memory_wait_for(u64 expected, u64 deadline,
+                                        u64 *out_last, u32 *out_samples)
+{
+    u64 current = 0;
+    u32 samples = 0;
+    bool sampled = false;
+
+    while (uptime_ms() < deadline) {
+        if (own_process_memory_bytes(&current)) {
+            sampled = true;
+            samples++;
+            if (current == expected) {
+                if (out_last) *out_last = current;
+                if (out_samples) *out_samples = samples;
+                return true;
+            }
+        }
+        (void)process_yield();
+    }
+    if (out_last) *out_last = sampled ? current : 0;
+    if (out_samples) *out_samples = samples;
+    return false;
+}
+
 static mg_thread_result_t worker(void *raw)
 {
     worker_arg_t *argument = raw;
@@ -455,13 +484,23 @@ int main(int argc, char **argv)
     REQUIRE(atomic_load_explicit(&cpu_overlap_seen, memory_order_acquire),
             "simultaneous two-CPU execution");
     u64 settled_user_bytes = 0;
-    bool joined_memory_stable = own_process_memory_stable(
-        uptime_ms() + 5000U, &settled_user_bytes);
-    if (!joined_memory_stable || settled_user_bytes != persistent_user_bytes) {
-        printf("THREADS1 FAIL joined reclaim baseline=%llu current=%llu "
-               "stable=%u\n", (unsigned long long)persistent_user_bytes,
+    u32 joined_reclaim_samples = 0;
+    u64 joined_reclaim_start = uptime_ms();
+    bool joined_memory_reclaimed = own_process_memory_wait_for(
+        persistent_user_bytes, joined_reclaim_start + 5000U,
+        &settled_user_bytes, &joined_reclaim_samples);
+    if (!joined_memory_reclaimed) {
+        u64 excess = settled_user_bytes > persistent_user_bytes
+            ? settled_user_bytes - persistent_user_bytes : 0;
+        printf("THREADS1 FAIL joined reclaim expected=%llu current=%llu "
+               "excess=%llu excess_pages=%llu workers=%u joined=%u "
+               "samples=%u wait_ms=%llu\n",
+               (unsigned long long)persistent_user_bytes,
                (unsigned long long)settled_user_bytes,
-               joined_memory_stable ? 1U : 0U);
+               (unsigned long long)excess,
+               (unsigned long long)(excess / 4096U), WORKERS, WORKERS,
+               joined_reclaim_samples,
+               (unsigned long long)(uptime_ms() - joined_reclaim_start));
         return 1;
     }
     REQUIRE(mg_condition_destroy(&gate_condition) == MG_OK,
@@ -524,17 +563,25 @@ int main(int argc, char **argv)
     /* Completion in user code precedes scheduler handoff and reclamation.
      * Wait for process-owned memory to return to baseline, proving detached
      * worker stacks and TLS mappings were released. */
-    u64 reap_deadline = uptime_ms() + 5000U;
+    u64 reap_start = uptime_ms();
     u64 current_user_bytes = 0;
-    while (uptime_ms() < reap_deadline &&
-           (!own_process_memory_bytes(&current_user_bytes) ||
-            current_user_bytes != baseline_user_bytes))
-        (void)process_yield();
-    if (!own_process_memory_bytes(&current_user_bytes) ||
-        current_user_bytes != baseline_user_bytes) {
-        printf("THREADS1 FAIL detached reclaim baseline=%llu current=%llu "
-               "workers=%u\n", (unsigned long long)baseline_user_bytes,
-               (unsigned long long)current_user_bytes, REPEAT_WORKERS);
+    u32 detached_reclaim_samples = 0;
+    bool detached_memory_reclaimed = own_process_memory_wait_for(
+        baseline_user_bytes, reap_start + 5000U, &current_user_bytes,
+        &detached_reclaim_samples);
+    if (!detached_memory_reclaimed) {
+        u64 excess = current_user_bytes > baseline_user_bytes
+            ? current_user_bytes - baseline_user_bytes : 0;
+        printf("THREADS1 FAIL detached reclaim expected=%llu current=%llu "
+               "excess=%llu excess_pages=%llu workers=%u completed=%u "
+               "samples=%u wait_ms=%llu\n",
+               (unsigned long long)baseline_user_bytes,
+               (unsigned long long)current_user_bytes,
+               (unsigned long long)excess,
+               (unsigned long long)(excess / 4096U), REPEAT_WORKERS,
+               atomic_load_explicit(&detached_count, memory_order_acquire),
+               detached_reclaim_samples,
+               (unsigned long long)(uptime_ms() - reap_start));
         return 1;
     }
 
