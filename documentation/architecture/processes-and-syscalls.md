@@ -3,8 +3,8 @@
 Mangrove separates execution scheduling from process ownership. A kernel
 thread is the scheduler object; a process owns a userspace address space,
 credentials, current directory, handles, executable state, and its attached
-threads. A newly spawned program still begins with one initial thread; public
-userspace thread creation is not available.
+threads. A newly spawned program begins with one initial thread and may create
+native Ring 3 workers through `<mg/thread.h>`.
 
 ## Process lifetime and inheritance
 
@@ -47,16 +47,28 @@ have not completed their scheduler handoff. `main_thread` is only an alias for
 the initial thread, used for initial launch and rollback; it is not the
 process's thread collection.
 
-Thread completion is separate from process completion. Returning from the
-initial entry requests process-wide exit. A later worker entry return records
-that worker's status (zero for a normal return from today's `void` kernel
-entry contract) and retires only that thread. An unhandled user exception
-from any attached thread requests process-wide termination. While a process is
-exiting, new syscalls are refused and its exit request is visible to each
-attached thread. Returning syscalls release their user-memory leases and
-process admission before the syscall boundary terminates the calling thread.
-Sibling threads are woken and must reach a safe exit boundary; resources are
-not partially torn down while any sibling remains live.
+Thread completion is separate from process completion. The initial thread's
+normal CRT return requests process-wide exit. A worker entry returns a 64-bit
+completion result and retires only that worker; `mg_thread_exit()` does the
+same explicitly. An unhandled user exception in any thread requests
+process-wide termination. Exit closes creation and syscall admission, wakes
+blocked siblings, and marks CPU-bound Ring 3 siblings for retirement at the
+next user-origin timer preemption. Returning syscalls release their user-memory
+leases and process admission before the syscall boundary retires the calling
+thread. Shared process state is not torn down while any owned thread remains
+live.
+
+`mg_thread_create()` returns a generation-tagged typed handle for join/detach
+authority and a separate boot-local thread ID for identity. Workers are
+joinable by default. Exactly one successful `mg_thread_join()` consumes the
+join right and handle; self-join is invalid, and a concurrent second join or
+join/detach race returns busy. `mg_thread_detach()` releases join entitlement
+and arranges automatic reaping. Closing a still-joinable thread handle is
+rejected. IDs are not handles and convey no authority. Workers use the native
+32 KiB stack default with one unmapped guard page; callers cannot select a
+custom size in this API. Creation passes its argument pointer unchanged; the
+caller must keep the referenced object valid until the worker has finished
+using it. Thread return values are 64-bit process-local completion results.
 
 Process-owned handles, mappings, IPC state, CWD, and terminal/session state
 are released only after admitted syscalls have unwound and every owned thread,
@@ -71,30 +83,30 @@ linker-backed stack are not freed. Interrupt and shutdown wake walks, and
 external termination's scheduler-group walk, pin the thread-list reader count
 before dropping the registry lock. Final publication and reaping wait for
 those walks; reaping also closes reader admission before detaching records.
-Process inspection aggregates attached thread states. Its CPU field
-uses `MG_PROCESS_CPU_MULTIPLE` if sequential per-thread reads observe distinct
-CPUs; that value is diagnostic and does not promise a simultaneous sample.
+Process inspection aggregates attached thread states. Its CPU field uses
+`MG_PROCESS_CPU_MULTIPLE` only when a scheduler-locked point-in-time sample sees
+the process executing on distinct CPUs; this is an observation, not a CPU
+reservation.
 
-Per-thread Ring 3 entry records now hold the initial registers, instruction
-pointer, stack pointer, FS base, and process-owned stack/TLS reservation
-references. The initial program entry still receives argc/argv in RDI/RSI.
-An internal worker-context preparer allocates an independent stack and TLS
-instance, places a private CRT worker-return target at the initial stack top,
-and publishes its valid bit only after every resource is ready. It does not
-attach or enqueue the context and is not a userspace API. Returning from that
-worker target retires only the worker; the initial CRT `exit` path remains
-process-wide.
+Per-thread Ring 3 entry records hold independent registers, instruction and
+stack pointers, FS base, FPU state, guarded user-stack mapping, and TLS
+instance. The initial program entry still receives argc/argv in RDI/RSI.
+Worker creation prepares all of these resources and a private CRT return target
+before process ownership, the handle, and scheduler publication become
+visible. If setup fails, the private context is fully rolled back.
 
-Each user stack has the existing 32 KiB usable size and one unmapped low guard
-page. The initial stack reservation is recorded alongside worker reservations.
-Reservations share the process address-space lock and first-fit anonymous
-range search, which also checks existing VMM leaves so ELF mappings cannot be
-overlapped. Stack and TLS pages are not ordinary anonymous-mapping records and
-cannot be removed through the process unmap syscall. The process retains these
-reservations until final address-space destruction; worker return does not
-reuse them because a per-thread reap/join lifetime contract is not available.
-This is safe but means a future API must add bounded thread retirement before
-supporting repeated worker creation in long-lived processes.
+Each user stack has 32 KiB usable space and one unmapped low guard page. Stack
+and TLS reservations share the process address-space lock and first-fit range
+search, which checks existing VMM leaves. Stack/TLS pages cannot be removed by
+ordinary anonymous unmap. After worker exit, the scheduler's incoming-stack
+handoff pins the execution record until the outgoing CPU no longer uses its
+kernel stack or register frame. A reaper then releases that kernel stack and
+unmaps the worker's TLS and user stack; VMM leases may defer an unmap until the
+last kernel operation releases its pin. Joinable workers retain only a small
+completion record until join or process exit. Detached records are removed
+automatically after safe handoff and resource release. Process exit can reclaim
+the remaining mappings together with the address space after every thread and
+syscall has stopped.
 
 The ELF loader accepts at most one validated nonempty `PT_TLS` segment; an
 all-zero `PT_TLS` emitted by the linker for an image without TLS sections means
@@ -106,16 +118,13 @@ not supported. FS base is saved per scheduler thread and restored on the
 incoming stack after context switches, including migration, while kernel GS
 and syscall-entry stack state retain their existing ownership.
 
-This remains an internal execution foundation, not a complete multithreading
-API. C17 atomics and native process-local wait/wake, mutex, and condition
-primitives are available through `<stdatomic.h>` and `<mg/sync.h>`; see the
-[userspace synchronization contract](userspace-synchronization.md). Public
-thread creation, IDs/handles, join/detach semantics, and thread reaping remain
-outstanding. The parent wait slot and IPC outstanding-request slot are
-process-wide, so concurrent waits and independent blocking IPC calls also
-need per-thread ownership or explicit serialization. loam's `errno` is TLS,
-but its allocator, stdio, streams, and other mutable state do not yet have a
-concurrent-use contract.
+The native synchronization primitives in `<stdatomic.h>` and `<mg/sync.h>`
+work with these threads; see the
+[userspace synchronization contract](userspace-synchronization.md). loam's
+`errno` and compiler-supported static TLS are per-thread. The allocator,
+stdio, streams, and other mutable loam state do not yet have a concurrent-use
+contract. The parent wait slot and IPC outstanding-request slot also remain
+process-wide, so concurrent use of those process operations must be serialized.
 
 Process credentials and launch/session metadata are published under the
 process registry lock. Lifecycle state is atomically readable outside that
@@ -448,10 +457,10 @@ it copies all input into 4 KiB chunks. A confirmed result activates a new
 read/write handle for the created inode. Existing names fail without being
 overwritten. Uncertain publication or cleanup returns `MG_ERR_UNCERTAIN`
 without a usable handle; callers must not retry automatically. The output
-handle address must be writable when the syscall begins. Mangrove currently
-supports one userspace thread per process, and external termination cannot
-discard an active syscall frame, so that validated mapping remains stable
-through the operation. These are runtime guarantees, not crash durability.
+handle address must be writable when the syscall begins. Admitted syscalls and
+scoped user-memory leases keep that mapping valid through the operation,
+including when another worker is running. These are runtime guarantees, not
+crash durability.
 Safe-file contents have no fixed 2 MiB admission ceiling. Lengths and snapshot
 capacities must fit `MG_FILE_CONTENT_ADDRESS_MAX`, the signed address-arithmetic
 range. The old `MG_FILE_CONTENT_MAX_BYTES` and `MG_FILE_REPLACE_MAX_BYTES` names

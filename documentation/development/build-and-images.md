@@ -44,6 +44,7 @@ Run these from the repository root:
 | `make test-terminal` | Run the current host-side terminal UTF-8 tests. |
 | `make test-random` | Run sanitizer-backed host tests for the kernel CSPRNG, syscall validation, and loam wrapper. |
 | `make test-guest-random` | Run the bounded isolated native CSPRNG smoke test with two QEMU vCPUs. |
+| `make test-guest-threads` | Run three isolated two-vCPU KVM worker-lifecycle tests, including SMP execution, synchronization, worker exit, and resource reclamation. |
 | `make test-guest-mgfs` | Run isolated [native MGFS guest persistence qualification](guest-filesystem.md). |
 | `make -B nettest` | Build the guest network test program. |
 | `make mkmgfs` | Build the MGFS image-creation tool. |

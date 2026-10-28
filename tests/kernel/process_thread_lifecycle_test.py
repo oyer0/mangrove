@@ -60,6 +60,7 @@ prefix = r'''
 #include <stdlib.h>
 #include <string.h>
 typedef uint64_t u64;
+typedef int64_t i64;
 typedef uint32_t u32;
 typedef int32_t i32;
 typedef size_t usize;
@@ -73,6 +74,8 @@ typedef struct process process_t;
 typedef struct kernel_thread kernel_thread_t;
 typedef struct {u32 ref_count;} kernel_object_t;
 typedef struct {u32 unused;} terminal_output_state_t;
+typedef struct process_user_region process_user_region_t;
+typedef struct process_thread_record process_thread_record_t;
 struct kernel_thread {
     u32 state, running_cpu;
     bool context_switch_pending, syscall_active, sleeping, stack_external;
@@ -84,6 +87,17 @@ struct kernel_thread {
     volatile bool process_exit_requested;
     i32 process_exit_status;
     bool process_exit_status_valid;
+    process_thread_record_t *worker_record;
+};
+struct process_thread_record {
+    kernel_object_t object;
+    process_t *process;
+    kernel_thread_t *execution, *join_waiter;
+    process_user_region_t *stack_region, *tls_region;
+    process_thread_record_t *next;
+    u64 id, result;
+    bool completed, kernel_stack_released, join_claimed, joined, detached,
+         listed, reclaiming;
 };
 struct process {
     u64 pid;
@@ -93,6 +107,9 @@ struct process {
     bool launch_ready;
     kernel_thread_t *main_thread, *threads;
     u32 thread_count, live_thread_count;
+    u32 worker_reapers;
+    bool worker_reap_pending;
+    process_thread_record_t *thread_records;
     u32 thread_list_readers;
     bool exit_requested, exit_cleanup_in_progress, exit_cleanup_complete;
     bool thread_reap_in_progress, exit_notification_sent, wait_claimed;
@@ -113,7 +130,13 @@ static unsigned wake_calls, console_cancels, cleanup_calls, freed_threads;
 static unsigned terminal_finishes, alternate_leaves, handle_closes, cwd_clears;
 static unsigned exit_notifications, unblocks;
 static bool process_finish_termination(process_t *process);
+static void process_worker_reclaim_pending(process_t *process);
 static bool scheduler_terminate_thread(kernel_thread_t *thread);
+void process_worker_exit(struct kernel_thread *thread, u64 result);
+static void process_worker_reclaim_pending(process_t *process)
+{assert(process);}
+static void process_worker_records_release_all(process_t *process)
+{assert(process && !process->thread_records && !process->worker_reapers);}
 static void process_unlink_locked(process_t *process);
 static void process_unlink_all_locked(process_t *process);
 static u64 spin_lock_irqsave(spinlock_t *lock)
@@ -192,8 +215,8 @@ names = (
     "process_syscall_enter",
     "process_syscall_leave",
     "process_thread_exit_requested",
-    "process_thread_prepare_exit",
     "process_thread_entry_completed",
+    "process_worker_exit",
     "process_scheduler_handoff_complete",
     "process_abort",
     "process_finalize_exit",

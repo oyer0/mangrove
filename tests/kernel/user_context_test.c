@@ -32,6 +32,7 @@ typedef struct user_execution_context {
     bool valid;
 } user_execution_context_t;
 typedef struct process process_t;
+typedef struct { unsigned references; } kernel_object_t;
 typedef struct process_user_region {
     uintptr_t reservation_base;
     usize reservation_pages;
@@ -50,12 +51,14 @@ typedef struct kernel_thread {
     process_t *process;
     thread_process_state_t process_state;
     bool process_initial;
+    void *worker_record;
     uintptr_t user_fs_base;
     user_execution_context_t user_context;
     thread_entry_t entry;
     void *entry_argument;
 } kernel_thread_t;
 struct process {
+    kernel_object_t object;
     process_state_t state;
     bool exit_requested;
     bool image_loaded;
@@ -67,6 +70,7 @@ struct process {
 };
 typedef struct cpu_local {
     kernel_thread_t *scheduler_idle_thread;
+    process_t *scheduler_post_handoff_process;
 } cpu_local_t;
 
 static kernel_thread_t *current_thread;
@@ -76,6 +80,7 @@ static bool scheduler_context_switch_in_progress;
 static u64 scheduler_lock;
 static uintptr_t fake_fs_base;
 static unsigned completed_workers, terminated_workers, process_exits;
+static u64 process_exit_result;
 static uintptr_t fake_next_region=0x400000000000ULL;
 static uintptr_t fake_tls_base=0x600000000000ULL;
 static bool fail_fake_tls, fake_stack_released;
@@ -95,9 +100,12 @@ static bool scheduler_enqueue_locked(kernel_thread_t *thread)
 { thread->queued = true; return true; }
 static void process_scheduler_handoff_complete(kernel_thread_t *thread)
 { (void)thread; }
+static bool object_reference(kernel_object_t *object)
+{ return object != NULL; }
 static kernel_thread_t *thread_current(void) { return current_thread; }
-static void process_thread_entry_completed(kernel_thread_t *thread, int status)
-{ assert(thread && !thread->process_initial && status == 0); completed_workers++; }
+static void process_worker_exit(kernel_thread_t *thread, u64 result)
+{ assert(thread && !thread->process_initial); completed_workers++;
+  process_exit_result = result; }
 static bool scheduler_terminate(void)
 { terminated_workers++; return true; }
 static void panic(const char *message) { (void)message; assert(false); }
@@ -152,8 +160,8 @@ static process_user_region_t *process_user_tls_create(process_t *process,
     assert(process);
     return result;
 }
-static bool process_user_region_release_unpublished(process_t *process,
-                                                     process_user_region_t *r)
+static bool process_user_region_release(process_t *process,
+                                        process_user_region_t *r)
 { assert(process&&r);fake_regions_released++;
   if(r->kind==PROCESS_USER_REGION_WORKER_STACK)fake_stack_released=true;
   return true; }
@@ -272,14 +280,17 @@ static void test_fs_base_follows_migrating_context(void)
 
 static void test_return_retires_worker_only(void)
 {
-    kernel_thread_t worker={.process=(process_t *)1,.process_initial=false};
+    kernel_thread_t worker={.process=(process_t *)1,.process_initial=false,
+                            .worker_record=(void *)1};
     kernel_thread_t initial={.process=(process_t *)1,.process_initial=true};
     current_thread=&worker;
     completed_workers=terminated_workers=process_exits=0;
-    assert(syscall_finish_worker_return());
-    assert(completed_workers==1 && terminated_workers==1 && !process_exits);
+    process_exit_result = 0;
+    assert(syscall_finish_worker_return(0x1234U));
+    assert(completed_workers==1 && terminated_workers==1 && !process_exits &&
+           process_exit_result==0x1234U);
     current_thread=&initial;
-    assert(!syscall_finish_worker_return());
+    assert(!syscall_finish_worker_return(0x5678U));
     assert(completed_workers==1 && terminated_workers==1 && !process_exits);
 }
 

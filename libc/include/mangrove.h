@@ -22,6 +22,7 @@
 #include <mg/random.h>
 #include <mg/tls.h>
 #include <mg/terminal.h>
+#include <mg/thread.h>
 
 u64 uptime_ms(void);
 mg_result_t system_poweroff(void);

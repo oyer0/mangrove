@@ -2,6 +2,7 @@
 #include <mangrove.h>
 #include <mg/volume_service.h>
 #include <mg/storage.h>
+#include <mg/thread.h>
 
 #ifndef NULL
 #define NULL ((void *)0)
@@ -446,6 +447,39 @@ mg_result_t process_yield(void)
 mg_result_t process_sleep_ms(u64 milliseconds)
 {
     return (mg_result_t)mg_syscall(86, (unsigned long)milliseconds, 0, 0);
+}
+
+mg_result_t mg_thread_create(mg_thread_created_t *out_thread,
+                             mg_thread_entry_t entry, void *argument)
+{
+    if (!out_thread || !entry) return MG_ERR_BAD_ARGUMENT;
+    return (mg_result_t)mg_syscall(108, (unsigned long)entry,
+                                   (unsigned long)argument,
+                                   (unsigned long)out_thread);
+}
+
+mg_result_t mg_thread_join(mg_thread_t thread,
+                           mg_thread_result_t *out_result)
+{
+    if (!out_result) return MG_ERR_BAD_ARGUMENT;
+    return (mg_result_t)mg_syscall(109, thread,
+                                   (unsigned long)out_result, 0);
+}
+
+mg_result_t mg_thread_detach(mg_thread_t thread)
+{
+    return (mg_result_t)mg_syscall(110, thread, 0, 0);
+}
+
+mg_result_t mg_thread_exit(mg_thread_result_t result)
+{
+    return (mg_result_t)mg_syscall(111, (unsigned long)result, 0, 0);
+}
+
+mg_result_t mg_thread_self(mg_thread_id_t *out_id)
+{
+    if (!out_id) return MG_ERR_BAD_ARGUMENT;
+    return (mg_result_t)mg_syscall(112, (unsigned long)out_id, 0, 0);
 }
 
 mg_result_t process_snapshot(mg_process_snapshot_request_t *request)

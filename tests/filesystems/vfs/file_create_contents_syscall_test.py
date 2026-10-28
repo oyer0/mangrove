@@ -52,7 +52,8 @@ typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32;
 typedef uint64_t u64; typedef size_t usize; typedef int64_t i64;
 typedef u32 process_handle_t; typedef u32 mg_handle_t;
 typedef enum {PROCESS_STATE_ACTIVE, PROCESS_STATE_TERMINATED} process_state_t;
-typedef enum {OBJECT_TYPE_INVALID, OBJECT_TYPE_FILE} kernel_object_type_t;
+typedef enum {OBJECT_TYPE_INVALID=0, OBJECT_TYPE_PROCESS=1,
+              OBJECT_TYPE_THREAD=2, OBJECT_TYPE_FILE=3} kernel_object_type_t;
 typedef struct kernel_object kernel_object_t;
 typedef struct process process_t;
 typedef struct {pthread_mutex_t native;} spinlock_t;
@@ -65,6 +66,8 @@ struct kernel_object {
     kernel_object_type_t type; u32 ref_count;
     void (*destroy)(kernel_object_t *); void *read, *write;
 };
+static bool process_thread_handle_close_allowed(kernel_object_t *object)
+{ (void)object; return false; }
 typedef struct {kernel_object_t base; vfs_file_handle_t *handle;} file_object_t;
 struct process {
     process_state_t state; void *handle_table; usize handle_capacity;

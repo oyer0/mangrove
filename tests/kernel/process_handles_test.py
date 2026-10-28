@@ -49,8 +49,8 @@ typedef uint32_t process_handle_t;
 #define PROCESS_HANDLE_SLOTS_INITIAL 16U
 #define PROCESS_HANDLE_SLOTS_MAX 65535U
 #define HANDLE_INDEX_MASK 0xffffU
-typedef enum { OBJECT_TYPE_INVALID, OBJECT_TYPE_TEST,
-               OBJECT_TYPE_PROCESS } kernel_object_type_t;
+typedef enum { OBJECT_TYPE_INVALID, OBJECT_TYPE_TEST, OBJECT_TYPE_PROCESS,
+               OBJECT_TYPE_THREAD } kernel_object_type_t;
 enum { PROCESS_STATE_ACTIVE = 1, PROCESS_STATE_TERMINATED = 2,
        OBJECT_RIGHT_READ = 1, OBJECT_RIGHT_WRITE = 2 };
 #define MG_ERR_BAD_ARGUMENT -1
@@ -127,6 +127,8 @@ static bool object_reference(kernel_object_t *object)
 { if (!object) return false; u32 count=__atomic_load_n(&object->ref_count,__ATOMIC_ACQUIRE); while(count&&count!=UINT32_MAX){if(__atomic_compare_exchange_n(&object->ref_count,&count,count+1U,false,__ATOMIC_ACQUIRE,__ATOMIC_RELAXED))return true;}return false; }
 static void object_release(kernel_object_t *object)
 { assert(object);u32 count=__atomic_fetch_sub(&object->ref_count,1U,__ATOMIC_ACQ_REL);assert(count); }
+static bool process_thread_handle_close_allowed(kernel_object_t *object)
+{ (void)object; return false; }
 '''
 
 NAMES = (

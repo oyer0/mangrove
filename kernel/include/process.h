@@ -59,6 +59,28 @@ typedef struct process_user_region {
     struct process_user_region *next;
 } process_user_region_t;
 
+/* Lightweight worker completion state. The process list owns one object
+ * reference; the typed thread handle owns another. Scheduler and user
+ * execution resources are reclaimed independently after final handoff. */
+typedef struct process_thread_record {
+    kernel_object_t object;
+    process_t *process;
+    struct kernel_thread *execution;
+    struct kernel_thread *join_waiter;
+    process_user_region_t *stack_region;
+    process_user_region_t *tls_region;
+    struct process_thread_record *next;
+    u64 id;
+    u64 result;
+    bool completed;
+    bool kernel_stack_released;
+    bool join_claimed;
+    bool joined;
+    bool detached;
+    bool listed;
+    bool reclaiming;
+} process_thread_record_t;
+
 /* A process owns userspace execution; scheduling remains thread-based. */
 struct process {
     u64 pid;
@@ -82,6 +104,12 @@ struct process {
     struct kernel_thread *threads;
     u32 thread_count;
     u32 live_thread_count;
+    process_thread_record_t *thread_records;
+    u32 worker_reapers;
+    /* Atomic fast-path hint. The intrusive list remains registry-locked;
+     * syscall epilogues only enter the potentially linear reaper while some
+     * completed worker still owns execution resources or a consumed record. */
+    bool worker_reap_pending;
     /* Pins unlocked walks that wake thread records. Final reap closes reader
      * admission and waits for these short walks before detaching records. */
     u32 thread_list_readers;
@@ -180,6 +208,18 @@ void process_scheduler_handoff_complete(struct kernel_thread *thread);
 /* Called when a process-owned kernel entry returns, before scheduler exit. */
 void process_thread_entry_completed(struct kernel_thread *thread,
                                     i32 status);
+void process_worker_exit(struct kernel_thread *thread, u64 result);
+int process_thread_create(process_t *process, uintptr_t entry,
+                          uintptr_t argument,
+                          process_handle_t *out_handle,
+                          u64 *out_thread_id);
+int process_thread_join(process_t *process,
+                        process_handle_t handle, u64 *out_result);
+int process_thread_detach(process_t *process,
+                          process_handle_t handle);
+bool process_thread_handle_close_allowed(kernel_object_t *object);
+u64 process_current_thread_id(void);
+void process_worker_reclaim_pending(process_t *process);
 /* Internal Ring 3 entry preparation used by the initial loader path and the
  * future kernel-only worker constructor. This is not a userspace syscall. */
 bool process_user_context_prepare_initial(process_t *process);

@@ -373,8 +373,41 @@ void scheduler_context_switch_complete(uintptr_t *outgoing_rsp_slot)
      * here, before the saved syscall/interrupt frame can return to Ring 3. */
     if (current_thread)
         wrmsr(MSR_IA32_FS_BASE, current_thread->user_fs_base);
-    if (terminated && outgoing->process)
+    if (terminated && outgoing->process) {
+        if (outgoing->worker_record) {
+            cpu_local_t *cpu = scheduler_cpu_local();
+            process_t *process = outgoing->process;
+            if (!cpu || cpu->scheduler_post_handoff_process ||
+                !object_reference(&process->object))
+                panic("scheduler: failed to retain worker handoff owner");
+            cpu->scheduler_post_handoff_process = process;
+        }
         process_scheduler_handoff_complete(outgoing);
+    }
+}
+
+void scheduler_context_switch_post_complete(void)
+{
+    cpu_local_t *cpu = scheduler_cpu_local();
+    process_t *process;
+    u64 saved_flags;
+
+    if (!cpu) return;
+    process = __atomic_exchange_n(&cpu->scheduler_post_handoff_process, NULL,
+                                  __ATOMIC_ACQ_REL);
+    if (!process) return;
+    /* A restored syscall or IRQ continuation can have IF clear. Worker
+     * reclamation may require cross-CPU TLB acknowledgements, so briefly
+     * enable interrupts only after the incoming register/stack context is
+     * complete. The process reference on this stack protects the deferred
+     * work if a nested interrupt schedules this thread again. */
+    __asm__ volatile("pushfq; popq %0" : "=r"(saved_flags) :: "memory");
+    if (!(saved_flags & (1ULL << 9)))
+        __asm__ volatile("sti" ::: "memory");
+    process_worker_reclaim_pending(process);
+    object_release(&process->object);
+    if (!(saved_flags & (1ULL << 9)))
+        __asm__ volatile("cli" ::: "memory");
 }
 
 static void scheduler_validate_saved_context(const kernel_thread_t *thread)
@@ -1217,7 +1250,7 @@ bool thread_destroy(kernel_thread_t *thread)
 
     /* Do not unlink a thread if the VMM's synchronous SMP teardown cannot
      * safely run in the caller's context. */
-    if (!thread->stack_external &&
+    if (!thread->stack_external && thread->kernel_stack.active &&
         !kernel_stack_release_context_valid())
         return false;
 
@@ -1244,10 +1277,43 @@ bool thread_destroy(kernel_thread_t *thread)
     scheduler_remove_queued_locked(thread);
     spin_unlock_irqrestore(&scheduler_lock, flags);
     mutex_cancel_waiter(thread);
-    if (!thread->stack_external &&
-        !kernel_stack_release(&thread->kernel_stack))
-        panic("scheduler: thread stack could not be safely reclaimed");
+    if (!thread->stack_external) {
+        if (thread->kernel_stack.active) {
+            if (!kernel_stack_release(&thread->kernel_stack))
+                panic("scheduler: thread stack could not be safely reclaimed");
+        } else if (thread->kernel_stack_base || thread->kernel_stack_size) {
+            return false;
+        }
+    }
     kfree(thread);
+    return true;
+}
+
+bool thread_release_terminated_stack(kernel_thread_t *thread)
+{
+    u64 flags;
+
+    if (!thread || thread->stack_external ||
+        !kernel_stack_release_context_valid() ||
+        !scheduler_thread_exit_complete(thread))
+        return false;
+    if (!thread->kernel_stack.active)
+        return thread->kernel_stack_base == 0U &&
+               thread->kernel_stack_size == 0U;
+    if (!kernel_stack_release(&thread->kernel_stack)) return false;
+
+    flags = spin_lock_irqsave(&scheduler_lock);
+    if (thread->state != THREAD_STATE_TERMINATED ||
+        thread->running_cpu != THREAD_CPU_NONE ||
+        thread->context_switch_pending) {
+        spin_unlock_irqrestore(&scheduler_lock, flags);
+        panic("scheduler: terminated stack reacquired during release");
+    }
+    thread->kernel_stack_base = 0;
+    thread->kernel_stack_size = 0;
+    thread->saved_stack_pointer = 0;
+    thread->saved_context_valid = false;
+    spin_unlock_irqrestore(&scheduler_lock, flags);
     return true;
 }
 
@@ -1777,6 +1843,25 @@ u32 scheduler_thread_running_cpu(const kernel_thread_t *thread)
     return cpu_index;
 }
 
+u32 scheduler_process_running_cpu_snapshot(const kernel_thread_t *threads)
+{
+    u32 cpu_index = THREAD_CPU_NONE;
+    u64 flags = spin_lock_irqsave(&scheduler_lock);
+
+    for (const kernel_thread_t *thread = threads; thread;
+         thread = thread->process_next) {
+        u32 running_cpu = thread->running_cpu;
+        if (running_cpu == THREAD_CPU_NONE) continue;
+        if (cpu_index == THREAD_CPU_NONE) cpu_index = running_cpu;
+        else if (cpu_index != running_cpu) {
+            cpu_index = ~(u32)1U;
+            break;
+        }
+    }
+    spin_unlock_irqrestore(&scheduler_lock, flags);
+    return cpu_index;
+}
+
 thread_state_t scheduler_thread_state_snapshot(const kernel_thread_t *thread)
 {
     thread_state_t state = THREAD_STATE_TERMINATED;
@@ -2087,6 +2172,19 @@ bool scheduler_prepare_preemption(struct cpu_registers *regs)
          * stack.  It may be woken by this IRQ, but must not be turned into a
          * same-ring trampoline context. */
         preemption_pending = false;
+        return false;
+    }
+
+    /* Process-wide exit is cooperative at syscall boundaries, but a sibling
+     * may be executing Ring 3 code without making syscalls. Retire it at the
+     * next user-origin interrupt before returning to that address space. The
+     * complete privilege frame remains on its kernel stack and the normal
+     * scheduler handoff/reaper path still owns all resource release. */
+    if (cpu_registers_has_privilege_stack(regs) &&
+        process_thread_exit_requested(thread)) {
+        process_thread_entry_completed(thread, -1);
+        if (!scheduler_terminate())
+            panic("scheduler: process-exit worker could not be retired");
         return false;
     }
 

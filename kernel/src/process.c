@@ -120,6 +120,7 @@ static void process_unlink_all_locked(process_t *process);
 static bool process_cleanup_exit_resources(process_t *process);
 static bool process_finish_termination(process_t *process);
 static kernel_thread_t *process_publish_terminated_locked(process_t *process);
+static void process_worker_records_release_all(process_t *process);
 static kernel_object_t *process_handle_lookup_reference(
     process_t *process, process_handle_t handle,
     kernel_object_type_t type, u32 required_rights);
@@ -250,7 +251,8 @@ static void process_object_destroy(kernel_object_t *object)
 
     if (process->active_syscalls || process->live_thread_count ||
         process->thread_list_readers ||
-        process->thread_count || process->threads || process->main_thread)
+        process->thread_count || process->threads || process->main_thread ||
+        process->worker_reapers || process->thread_records)
         panic("process: destruction with owned thread state");
 
     process_cwd_clear(process);
@@ -331,7 +333,7 @@ static bool process_thread_list_complete_locked(process_t *process)
     bool main_seen = process && !process->main_thread;
 
     if (!process || !process->thread_count || process->live_thread_count ||
-        process->active_syscalls)
+        process->active_syscalls || process->worker_reapers)
         return false;
     for (kernel_thread_t *thread = process->threads; thread;
          thread = thread->process_next) {
@@ -351,6 +353,48 @@ static bool process_thread_list_complete_locked(process_t *process)
         }
     }
     return count == process->thread_count && main_seen;
+}
+
+static void process_thread_record_destroy(kernel_object_t *object)
+{
+    process_thread_record_t *record;
+    if (!object) return;
+    record = (process_thread_record_t *)((u8 *)object -
+        __builtin_offsetof(process_thread_record_t, object));
+    if (record->listed || record->reclaiming || record->execution ||
+        record->stack_region || record->tls_region)
+        panic("process: destroying live worker completion record");
+    kfree(record);
+}
+
+static void process_worker_records_release_all(process_t *process)
+{
+    process_thread_record_t *records;
+    u64 flags;
+
+    if (!process) return;
+    flags = spin_lock_irqsave(&process_registry_lock);
+    records = process->thread_records;
+    process->thread_records = NULL;
+    __atomic_store_n(&process->worker_reap_pending, false,
+                     __ATOMIC_RELEASE);
+    for (process_thread_record_t *record = records; record;
+         record = record->next) {
+        record->listed = false;
+        record->process = NULL;
+        record->execution = NULL;
+        /* The whole address space is reclaimed by process destruction. */
+        record->stack_region = NULL;
+        record->tls_region = NULL;
+    }
+    spin_unlock_irqrestore(&process_registry_lock, flags);
+
+    while (records) {
+        process_thread_record_t *next = records->next;
+        records->next = NULL;
+        object_release(&records->object); /* process-list ownership */
+        records = next;
+    }
 }
 
 /* Caller holds process_registry_lock and an object reference. This short
@@ -382,7 +426,11 @@ static void process_thread_list_read_release(process_t *process)
     bool finish_exit = !process->thread_list_readers &&
         process->state == PROCESS_STATE_EXITING &&
         process->exit_cleanup_complete;
+    bool reap_workers = !process->thread_list_readers &&
+        process->state == PROCESS_STATE_ACTIVE &&
+        __atomic_load_n(&process->worker_reap_pending, __ATOMIC_ACQUIRE);
     spin_unlock_irqrestore(&process_registry_lock, flags);
+    if (reap_workers) process_worker_reclaim_pending(process);
     if (finish_exit) (void)process_finish_termination(process);
 }
 
@@ -644,6 +692,11 @@ static bool process_detach_thread_owned(process_t *process,
     __atomic_store_n(&thread->process_exit_requested, false,
                      __ATOMIC_RELAXED);
     thread->process_reference_held = false;
+    if (thread->worker_record) {
+        process_thread_record_t *record = thread->worker_record;
+        if (record->execution == thread) record->execution = NULL;
+        thread->worker_record = NULL;
+    }
     thread->process_exit_status = 0;
     thread->process_exit_status_valid = false;
     release_process_reference = true;
@@ -698,6 +751,8 @@ static bool process_finalize_exit(process_t *process)
             panic("process: completed thread could not be reaped");
     }
 
+    process_worker_records_release_all(process);
+
     flags = spin_lock_irqsave(&process_registry_lock);
     process->thread_reap_in_progress = false;
     if (!process->exit_notification_sent) {
@@ -720,6 +775,12 @@ u64 process_current_pid(void)
     process_t *process = process_current();
 
     return process ? process->pid : 0;
+}
+
+u64 process_current_thread_id(void)
+{
+    kernel_thread_t *thread = thread_current();
+    return thread && thread->process ? thread->id : 0;
 }
 
 static bool process_path_access(const vfs_node_t *node, void *context)
@@ -1229,7 +1290,66 @@ fail:
     return NULL;
 }
 
-static bool process_user_region_release_unpublished(
+/* Thread handles are reserved before worker ownership is published.  These
+ * helpers run while process_registry_lock is held, so exit admission, record
+ * ownership, handle visibility, and run-queue publication form one commit.
+ * The handle lock also serializes against table growth; no growth mutex is
+ * needed because these operations never sleep. */
+static bool process_thread_handle_activate_locked(process_t *process,
+                                                   process_handle_t handle)
+{
+    u32 index;
+    u16 generation;
+    u64 flags;
+    process_handle_slot_t *slot;
+
+    if (!process || !decode_handle(handle, &index, &generation)) return false;
+    flags = spin_lock_irqsave(&process->handle_lock);
+    if (!process->handle_table || index >= process->handle_capacity) {
+        spin_unlock_irqrestore(&process->handle_lock, flags);
+        return false;
+    }
+    slot = &handle_slots(process)[index];
+    if (process->state != PROCESS_STATE_ACTIVE || !slot->reserved ||
+        slot->active || slot->generation != generation || !slot->object) {
+        spin_unlock_irqrestore(&process->handle_lock, flags);
+        return false;
+    }
+    slot->active = true;
+    slot->reserved = false;
+    process_handle_revision_advance(process);
+    spin_unlock_irqrestore(&process->handle_lock, flags);
+    return true;
+}
+
+static bool process_thread_handle_deactivate_locked(process_t *process,
+                                                     process_handle_t handle)
+{
+    u32 index;
+    u16 generation;
+    u64 flags;
+    process_handle_slot_t *slot;
+
+    if (!process || !decode_handle(handle, &index, &generation)) return false;
+    flags = spin_lock_irqsave(&process->handle_lock);
+    if (!process->handle_table || index >= process->handle_capacity) {
+        spin_unlock_irqrestore(&process->handle_lock, flags);
+        return false;
+    }
+    slot = &handle_slots(process)[index];
+    if (!slot->active || slot->reserved || slot->generation != generation ||
+        !slot->object) {
+        spin_unlock_irqrestore(&process->handle_lock, flags);
+        return false;
+    }
+    slot->active = false;
+    slot->reserved = true;
+    process_handle_revision_advance(process);
+    spin_unlock_irqrestore(&process->handle_lock, flags);
+    return true;
+}
+
+static bool process_user_region_release(
     process_t *process, process_user_region_t *region)
 {
     process_user_region_t **cursor;
@@ -1246,6 +1366,214 @@ static bool process_user_region_release_unpublished(
     mutex_unlock(&process->memory_lock);
     kfree(region);
     return true;
+}
+
+/* Caller holds process_registry_lock. This flag avoids a process-wide record
+ * scan on every ordinary syscall while still allowing deferred VMM lease
+ * cleanup to be retried by the syscall that releases the final lease. */
+static bool process_worker_reap_needed_locked(process_t *process)
+{
+    if (!process || process->state != PROCESS_STATE_ACTIVE) return false;
+    for (process_thread_record_t *record = process->thread_records; record;
+         record = record->next) {
+        if (record->completed &&
+            (record->reclaiming || !record->kernel_stack_released ||
+             record->stack_region || record->tls_region ||
+             record->execution))
+            return true;
+    }
+    return false;
+}
+
+/* A completed worker can have released all execution resources while a
+ * process-thread-list reader temporarily prevents unlinking its scheduler
+ * object. Retry immediately after the last reader leaves; do not leave the
+ * terminated execution record waiting for an unrelated future syscall. */
+static bool process_worker_reap_immediate_locked(process_t *process)
+{
+    if (!process || process->state != PROCESS_STATE_ACTIVE ||
+        process->termination_pending || process->thread_list_readers ||
+        process->thread_reap_in_progress)
+        return false;
+    for (process_thread_record_t *record = process->thread_records; record;
+         record = record->next) {
+        if (record->listed && record->completed && !record->reclaiming &&
+            record->execution && record->kernel_stack_released &&
+            !record->stack_region && !record->tls_region)
+            return true;
+    }
+    return false;
+}
+
+/* A worker reap can unmap user TLS and stacks that were active on another
+ * CPU. Unlike a local-only stack release, that VMM operation requires local
+ * interrupts enabled so remote CPUs can acknowledge the TLB shootdown. Do
+ * not infer this from the current online count: an address space may still
+ * have remote active-CPU targets during a CPU transition. */
+static bool process_worker_reclaim_context_valid(void)
+{
+    u64 flags = process_cli_save();
+    process_cli_restore(flags);
+    return (flags & (1ULL << 9)) != 0 &&
+           kernel_stack_release_context_valid();
+}
+
+void process_worker_reclaim_pending(process_t *process)
+{
+    process_thread_record_t *record;
+    u64 flags;
+    bool retry_available = true;
+
+    if (!process || !__atomic_load_n(&process->worker_reap_pending,
+                                     __ATOMIC_ACQUIRE) ||
+        !process_worker_reclaim_context_valid() ||
+        !object_reference(&process->object))
+        return;
+
+    for (;;) {
+      flags = spin_lock_irqsave(&process_registry_lock);
+      record = process->thread_records;
+      if (record && !object_reference(&record->object))
+          panic("process: worker record reference overflow");
+      spin_unlock_irqrestore(&process_registry_lock, flags);
+
+      while (record) {
+        process_thread_record_t *next;
+        kernel_thread_t *execution = NULL;
+        process_user_region_t *stack_region = NULL;
+        process_user_region_t *tls_region = NULL;
+        bool claimed = false;
+        bool stack_released = true;
+        bool tls_released = true;
+        bool execution_stack_released = true;
+        bool drop_list_reference = false;
+        bool cleanup_ready = false;
+        kernel_thread_t *terminated_waiter = NULL;
+
+        flags = spin_lock_irqsave(&process_registry_lock);
+        next = record->next;
+        if (next && !object_reference(&next->object))
+            panic("process: next worker record reference overflow");
+        if (process->state == PROCESS_STATE_ACTIVE &&
+            !process->termination_pending &&
+            !process->thread_reap_in_progress &&
+            record->listed && record->completed && !record->reclaiming &&
+            process->worker_reapers != ~(u32)0 &&
+            object_reference(&record->object)) {
+            record->reclaiming = true;
+            process->worker_reapers++;
+            execution = record->execution;
+            stack_region = record->stack_region;
+            tls_region = record->tls_region;
+            claimed = true;
+        }
+        spin_unlock_irqrestore(&process_registry_lock, flags);
+
+        if (claimed) {
+            if (execution)
+                execution_stack_released =
+                    thread_release_terminated_stack(execution);
+            if (tls_region)
+                tls_released = process_user_region_release(
+                    process, tls_region);
+            if (stack_region)
+                stack_released = process_user_region_release(
+                    process, stack_region);
+
+            /* User mappings can remain deferred while a sibling's VMM lease
+             * pins them; the completion record retains those region nodes
+             * until a later lease-release retry. */
+            bool retire_execution = false;
+            flags = spin_lock_irqsave(&process_registry_lock);
+            if (execution_stack_released && execution)
+                record->kernel_stack_released = true;
+            if (tls_released && record->tls_region == tls_region) {
+                record->tls_region = NULL;
+                if (execution && execution->user_context.tls_region ==
+                                     tls_region)
+                    execution->user_context.tls_region = NULL;
+            }
+            if (stack_released && record->stack_region == stack_region) {
+                record->stack_region = NULL;
+                if (execution && execution->user_context.stack_region ==
+                                     stack_region)
+                    execution->user_context.stack_region = NULL;
+            }
+            if (execution_stack_released && execution &&
+                process->state == PROCESS_STATE_ACTIVE &&
+                !process->termination_pending)
+                retire_execution = true;
+            spin_unlock_irqrestore(&process_registry_lock, flags);
+
+            /* The completion record carries join authority and result. The
+             * scheduler object is no longer needed once its final stack has
+             * been released, even while the worker remains joinable. */
+            if (retire_execution &&
+                process_detach_thread(process, execution)) {
+                if (!thread_destroy(execution))
+                    panic("process: completed worker could not be reaped");
+                execution = NULL;
+            }
+
+            flags = spin_lock_irqsave(&process_registry_lock);
+            if (execution && !record->execution)
+                panic("process: worker execution owner disappeared");
+            /* The record remains joinable after its scheduler object is
+             * gone. Remove it only when join/detach has consumed that right
+             * and every lease-deferred user region has been released. */
+            if (!record->execution && record->listed &&
+                !record->stack_region && !record->tls_region &&
+                (record->joined || record->detached)) {
+                process_thread_record_t **cursor = &process->thread_records;
+                while (*cursor && *cursor != record)
+                    cursor = &(*cursor)->next;
+                if (*cursor == record) {
+                    *cursor = record->next;
+                    record->next = NULL;
+                    record->listed = false;
+                    record->process = NULL;
+                    drop_list_reference = true;
+                }
+            }
+            record->reclaiming = false;
+            if (!process->worker_reapers) {
+                spin_unlock_irqrestore(&process_registry_lock, flags);
+                panic("process: worker reaper count underflow");
+            }
+            process->worker_reapers--;
+            cleanup_ready = process->launch_ready &&
+                process->state == PROCESS_STATE_EXITING &&
+                !process->exit_cleanup_complete &&
+                !process->exit_cleanup_in_progress &&
+                process_thread_list_complete_locked(process);
+            terminated_waiter = process_publish_terminated_locked(process);
+            spin_unlock_irqrestore(&process_registry_lock, flags);
+
+            if (terminated_waiter &&
+                !scheduler_unblock(terminated_waiter))
+                panic("process: worker reap failed to wake process waiter");
+            if (cleanup_ready) (void)process_cleanup_exit_resources(process);
+            if (drop_list_reference) object_release(&record->object);
+            object_release(&record->object); /* claimed reaper pin */
+            object_release(&record->object); /* traversal/reaper pin */
+        } else {
+            object_release(&record->object); /* traversal pin */
+        }
+        record = next;
+      }
+      flags = spin_lock_irqsave(&process_registry_lock);
+      bool retry_immediate =
+          retry_available &&
+          process_worker_reap_immediate_locked(process);
+      if (retry_immediate) retry_available = false;
+      __atomic_store_n(&process->worker_reap_pending,
+                       process_worker_reap_needed_locked(process) ||
+                           retry_immediate,
+                       __ATOMIC_RELEASE);
+      spin_unlock_irqrestore(&process_registry_lock, flags);
+      if (!retry_immediate) break;
+    }
+    object_release(&process->object);
 }
 
 static process_user_region_t *process_user_region_find(
@@ -1634,28 +1962,6 @@ bool process_thread_exit_requested(const struct kernel_thread *thread)
                                       __ATOMIC_ACQUIRE);
 }
 
-static bool process_thread_prepare_exit(kernel_thread_t *thread)
-{
-    process_t *process;
-    u64 flags;
-
-    if (!thread || !(process = thread->process)) return false;
-    flags = spin_lock_irqsave(&process_registry_lock);
-    if (thread->process != process ||
-        thread->process_state == THREAD_PROCESS_UNATTACHED ||
-        thread->process_state == THREAD_PROCESS_HANDOFF_COMPLETE) {
-        spin_unlock_irqrestore(&process_registry_lock, flags);
-        return false;
-    }
-    thread->process_state = THREAD_PROCESS_EXIT_REQUESTED;
-    if (process->state == PROCESS_STATE_EXITING) {
-        __atomic_store_n(&thread->process_exit_requested, true,
-                         __ATOMIC_RELEASE);
-    }
-    spin_unlock_irqrestore(&process_registry_lock, flags);
-    return true;
-}
-
 void process_thread_entry_completed(struct kernel_thread *thread, i32 status)
 {
     process_t *process;
@@ -1665,14 +1971,42 @@ void process_thread_entry_completed(struct kernel_thread *thread, i32 status)
         (void)process_exit(process, status);
         return;
     }
-    u64 flags = spin_lock_irqsave(&process_registry_lock);
-    if (thread->process == process &&
+    if (!thread->worker_record) {
+        /* Preserve completion accounting for existing process-owned kernel
+         * threads. Native Ring 3 workers always carry a join record. */
+        u64 flags = spin_lock_irqsave(&process_registry_lock);
+        if (thread->process == process &&
+            thread->process_state != THREAD_PROCESS_HANDOFF_COMPLETE) {
+            thread->process_exit_status = status;
+            thread->process_exit_status_valid = true;
+            thread->process_state = THREAD_PROCESS_EXIT_REQUESTED;
+        }
+        spin_unlock_irqrestore(&process_registry_lock, flags);
+        return;
+    }
+    process_worker_exit(thread, (u64)(i64)status);
+}
+
+void process_worker_exit(struct kernel_thread *raw_thread, u64 result)
+{
+    kernel_thread_t *thread = raw_thread;
+    process_t *process;
+    process_thread_record_t *record;
+    u64 flags;
+
+    if (!thread || !(process = thread->process) || thread->process_initial)
+        return;
+    flags = spin_lock_irqsave(&process_registry_lock);
+    record = thread->worker_record;
+    if (thread->process == process && record &&
+        record->process == process && record->execution == thread &&
         thread->process_state != THREAD_PROCESS_HANDOFF_COMPLETE) {
-        thread->process_exit_status = status;
+        thread->process_exit_status = (i32)result;
         thread->process_exit_status_valid = true;
+        record->result = result;
+        thread->process_state = THREAD_PROCESS_EXIT_REQUESTED;
     }
     spin_unlock_irqrestore(&process_registry_lock, flags);
-    (void)process_thread_prepare_exit(thread);
 }
 
 void process_scheduler_handoff_complete(struct kernel_thread *raw_thread)
@@ -1680,6 +2014,7 @@ void process_scheduler_handoff_complete(struct kernel_thread *raw_thread)
     kernel_thread_t *thread = raw_thread;
     process_t *process;
     kernel_thread_t *waiter = NULL;
+    kernel_thread_t *join_waiter = NULL;
     bool cleanup_ready = false;
     u64 flags;
 
@@ -1695,6 +2030,17 @@ void process_scheduler_handoff_complete(struct kernel_thread *raw_thread)
             panic("process: live thread count underflow");
         }
         process->live_thread_count--;
+        if (thread->worker_record) {
+            process_thread_record_t *record = thread->worker_record;
+            if (record->process == process && record->execution == thread) {
+                record->completed = true;
+                record->kernel_stack_released = false;
+                __atomic_store_n(&process->worker_reap_pending, true,
+                                 __ATOMIC_RELEASE);
+                join_waiter = record->join_waiter;
+                record->join_waiter = NULL;
+            }
+        }
     }
     /* An unpublished process is still owned by process_abort(), which rolls
      * back its launch resources after stopping the prepared initial thread. */
@@ -1706,6 +2052,8 @@ void process_scheduler_handoff_complete(struct kernel_thread *raw_thread)
     waiter = process_publish_terminated_locked(process);
     spin_unlock_irqrestore(&process_registry_lock, flags);
 
+    if (join_waiter && !scheduler_wake_waiter(join_waiter))
+        panic("process: failed to wake completed worker joiner");
     if (cleanup_ready) (void)process_cleanup_exit_resources(process);
     if (waiter) (void)scheduler_unblock(waiter);
 }
@@ -2424,7 +2772,7 @@ static process_user_region_t *process_user_tls_create(process_t *process,
         &tls_start);
     if (!region) return NULL;
     if (tls_start > VMM_USER_ADDRESS_LIMIT - module_size) {
-        if (!process_user_region_release_unpublished(process, region))
+        if (!process_user_region_release(process, region))
             panic("process: TLS range rollback failed");
         return NULL;
     }
@@ -2508,7 +2856,7 @@ bool process_user_context_prepare_worker(process_t *process,
     if (process->tls_present) {
         tls_region = process_user_tls_create(process, &fs_base);
         if (!tls_region) {
-            if (!process_user_region_release_unpublished(process,
+            if (!process_user_region_release(process,
                                                          stack_region))
                 panic("process: worker-stack rollback failed");
             return false;
@@ -2521,10 +2869,10 @@ bool process_user_context_prepare_worker(process_t *process,
      * for an exit racing after this point. */
     if (process->state != PROCESS_STATE_ACTIVE ||
         __atomic_load_n(&process->exit_requested, __ATOMIC_ACQUIRE)) {
-        if (tls_region && !process_user_region_release_unpublished(
+        if (tls_region && !process_user_region_release(
                 process, tls_region))
             panic("process: worker-TLS termination rollback failed");
-        if (!process_user_region_release_unpublished(process, stack_region))
+        if (!process_user_region_release(process, stack_region))
             panic("process: worker-stack termination rollback failed");
         return false;
     }
@@ -2561,15 +2909,144 @@ bool process_user_context_discard_worker(process_t *process,
         return false;
     if (tls_region &&
         (tls_region->kind != PROCESS_USER_REGION_THREAD_TLS ||
-         !process_user_region_release_unpublished(process, tls_region)))
+         !process_user_region_release(process, tls_region)))
         return false;
-    if (!process_user_region_release_unpublished(process, stack_region))
+    if (!process_user_region_release(process, stack_region))
         panic("process: unpublished worker-stack release failed");
     memset(&thread->user_context, 0, sizeof(thread->user_context));
     thread->user_fs_base = 0;
     thread->entry = NULL;
     thread->entry_argument = NULL;
     return true;
+}
+
+int process_thread_create(process_t *process, uintptr_t entry,
+                          uintptr_t argument, process_handle_t *out_handle,
+                          u64 *out_thread_id)
+{
+    kernel_thread_t *thread = NULL;
+    process_thread_record_t *record = NULL;
+    process_handle_t handle = 0;
+    bool handle_reserved = false;
+    bool handle_reference = false;
+    bool attached = false;
+    bool published = false;
+    bool release_process_reference = false;
+    int rollback_error = MG_ERR_NO_MEMORY;
+    u64 flags;
+
+    if (!process || !entry || !out_handle || !out_thread_id)
+        return MG_ERR_BAD_ARGUMENT;
+    if (__atomic_load_n(&process->exit_requested, __ATOMIC_ACQUIRE))
+        return MG_ERR_SHUTDOWN;
+    if (!vmm_user_range_executable(process->address_space, entry, 1U))
+        return MG_ERR_INVALID_EXEC;
+
+    thread = thread_create_suspended("user-worker", process_user_thread_entry,
+                                     process);
+    if (!thread) return MG_ERR_NO_MEMORY;
+    record = (process_thread_record_t *)kmalloc(sizeof(*record));
+    if (!record) {
+        if (!thread_destroy(thread))
+            panic("process: failed to destroy uninitialized worker");
+        return MG_ERR_NO_MEMORY;
+    }
+    memset(record, 0, sizeof(*record));
+    object_init(&record->object, OBJECT_TYPE_THREAD,
+                process_thread_record_destroy);
+    thread->worker_record = record;
+
+    if (!process_user_context_prepare_worker(process, thread, entry,
+                                              argument)) {
+        thread->worker_record = NULL;
+        if (thread->user_context.valid &&
+            !process_user_context_discard_worker(process, thread))
+            panic("process: worker context preparation rollback failed");
+        if (!thread_destroy(thread))
+            panic("process: failed to destroy failed worker context");
+        object_release(&record->object);
+        return !__atomic_load_n(&process->exit_requested, __ATOMIC_ACQUIRE)
+            ? MG_ERR_NO_MEMORY : MG_ERR_SHUTDOWN;
+    }
+
+    record->execution = thread;
+    record->id = thread->id;
+    record->stack_region = thread->user_context.stack_region;
+    record->tls_region = thread->user_context.tls_region;
+
+    /* The initial reference becomes process-list ownership on commit.  A
+     * second reference is transferred into the hidden, reserved handle. */
+    if (!object_reference(&record->object)) goto rollback_private;
+    handle_reference = true;
+    if (!process_handle_reserve(process, &record->object, 0, &handle))
+        goto rollback_private;
+    handle_reserved = true;
+    handle_reference = false; /* transferred to the handle table */
+
+    /* Failure to reserve a handle is resource exhaustion; after reservation,
+     * failure to admit or enqueue the fully prepared worker is a lifecycle or
+     * scheduler-busy result instead. */
+    rollback_error = MG_ERR_BUSY;
+    flags = spin_lock_irqsave(&process_registry_lock);
+    if (process_thread_register_locked(process, thread, false)) {
+        attached = true;
+        record->process = process;
+        record->listed = true;
+        record->next = process->thread_records;
+        process->thread_records = record;
+        thread->worker_record = record;
+        /* Keep the handle unavailable until ownership and queue publication
+         * are ready.  Termination admission shares this lock, so an exit sees
+         * either an unpublished private context or a complete worker. */
+        published = process_thread_handle_activate_locked(process, handle) &&
+                    scheduler_enqueue(thread);
+        if (!published) {
+            if (process_thread_handle_deactivate_locked(process, handle))
+                handle_reserved = true;
+            process->thread_records = record->next;
+            record->next = NULL;
+            record->listed = false;
+            record->process = NULL;
+            thread->worker_record = NULL;
+            process->threads = thread->process_next;
+            process->thread_count--;
+            process->live_thread_count--;
+            thread->process = NULL;
+            thread->process_next = NULL;
+            thread->process_state = THREAD_PROCESS_UNATTACHED;
+            thread->process_reference_held = false;
+            release_process_reference = true;
+            attached = false;
+        }
+    }
+    spin_unlock_irqrestore(&process_registry_lock, flags);
+
+    if (published) {
+        *out_handle = handle;
+        *out_thread_id = record->id;
+        return MG_OK;
+    }
+    if (release_process_reference) object_release(&process->object);
+    if (handle_reserved && !process_handle_cancel(process, handle))
+        panic("process: failed to cancel unpublished worker handle");
+    if (attached)
+        panic("process: worker publication rollback remained attached");
+
+rollback_private:
+    if (handle_reference) object_release(&record->object);
+    if (thread->user_context.valid &&
+        !process_user_context_discard_worker(process, thread))
+        panic("process: private worker rollback failed");
+    thread->worker_record = NULL;
+    if (!thread_destroy(thread))
+        panic("process: private worker could not be destroyed");
+    record->execution = NULL;
+    record->stack_region = NULL;
+    record->tls_region = NULL;
+    object_release(&record->object);
+    if (__atomic_load_n(&process->exit_requested, __ATOMIC_ACQUIRE))
+        return MG_ERR_SHUTDOWN;
+    return rollback_error;
 }
 
 void process_user_context_enter(void)
@@ -3394,6 +3871,179 @@ kernel_object_t *process_handle_lookup(process_t *process,
                                            required_rights);
 }
 
+static process_thread_record_t *process_thread_record_from_object(
+    kernel_object_t *object)
+{
+    if (!object || object->type != OBJECT_TYPE_THREAD) return NULL;
+    return (process_thread_record_t *)((u8 *)object -
+        __builtin_offsetof(process_thread_record_t, object));
+}
+
+bool process_thread_handle_close_allowed(kernel_object_t *object)
+{
+    process_thread_record_t *record =
+        process_thread_record_from_object(object);
+    bool allowed;
+    u64 flags;
+
+    if (!record) return false;
+    flags = spin_lock_irqsave(&process_registry_lock);
+    allowed = record->joined || record->detached;
+    spin_unlock_irqrestore(&process_registry_lock, flags);
+    return allowed;
+}
+
+int process_thread_join(process_t *process, process_handle_t handle,
+                        u64 *out_result)
+{
+    kernel_object_t *object;
+    process_thread_record_t *record;
+    kernel_thread_t *thread = thread_current();
+    u64 wait_flags;
+    u64 result = 0;
+    int failure = MG_OK;
+    bool claimed = false;
+
+    if (!process || !out_result || !thread || thread->process != process)
+        return MG_ERR_BAD_ARGUMENT;
+    object = process_handle_lookup(process, handle, OBJECT_TYPE_THREAD, 0);
+    if (!object) return MG_ERR_INVALID_HANDLE;
+    record = process_thread_record_from_object(object);
+    if (!record) {
+        object_release(object);
+        return MG_ERR_INVALID_HANDLE;
+    }
+
+    wait_flags = process_cli_save();
+    u64 flags = spin_lock_irqsave(&process_registry_lock);
+    if (!record->listed || record->process != process) {
+        failure = MG_ERR_INVALID_HANDLE;
+    } else if (record->id == thread->id) {
+        failure = MG_ERR_BAD_ARGUMENT;
+    } else if (record->joined || record->detached ||
+               record->join_claimed) {
+        failure = MG_ERR_BUSY;
+    } else if (process->state != PROCESS_STATE_ACTIVE ||
+               __atomic_load_n(&process->exit_requested, __ATOMIC_ACQUIRE)) {
+        failure = MG_ERR_SHUTDOWN;
+    } else {
+        record->join_claimed = true;
+        record->join_waiter = thread;
+        claimed = true;
+    }
+    spin_unlock_irqrestore(&process_registry_lock, flags);
+    if (failure != MG_OK) {
+        process_cli_restore(wait_flags);
+        object_release(object);
+        return failure;
+    }
+
+    for (;;) {
+        flags = spin_lock_irqsave(&process_registry_lock);
+        if (!record->listed || record->process != process) {
+            failure = MG_ERR_INVALID_HANDLE;
+        } else if (process->state != PROCESS_STATE_ACTIVE ||
+                   __atomic_load_n(&process->exit_requested,
+                                   __ATOMIC_ACQUIRE) ||
+                   process_thread_exit_requested(thread) ||
+                   process_shutdown_requested(process)) {
+            failure = MG_ERR_SHUTDOWN;
+        } else if (record->completed) {
+            result = record->result;
+            record->joined = true;
+            __atomic_store_n(&process->worker_reap_pending, true,
+                             __ATOMIC_RELEASE);
+            record->join_claimed = false;
+            record->join_waiter = NULL;
+            claimed = false;
+        }
+        if (failure != MG_OK || !claimed) {
+            if (failure != MG_OK && record->join_claimed &&
+                record->join_waiter == thread) {
+                record->join_claimed = false;
+                record->join_waiter = NULL;
+                claimed = false;
+            }
+            spin_unlock_irqrestore(&process_registry_lock, flags);
+            break;
+        }
+        spin_unlock_irqrestore(&process_registry_lock, flags);
+
+        if (process_take_interrupt(process)) {
+            flags = spin_lock_irqsave(&process_registry_lock);
+            if (record->join_claimed && record->join_waiter == thread) {
+                record->join_claimed = false;
+                record->join_waiter = NULL;
+            }
+            spin_unlock_irqrestore(&process_registry_lock, flags);
+            claimed = false;
+            failure = process_shutdown_requested(process)
+                ? MG_ERR_SHUTDOWN : MG_ERR_INTERRUPTED;
+            break;
+        }
+        if (!scheduler_block()) {
+            flags = spin_lock_irqsave(&process_registry_lock);
+            if (record->join_claimed && record->join_waiter == thread) {
+                record->join_claimed = false;
+                record->join_waiter = NULL;
+            }
+            spin_unlock_irqrestore(&process_registry_lock, flags);
+            claimed = false;
+            failure = MG_ERR_BUSY;
+            break;
+        }
+    }
+    scheduler_clear_event_wake(thread);
+    process_cli_restore(wait_flags);
+
+    if (failure == MG_OK && !claimed) {
+        *out_result = result;
+        /* joined is committed before the slot is consumed. A concurrent
+         * explicit close may win the slot race; it cannot undo the join. */
+        (void)process_handle_close(process, handle);
+    }
+    object_release(object);
+    return failure;
+}
+
+int process_thread_detach(process_t *process, process_handle_t handle)
+{
+    kernel_object_t *object;
+    process_thread_record_t *record;
+    u64 flags;
+
+    if (!process) return MG_ERR_BAD_ARGUMENT;
+    object = process_handle_lookup(process, handle, OBJECT_TYPE_THREAD, 0);
+    if (!object) return MG_ERR_INVALID_HANDLE;
+    record = process_thread_record_from_object(object);
+    if (!record) {
+        object_release(object);
+        return MG_ERR_INVALID_HANDLE;
+    }
+
+    flags = spin_lock_irqsave(&process_registry_lock);
+    int result = MG_OK;
+    if (!record->listed || record->process != process)
+        result = MG_ERR_INVALID_HANDLE;
+    else if (record->joined || record->detached || record->join_claimed)
+        result = MG_ERR_BUSY;
+    else {
+        record->detached = true;
+        __atomic_store_n(&process->worker_reap_pending, true,
+                         __ATOMIC_RELEASE);
+    }
+    spin_unlock_irqrestore(&process_registry_lock, flags);
+
+    if (result == MG_OK) {
+        /* Detach, unlike ordinary handle close, is the explicit operation
+         * that releases join entitlement. A competing close may consume the
+         * already-detached handle first. */
+        (void)process_handle_close(process, handle);
+    }
+    object_release(object);
+    return result;
+}
+
 bool process_handle_close(process_t *process, process_handle_t handle)
 {
     u32 index;
@@ -3401,6 +4051,21 @@ bool process_handle_close(process_t *process, process_handle_t handle)
     kernel_object_t *object;
     u64 flags;
     if (!process || !decode_handle(handle, &index, &generation)) return false;
+
+    /* A raw close cannot release a live worker's join entitlement. Retain
+     * the object while checking policy outside handle_lock; lifecycle state
+     * only moves toward joined/detached, so a permitted close remains
+     * permitted when the slot is revalidated below. Internal process-wide
+     * cleanup uses process_handle_close_all() and deliberately bypasses this
+     * user-operation rule. */
+    object = process_handle_lookup_reference(process, handle,
+        OBJECT_TYPE_INVALID, 0);
+    if (!object) return false;
+    bool allowed = object->type != OBJECT_TYPE_THREAD ||
+        process_thread_handle_close_allowed(object);
+    object_release(object);
+    if (!allowed) return false;
+
     if (!mutex_lock(&process->handle_growth_mutex)) return false;
     flags = spin_lock_irqsave(&process->handle_lock);
     if (!process->handle_table || index >= process->handle_capacity) {
@@ -3531,18 +4196,8 @@ u32 process_snapshot_read(u32 offset, mg_process_info_t *output,
             info.parent_pid = process->parent ? process->parent->pid : 0;
             info.session_id = process->session_id;
             info.state = process_inspection_state(process);
-            info.running_cpu = MG_PROCESS_CPU_NONE;
-            for (kernel_thread_t *thread = process->threads; thread;
-                 thread = thread->process_next) {
-                u32 running_cpu = scheduler_thread_running_cpu(thread);
-                if (running_cpu == MG_PROCESS_CPU_NONE) continue;
-                if (info.running_cpu == MG_PROCESS_CPU_NONE)
-                    info.running_cpu = running_cpu;
-                else if (info.running_cpu != running_cpu) {
-                    info.running_cpu = MG_PROCESS_CPU_MULTIPLE;
-                    break;
-                }
-            }
+            info.running_cpu = scheduler_process_running_cpu_snapshot(
+                process->threads);
             info.flags = (process->system_service
                           ? MG_PROCESS_FLAG_SYSTEM_SERVICE : 0U) |
                          (process->session_shell

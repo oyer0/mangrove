@@ -7,6 +7,7 @@
 #define CPU_MAX_COUNT 256U
 
 struct kernel_thread;
+struct process;
 struct page_table;
 
 typedef struct cpu_local
@@ -21,6 +22,9 @@ typedef struct cpu_local
     bool online;
     struct gdt_cpu_state *descriptor;
     struct kernel_thread *scheduler_current_thread;
+    /* Process whose newly completed worker can be reclaimed after the
+     * incoming context has restored its interrupt state. */
+    struct process *scheduler_post_handoff_process;
     /* Number of spinlocks held by code executing on this CPU. The acquisition
      * attempt is counted around its atomic operation; scheduling is deferred
      * until the held count returns to zero. */

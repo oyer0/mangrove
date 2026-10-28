@@ -70,11 +70,18 @@ typedef struct kernel_thread kernel_thread_t;
 typedef struct process process_t;
 typedef struct {bool active;} kernel_stack_t;
 typedef struct {process_t *process; u32 references;} kernel_object_t;
+typedef struct process_thread_record {
+ process_t *process; kernel_thread_t *execution, *join_waiter;
+ bool completed, kernel_stack_released;
+} process_thread_record_t;
 struct process {int state; kernel_thread_t *main_thread, *threads;
  u32 thread_count, live_thread_count, active_syscalls;
  u32 thread_list_readers;
+ process_thread_record_t *thread_records;
+ u32 worker_reapers;
  bool termination_pending, external_termination_in_progress, launch_ready;
  bool thread_reap_in_progress;
+ bool worker_reap_pending;
  bool system_service, exit_requested, exit_cleanup_complete,
       exit_cleanup_in_progress; i32 exit_status; u32 service_id;
  process_t *parent, *waiting_child; kernel_thread_t *waiting_thread;
@@ -85,7 +92,7 @@ struct kernel_thread {
  bool syscall_active, context_switch_pending, queued, sleeping;
  bool entry_started, stack_external;
  uintptr_t preempt_return_rip;
- u64 wakeup_deadline_ms; kernel_thread_t *next;
+ u64 wakeup_deadline_ms; usize kernel_stack_size; kernel_thread_t *next;
  void *waiting_mutex; uintptr_t kernel_stack_base;
  kernel_stack_t kernel_stack;
  process_t *process;
@@ -95,6 +102,7 @@ struct kernel_thread {
  volatile bool process_exit_requested;
  i32 process_exit_status;
  bool process_exit_status_valid;
+ process_thread_record_t *worker_record;
 };
 typedef struct {kernel_thread_t *scheduler_idle_thread;} cpu_local_t;
 static cpu_local_t cpu;
@@ -103,6 +111,7 @@ static struct {u32 blocked_threads, sleeping_threads;} scheduler_stats;
 static u32 scheduler_lock, process_registry_lock;
 static unsigned removed, cancelled, freed, exited, closed_handles, unmapped;
 static unsigned self_dispatches, self_handoffs;
+static unsigned worker_reap_calls;
 static unsigned lookup_references, lookup_releases;
 static bool group_allowed=true;
 static process_t *current_process;
@@ -169,12 +178,15 @@ static bool scheduler_thread_exit_complete(const kernel_thread_t *thread)
 static bool scheduler_terminate_thread_group(kernel_thread_t *head,
                                                usize expected_count);
 static bool process_finish_termination(process_t *process);
+static void process_worker_reclaim_pending(process_t *process);
 static void process_cleanup_exit_resources(process_t *process);
 static void console_cancel_waiter(kernel_thread_t *thread) {(void)thread;}
 static bool scheduler_wake_waiter(kernel_thread_t *thread)
 {(void)thread; return true;}
 static bool scheduler_unblock(kernel_thread_t *thread)
 {(void)thread; return true;}
+static void process_worker_reclaim_pending(process_t *process)
+{assert(process && !process_registry_lock); worker_reap_calls++;}
 static bool process_exit(process_t *process, i32 status)
 {(void)status; assert(process->state == PROCESS_STATE_ACTIVE &&
                       !process->active_syscalls);
@@ -253,6 +265,12 @@ static void process_cleanup_exit_resources(process_t *process)
  (void)process_finish_termination(process);
 }
 int main(void) {
+ process_t reap_process={.state=PROCESS_STATE_ACTIVE,.thread_count=1,
+   .thread_list_readers=1,.worker_reap_pending=true};
+ kernel_thread_t reap_thread={0};reap_process.threads=&reap_thread;
+ process_thread_list_read_release(&reap_process);
+ assert(!reap_process.thread_list_readers && worker_reap_calls==1);
+
  process_t caller={.state=PROCESS_STATE_ACTIVE};
  process_t target = {.state=PROCESS_STATE_ACTIVE,.parent=&caller,
    .launch_ready=true,.thread_count=1,.live_thread_count=1};

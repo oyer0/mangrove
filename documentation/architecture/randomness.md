@@ -39,9 +39,10 @@ byte request retries initialization. Reseed failure clears the generator
 state; the kernel does not continue serving bytes from a state whose required
 reseed failed. The generator state is global to the kernel, protected by an
 IRQ-safe lock, and is never returned or logged. Processes receive only bytes
-written to their validated destination. The syscall mapping check is stable
-for the current one-userspace-thread-per-process model; future support for
-multiple userspace threads in one address space needs mapping-lifetime rules.
+written to their validated destination. A scoped user-memory lease keeps the
+destination mapping valid during the request, including while another worker
+runs. A failed request may have written a prefix; callers must discard the
+entire requested range.
 
 ## Entropy source and trust assumptions
 

@@ -1,9 +1,9 @@
 # Userspace synchronization
 
-Mangrove provides C17 scalar atomics and a native process-local wait/wake
-facility for programs that need to coordinate concurrently executing contexts.
-The interface does not create threads and is not a POSIX threads layer.
-Public userspace thread creation is not yet available.
+Mangrove provides C17 scalar atomics, a native process-local wait/wake
+facility, and native workers through `<mg/thread.h>`. These interfaces support
+coordination between concurrently executing contexts; they are not a POSIX
+threads layer.
 
 ## C17 atomics
 
@@ -101,7 +101,8 @@ lease jointly protect process, stack, address-space, and word lifetimes.
 
 Host sanitizer tests execute the production kernel wait/wake and loam
 synchronization sources with controlled scheduler/VMM fixtures. They exercise
-host pthread concurrency, not native Mangrove user threads. The native atomic
-and API link probes verify target code generation and linkage. Until public
-thread creation and worker stack/TLS reclamation exist, no guest test can
-exercise multiple native Ring 3 threads in one process.
+host pthread concurrency and do not replace native SMP qualification. The
+native worker lifecycle acceptance runner exercises Ring 3 creation, TLS,
+wait/wake, mutex/condition coordination, join/detach, and safe resource reap on
+two KVM CPUs. loam's allocator, stdio streams, and other mutable shared state
+remain outside the thread-safety contract.

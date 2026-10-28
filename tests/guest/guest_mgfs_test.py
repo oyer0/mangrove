@@ -207,6 +207,8 @@ def phase_launch_command(phase, executable):
         return '/bin/argvtest'
     if phase == 'random':
         return '/bin/randomtest'
+    if phase == 'threads':
+        return '/bin/threadtest'
     if phase == 'ca-store-verify':
         return '/bin/castoretest'
     if phase == 'mgtls':
@@ -236,7 +238,8 @@ def create_disk(folder, build, run, relative_launch=False,
                 network_ping_smoke=False, manual_login=False,
                 random_smoke=False, ca_store_smoke=False,
                 mgtls_smoke=False, mgtls_tls_smoke=False,
-                fetch_https_smoke=False, kernel_override=None):
+                fetch_https_smoke=False, thread_smoke=False,
+                kernel_override=None):
     # The disposable image is sparse on common host filesystems, but reserve
     # enough room for a fully allocated image, extracted root partition, and
     # bounded checker/firmware evidence before starting image construction.
@@ -270,13 +273,16 @@ def create_disk(folder, build, run, relative_launch=False,
     if random_smoke:
         install(image, 2, 'randomtest',
                 (build / 'randomtest/randomtest.elf').read_bytes())
+    if thread_smoke:
+        install(image, 2, 'threadtest',
+                (build / 'threadtest/threadtest.elf').read_bytes())
     if ca_store_smoke:
         install(image, 2, 'castoretest',
                 (build / 'castoretest/castoretest.elf').read_bytes())
     if mgtls_smoke or mgtls_tls_smoke:
         install(image, 2, 'mgtlstest',
                 (build / 'mgtlstest/mgtlstest.elf').read_bytes())
-    if not power_history_smoke and not arguments_smoke and not random_smoke and not ca_store_smoke and not mgtls_smoke and not mgtls_tls_smoke and not fetch_https_smoke:
+    if not power_history_smoke and not arguments_smoke and not random_smoke and not thread_smoke and not ca_store_smoke and not mgtls_smoke and not mgtls_tls_smoke and not fetch_https_smoke:
         install(image, 2, 'fstest', (build / 'fstest/fstest.elf').read_bytes())
     if shoot_v1:
         install(image, 6, 'shoot-v1-script.shoot',
@@ -290,6 +296,8 @@ def create_disk(folder, build, run, relative_launch=False,
         phases = ('arguments',)
     if random_smoke:
         phases = ('random',)
+    if thread_smoke:
+        phases = ('threads',)
     if ca_store_smoke:
         phases = ('ca-store-reboot', 'ca-store-verify')
     if mgtls_smoke:
@@ -375,9 +383,11 @@ def create_disk(folder, build, run, relative_launch=False,
                 "/bin/type /temp/literal-esc.txt\n"
                 "/bin/say AFTER LITERAL TYPE\n"
                 if phase == 'shoot-v1' else '')
+            command_output = ('' if phase == 'threads' else
+                              f' > /temp/{phase}.log')
             script = (prefix + network_wait +
                       interactive_esc +
-                      f'{launch_command} > /temp/{phase}.log\n' +
+                      f'{launch_command}{command_output}\n' +
                       network_commands +
                       f'/bin/say child-exit-0-{phase}-{run} > /temp/{phase}.exit\n'
                       '/bin/shutdown\n').encode()
@@ -645,6 +655,13 @@ def boot(folder, disk, phase, args):
                     text, expected_status=43 if expected_failure else None)
                 if launched and failed_test:
                     raise RuntimeError(failed_test + '; inspect the native phase log')
+                if phase == 'threads' and launched:
+                    thread_failure = re.search(
+                        r'(?m)^THREADS1 FAIL [^\r\n]*', text)
+                    if thread_failure:
+                        raise RuntimeError(
+                            'native thread lifecycle regression: ' +
+                            thread_failure.group(0))
                 if launched and expected_failure:
                     failure_match = re.search(
                         r'(?m)^FSTEST1 failed pid=[1-9][0-9]* status=(-?[0-9]+)$',
@@ -1081,6 +1098,37 @@ def inspect_random(folder, disk, build, run):
     return {'bytes_requested': 2 * 1024 * 1024,
             'generation_ms': int(match.group(1)), 'child_request': True,
             'checker': 'PASS', 'disk_sha256': digest(disk)}
+
+
+def inspect_threads(folder, disk, build, run):
+    """Independently check native thread lifecycle evidence from the guest."""
+    with disk.open('rb') as source:
+        source.seek(ROOT_OFFSET)
+        image = source.read(PART_BYTES)
+    root = folder / 'threads-root.img'
+    root.write_bytes(image)
+    check_image(build, root, folder / 'threads-checker.log')
+    _, binary = find(image, '/bin/threadtest')
+    if payload(image, binary) != (build / 'threadtest/threadtest.elf').read_bytes():
+        raise ValueError('thread test binary differs from built source')
+    _, evidence = find(image, '/temp/thread-evidence.txt')
+    transcript = payload(image, evidence).decode('ascii', errors='strict')
+    (folder / 'threads-guest.log').write_text(transcript)
+    expected = ('THREADS1 PASS cpus=2 workers=2 iterations=2000 atomic=4000 '
+                'mutex=4000 tls=isolated return=join explicit-exit=pass '
+                'detached=24 termination=spin,wait,fault\n')
+    if transcript != expected:
+        raise ValueError('native thread lifecycle evidence is incomplete: ' +
+                         repr(transcript))
+    _, completion = find(image, '/temp/threads.exit')
+    if payload(image, completion) != f'child-exit-0-threads-{run}\n'.encode('ascii'):
+        raise ValueError('native thread test did not return successfully to Shoot')
+    return {'workers': 2, 'atomic_updates': 4000,
+            'mutex_updates': 4000, 'simultaneous_two_cpu_execution': True,
+            'tls_errno_isolated': True, 'join_detach_and_worker_exit': True,
+            'process_exit_workers': ['CPU-bound', 'blocked synchronization',
+                                     'unhandled worker exception'],
+            'independent_mgfs_check': 'PASS', 'disk_sha256': digest(disk)}
 
 
 def inspect_shoot_v1(folder, disk, build, run):
@@ -1840,6 +1888,8 @@ def main():
                         help='qualify large native argv, Shoot globs, and deletion')
     parser.add_argument('--random-smoke', action='store_true',
                         help='qualify native secure random status and large requests')
+    parser.add_argument('--thread-smoke', action='store_true',
+                        help='qualify native worker lifecycle on two KVM CPUs')
     parser.add_argument('--ca-store-smoke', action='store_true',
                         help='qualify native CA store read-only access across reboot')
     parser.add_argument('--mgtls-smoke', action='store_true',
@@ -1879,6 +1929,13 @@ def main():
             args.network_receive_smoke or args.network_ping_smoke or
             args.negative_control or args.repetitions != 1):
         parser.error('--random-smoke is a focused standalone workflow')
+    if args.thread_smoke and (args.arguments_smoke or args.random_smoke or
+            args.ca_store_smoke or args.mgtls_smoke or args.mgtls_tls_smoke or
+            args.fetch_https_smoke or args.shoot_v1 or args.power_history_smoke or
+            args.network_ping_smoke or args.network_receive_smoke or
+            args.relative_launch or args.negative_control or args.cpus != 2 or
+            not args.no_nic):
+        parser.error('--thread-smoke is a focused two-CPU, no-NIC workflow')
     if args.ca_store_smoke and (args.arguments_smoke or args.random_smoke or
             args.shoot_v1 or args.power_history_smoke or args.network_ping_smoke or
             args.network_receive_smoke or args.relative_launch or
@@ -1920,6 +1977,7 @@ def main():
               'no_nic':args.no_nic,'relative_launch':args.relative_launch,
               'shoot_v1':args.shoot_v1, 'arguments_smoke':args.arguments_smoke,
               'random_smoke':args.random_smoke,
+              'thread_smoke':args.thread_smoke,
               'ca_store_smoke':args.ca_store_smoke,
               'mgtls_smoke':args.mgtls_smoke,
               'mgtls_tls_smoke':args.mgtls_tls_smoke,
@@ -1943,12 +2001,15 @@ def main():
                              ca_store_smoke=args.ca_store_smoke,
                              mgtls_smoke=args.mgtls_smoke,
                              mgtls_tls_smoke=args.mgtls_tls_smoke,
-                             fetch_https_smoke=args.fetch_https_smoke)
+                             fetch_https_smoke=args.fetch_https_smoke,
+                             thread_smoke=args.thread_smoke)
             result['initial_sha256']=digest(disk)
             if args.arguments_smoke:
                 phases = ('arguments',)
             elif args.random_smoke:
                 phases = ('random',)
+            elif args.thread_smoke:
+                phases = ('threads',)
             elif args.ca_store_smoke:
                 phases = ('ca-store-reboot', 'ca-store-verify')
             elif args.mgtls_smoke:
@@ -1977,6 +2038,8 @@ def main():
                     result[phase] = inspect_arguments(folder,disk,args.build_dir,run)
                 elif phase == 'random':
                     result[phase] = inspect_random(folder,disk,args.build_dir,run)
+                elif phase == 'threads':
+                    result[phase] = inspect_threads(folder,disk,args.build_dir,run)
                 elif phase in ('ca-store-reboot', 'ca-store-verify'):
                     result[phase] = inspect_ca_store(folder, disk,
                                                      args.build_dir, phase, run)
@@ -2020,6 +2083,7 @@ def main():
                     raise RuntimeError(phase_error)
             if (not args.shoot_v1 and not args.power_history_smoke and
                     not args.arguments_smoke and not args.random_smoke and
+                    not args.thread_smoke and
                     not args.ca_store_smoke and not args.mgtls_smoke and
                     not args.mgtls_tls_smoke and
                     not args.fetch_https_smoke and

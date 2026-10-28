@@ -33,7 +33,7 @@ names = (
     "process_memory_size_to_pages", "process_memory_find_space",
     "process_user_region_insert_locked", "process_user_register_initial_stack",
     "process_user_region_copy_to_frames", "process_user_region_create",
-    "process_user_region_release_unpublished", "process_user_tls_create",
+    "process_user_region_release", "process_user_tls_create",
     "process_memory_unmap",
 )
 production = "\n".join(function(name) for name in names)
@@ -131,8 +131,8 @@ static void test_stack_guard_reservation_and_unmap(void)
         PROCESS_USER_REGION_WORKER_STACK,1U,8U,VMM_PAGE_SIZE,NULL,0,0,0,NULL);
     assert(b&&b->reservation_base==a->reservation_base+9U*VMM_PAGE_SIZE);
     assert(a->reservation_base+a->reservation_pages*VMM_PAGE_SIZE<=b->reservation_base);
-    assert(process_user_region_release_unpublished(&p,b));
-    assert(process_user_region_release_unpublished(&p,a));
+    assert(process_user_region_release(&p,b));
+    assert(process_user_region_release(&p,a));
     assert(p.user_regions&&p.user_regions->kind==PROCESS_USER_REGION_INITIAL_STACK&&
            !p.user_regions->next);
     assert(vmm_unmap_user_range(p.address_space,(void*)stack_base,8U));
@@ -161,8 +161,8 @@ static void test_tls_image_zero_fill_and_instances(void)
     memcpy(&self_b,mapped_bytes(start_a+sizeof(uintptr_t)),sizeof(self_b));
     assert(self_a==start_a&&self_b==0);
     assert(vmm_user_range_unmapped(p.address_space,a->reservation_base,VMM_PAGE_SIZE));
-    assert(process_user_region_release_unpublished(&p,b));
-    assert(process_user_region_release_unpublished(&p,a));
+    assert(process_user_region_release(&p,b));
+    assert(process_user_region_release(&p,a));
     assert(live_frames==0&&mapping_count==0);
     assert(pthread_mutex_destroy(&p.memory_lock)==0);
 }

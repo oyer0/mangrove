@@ -3,6 +3,7 @@
 .global thread_context_enter
 .extern scheduler_context_switch_saved
 .extern scheduler_context_switch_complete
+.extern scheduler_context_switch_post_complete
 .extern scheduler_context_restore_current
 
 /*
@@ -61,6 +62,32 @@ thread_context_switch:
     popq %r14
     popq %r15
     popfq
+    /* The ownership handoff above ran with interrupts masked. Resource
+     * reclamation that may wait for remote TLB acknowledgements runs only
+     * after the incoming context's interrupt state has been restored. */
+    pushq %rax
+    pushq %rdi
+    pushq %rsi
+    pushq %rdx
+    pushq %rcx
+    pushq %r8
+    pushq %r9
+    pushq %r10
+    pushq %r11
+    pushfq
+    subq $8, %rsp
+    call scheduler_context_switch_post_complete
+    addq $8, %rsp
+    popfq
+    popq %r11
+    popq %r10
+    popq %r9
+    popq %r8
+    popq %rcx
+    popq %rdx
+    popq %rsi
+    popq %rdi
+    popq %rax
     ret
 
 /* Enter a prepared thread context without retaining the AP startup frame. */

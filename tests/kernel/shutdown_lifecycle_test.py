@@ -76,6 +76,7 @@ struct process {
  u32 service_id,thread_count; u64 pid; char name[32];
  kernel_thread_t *main_thread,*threads;
  u32 thread_list_readers; bool thread_reap_in_progress;
+ bool worker_reap_pending;
  kernel_object_t object; process_t *next_all;
 };
 static process_t *all_processes;
@@ -97,6 +98,8 @@ static void panic(const char *message)
 { (void)message; assert(!"unexpected process panic"); }
 static bool process_finish_termination(process_t *process)
 { (void)process; return false; }
+static void process_worker_reclaim_pending(process_t *process)
+{ (void)process; assert(!process_registry_lock); }
 static bool scheduler_wake_waiter(kernel_thread_t *thread)
 { assert(thread); wake_calls++; thread->pending_wake=true; return true; }
 static bool process_terminate_external(process_t *process, i32 status)

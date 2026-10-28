@@ -21,6 +21,7 @@
 #include <mg/storage.h>
 #include <mg/terminal.h>
 #include <mg/time.h>
+#include <mg/thread.h>
 #include <mg/identity.h>
 #include <net/user.h>
 #include <string.h>
@@ -78,13 +79,14 @@ extern void syscall_entry(void);
 static void syscall_fail(syscall_frame_t *frame, i64 error);
 static void syscall_dispatch_inner(syscall_frame_t *frame);
 
-static bool syscall_finish_worker_return(void)
+static bool syscall_finish_worker_return(u64 result)
 {
     kernel_thread_t *thread = thread_current();
 
-    if (!thread || !thread->process || thread->process_initial)
+    if (!thread || !thread->process || thread->process_initial ||
+        !thread->worker_record)
         return false;
-    process_thread_entry_completed(thread, 0);
+    process_worker_exit(thread, result);
     if (!scheduler_terminate())
         panic("syscall: failed to retire returned worker thread");
     return true;
@@ -1534,12 +1536,23 @@ static void syscall_dispatch_inner(syscall_frame_t *frame)
             frame->rax = (u64)syscall_object_io_result(file_write, result);
             return;
         }
-        case SYSCALL_CLOSE:
-            frame->rax = process_handle_close(
-                             process_current(),
-                             (process_handle_t)frame->rdi)
-                ? (u64)MG_OK : (u64)MG_ERR_INVALID_HANDLE;
+        case SYSCALL_CLOSE: {
+            process_t *process = process_current();
+            process_handle_t handle = (process_handle_t)frame->rdi;
+            kernel_object_t *object = process_handle_lookup_any(
+                process, handle, OBJECT_TYPE_INVALID, 0);
+            if (!object) {
+                syscall_fail(frame, MG_ERR_INVALID_HANDLE);
+                return;
+            }
+            bool allowed = object->type != OBJECT_TYPE_THREAD ||
+                process_thread_handle_close_allowed(object);
+            object_release(object);
+            frame->rax = allowed && process_handle_close(process, handle)
+                ? (u64)MG_OK : (u64)(allowed ? MG_ERR_INVALID_HANDLE :
+                                               MG_ERR_BUSY);
             return;
+        }
         case SYSCALL_SPAWN: {
             char cmdline[256];
             process_handle_t handle;
@@ -4009,10 +4022,77 @@ static void syscall_dispatch_inner(syscall_frame_t *frame)
             /* Private CRT worker-return operation. It is restricted to a
              * non-initial process thread; explicit process_exit() stays
              * process-wide for every thread. */
-            if (!syscall_finish_worker_return()) {
+            if (!syscall_finish_worker_return(frame->rdi)) {
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
             }
+            return;
+        }
+        case SYSCALL_THREAD_CREATE: {
+            mg_thread_created_t *output =
+                (mg_thread_created_t *)(uintptr_t)frame->rdx;
+            process_handle_t handle = 0;
+            u64 id = 0;
+            if (!output || !syscall_user_buffer_writable(output,
+                    sizeof(*output))) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            i64 result = process_thread_create(process_current(),
+                (uintptr_t)frame->rdi, (uintptr_t)frame->rsi, &handle, &id);
+            if (result < 0) {
+                syscall_fail(frame, result);
+                return;
+            }
+            output->handle = handle;
+            output->id = id;
+            frame->rax = (u64)MG_OK;
+            return;
+        }
+        case SYSCALL_THREAD_JOIN: {
+            mg_thread_result_t *output =
+                (mg_thread_result_t *)(uintptr_t)frame->rsi;
+            if (!output || !syscall_user_buffer_writable(output,
+                    sizeof(*output))) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            i64 result = process_thread_join(process_current(),
+                (process_handle_t)frame->rdi, output);
+            if (result < 0) syscall_fail(frame, result);
+            else frame->rax = (u64)result;
+            return;
+        }
+        case SYSCALL_THREAD_DETACH: {
+            i64 result = process_thread_detach(process_current(),
+                (process_handle_t)frame->rdi);
+            if (result < 0) syscall_fail(frame, result);
+            else frame->rax = (u64)result;
+            return;
+        }
+        case SYSCALL_THREAD_EXIT: {
+            kernel_thread_t *thread = thread_current();
+            if (!thread || !thread->process || thread->process_initial ||
+                !thread->worker_record) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            process_worker_exit(thread, frame->rdi);
+            if (!scheduler_terminate())
+                panic("syscall: explicit worker exit failed to schedule");
+            return;
+        }
+        case SYSCALL_THREAD_SELF: {
+            mg_thread_id_t *output =
+                (mg_thread_id_t *)(uintptr_t)frame->rdi;
+            u64 id = process_current_thread_id();
+            if (!id || !output ||
+                !syscall_user_buffer_writable(output, sizeof(*output))) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            *output = id;
+            frame->rax = (u64)MG_OK;
             return;
         }
         case SYSCALL_SYNC_WAIT_U32: {
@@ -4069,7 +4149,8 @@ void syscall_dispatch(void *raw_frame)
     }
     process = thread->process;
     tracked = frame->rax != SYSCALL_EXIT &&
-              frame->rax != SYSCALL_THREAD_RETURN;
+              frame->rax != SYSCALL_THREAD_RETURN &&
+              frame->rax != SYSCALL_THREAD_EXIT;
     if (tracked && !process_syscall_enter(process)) {
         if (process_thread_exit_requested(thread)) {
             process_thread_entry_completed(thread, -1);
@@ -4088,6 +4169,15 @@ void syscall_dispatch(void *raw_frame)
     thread->syscall_user_access_context = previous_context;
     if (tracked) scheduler_syscall_leave();
     if (tracked) process_syscall_leave(process);
+    if (tracked && __atomic_load_n(&process->worker_reap_pending,
+                                   __ATOMIC_ACQUIRE)) {
+        /* Worker stack reclamation may wait for cross-CPU TLB shootdowns.
+         * All syscall leases are gone and no kernel lock is held here. The
+         * syscall frame remains on this thread's protected kernel stack. */
+        __asm__ volatile("sti" ::: "memory");
+        process_worker_reclaim_pending(process);
+        __asm__ volatile("cli" ::: "memory");
+    }
     if (context.allocation_failed && (i64)frame->rax == MG_ERR_BAD_ARGUMENT)
         syscall_fail(frame, MG_ERR_NO_MEMORY);
     if (tracked && process_thread_exit_requested(thread)) {
