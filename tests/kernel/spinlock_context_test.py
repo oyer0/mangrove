@@ -129,6 +129,18 @@ static bool thread_saved_stack_valid(const kernel_thread_t *thread) {
 static bool cpu_registers_has_privilege_stack(const cpu_registers_t *regs) {
     return regs && regs->from_user;
 }
+/* The extracted production scheduler path now checks coordinated process
+ * exit before returning to Ring 3. This fixture has no process lifecycle;
+ * keep that branch inert while exercising the existing preemption contract. */
+static bool process_thread_exit_requested(const kernel_thread_t *thread) {
+    (void)thread;
+    return false;
+}
+static void process_thread_entry_completed(kernel_thread_t *thread, i32 status) {
+    (void)thread;
+    (void)status;
+}
+static bool scheduler_terminate(void) { return true; }
 static uintptr_t cpu_registers_interrupted_rsp(const cpu_registers_t *regs) {
     return regs->interrupted_rsp;
 }

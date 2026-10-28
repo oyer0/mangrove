@@ -44,6 +44,7 @@ struct process;
 struct cpu_local;
 struct kernel_mutex;
 struct process_user_region;
+struct process_thread_record;
 
 /* Initial Ring 3 state belongs to a schedulable thread. Registers saved by
  * an interrupt or syscall remain on that thread's kernel stack; this record
@@ -153,6 +154,7 @@ struct kernel_thread {
     char name[32];
     struct process *process;
     struct kernel_thread *process_next;
+    struct process_thread_record *worker_record;
     thread_process_state_t process_state;
     bool process_initial;
     bool process_reference_held;
@@ -184,6 +186,9 @@ kernel_thread_t *thread_create_suspended_with_priority(const char *name,
                                                        void *argument,
                                                        thread_priority_t priority);
 bool thread_destroy(kernel_thread_t *thread);
+/* Release the execution stack only after the terminated context has been
+ * switched away. The scheduler record remains available for join/reap. */
+bool thread_release_terminated_stack(kernel_thread_t *thread);
 bool thread_switch_to(kernel_thread_t *target);
 bool scheduler_enqueue(kernel_thread_t *thread);
 kernel_thread_t *scheduler_select_next(void);
@@ -224,6 +229,10 @@ bool scheduler_thread_initial_process_attachable(
     const kernel_thread_t *thread);
 /* Return the stable CPU index currently owning a thread, or UINT32_MAX. */
 u32 scheduler_thread_running_cpu(const kernel_thread_t *thread);
+/* Atomically sample CPU ownership for a stable process thread list.  Returns
+ * THREAD_CPU_NONE, one CPU index, or THREAD_CPU_MULTIPLE.  The caller keeps
+ * the process list stable while this scheduler-locked snapshot is taken. */
+u32 scheduler_process_running_cpu_snapshot(const kernel_thread_t *threads);
 thread_state_t scheduler_thread_state_snapshot(const kernel_thread_t *thread);
 bool scheduler_sleep(u64 milliseconds);
 void scheduler_syscall_enter(void);
@@ -237,6 +246,10 @@ bool scheduler_prepare_idle_cpu(struct cpu_local *cpu,
                                 kernel_stack_t *stack);
 /* Enter the current CPU's idle context.  A successful call does not return. */
 bool scheduler_start_cpu(void);
+/* Assembly context-switch ownership hooks. The post hook runs after incoming
+ * RFLAGS are restored and may reclaim resources using SMP TLB shootdowns. */
+void scheduler_context_switch_complete(uintptr_t *outgoing_rsp_slot);
+void scheduler_context_switch_post_complete(void);
 bool scheduler_prepare_preemption(struct cpu_registers *regs);
 u64 scheduler_preempt_from_trampoline(void);
 u64 scheduler_preempt_return_flags(void);

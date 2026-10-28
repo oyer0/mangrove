@@ -130,23 +130,21 @@ HTTPS, while HTTPS-to-HTTP redirects are rejected. `fetch` is limited to TLS
 Mozilla policy metadata such as distrust-after dates.
 
 wolfSSL 5.9.4's `SINGLE_THREADED` configuration disables mutex operations and
-uses ordinary, non-atomic reference counters. This matches Mangrove's current
-process model: each process has one userspace thread, and its address space
-contains its own wolfSSL and mgTLS global state. wolfSSL's static
-certificate-time callback and library initialization count are therefore
-process-local, not shared by independent processes. Separate processes can
-create independent mgTLS contexts and sessions without racing through
-wolfSSL's globals; however, Mangrove's TCP implementation currently permits
-only one live connection system-wide, so it limits simultaneous network
-sessions independently of wolfSSL. Within one process, applications must
-serialize all mgTLS calls and must not call wolfSSL directly. Sequential use
-of multiple contexts/sessions follows the API lifecycle contract.
+uses ordinary, non-atomic reference counters. Mangrove supports multiple
+userspace workers in one process, so applications must serialize every mgTLS
+call within a process and must not call wolfSSL directly. Separate processes
+have independent wolfSSL and mgTLS state. wolfSSL's static certificate-time
+callback and library initialization count therefore do not race between
+independent processes. The kernel currently permits only one live TCP
+connection system-wide, which limits simultaneous network sessions
+independently of wolfSSL. Sequential use of multiple contexts/sessions follows
+the API lifecycle contract.
 
-The no-lock configuration is not a promise of thread safety. If Mangrove adds
-multiple userspace threads in one process, mgTLS must move to the platform's
-wolfSSL mutex/atomic integration and protect its own initialization, time
-callback error, and context-lifetime state before concurrent API use. Merely
-removing `SINGLE_THREADED` would not provide that integration.
+The no-lock configuration is not a promise of thread safety. Enabling
+concurrent mgTLS calls requires the platform's wolfSSL mutex/atomic integration
+and synchronization for mgTLS initialization, time-callback error, and
+context-lifetime state. Merely removing `SINGLE_THREADED` would not provide
+that integration.
 
 The client build includes SHA-384 for certificate-signature verification and
 wolfSSL alternate-chain path selection. Alternate-chain handling permits a

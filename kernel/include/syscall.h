@@ -121,6 +121,11 @@ enum syscall_number {
     /* Address-keyed, same-process userspace synchronization operations. */
     SYSCALL_SYNC_WAIT_U32 = 106,
     SYSCALL_SYNC_WAKE_U32 = 107,
+    SYSCALL_THREAD_CREATE = 108,
+    SYSCALL_THREAD_JOIN = 109,
+    SYSCALL_THREAD_DETACH = 110,
+    SYSCALL_THREAD_EXIT = 111,
+    SYSCALL_THREAD_SELF = 112,
 };
 
 /* Initialize the native syscall MSRs for the CPU executing this function. */

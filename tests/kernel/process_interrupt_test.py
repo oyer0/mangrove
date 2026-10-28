@@ -53,6 +53,7 @@ struct process {
     u32 thread_count;
     u32 thread_list_readers;
     bool thread_reap_in_progress, exit_cleanup_complete;
+    bool worker_reap_pending;
     kernel_object_t object;
 };
 static int process_registry_lock;
@@ -68,6 +69,8 @@ static void panic(const char *message)
 { (void)message; assert(!"unexpected process panic"); }
 static bool process_finish_termination(process_t *process)
 { (void)process; return false; }
+static void process_worker_reclaim_pending(process_t *process)
+{ (void)process; assert(!process_registry_lock); }
 static bool scheduler_wake_waiter(kernel_thread_t *thread)
 { assert(thread); thread->wakes++; return true; }
 '''

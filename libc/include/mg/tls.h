@@ -7,13 +7,12 @@
 typedef struct mgtls_context mgtls_context_t;
 typedef struct mgtls_session mgtls_session_t;
 
-/* mgTLS operations are process-local and synchronous. Mangrove currently has
- * one userspace thread per process, so contexts, sessions, and library calls
- * are not internally synchronized. Callers must serialize mgTLS operations
- * within a process. Separate processes have independent library state. If
- * Mangrove adds process threads, mgTLS must be rebuilt with wolfSSL mutex and
- * atomic support and its own process-local state synchronized before concurrent
- * use is supported. The system CA bundle is loaded by context_create(). */
+/* mgTLS operations are process-local and synchronous. The current wolfSSL
+ * build uses SINGLE_THREADED and has no internal mutexes or atomic reference
+ * counters. Callers must serialize every mgTLS operation within a process,
+ * including initialization, contexts, sessions, callbacks, and cleanup.
+ * Separate processes have independent library state. The system CA bundle is
+ * loaded by context_create(). */
 #define MGTLS_SYSTEM_CA_BUNDLE "/share/ca-certificates/ca-bundle.pem"
 #define MGTLS_SYSTEM_CA_MANIFEST "/share/ca-certificates/manifest.json"
 #define MGTLS_TIMEOUT_DEFAULT 5000U

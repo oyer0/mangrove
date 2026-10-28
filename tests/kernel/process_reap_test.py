@@ -57,6 +57,7 @@ enum {MG_OK=0, MG_ERR_BAD_ARGUMENT=-4, MG_ERR_INVALID_HANDLE=-8,
 #define PROCESS_NO_SESSION 0
 #define THREAD_CPU_NONE UINT32_MAX
 typedef struct process process_t;
+typedef struct process_thread_record process_thread_record_t;
 typedef struct kernel_thread {
  u32 state, running_cpu; bool context_switch_pending, syscall_active, sleeping;
  bool stack_external;
@@ -68,8 +69,16 @@ typedef struct kernel_thread {
  volatile bool process_exit_requested;
  i32 process_exit_status;
  bool process_exit_status_valid;
+ process_thread_record_t *worker_record;
 } kernel_thread_t;
 typedef struct {unsigned ref_count; process_t *process;} kernel_object_t;
+struct process_thread_record {
+ kernel_object_t object; process_t *process;
+ kernel_thread_t *execution, *join_waiter;
+ process_thread_record_t *next;
+ void *stack_region, *tls_region;
+ bool completed, kernel_stack_released, listed, reclaiming;
+};
 struct process {
  int state; bool wait_collected, owner_reference_held, shutdown_requested;
  bool launch_ready, wait_claimed, exit_cleanup_complete,
@@ -80,6 +89,9 @@ struct process {
  process_t *parent, *waiting_child, *next_all, *first_child, *next_sibling;
  kernel_thread_t *main_thread, *threads, *waiting_thread;
  u32 thread_count, live_thread_count, thread_list_readers;
+ u32 worker_reapers;
+ process_thread_record_t *thread_records;
+ bool worker_reap_pending;
  kernel_object_t object;
  void *address_space, *handle_table;
 };
@@ -106,6 +118,8 @@ static u64 process_cli_save(void){return 1;}
 static void process_cli_restore(u64 flags){(void)flags;}
 static kernel_thread_t *thread_current(void){return &parent_thread;}
 static bool scheduler_unblock(kernel_thread_t *thread)
+{(void)thread;return true;}
+static bool scheduler_wake_waiter(kernel_thread_t *thread)
 {(void)thread;return true;}
 static bool process_shutdown_requested(const process_t *p)
 {return p->shutdown_requested;}
@@ -195,6 +209,7 @@ running = running.replace('bool scheduler_thread_is_running(',
                           'static __attribute__((unused)) bool scheduler_thread_is_running(', 1)
 code = prefix + completion + running
 for name in ('process_thread_list_complete_locked',
+             'process_worker_records_release_all',
              'process_publish_terminated_locked',
              'process_scheduler_handoff_complete',
              'process_detach_thread_owned', 'process_detach_thread',

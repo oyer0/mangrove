@@ -23,7 +23,7 @@ _start:
 .global __mangrove_thread_return
 .type __mangrove_thread_return, @function
 __mangrove_thread_return:
-    xor %edi, %edi
+    mov %rax, %rdi              /* Preserve the worker's return value. */
     mov $105, %eax                 /* SYSCALL_THREAD_RETURN, private ABI */
     syscall
     ud2                            /* This syscall must not return. */

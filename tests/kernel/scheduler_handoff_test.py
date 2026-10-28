@@ -41,7 +41,8 @@ enum {THREAD_STATE_READY,THREAD_STATE_RUNNING,THREAD_STATE_BLOCKED,THREAD_STATE_
 enum {KERNEL_STACK_USAGE_BOOTSTRAP};
 #define THREAD_CPU_NONE ((u32)-1)
 typedef struct {bool active;} kernel_stack_t;
-typedef struct process {unsigned handoffs;} process_t;
+typedef struct {unsigned references;} kernel_object_t;
+typedef struct process {kernel_object_t object;unsigned handoffs;} process_t;
 typedef struct kernel_thread {
  struct kernel_thread *next; uintptr_t saved_stack_pointer;
  unsigned state,running_cpu,effective_priority,base_priority,last_selected_priority,ready_wait_ticks;
@@ -49,10 +50,12 @@ typedef struct kernel_thread {
  bool stack_external; uintptr_t kernel_stack_base; size_t kernel_stack_size;
  kernel_stack_t kernel_stack;
  process_t *process;
+ void *worker_record;
  unsigned fpu_state;
  uintptr_t user_fs_base;
 } kernel_thread_t;
-typedef struct {kernel_thread_t *scheduler_idle_thread;} cpu_local_t;
+typedef struct {kernel_thread_t *scheduler_idle_thread;
+ process_t *scheduler_post_handoff_process;} cpu_local_t;
 static cpu_local_t cpu; static kernel_thread_t bootstrap_thread, *current_thread, *idle_thread;
 typedef struct {kernel_thread_t *head;} thread_ready_queue_t;
 static thread_ready_queue_t ready_queues[3];
@@ -70,6 +73,8 @@ static void kernel_stack_usage_sample(unsigned kind, uintptr_t top, uintptr_t rs
 static u64 spin_lock_irqsave(unsigned *p){assert(!*p);*p=1;return 0;}
 static void spin_unlock_irqrestore(unsigned *p,u64 f){(void)f;assert(*p);*p=0;}
 static void panic(const char *s){puts(s);abort();}
+static bool object_reference(kernel_object_t *object)
+{if(!object||object->references==~0U)return false;object->references++;return true;}
 static void process_scheduler_handoff_complete(kernel_thread_t *thread)
 {assert(thread && thread->process && !scheduler_lock &&
         !scheduler_context_switch_in_progress);thread->process->handoffs++;}

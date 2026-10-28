@@ -179,6 +179,7 @@ FONT_ASSET   := kernel/assets/font.psf
 FSTEST_DIR   := $(BUILD_DIR)/fstest
 CASTORETEST_DIR := $(BUILD_DIR)/castoretest
 MGTLS_TEST_DIR := $(BUILD_DIR)/mgtlstest
+THREADTEST_DIR := $(BUILD_DIR)/threadtest
 NETTEST_DIR  := $(BUILD_DIR)/nettest
 PING_DIR     := $(BUILD_DIR)/ping
 RESOLVE_DIR  := $(BUILD_DIR)/resolve
@@ -244,6 +245,7 @@ WHERE        := $(WHERE_DIR)/where.elf
 FSTEST       := $(FSTEST_DIR)/fstest.elf
 CASTORETEST  := $(CASTORETEST_DIR)/castoretest.elf
 MGTLS_TEST   := $(MGTLS_TEST_DIR)/mgtlstest.elf
+THREADTEST   := $(THREADTEST_DIR)/threadtest.elf
 MGTLS_TRACE  := $(MGTLS_TEST_DIR)/resource_trace.o
 NETTEST      := $(NETTEST_DIR)/nettest.elf
 PING         := $(PING_DIR)/ping.elf
@@ -672,7 +674,7 @@ help:
 	@echo
 	@echo "Specialist targets: binaries image fresh-image usb-image mkmgfs mgfsck"
 	@echo "                    test-time test-terminal test-font test-help test-guest-shutdown test-guest-logout test-guest-reed"
-	@echo "                    test-random test-guest-random test-say and individual programs"
+	@echo "                    test-random test-guest-random test-guest-threads test-say and individual programs"
 
 make: image
 
@@ -3360,6 +3362,29 @@ test-guest-arguments:
 		--arguments-smoke --cpus 2 --no-nic --accel "$(GUEST_ARGUMENTS_ACCEL)" \
 		--ovmf-code "$(OVMF_CODE_SOURCE)" --ovmf-vars "$(OVMF_VARS_SOURCE)"
 
+# Explicit native userspace-thread acceptance payload; never installed in a
+# normal developer image. Requires KVM for real two-vCPU qualification.
+threadtest: $(THREADTEST)
+$(THREADTEST_DIR)/main.o: tests/userspace/thread_lifecycle_guest.c $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -std=c17 -c $< -o $@
+$(THREADTEST): $(THREADTEST_DIR)/main.o $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
+		$(USER_CRT) $< $(USER_LIBC)
+
+GUEST_THREADS_BUILD ?= $(abspath $(BUILD_DIR))/guest-builds/threads
+GUEST_THREADS_OUTPUT ?=
+GUEST_THREADS_ACCEL ?= $(NATIVE_GUEST_ACCEL)
+.PHONY: test-guest-threads
+test-guest-threads:
+	$(QEMU_ACCEL_PREFLIGHT) "$(GUEST_THREADS_ACCEL)"
+	$(MAKE) -j4 BUILD_DIR="$(GUEST_THREADS_BUILD)" binaries threadtest mkmgfs mgfsck RTC_UTC_TRUST=1
+	python3 tests/guest/guest_mgfs_test.py --build-dir "$(GUEST_THREADS_BUILD)" \
+		$(if $(GUEST_THREADS_OUTPUT),--output "$(GUEST_THREADS_OUTPUT)") \
+		--thread-smoke --cpus 2 --no-nic --repetitions 3 \
+		--accel "$(GUEST_THREADS_ACCEL)" \
+		--ovmf-code "$(OVMF_CODE_SOURCE)" --ovmf-vars "$(OVMF_VARS_SOURCE)"
+
 randomtest: $(BUILD_DIR)/randomtest/randomtest.elf
 $(BUILD_DIR)/randomtest/randomtest.o: tests/userspace/random_guest.c $(USER_LIBC)
 	@mkdir -p $(dir $@)
@@ -3383,7 +3408,8 @@ test-sync: test-process-handles
 test-sync: test-syscall-user-memory
 test-sync: test-process-memory-unmap
 test-sync: test-process-interrupt
-test-sync: test-process-thread-lifecycle test-process-thread-termination
+test-sync: test-process-thread-lifecycle test-process-thread-termination \
+		test-process-thread-api test-scheduler-process-cpu
 test-sync: test-user-context
 test-sync: test-user-tls
 
@@ -3397,9 +3423,16 @@ test-user-tls: test-libc-link $(PING)
 	python3 tests/userspace/tls_model_test.py "$(HOST_CC)" \
 		"$(RUNTIME_API_LINK_OBJ)" "$(RUNTIME_API_LINK_ELF)" "$(PING)"
 
-.PHONY: test-process-thread-lifecycle test-process-thread-termination
+.PHONY: test-process-thread-lifecycle test-process-thread-termination \
+	test-process-thread-api test-scheduler-process-cpu
 test-process-thread-lifecycle:
 	python3 tests/kernel/process_thread_lifecycle_test.py "$(HOST_CC)"
 
 test-process-thread-termination:
 	python3 tests/kernel/process_thread_termination_test.py "$(HOST_CC)"
+
+test-process-thread-api:
+	python3 tests/kernel/process_thread_api_test.py "$(HOST_CC)"
+
+test-scheduler-process-cpu:
+	python3 tests/kernel/scheduler_process_cpu_snapshot_test.py "$(HOST_CC)"
