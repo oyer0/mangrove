@@ -109,10 +109,11 @@ The lock then defers timer preemption and prevents maskable interrupt
 reentrancy until release. This does not protect against NMI reentry, which
 must not use the same local cache state.
 
-Each CPU has a local LAPIC scheduler timer. The BSP's PIT path remains the
-global scheduler timekeeping source and wakes sleeping threads; local LAPIC
-timer interrupts provide per-CPU preemption without multiplying wall-clock
-time by the CPU count.
+Each CPU has a local LAPIC scheduler timer. The BSP's PIT path remains a global
+scheduler notification that checks sleeping-thread deadlines; elapsed
+monotonic time comes from the selected shared hardware clocksource, not the
+number of PIT interrupts. Local LAPIC timer interrupts provide per-CPU
+preemption without multiplying elapsed time by the CPU count.
 
 Timer preemption counters are diagnostic accounting shared across CPUs. Their
 increments and samples use relaxed atomic operations: these counters do not

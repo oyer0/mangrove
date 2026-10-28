@@ -7,7 +7,7 @@
 #include <timer.h>
 
 #define HTTP_REQUEST_MAX 2048U
-#define HTTP_WAIT_TICKS 15000U
+#define HTTP_WAIT_MS 15000U
 #define HTTP_TCP_TIMEOUT_MS 5000U
 
 static bool http_ipv4_literal(const char *text, net_ipv4_t *address)
@@ -130,8 +130,9 @@ bool http_get(net_device_t *device, const char *url,
         if (result_out) *result_out = result;
         return false;
     }
-    start = timer_ticks();
-    while (!http_parser_complete(&parser) && timer_ticks() - start < HTTP_WAIT_TICKS) {
+    start = timer_uptime_ms();
+    while (!http_parser_complete(&parser) &&
+           timer_uptime_ms() - start < HTTP_WAIT_MS) {
         usize count = tcp_receive_bytes(connection, receive, sizeof(receive),
                                         &tcp_status);
         if (count && !http_parser_feed(&parser, receive, count)) {

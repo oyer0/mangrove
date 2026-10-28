@@ -607,7 +607,7 @@ void scheduler_dump(void)
          thread && seen++ < scheduler_stats.sleeping_threads;
          thread = thread->next) {
         kprint(" %s(%llu@%llu)", thread->name, thread->id,
-               thread->wakeup_tick);
+               thread->wakeup_deadline_ms);
     }
     kprint("\n  switches=%llu preemptions=%llu yields=%llu blocks=%llu wakes=%llu\n",
            scheduler_stats.context_switches,
@@ -1433,7 +1433,7 @@ static void sleeping_remove(kernel_thread_t *thread)
     }
     thread->next = NULL;
     thread->sleeping = false;
-    thread->wakeup_tick = 0;
+    thread->wakeup_deadline_ms = 0;
 }
 
 bool scheduler_terminate_thread(kernel_thread_t *thread)
@@ -1483,7 +1483,7 @@ static bool scheduler_unblock_locked(kernel_thread_t *thread)
     bool was_sleeping;
     bool old_wakeup_boosted;
     thread_priority_t old_effective_priority;
-    u64 old_wakeup_tick;
+    u64 old_wakeup_deadline_ms;
     u32 old_running_cpu;
 
     if (!thread || thread == idle_thread ||
@@ -1495,7 +1495,7 @@ static bool scheduler_unblock_locked(kernel_thread_t *thread)
     was_sleeping = thread->sleeping;
     old_wakeup_boosted = thread->wakeup_boosted;
     old_effective_priority = thread->effective_priority;
-    old_wakeup_tick = thread->wakeup_tick;
+    old_wakeup_deadline_ms = thread->wakeup_deadline_ms;
     sleeping_remove(thread);
     thread->effective_priority = thread->base_priority ==
         THREAD_PRIORITY_BACKGROUND ? THREAD_PRIORITY_NORMAL :
@@ -1509,7 +1509,7 @@ static bool scheduler_unblock_locked(kernel_thread_t *thread)
         thread->wakeup_boosted = old_wakeup_boosted;
         thread->effective_priority = old_effective_priority;
         if (was_sleeping) {
-            thread->wakeup_tick = old_wakeup_tick;
+            thread->wakeup_deadline_ms = old_wakeup_deadline_ms;
             thread->next = sleeping_threads;
             sleeping_threads = thread;
             thread->sleeping = true;
@@ -1726,19 +1726,24 @@ bool scheduler_terminate(void)
     return scheduler_handoff(outgoing, target, saved_flags);
 }
 
-bool scheduler_sleep(u64 ticks)
+bool scheduler_sleep(u64 milliseconds)
 {
     kernel_thread_t *thread;
     kernel_thread_t *outgoing;
     kernel_thread_t *target;
     bool handoff;
+    u64 now_ms;
+    u64 wakeup_deadline_ms;
     u64 saved_flags;
 
-    if (ticks == 0) {
+    if (milliseconds == 0) {
         return true;
     }
     if (spinlock_depth_current() != 0U)
         return false;
+    now_ms = timer_uptime_ms();
+    wakeup_deadline_ms = now_ms > (~(u64)0 - milliseconds) ?
+        ~(u64)0 : now_ms + milliseconds;
     saved_flags = spin_lock_irqsave(&scheduler_lock);
     /* Pin the CPU before resolving its running thread. */
     thread = current_thread;
@@ -1753,8 +1758,7 @@ bool scheduler_sleep(u64 ticks)
         return false;
     }
 
-    thread->wakeup_tick = scheduler_tick_count > (~(u64)0 - ticks) ?
-        ~(u64)0 : scheduler_tick_count + ticks;
+    thread->wakeup_deadline_ms = wakeup_deadline_ms;
     thread->next = sleeping_threads;
     sleeping_threads = thread;
     thread->sleeping = true;
@@ -1812,6 +1816,7 @@ bool scheduler_global_tick(void)
     kernel_thread_t *thread;
     bool woke_thread = false;
     bool promoted_thread;
+    u64 now_ms = timer_uptime_ms();
     u64 flags;
 
     if (!cpu || !cpu->bsp)
@@ -1823,7 +1828,7 @@ bool scheduler_global_tick(void)
     sleeping = sleeping_threads;
     while (sleeping) {
         next_sleeping = sleeping->next;
-        if (sleeping->wakeup_tick <= scheduler_tick_count) {
+        if (sleeping->wakeup_deadline_ms <= now_ms) {
             sleeping_remove(sleeping);
             if (scheduler_stats.sleeping_threads)
                 scheduler_stats.sleeping_threads--;

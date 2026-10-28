@@ -70,7 +70,7 @@ struct kernel_thread {
     u64 preempt_return_cs;
     u64 preempt_return_ss;
     bool preempt_from_user;
-    u64 wakeup_tick;
+    u64 wakeup_deadline_ms;
     bool sleeping;
     /* A syscall runs on this thread's kernel stack and may deliberately
      * block.  IRQ accounting still runs, but its live syscall frame must not
@@ -173,7 +173,7 @@ bool scheduler_thread_is_running(const kernel_thread_t *thread);
 bool scheduler_thread_exit_complete(const kernel_thread_t *thread);
 /* Return the stable CPU index currently owning a thread, or UINT32_MAX. */
 u32 scheduler_thread_running_cpu(const kernel_thread_t *thread);
-bool scheduler_sleep(u64 ticks);
+bool scheduler_sleep(u64 milliseconds);
 void scheduler_syscall_enter(void);
 void scheduler_syscall_leave(void);
 bool scheduler_validate_state(void);

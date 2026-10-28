@@ -10,7 +10,7 @@
 #define DNS_PORT 53U
 #define DNS_SOURCE_PORT 53000U
 #define DNS_PACKET_MAX 512U
-#define DNS_WAIT_TICKS 5000U
+#define DNS_WAIT_MS 5000U
 #define DNS_RETRIES 3U
 
 typedef struct {
@@ -118,8 +118,8 @@ bool dns_resolve_a(net_device_t *device, const char *hostname,
         }
         (void)udp_transmit(device, configuration->address, configuration->dns,
                            DNS_SOURCE_PORT, DNS_PORT, packet, query_length);
-        start = timer_ticks();
-        while (timer_ticks() - start < DNS_WAIT_TICKS &&
+        start = timer_uptime_ms();
+        while (timer_uptime_ms() - start < DNS_WAIT_MS &&
                __atomic_load_n(&state.event, __ATOMIC_ACQUIRE) == 0) {
             if (process_take_interrupt(process_current())) {
                 status = DNS_STATUS_INTERRUPTED;

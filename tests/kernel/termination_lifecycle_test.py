@@ -76,7 +76,7 @@ struct kernel_thread {
  bool syscall_active, context_switch_pending, queued, sleeping;
  bool entry_started, stack_external;
  uintptr_t preempt_return_rip;
- u64 wakeup_tick; kernel_thread_t *next;
+ u64 wakeup_deadline_ms; kernel_thread_t *next;
  void *waiting_mutex; uintptr_t kernel_stack_base;
  kernel_stack_t kernel_stack;
  process_t *process;

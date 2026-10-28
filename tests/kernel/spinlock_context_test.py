@@ -60,7 +60,7 @@ typedef struct kernel_thread {
     u32 running_cpu;
     uintptr_t saved_stack_pointer, preempt_return_rip, preempt_return_rsp;
     u64 preempt_return_rflags, preempt_return_cs, preempt_return_ss;
-    u64 wakeup_tick;
+    u64 wakeup_deadline_ms;
     struct kernel_thread *next;
 } kernel_thread_t;
 typedef struct cpu_registers {
@@ -86,7 +86,7 @@ static _Thread_local cpu_local_t local_cpu;
 static scheduler_lock_t scheduler_lock;
 static scheduler_stats_t scheduler_stats;
 static kernel_thread_t *sleeping_threads;
-static u64 scheduler_tick_count;
+static u64 timer_uptime_ms(void) { return 0; }
 static _Atomic u32 scheduler_lock_calls;
 static bool test_interrupts_enabled = true;
 static u64 spin_irq_save(void);

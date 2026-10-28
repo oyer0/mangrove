@@ -46,29 +46,34 @@ prefix = r'''
 #define KERNEL_BOOT_DEBUG_LOG(...) ((void)printf(__VA_ARGS__))
 typedef uint64_t u64; typedef unsigned u32;
 enum { THREAD_STATE_RUNNING, THREAD_STATE_READY, THREAD_STATE_BLOCKED, THREAD_STATE_TERMINATED };
-enum { THREAD_PRIORITY_BACKGROUND=2 };
+enum { THREAD_PRIORITY_HIGH=0, THREAD_PRIORITY_NORMAL=1,
+       THREAD_PRIORITY_BACKGROUND=2 };
 typedef enum {SCHEDULER_DISPATCH_REQUEUE, SCHEDULER_DISPATCH_BLOCK,
               SCHEDULER_DISPATCH_TERMINATE} scheduler_dispatch_action_t;
 #define THREAD_CPU_NONE ((u32)-1)
 #define scheduler_trace(...) ((void)0)
 typedef struct {bool active;} kernel_stack_t;
 typedef struct kernel_thread {
- unsigned state, running_cpu; bool queued, sleeping, entry_started;
+ unsigned state, running_cpu, effective_priority, base_priority;
+ bool queued, sleeping, entry_started, wakeup_boosted;
  void *process; const char *name; void (*entry)(void *); void *entry_argument;
- uintptr_t saved_stack_pointer; u64 wakeup_tick; struct kernel_thread *next;
+ uintptr_t saved_stack_pointer; u64 wakeup_deadline_ms; struct kernel_thread *next;
  kernel_stack_t kernel_stack;
 } kernel_thread_t;
 typedef struct {
  unsigned index; bool bsp;
  kernel_thread_t *scheduler_current_thread, *scheduler_idle_thread;
- unsigned scheduler_context_switching; u64 kernel_thread_runs;
+ unsigned scheduler_context_switching; bool scheduler_preemption_pending;
+ u64 kernel_thread_runs;
 } cpu_local_t;
 static cpu_local_t cpus[2];
 static kernel_thread_t caller, other, idle[2], target, bootstrap_thread;
 static kernel_thread_t *sleeping_threads, *next_target;
-static struct {unsigned blocks, blocked_threads, sleeping_threads, dispatches[3];} scheduler_stats;
+static struct {unsigned blocks, blocked_threads, sleeping_threads, wakeups, dispatches[3];} scheduler_stats;
 static unsigned active_cpu, scheduler_lock, migrations, handoffs;
+static bool enqueue_allowed;
 static u64 scheduler_tick_count;
+static u64 uptime_ms;
 static bool interrupts_enabled, migrate_armed;
 static jmp_buf entry_return;
 extern char __stack_guard_bottom[], __stack_bottom[];
@@ -105,6 +110,7 @@ static cpu_local_t *cpu_current(void) {
  return snapshot;
 }
 static unsigned cpu_current_index(void) {return active_cpu;}
+static u64 timer_uptime_ms(void) {return uptime_ms;}
 static unsigned spinlock_depth_current(void) {return scheduler_lock;}
 static u64 spin_lock_irqsave(unsigned *lock) {
  bool enabled=interrupts_enabled;
@@ -120,6 +126,8 @@ static bool thread_context_ready(const kernel_thread_t *t) {return thread_saved_
 static kernel_thread_t *scheduler_select_next_locked(void) {assert(scheduler_lock);return next_target;}
 static bool scheduler_consume_pending_wake_locked(kernel_thread_t *t,bool block) {(void)t;(void)block;return false;}
 static void sleeping_remove(kernel_thread_t *t) {assert(sleeping_threads==t);sleeping_threads=t->next;t->sleeping=false;}
+static bool scheduler_enqueue_locked(kernel_thread_t *t) {assert(scheduler_lock);if(!enqueue_allowed)return false;t->queued=true;return true;}
+static bool scheduler_age_ready_threads_locked(void) {assert(scheduler_lock);return false;}
 static void panic(const char *s) {(void)s;assert(!"unexpected scheduler panic");}
 static bool scheduler_handoff(kernel_thread_t *out,kernel_thread_t *in,u64 flags) {
  assert(out==&caller && in==&target && active_cpu==1);
@@ -129,6 +137,7 @@ static bool scheduler_handoff(kernel_thread_t *out,kernel_thread_t *in,u64 flags
 macros = r'''
 #define current_thread (scheduler_cpu_local()->scheduler_current_thread)
 #define idle_thread (scheduler_cpu_local()->scheduler_idle_thread)
+#define preemption_pending (scheduler_cpu_local()->scheduler_preemption_pending)
 #define scheduler_context_switch_in_progress (scheduler_cpu_local()->scheduler_context_switching)
 '''
 suffix = r'''
@@ -137,9 +146,11 @@ static void reset(bool success) {
  caller=(kernel_thread_t){.state=THREAD_STATE_RUNNING,.running_cpu=0,.saved_stack_pointer=0x1000};
  other=(kernel_thread_t){.state=THREAD_STATE_RUNNING,.running_cpu=0,.saved_stack_pointer=0x2000};
  target=(kernel_thread_t){.state=THREAD_STATE_READY,.running_cpu=THREAD_CPU_NONE,.saved_stack_pointer=0x3000};
- for(unsigned i=0;i<2;i++){cpus[i].index=i;cpus[i].scheduler_idle_thread=&idle[i];}
+ for(unsigned i=0;i<2;i++){cpus[i].index=i;cpus[i].bsp=i==0;cpus[i].scheduler_idle_thread=&idle[i];}
  cpus[0].scheduler_current_thread=&caller;
  active_cpu=0;scheduler_lock=0;migrations=0;handoffs=0;
+ scheduler_tick_count=0;enqueue_allowed=true;
+ uptime_ms=100;
  sleeping_threads=NULL;next_target=success?&target:NULL;
  interrupts_enabled=true;migrate_armed=true;set_gs();
 }
@@ -176,6 +187,25 @@ int main(int argc,char **argv) {
   other.entry=entered;other.entry_argument=&other;
   caller.name="caller";other.name="other";
   if(!setjmp(entry_return))thread_entry_trampoline();
+ } else if(!strcmp(argv[1],"deadline")) {
+  reset(false);migrate_armed=false;
+  cpus[0].scheduler_current_thread=&idle[0];
+  target=(kernel_thread_t){.state=THREAD_STATE_BLOCKED,
+   .running_cpu=THREAD_CPU_NONE,.effective_priority=THREAD_PRIORITY_NORMAL,
+   .base_priority=THREAD_PRIORITY_NORMAL,.sleeping=true,
+   .wakeup_deadline_ms=105};
+  sleeping_threads=&target;scheduler_stats.sleeping_threads=1;
+  scheduler_stats.blocked_threads=1;uptime_ms=104;
+  assert(!scheduler_global_tick());
+  assert(target.state==THREAD_STATE_BLOCKED && target.sleeping && !target.queued);
+  assert(scheduler_stats.sleeping_threads==1 && scheduler_stats.wakeups==0);
+  /* A delayed scheduler notification observes elapsed time directly; it does
+   * not need one delivered tick for each millisecond of the requested sleep. */
+  uptime_ms=110;
+  assert(scheduler_global_tick());
+  assert(target.state==THREAD_STATE_READY && !target.sleeping && target.queued);
+  assert(scheduler_stats.sleeping_threads==0 &&
+         scheduler_stats.blocked_threads==0 && scheduler_stats.wakeups==1);
  } else for(unsigned success=0;success<2;success++) {
   reset(success);
   bool result;
@@ -188,6 +218,8 @@ int main(int argc,char **argv) {
   assert(other.state==THREAD_STATE_RUNNING && other.running_cpu==0);
   assert(cpus[1].scheduler_current_thread==(success?&target:&caller));
   assert(caller.running_cpu==(success?THREAD_CPU_NONE:1));
+  if(!strcmp(argv[1],"sleep"))
+   assert(caller.wakeup_deadline_ms==105);
   assert(handoffs==success);
  }
 #ifdef __linux__
@@ -201,10 +233,10 @@ with tempfile.TemporaryDirectory(prefix='mangrove-scheduler-current-') as tmp:
     path.write_text(prefix + function('scheduler_cpu_local') + macros + ''.join(function(name) for name in (
         'scheduler_prepare_dispatch_locked', 'scheduler_block', 'scheduler_terminate', 'scheduler_sleep',
         'scheduler_current_thread', 'scheduler_current_stack_guard_fault',
-        'thread_entry_trampoline')) + suffix)
+        'scheduler_global_tick', 'thread_entry_trampoline')) + suffix)
     binary = Path(tmp) / 'test'
     subprocess.run(['cc', '-std=c11', '-Wall', '-Wextra', '-Werror', '-fsanitize=address,undefined', str(path), '-o', str(binary)], check=True)
     results = [subprocess.run([str(binary), case]).returncode
-               for case in ('block', 'sleep', 'terminate', 'snapshot', 'entry')]
+               for case in ('block', 'sleep', 'terminate', 'snapshot', 'entry', 'deadline')]
     if any(results):
         raise SystemExit(f'scheduler migration regressions failed: {results}')
