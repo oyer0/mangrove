@@ -852,6 +852,19 @@ test-power-presentation:
 	python3 tests/userspace/power_presentation_test.py "$(HOST_CC)"
 
 test-time:
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -pthread \
+		-fsanitize=address,undefined -fno-builtin \
+		-Ikernel/include -Iinclude -idirafter libc/include \
+		tests/kernel/clocksource_test.c -o /tmp/mangrove-clocksource-test
+	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-clocksource-test
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -pthread \
+		-fsanitize=address,undefined -ffunction-sections -fdata-sections \
+		-Wl,--gc-sections -fno-builtin -Ikernel/include \
+		-Ikernel/include/usb -Ikernel/include/pci -Ikernel/include/storage \
+		-Iinclude -idirafter libc/include \
+		tests/kernel/clocksource_timer_test.c kernel/src/clocksource.c \
+		-o /tmp/mangrove-clocksource-timer-test
+	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-clocksource-timer-test
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
 		-Ilibc/include -Iinclude tests/kernel/timekeeping_test.c \
 		libc/src/time_convert.c -o /tmp/mangrove-timekeeping-test

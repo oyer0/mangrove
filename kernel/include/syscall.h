@@ -114,6 +114,7 @@ enum syscall_number {
     /* Writes bytes literally to an object. On the console, ESC is data and
      * cannot begin a terminal command; on files this matches SYSCALL_WRITE. */
     SYSCALL_WRITE_LITERAL = 103,
+    SYSCALL_CLOCK_MONOTONIC_INFO = 104,
 };
 
 /* Initialize the native syscall MSRs for the CPU executing this function. */

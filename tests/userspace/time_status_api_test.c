@@ -21,6 +21,15 @@ long mg_syscall(unsigned long number, unsigned long arg0,
                 ? MG_TIME_NANOSECONDS_PER_SEC : 0,
             .reserved = 0,
         };
+    } else if (number == 104) {
+        mg_monotonic_info_t *out =
+            (mg_monotonic_info_t *)(uintptr_t)arg0;
+        *out = (mg_monotonic_info_t){
+            .time = {123456789},
+            .source = MG_CLOCKSOURCE_HPET,
+            .quality = MG_CLOCK_QUALITY_HARDWARE,
+            .resolution_ns = 1000000,
+        };
     }
     return MG_OK;
 }
@@ -31,6 +40,8 @@ int main(void)
 {
     _Static_assert(sizeof(mg_realtime_info_t) == 28,
                    "realtime info ABI size changed");
+    _Static_assert(sizeof(mg_monotonic_info_t) == 24,
+                   "monotonic info ABI size changed");
     mg_realtime_info_t info;
     for (next_state = MG_REALTIME_UNTRUSTED;
          next_state <= MG_REALTIME_TRUSTED; next_state++) {
@@ -46,6 +57,14 @@ int main(void)
         }
     }
     assert(mg_clock_realtime_info((mg_realtime_info_t *)0) ==
+           MG_ERR_BAD_ARGUMENT);
+    mg_monotonic_info_t monotonic = {0};
+    assert(mg_clock_monotonic_info(&monotonic) == MG_OK &&
+           last_syscall == 104 && monotonic.time.milliseconds == 123456789 &&
+           monotonic.source == MG_CLOCKSOURCE_HPET &&
+           monotonic.quality == MG_CLOCK_QUALITY_HARDWARE &&
+           monotonic.resolution_ns == 1000000);
+    assert(mg_clock_monotonic_info((mg_monotonic_info_t *)0) ==
            MG_ERR_BAD_ARGUMENT);
     mg_mangrove_time_t time = {0};
     assert(mg_clock_realtime(&time) == MG_OK && last_syscall == 62);

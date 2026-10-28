@@ -2539,6 +2539,21 @@ static void syscall_dispatch_inner(syscall_frame_t *frame)
             frame->rax = MG_OK;
             return;
         }
+        case SYSCALL_CLOCK_MONOTONIC_INFO: {
+            mg_monotonic_info_t value;
+            mg_monotonic_info_t *user_value =
+                (mg_monotonic_info_t *)(uintptr_t)frame->rdi;
+
+            if (!user_value || !syscall_user_buffer_writable(user_value,
+                                                            sizeof(value))) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            timer_monotonic_info(&value);
+            memcpy(user_value, &value, sizeof(value));
+            frame->rax = MG_OK;
+            return;
+        }
         case SYSCALL_RANDOM_STATUS: {
             mg_result_t result = csprng_status();
             if (result != MG_OK) {

@@ -15,6 +15,27 @@ typedef struct PACKED {
     u64 milliseconds;
 } mg_monotonic_time_t;
 
+typedef enum mg_clocksource_id {
+    MG_CLOCKSOURCE_HPET = 1,
+    MG_CLOCKSOURCE_ACPI_PM_TIMER = 2,
+    MG_CLOCKSOURCE_PIT = 3,
+} mg_clocksource_id_t;
+
+typedef enum mg_clocksource_quality {
+    MG_CLOCK_QUALITY_DEGRADED = 0,
+    MG_CLOCK_QUALITY_BOUNDED = 1,
+    MG_CLOCK_QUALITY_HARDWARE = 2,
+} mg_clocksource_quality_t;
+
+/* The effective resolution of this API is one millisecond. BOUNDED identifies
+ * narrow counters whose wrap extension depends on observing each wrap. */
+typedef struct PACKED {
+    mg_monotonic_time_t time;
+    u32 source;
+    u32 quality;
+    u64 resolution_ns;
+} mg_monotonic_info_t;
+
 typedef struct PACKED {
     /* Scheduler-accounted process CPU time in nominal 1 ms ticks. */
     u64 ticks;
@@ -69,6 +90,8 @@ typedef struct PACKED {
  * deployment has not established RTC-as-UTC trust, or no validated realtime
  * is available. Current CMOS-backed realtime has whole-second resolution. */
 mg_result_t mg_clock_monotonic(mg_monotonic_time_t *out);
+/* Returns the current monotonic sample and the active source's quality. */
+mg_result_t mg_clock_monotonic_info(mg_monotonic_info_t *out);
 mg_result_t mg_clock_realtime(mg_mangrove_time_t *out);
 /* Returns MG_OK when the status query itself succeeds, including when the
  * result state is untrusted, unavailable, or invalid. */
