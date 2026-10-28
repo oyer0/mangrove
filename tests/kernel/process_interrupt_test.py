@@ -35,17 +35,24 @@ prelude = r'''
 typedef uint64_t u64;
 typedef uint32_t u32;
 typedef size_t usize;
-enum { PROCESS_STATE_ACTIVE = 0, PROCESS_STATE_TERMINATED = 1 };
+enum { PROCESS_STATE_ACTIVE = 0, PROCESS_STATE_EXITING,
+       PROCESS_STATE_TERMINATED };
 typedef struct process process_t;
 typedef struct { u32 references; } kernel_object_t;
-typedef struct kernel_thread { unsigned wakes; } kernel_thread_t;
+typedef struct kernel_thread {
+    unsigned wakes;
+    struct kernel_thread *process_next;
+} kernel_thread_t;
 struct process {
     u64 session_id;
     int state;
     bool session_shell, launch_ready;
-    volatile bool interrupt_requested;
+    volatile bool interrupt_requested, exit_requested;
     process_t *waiting_child, *parent, *next_all;
-    kernel_thread_t *main_thread;
+    kernel_thread_t *main_thread, *threads;
+    u32 thread_count;
+    u32 thread_list_readers;
+    bool thread_reap_in_progress, exit_cleanup_complete;
     kernel_object_t object;
 };
 static int process_registry_lock;
@@ -57,11 +64,18 @@ static bool object_reference(kernel_object_t *object)
 { assert(process_registry_lock); object->references++; return true; }
 static void object_release(kernel_object_t *object)
 { assert(!process_registry_lock && object->references > 1U); object->references--; }
+static void panic(const char *message)
+{ (void)message; assert(!"unexpected process panic"); }
+static bool process_finish_termination(process_t *process)
+{ (void)process; return false; }
 static bool scheduler_wake_waiter(kernel_thread_t *thread)
 { assert(thread); thread->wakes++; return true; }
 '''
 
-body = function('process_take_interrupt') + function('process_interrupt_foreground_session')
+body = (function('process_thread_list_read_acquire_locked') +
+        function('process_thread_list_read_release') +
+        function('process_take_interrupt') +
+        function('process_interrupt_foreground_session'))
 postlude = r'''
 static void clear_fixture(void)
 {
@@ -78,7 +92,8 @@ int main(void)
                        .parent=&wrapper, .launch_ready=true, .object={1}};
     process_t unrelated = {.state=PROCESS_STATE_ACTIVE, .session_id=9,
                            .launch_ready=true, .object={1}};
-    kernel_thread_t wrapper_thread={0}, child_thread={0};
+    kernel_thread_t wrapper_thread={0}, child_thread={0},
+                    child_worker_thread={0};
 
     shell.waiting_child = &wrapper;
     shell.next_all = &wrapper;
@@ -86,15 +101,23 @@ int main(void)
     wrapper.main_thread = &wrapper_thread;
     wrapper.next_all = &child;
     child.main_thread = &child_thread;
+    child.threads = &child_thread;
+    child.thread_count = 2;
+    child_thread.process_next = &child_worker_thread;
+    child_worker_thread.process_next = NULL;
     child.next_all = &unrelated;
     all_processes = &shell;
 
     assert(process_interrupt_foreground_session());
     assert(!shell.interrupt_requested && !wrapper.interrupt_requested);
-    assert(child.interrupt_requested && child_thread.wakes == 1U);
+    assert(child.interrupt_requested && child_thread.wakes == 1U &&
+           child_worker_thread.wakes == 1U);
     assert(child.object.references == 1U);
     assert(process_take_interrupt(&child));
     assert(!process_take_interrupt(&child));
+    child.exit_requested = true;
+    assert(process_take_interrupt(&child));
+    child.exit_requested = false;
 
     /* An ambiguous console session is rejected rather than interrupting a
        process belonging to an arbitrary second session. */

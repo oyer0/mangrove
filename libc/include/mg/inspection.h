@@ -16,6 +16,9 @@
 #define MG_PROCESS_SNAPSHOT_PAGE_MAX 32U
 #define MG_CPU_SNAPSHOT_PAGE_MAX     32U
 #define MG_PROCESS_CPU_NONE           (~(u32)0)
+/* The snapshot observed process-owned threads assigned to distinct CPUs; the
+ * per-thread CPU reads are not one simultaneous cross-CPU sample. */
+#define MG_PROCESS_CPU_MULTIPLE       (~(u32)1)
 
 typedef enum {
     MG_PROCESS_INSPECTION_RUNNING = 1,

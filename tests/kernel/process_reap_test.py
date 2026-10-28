@@ -1,11 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Production process collection across a controlled child exit/handoff.
-
-The blocked parent wakes after process termination is published, while the
-child still owns a resumable kernel cleanup frame on the other CPU. Optional
-source arguments run the same assertions against an earlier implementation.
-"""
+"""Production process wait/poll/reap after thread cleanup and stack handoff."""
 from pathlib import Path
 import argparse
 import os
@@ -51,26 +46,41 @@ typedef uint32_t u32;
 typedef int32_t i32;
 typedef u64 process_handle_t;
 typedef u64 mg_session_id_t;
-enum {PROCESS_STATE_ACTIVE=1, PROCESS_STATE_TERMINATED};
+enum {PROCESS_STATE_ACTIVE, PROCESS_STATE_EXITING, PROCESS_STATE_TERMINATED};
 enum {THREAD_STATE_RUNNING, THREAD_STATE_READY, THREAD_STATE_BLOCKED,
       THREAD_STATE_TERMINATED};
+enum {THREAD_PROCESS_UNATTACHED, THREAD_PROCESS_ATTACHED,
+      THREAD_PROCESS_EXIT_REQUESTED, THREAD_PROCESS_HANDOFF_COMPLETE};
 enum {MG_OK=0, MG_ERR_BAD_ARGUMENT=-4, MG_ERR_INVALID_HANDLE=-8,
       MG_ERR_BUSY=-14, MG_ERR_SHUTDOWN=-38, MG_ERR_WOULD_BLOCK=-19,
       MG_ERR_NOT_CHILD=-22, OBJECT_TYPE_PROCESS=3};
 #define PROCESS_NO_SESSION 0
 #define THREAD_CPU_NONE UINT32_MAX
+typedef struct process process_t;
 typedef struct kernel_thread {
  u32 state, running_cpu; bool context_switch_pending, syscall_active, sleeping;
+ bool stack_external;
  uintptr_t preempt_return_rip;
+ process_t *process;
+ struct kernel_thread *process_next;
+ int process_state;
+ bool process_initial, process_reference_held;
+ volatile bool process_exit_requested;
+ i32 process_exit_status;
+ bool process_exit_status_valid;
 } kernel_thread_t;
-typedef struct process process_t;
 typedef struct {unsigned ref_count; process_t *process;} kernel_object_t;
 struct process {
  int state; bool wait_collected, owner_reference_held, shutdown_requested;
- bool launch_ready;
+ bool launch_ready, wait_claimed, exit_cleanup_complete,
+      exit_cleanup_in_progress,
+      thread_reap_in_progress, exit_notification_sent, termination_pending,
+      external_termination_in_progress;
  i32 exit_status; u64 session_id; u32 active_syscalls;
  process_t *parent, *waiting_child, *next_all, *first_child, *next_sibling;
- kernel_thread_t *main_thread, *waiting_thread; kernel_object_t object;
+ kernel_thread_t *main_thread, *threads, *waiting_thread;
+ u32 thread_count, live_thread_count, thread_list_readers;
+ kernel_object_t object;
  void *address_space, *handle_table;
 };
 static u32 process_registry_lock, scheduler_lock;
@@ -80,8 +90,11 @@ static unsigned sleep_calls, owner_releases, step;
 static bool block_success, sleep_success, request_shutdown;
 static bool cancel_initial, expected_panic;
 static unsigned destroyed_roots, released_memory, frees, external_terminations;
+static unsigned block_calls, exit_notifications, thread_reaps;
 static jmp_buf panic_environment;
 static bool scheduler_thread_exit_complete(const kernel_thread_t *thread);
+static void process_scheduler_handoff_complete(kernel_thread_t *thread);
+static bool process_cleanup_exit_resources(process_t *process);
 static u64 spin_lock_irqsave(u32 *lock)
 {assert(!*lock);*lock=1;return 1;}
 static void spin_unlock_irqrestore(u32 *lock,u64 flags)
@@ -91,6 +104,8 @@ static void spin_unlock(u32 *lock){spin_unlock_irqrestore(lock,0);}
 static u64 process_cli_save(void){return 1;}
 static void process_cli_restore(u64 flags){(void)flags;}
 static kernel_thread_t *thread_current(void){return &parent_thread;}
+static bool scheduler_unblock(kernel_thread_t *thread)
+{(void)thread;return true;}
 static bool process_shutdown_requested(const process_t *p)
 {return p->shutdown_requested;}
 static kernel_object_t *process_handle_lookup_any(process_t *p,
@@ -105,19 +120,27 @@ static void object_release(kernel_object_t *object)
 {assert(!process_registry_lock && object==&child.object);
  /* No collector may release ownership before the child is really done. */
  if(!child.owner_reference_held || object->ref_count==1)
-   assert(scheduler_thread_exit_complete(child.main_thread));
+   assert(child.thread_count==0 ||
+          scheduler_thread_exit_complete(child.main_thread));
  assert(object->ref_count);object->ref_count--;
  if(!child.owner_reference_held && !owner_releases)owner_releases++;
  if(!object->ref_count)all_processes=NULL;}
 static void process_unlink_locked(process_t *p)
 {assert(process_registry_lock && p==&child);p->parent=NULL;}
+static bool process_cleanup_exit_resources(process_t *process)
+{(void)process;return false;}
 static bool scheduler_block(void)
 {assert(!process_registry_lock && !scheduler_lock);
- if(!block_success)return false;
- child.state=PROCESS_STATE_TERMINATED;
- child_thread.state=THREAD_STATE_READY;child_thread.running_cpu=THREAD_CPU_NONE;
- child_thread.syscall_active=true;
- /* process_exit() woke the parent before the child's scheduler_terminate(). */
+ block_calls++;if(!block_success)return false;
+ if(request_shutdown){parent.shutdown_requested=true;return true;}
+ if(parent.shutdown_requested)return true;
+ child.state=PROCESS_STATE_EXITING;child.exit_cleanup_complete=true;
+ child_thread.state=THREAD_STATE_TERMINATED;child_thread.running_cpu=THREAD_CPU_NONE;
+ child_thread.context_switch_pending=false;child_thread.sleeping=false;
+ child_thread.preempt_return_rip=0;
+ child_thread.process_state=THREAD_PROCESS_EXIT_REQUESTED;
+ process_scheduler_handoff_complete(&child_thread);
+ /* Completion is published only after resource cleanup and stack handoff. */
  parent.waiting_child=NULL;parent.waiting_thread=NULL;
  return true;}
 static __attribute__((unused)) bool scheduler_sleep(u64 ticks)
@@ -131,20 +154,28 @@ static __attribute__((unused)) bool scheduler_sleep(u64 ticks)
  return true;}
 static bool process_terminate_external(process_t *p,i32 status)
 {assert(p==&child && status==-1);external_terminations++;
- if(p->state!=PROCESS_STATE_ACTIVE)return false;
- p->state=PROCESS_STATE_TERMINATED;
- child_thread.state=THREAD_STATE_TERMINATED;return true;}
+ if(p->state!=PROCESS_STATE_ACTIVE || p->active_syscalls)return false;
+ p->state=PROCESS_STATE_EXITING;p->exit_cleanup_complete=true;
+ child_thread.state=THREAD_STATE_TERMINATED;child_thread.running_cpu=THREAD_CPU_NONE;
+ child_thread.context_switch_pending=false;child_thread.process_state=THREAD_PROCESS_EXIT_REQUESTED;
+ process_scheduler_handoff_complete(&child_thread);return true;}
 static void process_cwd_clear(process_t *p){assert(p==&child);}
 static void process_unlink_all(process_t *p){assert(p==&child);all_processes=NULL;}
 static bool thread_destroy(kernel_thread_t *t)
-{return scheduler_thread_exit_complete(t) || cancel_initial;}
+{if(cancel_initial)return true;
+ if(!t || t->process || t->process_state!=THREAD_PROCESS_UNATTACHED ||
+    !scheduler_thread_exit_complete(t))return false;
+ thread_reaps++;return true;}
 static void process_memory_release_all(process_t *p)
 {assert(p==&child);released_memory++;}
 static void vmm_destroy_address_space(void *root)
 {assert(root==child.address_space);destroyed_roots++;}
 static void kfree(void *p){(void)p;frees++;}
+static bool kernel_stack_release_context_valid(void){return true;}
+static void session_process_exited(process_t *p)
+{(void)p;exit_notifications++;}
 static __attribute__((unused)) void panic(const char *message)
-{assert(expected_panic && !strcmp(message,"process: destruction before main thread exit"));
+{assert(expected_panic && !strcmp(message,"process: destruction with owned thread state"));
  longjmp(panic_environment,1);}
 '''
 # Old-source negative controls supply this predicate only to the fixture's
@@ -160,7 +191,12 @@ running = function(scheduler, 'scheduler_thread_is_running')
 running = running.replace('bool scheduler_thread_is_running(',
                           'static __attribute__((unused)) bool scheduler_thread_is_running(', 1)
 code = prefix + completion + running
-for name in ('process_wait', 'process_poll', 'process_reap_session_members',
+for name in ('process_thread_list_complete_locked',
+             'process_publish_terminated_locked',
+             'process_scheduler_handoff_complete',
+             'process_detach_thread_owned', 'process_detach_thread',
+             'process_finalize_exit',
+             'process_wait', 'process_poll', 'process_reap_session_members',
              'process_terminate_session_members', 'process_object_destroy'):
     code += function(source, name)
 code += r'''
@@ -169,14 +205,21 @@ static void reset(bool active)
  memset(&parent,0,sizeof(parent));memset(&child,0,sizeof(child));
  parent.state=PROCESS_STATE_ACTIVE;
  child.state=active?PROCESS_STATE_ACTIVE:PROCESS_STATE_TERMINATED;
- child.parent=&parent;child.main_thread=&child_thread;child.session_id=42;
+ child.parent=&parent;child.main_thread=&child_thread;child.threads=&child_thread;
+ child.thread_count=1;child.live_thread_count=active?1:0;
+ child.exit_cleanup_complete=!active;child.session_id=42;
  child.launch_ready=true;
  child.owner_reference_held=true;child.exit_status=23;
  child.object=(kernel_object_t){.ref_count=2,.process=&child};
  child_thread=(kernel_thread_t){.state=THREAD_STATE_READY,
-   .running_cpu=THREAD_CPU_NONE,.syscall_active=true};
+   .running_cpu=THREAD_CPU_NONE,.syscall_active=true,.process=&child,
+   .process_state=active?THREAD_PROCESS_ATTACHED:
+                       THREAD_PROCESS_HANDOFF_COMPLETE,
+   .process_initial=true,.process_reference_held=true};
+ if(!active)child_thread.state=THREAD_STATE_TERMINATED;
  all_processes=&child;parent_thread=(kernel_thread_t){0};
  process_registry_lock=scheduler_lock=sleep_calls=owner_releases=step=0;
+ block_calls=exit_notifications=thread_reaps=0;
  cancel_initial=expected_panic=false;
  destroyed_roots=released_memory=frees=external_terminations=0;
  block_success=sleep_success=true;request_shutdown=false;
@@ -187,17 +230,19 @@ int main(void)
  assert(!scheduler_thread_exit_complete(NULL));
  reset(true);
  assert(process_wait(&parent,7,&status)==MG_OK && status==23);
- assert(sleep_calls==2 && owner_releases==1 && child.wait_collected &&
+ assert(block_calls==1 && owner_releases==1 && child.wait_collected &&
         !child.owner_reference_held && !process_registry_lock && !scheduler_lock);
  reset(false);child_thread.state=THREAD_STATE_BLOCKED;
- assert(process_wait(&parent,7,&status)==MG_OK && sleep_calls==2);
- reset(false);child_thread.state=THREAD_STATE_TERMINATED;
- assert(process_wait(&parent,7,&status)==MG_OK && !sleep_calls);
+ assert(process_wait(&parent,7,&status)==MG_ERR_BUSY && block_calls==0);
+ reset(false);
+ int completed_wait=process_wait(&parent,7,&status);
+ assert(completed_wait==MG_OK && !block_calls);
 
- reset(false);status=-1;
+ reset(true);status=-1;
  assert(process_poll(&parent,7,&status)==MG_ERR_WOULD_BLOCK && status==-1);
  child_thread.state=THREAD_STATE_BLOCKED;
  assert(process_poll(&parent,7,&status)==MG_ERR_WOULD_BLOCK);
+ child.state=PROCESS_STATE_EXITING;child.exit_cleanup_complete=true;
  child_thread.state=THREAD_STATE_TERMINATED;child_thread.running_cpu=1;
  assert(process_poll(&parent,7,&status)==MG_ERR_WOULD_BLOCK);
  child_thread.running_cpu=THREAD_CPU_NONE;child_thread.context_switch_pending=true;
@@ -208,6 +253,8 @@ int main(void)
  child_thread.sleeping=false;child_thread.preempt_return_rip=123;
  assert(process_poll(&parent,7,&status)==MG_ERR_WOULD_BLOCK);
  child_thread.preempt_return_rip=0;
+ child.state=PROCESS_STATE_TERMINATED;child.live_thread_count=0;
+ child_thread.process_state=THREAD_PROCESS_HANDOFF_COMPLETE;
  assert(process_poll(&parent,7,&status)==MG_OK && status==23);
  assert(!owner_releases && !child.wait_collected);
 
@@ -216,23 +263,25 @@ int main(void)
  child_thread.state=THREAD_STATE_TERMINATED;child_thread.context_switch_pending=true;
  process_reap_session_members(42);assert(!owner_releases);
  child_thread.context_switch_pending=false;
+ child.object.ref_count=2; /* process owner plus its retained thread record */
  process_reap_session_members(42);assert(owner_releases==1 && !all_processes);
 
- reset(false);request_shutdown=true;
- assert(process_wait(&parent,7,&status)==MG_ERR_SHUTDOWN && sleep_calls==1);
+ reset(true);request_shutdown=true;
+ assert(process_wait(&parent,7,&status)==MG_ERR_SHUTDOWN && block_calls==1);
  assert(!owner_releases && !child.wait_collected && child.owner_reference_held);
  reset(true);parent.shutdown_requested=true;
  assert(process_wait(&parent,7,&status)==MG_ERR_SHUTDOWN && !owner_releases);
  assert(!child.wait_collected && child.owner_reference_held);
  reset(true);block_success=false;
  assert(process_wait(&parent,7,&status)==MG_ERR_BUSY && !owner_releases);
- reset(false);sleep_success=false;
- assert(process_wait(&parent,7,&status)==MG_ERR_BUSY && !owner_releases);
 
- reset(false);
+ reset(true);
+ child.active_syscalls=1;
  assert(!process_terminate_session_members(42) && child.owner_reference_held);
- child_thread.state=THREAD_STATE_TERMINATED;
- assert(process_terminate_session_members(42) && !owner_releases);
+ child.active_syscalls=0;
+ assert(process_terminate_session_members(42) && !owner_releases &&
+        child.state==PROCESS_STATE_TERMINATED &&
+        child_thread.process_state==THREAD_PROCESS_HANDOFF_COMPLETE);
 
  /* A missed admission check must fail before retiring page tables. */
  reset(false);expected_panic=true;
@@ -241,13 +290,10 @@ int main(void)
    assert(!"live-thread destruction did not fail closed");
  }
  assert(!destroyed_roots && !released_memory && !frees);
- reset(false);child_thread.state=THREAD_STATE_TERMINATED;
+ reset(false);
+ assert(process_finalize_exit(&child));
  process_object_destroy(&child.object);
  assert(destroyed_roots==1 && released_memory==1 && frees==2);
- /* Unpublished process creation rollback can cancel an initial READY frame. */
- reset(false);cancel_initial=true;
- process_object_destroy(&child.object);
- assert(destroyed_roots==1 && frees==2);
  puts("process reaping: wake-before-exit, suspended cleanup, remote handoff, poll, session collection, and shutdown cancellation passed");
 }
 '''

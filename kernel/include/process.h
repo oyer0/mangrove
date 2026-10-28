@@ -35,17 +35,21 @@ typedef u32 process_handle_t;
 
 typedef enum {
     PROCESS_STATE_ACTIVE = 0,
+    PROCESS_STATE_EXITING,
     PROCESS_STATE_TERMINATED,
 } process_state_t;
 
 /* A process owns userspace execution; scheduling remains thread-based. */
 struct process {
     u64 pid;
-    process_state_t state;
+    /* State is atomically observable by admitted sibling operations; all
+     * transitions and related lifecycle fields remain registry-locked. */
+    _Atomic process_state_t state;
     /* Protected by the process registry lock. A syscall admission retains
      * the process object until its syscall-stack leases have been released. */
     u32 active_syscalls;
     bool termination_pending;
+    bool external_termination_in_progress;
     /* False while a newly created process is still being populated. Registry
      * scans and external termination treat it as in-flight construction. */
     bool launch_ready;
@@ -53,6 +57,20 @@ struct process {
     process_t *first_child;
     process_t *next_sibling;
     struct kernel_thread *main_thread;
+    /* Protected by process_registry_lock. The list owns every attached
+     * scheduler record and retains this process object once per thread. */
+    struct kernel_thread *threads;
+    u32 thread_count;
+    u32 live_thread_count;
+    /* Pins unlocked walks that wake thread records. Final reap closes reader
+     * admission and waits for these short walks before detaching records. */
+    u32 thread_list_readers;
+    bool exit_requested;
+    bool exit_cleanup_in_progress;
+    bool exit_cleanup_complete;
+    bool thread_reap_in_progress;
+    bool exit_notification_sent;
+    bool wait_claimed;
     struct page_table *address_space;
     uintptr_t entry_point;
     uintptr_t user_stack_top;
@@ -127,6 +145,17 @@ bool process_assign_system_service(process_t *process, u32 service_id);
 bool process_get_credentials(const process_t *process,
                              process_credentials_t *credentials);
 bool process_attach_thread(process_t *process, struct kernel_thread *thread);
+/* Transfers a completed non-current thread out of its process owner list.
+ * The caller must hold a process reference and may destroy the thread only
+ * after this succeeds. */
+bool process_detach_thread(process_t *process, struct kernel_thread *thread);
+/* Scheduler lifecycle hook, called only after the outgoing stack handoff. */
+void process_scheduler_handoff_complete(struct kernel_thread *thread);
+/* Called when a process-owned kernel entry returns, before scheduler exit. */
+void process_thread_entry_completed(struct kernel_thread *thread,
+                                    i32 status);
+/* True when this thread must leave userspace after its current syscall. */
+bool process_thread_exit_requested(const struct kernel_thread *thread);
 process_t *process_current(void);
 u64 process_current_pid(void);
 bool process_exit(process_t *process, i32 status);

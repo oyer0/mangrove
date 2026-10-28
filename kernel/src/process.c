@@ -19,6 +19,7 @@
 #include <spinlock.h>
 #include <panic.h>
 #include <timer.h>
+#include <kernel_stack.h>
 
 #ifndef NULL
 #define NULL ((void *)0)
@@ -83,6 +84,9 @@ static void process_unlink(process_t *process);
 static void process_unlink_all(process_t *process);
 static void process_unlink_locked(process_t *process);
 static void process_unlink_all_locked(process_t *process);
+static bool process_cleanup_exit_resources(process_t *process);
+static bool process_finish_termination(process_t *process);
+static kernel_thread_t *process_publish_terminated_locked(process_t *process);
 static kernel_object_t *process_handle_lookup_reference(
     process_t *process, process_handle_t handle,
     kernel_object_type_t type, u32 required_rights);
@@ -211,8 +215,10 @@ static void process_object_destroy(kernel_object_t *object)
     process_t *child;
     process_t *next;
 
-    if (process->active_syscalls)
-        panic("process: destruction with active syscall references");
+    if (process->active_syscalls || process->live_thread_count ||
+        process->thread_list_readers ||
+        process->thread_count || process->threads || process->main_thread)
+        panic("process: destruction with owned thread state");
 
     process_cwd_clear(process);
     process_unlink_all(process);
@@ -230,8 +236,6 @@ static void process_object_destroy(kernel_object_t *object)
         process->first_child = NULL;
         spin_unlock_irqrestore(&process_registry_lock, flags);
     }
-    if (process->main_thread && !thread_destroy(process->main_thread))
-        panic("process: destruction before main thread exit");
     process_memory_release_all(process);
     vmm_destroy_address_space(process->address_space);
     kfree(process->handle_table);
@@ -245,6 +249,128 @@ bool process_init(void)
     all_processes = NULL;
     process_shutdown_active = false;
     return true;
+}
+
+/* Caller holds process_registry_lock. The process list is also the lifetime
+ * owner for this scheduler record; one process-object reference pins its
+ * address space and shared resources until the record is detached. */
+static bool process_thread_register_locked(process_t *process,
+                                           kernel_thread_t *thread,
+                                           bool allow_bootstrap_current)
+{
+    if (!process || !thread || process->state != PROCESS_STATE_ACTIVE ||
+        process->termination_pending || thread->process ||
+        thread->process_state != THREAD_PROCESS_UNATTACHED ||
+        thread->process_reference_held ||
+        process->thread_count == ~(u32)0 ||
+        process->live_thread_count > process->thread_count ||
+        process->live_thread_count == ~(u32)0 ||
+        (!scheduler_thread_process_attachable(thread) &&
+         !(allow_bootstrap_current &&
+           scheduler_thread_initial_process_attachable(thread))) ||
+        (!process->thread_count && (process->threads || process->main_thread ||
+                                    process->live_thread_count)) ||
+        (process->thread_count && !process->main_thread) ||
+        !object_reference(&process->object))
+        return false;
+
+    thread->process = process;
+    thread->process_next = process->threads;
+    thread->process_state = THREAD_PROCESS_ATTACHED;
+    thread->process_initial = process->main_thread == NULL;
+    thread->process_reference_held = true;
+    __atomic_store_n(&thread->process_exit_requested, false,
+                     __ATOMIC_RELAXED);
+    thread->process_exit_status = 0;
+    thread->process_exit_status_valid = false;
+    process->threads = thread;
+    process->thread_count++;
+    process->live_thread_count++;
+    if (thread->process_initial) process->main_thread = thread;
+    return true;
+}
+
+static bool process_thread_list_complete_locked(process_t *process)
+{
+    u32 count = 0;
+    bool main_seen = process && !process->main_thread;
+
+    if (!process || !process->thread_count || process->live_thread_count ||
+        process->active_syscalls)
+        return false;
+    for (kernel_thread_t *thread = process->threads; thread;
+         thread = thread->process_next) {
+        /* Bound traversal by the published count. This also rejects a
+         * malformed cycle instead of walking it indefinitely. */
+        if (count >= process->thread_count || thread->process != process ||
+            !thread->process_reference_held ||
+            thread->process_state != THREAD_PROCESS_HANDOFF_COMPLETE ||
+            !scheduler_thread_exit_complete(thread))
+            return false;
+        count++;
+        if (thread->process_initial && process->main_thread != thread)
+            return false;
+        if (thread == process->main_thread) {
+            if (!thread->process_initial) return false;
+            main_seen = true;
+        }
+    }
+    return count == process->thread_count && main_seen;
+}
+
+/* Caller holds process_registry_lock and an object reference. This short
+ * reader pin lets callers walk the intrusive list without keeping the
+ * registry lock across scheduler wake operations. Final reap closes admission
+ * atomically with checking the count. */
+static bool process_thread_list_read_acquire_locked(process_t *process)
+{
+    if (!process || process->state == PROCESS_STATE_TERMINATED ||
+        process->thread_reap_in_progress || !process->threads ||
+        !process->thread_count ||
+        process->thread_list_readers == ~(u32)0)
+        return false;
+    process->thread_list_readers++;
+    return true;
+}
+
+static void process_thread_list_read_release(process_t *process)
+{
+    u64 flags;
+
+    if (!process) return;
+    flags = spin_lock_irqsave(&process_registry_lock);
+    if (!process->thread_list_readers) {
+        spin_unlock_irqrestore(&process_registry_lock, flags);
+        panic("process: thread-list reader underflow");
+    }
+    process->thread_list_readers--;
+    bool finish_exit = !process->thread_list_readers &&
+        process->state == PROCESS_STATE_EXITING &&
+        process->exit_cleanup_complete;
+    spin_unlock_irqrestore(&process_registry_lock, flags);
+    if (finish_exit) (void)process_finish_termination(process);
+}
+
+static kernel_thread_t *process_publish_terminated_locked(process_t *process)
+{
+    kernel_thread_t *waiter = NULL;
+    if (!process || process->state != PROCESS_STATE_EXITING ||
+        process->thread_list_readers ||
+        !process->exit_cleanup_complete ||
+        !process_thread_list_complete_locked(process))
+        return NULL;
+
+    process->state = PROCESS_STATE_TERMINATED;
+    process->termination_pending = false;
+    process->external_termination_in_progress = false;
+    if (process->parent && process->parent->state == PROCESS_STATE_ACTIVE &&
+        process->parent->waiting_child == process &&
+        process->parent->waiting_thread) {
+        waiter = process->parent->waiting_thread;
+        process->parent->waiting_child = NULL;
+        process->parent->waiting_thread = NULL;
+    }
+    return waiter;
 }
 
 process_t *process_create_with_failure(const char *name, process_t *parent,
@@ -306,7 +432,6 @@ process_t *process_create_with_failure(const char *name, process_t *parent,
         process->credentials = inherited_credentials;
         process->credentials_initialized = true;
     }
-    process->main_thread = main_thread;
     strncpy(process->name, name, sizeof(process->name) - 1);
     process->name[sizeof(process->name) - 1] = '\0';
     vfs_location_t *inherited = parent ? process_cwd_acquire(parent) : NULL;
@@ -344,6 +469,15 @@ process_t *process_create_with_failure(const char *name, process_t *parent,
             kfree(process);
             return NULL;
         }
+        if (!process_thread_register_locked(process, main_thread, true)) {
+            if (out_stage) *out_stage = "initial thread registration";
+            spin_unlock_irqrestore(&process_registry_lock, flags);
+            process_cwd_clear(process);
+            vmm_destroy_address_space(process->address_space);
+            kfree(process->handle_table);
+            kfree(process);
+            return NULL;
+        }
         process->pid = next_pid++;
         if (parent) {
             process->next_sibling = parent->first_child;
@@ -351,7 +485,6 @@ process_t *process_create_with_failure(const char *name, process_t *parent,
         }
         process->next_all = all_processes;
         all_processes = process;
-        main_thread->process = process;
         spin_unlock_irqrestore(&process_registry_lock, flags);
     }
     return process;
@@ -424,15 +557,120 @@ bool process_get_credentials(const process_t *process,
 
 bool process_attach_thread(process_t *process, struct kernel_thread *thread)
 {
-    if (!process || !thread || process->state != PROCESS_STATE_ACTIVE ||
-        (thread->process && thread->process != process) ||
-        (process->main_thread && process->main_thread != thread)) {
+    bool attached;
+    u64 flags;
+
+    if (!process || !thread) return false;
+    flags = spin_lock_irqsave(&process_registry_lock);
+    attached = process_thread_register_locked(process, thread, false);
+    spin_unlock_irqrestore(&process_registry_lock, flags);
+    return attached;
+}
+
+static bool process_detach_thread_owned(process_t *process,
+                                       kernel_thread_t *thread,
+                                       bool exit_reaper)
+{
+    kernel_thread_t **cursor;
+    bool release_process_reference = false;
+    u64 flags;
+
+    if (!process || !thread || !scheduler_thread_exit_complete(thread))
+        return false;
+    flags = spin_lock_irqsave(&process_registry_lock);
+    if (thread->process != process ||
+        thread->process_state != THREAD_PROCESS_HANDOFF_COMPLETE ||
+        process->termination_pending || !thread->process_reference_held ||
+        process->thread_list_readers ||
+        (process->thread_reap_in_progress && !exit_reaper) ||
+        !process->thread_count || !process->threads) {
+        spin_unlock_irqrestore(&process_registry_lock, flags);
         return false;
     }
-    thread->process = process;
-    if (!process->main_thread) {
-        process->main_thread = thread;
+    if (thread->process_initial && process->state != PROCESS_STATE_TERMINATED &&
+        !process->exit_cleanup_in_progress) {
+        spin_unlock_irqrestore(&process_registry_lock, flags);
+        return false;
     }
+    cursor = (kernel_thread_t **)&process->threads;
+    while (*cursor && *cursor != thread)
+        cursor = &(*cursor)->process_next;
+    if (*cursor != thread) {
+        spin_unlock_irqrestore(&process_registry_lock, flags);
+        return false;
+    }
+    *cursor = thread->process_next;
+    if (process->main_thread == thread) process->main_thread = NULL;
+    process->thread_count--;
+    thread->process = NULL;
+    thread->process_next = NULL;
+    thread->process_state = THREAD_PROCESS_UNATTACHED;
+    thread->process_initial = false;
+    __atomic_store_n(&thread->process_exit_requested, false,
+                     __ATOMIC_RELAXED);
+    thread->process_reference_held = false;
+    thread->process_exit_status = 0;
+    thread->process_exit_status_valid = false;
+    release_process_reference = true;
+    spin_unlock_irqrestore(&process_registry_lock, flags);
+
+    if (release_process_reference) object_release(&process->object);
+    return true;
+}
+
+bool process_detach_thread(process_t *process, struct kernel_thread *thread)
+{
+    return process_detach_thread_owned(process, thread, false);
+}
+
+static bool process_finalize_exit(process_t *process)
+{
+    u64 flags;
+    bool notify = false;
+
+    if (!process || !kernel_stack_release_context_valid()) return false;
+    flags = spin_lock_irqsave(&process_registry_lock);
+    if (process->state != PROCESS_STATE_TERMINATED ||
+        !process->exit_cleanup_complete || process->thread_reap_in_progress ||
+        process->thread_list_readers ||
+        !process_thread_list_complete_locked(process)) {
+        bool done = process->thread_count == 0 &&
+            process->state == PROCESS_STATE_TERMINATED &&
+            process->exit_cleanup_complete &&
+            process->exit_notification_sent;
+        spin_unlock_irqrestore(&process_registry_lock, flags);
+        return done;
+    }
+    process->thread_reap_in_progress = true;
+    spin_unlock_irqrestore(&process_registry_lock, flags);
+
+    for (;;) {
+        kernel_thread_t *thread;
+        flags = spin_lock_irqsave(&process_registry_lock);
+        thread = process->threads;
+        spin_unlock_irqrestore(&process_registry_lock, flags);
+        if (!thread) break;
+        if (!process_detach_thread_owned(process, thread, true)) {
+            flags = spin_lock_irqsave(&process_registry_lock);
+            process->thread_reap_in_progress = false;
+            spin_unlock_irqrestore(&process_registry_lock, flags);
+            return false;
+        }
+        /* PID 1 adopts the statically allocated BSP bootstrap scheduler
+         * record. Its process ownership ends here, but the scheduler record
+         * and linker-backed stack are permanent kernel state. */
+        if (!thread->stack_external && !thread_destroy(thread))
+            panic("process: completed thread could not be reaped");
+    }
+
+    flags = spin_lock_irqsave(&process_registry_lock);
+    process->thread_reap_in_progress = false;
+    if (!process->exit_notification_sent) {
+        process->exit_notification_sent = true;
+        notify = true;
+    }
+    spin_unlock_irqrestore(&process_registry_lock, flags);
+    if (notify) session_process_exited(process);
     return true;
 }
 
@@ -796,51 +1034,114 @@ i64 process_memory_unmap(process_t *process, uintptr_t address)
     return MG_OK;
 }
 
-bool process_exit(process_t *process, i32 status)
+static bool process_cleanup_exit_resources(process_t *process)
 {
-    kernel_thread_t *waiter = NULL;
     u64 flags;
 
-    if (!process) {
-        return false;
-    }
+    if (!process) return false;
     flags = spin_lock_irqsave(&process_registry_lock);
-    if (process->state != PROCESS_STATE_ACTIVE || process->active_syscalls) {
+    if (!process->launch_ready ||
+        process->state != PROCESS_STATE_EXITING || process->active_syscalls ||
+        !process_thread_list_complete_locked(process) ||
+        process->exit_cleanup_complete || process->exit_cleanup_in_progress) {
+        bool complete = process->exit_cleanup_complete;
         spin_unlock_irqrestore(&process_registry_lock, flags);
-        return false;
+        return complete;
     }
-    process->exit_status = status;
-    process->state = PROCESS_STATE_TERMINATED;
-    process->termination_pending = false;
-    if (process->parent && process->parent->state == PROCESS_STATE_ACTIVE &&
-        process->parent->waiting_child == process &&
-        process->parent->waiting_thread) {
-        waiter = process->parent->waiting_thread;
-        process->parent->waiting_child = NULL;
-        process->parent->waiting_thread = NULL;
-    }
+    process->exit_cleanup_in_progress = true;
     spin_unlock_irqrestore(&process_registry_lock, flags);
 
-    /* Complete any partial ESC command as visible text before the process's
-     * terminal state disappears. This is serialized with concurrent output. */
+    /* This path runs only after every process thread has completed its
+     * scheduler/CR3 handoff and every admitted syscall lease has been
+     * released. The caller is on another live scheduler stack. */
     terminal_output_finish_for_process(process->pid,
                                        &process->terminal_output);
-    /* A full-screen terminal lease belongs to a process, not to its final
-     * userspace instruction.  Restore the shell screen after the registry
-     * transition, including for external termination and faults. */
     (void)terminal_alternate_leave_process(process->pid);
-    /* A fault or abrupt process exit must never leave presentation batching
-     * owned by the dead process. */
     terminal_force_end_batch();
     ipc_process_exit(process);
-    session_process_exited(process);
-    /* Anonymous mappings are process-owned rather than zombie-owned; the
-     * exit path releases them before the parent later collects the status. */
     process_memory_release_all(process);
     process_handle_close_all(process);
     process_cwd_clear(process);
-    if (waiter) {
-        (void)scheduler_unblock(waiter);
+
+    flags = spin_lock_irqsave(&process_registry_lock);
+    process->exit_cleanup_complete = true;
+    process->exit_cleanup_in_progress = false;
+    spin_unlock_irqrestore(&process_registry_lock, flags);
+    (void)process_finish_termination(process);
+    return true;
+}
+
+static bool process_finish_termination(process_t *process)
+{
+    kernel_thread_t *waiter = NULL;
+    bool terminated;
+    u64 flags;
+
+    if (!process) return false;
+    flags = spin_lock_irqsave(&process_registry_lock);
+    waiter = process_publish_terminated_locked(process);
+    terminated = process->state == PROCESS_STATE_TERMINATED;
+    spin_unlock_irqrestore(&process_registry_lock, flags);
+
+    if (waiter) (void)scheduler_unblock(waiter);
+    return terminated;
+}
+
+bool process_exit(process_t *process, i32 status)
+{
+    kernel_thread_t *current = thread_current();
+    bool first_request = false;
+    u64 flags;
+
+    if (!process) return false;
+    flags = spin_lock_irqsave(&process_registry_lock);
+    if (process->state == PROCESS_STATE_TERMINATED ||
+        (process->state == PROCESS_STATE_ACTIVE &&
+         process->termination_pending &&
+         !process->external_termination_in_progress)) {
+        spin_unlock_irqrestore(&process_registry_lock, flags);
+        return false;
+    }
+    if (process->state == PROCESS_STATE_ACTIVE) {
+        process->state = PROCESS_STATE_EXITING;
+        process->termination_pending = true;
+        /* A self-exit may win against an external termination reservation.
+         * The scheduler's group preflight cannot concurrently commit while
+         * this process thread is running, so the external attempt will fail
+         * atomically and release its reservation. */
+        process->external_termination_in_progress = false;
+        __atomic_store_n(&process->exit_requested, true, __ATOMIC_RELEASE);
+        process->exit_status = status;
+        first_request = true;
+        for (kernel_thread_t *thread = process->threads; thread;
+             thread = thread->process_next) {
+            __atomic_store_n(&thread->process_exit_requested, true,
+                             __ATOMIC_RELEASE);
+            if (thread->process_state == THREAD_PROCESS_ATTACHED)
+                thread->process_state = THREAD_PROCESS_EXIT_REQUESTED;
+        }
+    } else if (process->state != PROCESS_STATE_EXITING) {
+        spin_unlock_irqrestore(&process_registry_lock, flags);
+        return false;
+    }
+    if (current && current->process == process &&
+        current->process_state != THREAD_PROCESS_HANDOFF_COMPLETE) {
+        current->process_state = THREAD_PROCESS_EXIT_REQUESTED;
+        __atomic_store_n(&current->process_exit_requested, true,
+                         __ATOMIC_RELEASE);
+    }
+    spin_unlock_irqrestore(&process_registry_lock, flags);
+
+    /* A process exit is cooperative for siblings. Wake every registered wait
+     * without holding the registry lock; syscall admission is already closed. */
+    if (first_request) {
+        for (kernel_thread_t *thread = process->threads; thread;
+             thread = thread->process_next) {
+            if (thread != current) {
+                console_cancel_waiter(thread);
+                (void)scheduler_wake_waiter(thread);
+            }
+        }
     }
     return true;
 }
@@ -870,6 +1171,7 @@ bool process_syscall_enter(process_t *process)
     if (!process) return false;
     flags = spin_lock_irqsave(&process_registry_lock);
     if (process->state == PROCESS_STATE_ACTIVE &&
+        !__atomic_load_n(&process->exit_requested, __ATOMIC_ACQUIRE) &&
         !process->termination_pending &&
         process->active_syscalls != ~(u32)0 &&
         object_reference(&process->object)) {
@@ -900,10 +1202,12 @@ static bool process_termination_begin(process_t *process)
 
     if (!process) return false;
     flags = spin_lock_irqsave(&process_registry_lock);
-    if (process->state == PROCESS_STATE_ACTIVE && process->main_thread &&
+    if (process->state == PROCESS_STATE_ACTIVE && process->thread_count &&
         process->launch_ready && !process->active_syscalls &&
-        !process->termination_pending) {
+        !process->termination_pending &&
+        !process->external_termination_in_progress) {
         process->termination_pending = true;
+        process->external_termination_in_progress = true;
         admitted = true;
     }
     spin_unlock_irqrestore(&process_registry_lock, flags);
@@ -916,6 +1220,7 @@ static void process_termination_cancel(process_t *process)
 
     if (!process) return;
     flags = spin_lock_irqsave(&process_registry_lock);
+    process->external_termination_in_progress = false;
     if (process->state == PROCESS_STATE_ACTIVE)
         process->termination_pending = false;
     spin_unlock_irqrestore(&process_registry_lock, flags);
@@ -929,11 +1234,94 @@ bool process_terminate_current_exception(i32 status)
     /* The IDT checked the saved privilege level.  Keep a second ownership
      * check here so an exception path can never terminate an unrelated
      * kernel/service thread. */
-    if (!process || !thread || process->state != PROCESS_STATE_ACTIVE ||
-        process->main_thread != thread || !process_exit(process, status)) {
+    if (!process || !thread || thread->process != process ||
+        thread->process_state == THREAD_PROCESS_UNATTACHED ||
+        !process_exit(process, status)) {
         return false;
     }
     return scheduler_terminate();
+}
+
+bool process_thread_exit_requested(const struct kernel_thread *thread)
+{
+    return thread && __atomic_load_n(&thread->process_exit_requested,
+                                      __ATOMIC_ACQUIRE);
+}
+
+static bool process_thread_prepare_exit(kernel_thread_t *thread)
+{
+    process_t *process;
+    u64 flags;
+
+    if (!thread || !(process = thread->process)) return false;
+    flags = spin_lock_irqsave(&process_registry_lock);
+    if (thread->process != process ||
+        thread->process_state == THREAD_PROCESS_UNATTACHED ||
+        thread->process_state == THREAD_PROCESS_HANDOFF_COMPLETE) {
+        spin_unlock_irqrestore(&process_registry_lock, flags);
+        return false;
+    }
+    thread->process_state = THREAD_PROCESS_EXIT_REQUESTED;
+    if (process->state == PROCESS_STATE_EXITING) {
+        __atomic_store_n(&thread->process_exit_requested, true,
+                         __ATOMIC_RELEASE);
+    }
+    spin_unlock_irqrestore(&process_registry_lock, flags);
+    return true;
+}
+
+void process_thread_entry_completed(struct kernel_thread *thread, i32 status)
+{
+    process_t *process;
+
+    if (!thread || !(process = thread->process)) return;
+    if (thread->process_initial) {
+        (void)process_exit(process, status);
+        return;
+    }
+    u64 flags = spin_lock_irqsave(&process_registry_lock);
+    if (thread->process == process &&
+        thread->process_state != THREAD_PROCESS_HANDOFF_COMPLETE) {
+        thread->process_exit_status = status;
+        thread->process_exit_status_valid = true;
+    }
+    spin_unlock_irqrestore(&process_registry_lock, flags);
+    (void)process_thread_prepare_exit(thread);
+}
+
+void process_scheduler_handoff_complete(struct kernel_thread *raw_thread)
+{
+    kernel_thread_t *thread = raw_thread;
+    process_t *process;
+    kernel_thread_t *waiter = NULL;
+    bool cleanup_ready = false;
+    u64 flags;
+
+    if (!thread || !(process = thread->process) ||
+        !scheduler_thread_exit_complete(thread))
+        return;
+    flags = spin_lock_irqsave(&process_registry_lock);
+    if (thread->process == process &&
+        thread->process_state != THREAD_PROCESS_HANDOFF_COMPLETE) {
+        thread->process_state = THREAD_PROCESS_HANDOFF_COMPLETE;
+        if (!process->live_thread_count) {
+            spin_unlock_irqrestore(&process_registry_lock, flags);
+            panic("process: live thread count underflow");
+        }
+        process->live_thread_count--;
+    }
+    /* An unpublished process is still owned by process_abort(), which rolls
+     * back its launch resources after stopping the prepared initial thread. */
+    cleanup_ready = process->launch_ready &&
+        process->state == PROCESS_STATE_EXITING &&
+        !process->exit_cleanup_complete &&
+        !process->exit_cleanup_in_progress &&
+        process_thread_list_complete_locked(process);
+    waiter = process_publish_terminated_locked(process);
+    spin_unlock_irqrestore(&process_registry_lock, flags);
+
+    if (cleanup_ready) (void)process_cleanup_exit_resources(process);
+    if (waiter) (void)scheduler_unblock(waiter);
 }
 
 static void process_unlink_locked(process_t *process)
@@ -981,14 +1369,32 @@ static void process_unlink_all(process_t *process)
 static void process_abort(process_t *process)
 {
     u64 flags;
+    kernel_thread_t *thread;
 
     if (!process) return;
     flags = spin_lock_irqsave(&process_registry_lock);
-    if (process->state != PROCESS_STATE_ACTIVE) {
+    if (process->state != PROCESS_STATE_ACTIVE || process->launch_ready ||
+        process->active_syscalls || process->thread_count != 1U ||
+        process->live_thread_count != 1U || !process->main_thread) {
         spin_unlock_irqrestore(&process_registry_lock, flags);
-        return;
+        panic("process: invalid launch rollback state");
     }
+    thread = process->main_thread;
+    process->state = PROCESS_STATE_EXITING;
+    process->termination_pending = true;
+    __atomic_store_n(&process->exit_requested, true, __ATOMIC_RELEASE);
+    __atomic_store_n(&thread->process_exit_requested, true, __ATOMIC_RELEASE);
+    spin_unlock_irqrestore(&process_registry_lock, flags);
+
+    /* Launch rollback owns a suspended, unpublished initial thread. Mark it
+     * stopped through the scheduler before unlinking the process-owned record. */
+    if (!scheduler_terminate_thread(thread))
+        panic("process: launch rollback thread was already active");
+    process_scheduler_handoff_complete(thread);
+
+    flags = spin_lock_irqsave(&process_registry_lock);
     process->state = PROCESS_STATE_TERMINATED;
+    process->termination_pending = false;
     process_unlink_locked(process);
     process_unlink_all_locked(process);
     spin_unlock_irqrestore(&process_registry_lock, flags);
@@ -998,27 +1404,108 @@ static void process_abort(process_t *process)
     ipc_process_exit(process);
     process_handle_close_all(process);
     process_cwd_clear(process);
+    if (!process_detach_thread(process, thread) || !thread_destroy(thread))
+        panic("process: launch rollback could not release initial thread");
     process->owner_reference_held = false;
     object_release(&process->object);
 }
 
 bool process_terminate_external(process_t *process, i32 status)
 {
-    kernel_thread_t *main_thread;
+    kernel_thread_t *threads = NULL;
+    usize thread_count = 0;
+    bool exiting_process = false;
+    bool reserved = false;
+    bool thread_list_pinned = false;
+    u64 flags;
 
     if (!process || process == process_current()) {
         return false;
     }
-    if (!process_termination_begin(process)) return false;
-    main_thread = process->main_thread;
-    if (!scheduler_terminate_thread(main_thread)) {
+    flags = spin_lock_irqsave(&process_registry_lock);
+    if (!process->launch_ready) {
+        spin_unlock_irqrestore(&process_registry_lock, flags);
+        return false;
+    }
+    exiting_process = process->state == PROCESS_STATE_EXITING;
+    spin_unlock_irqrestore(&process_registry_lock, flags);
+    if (!exiting_process) {
+        if (!process_termination_begin(process)) return false;
+        flags = spin_lock_irqsave(&process_registry_lock);
+        if (process->state == PROCESS_STATE_ACTIVE &&
+            process->termination_pending &&
+            process->external_termination_in_progress &&
+            process_thread_list_read_acquire_locked(process)) {
+            threads = process->threads;
+            thread_count = process->thread_count;
+            thread_list_pinned = true;
+            reserved = true;
+        }
+        spin_unlock_irqrestore(&process_registry_lock, flags);
+        if (!reserved) {
+            process_termination_cancel(process);
+            return false;
+        }
+    } else {
+        flags = spin_lock_irqsave(&process_registry_lock);
+        if (process->state == PROCESS_STATE_EXITING &&
+            !process->active_syscalls && process->thread_count &&
+            !process->external_termination_in_progress &&
+            process_thread_list_read_acquire_locked(process)) {
+            process->external_termination_in_progress = true;
+            threads = process->threads;
+            thread_count = process->thread_count;
+            thread_list_pinned = true;
+            reserved = true;
+        }
+        spin_unlock_irqrestore(&process_registry_lock, flags);
+        if (!reserved) return false;
+    }
+
+    if (!scheduler_terminate_thread_group(threads, thread_count)) {
+        if (thread_list_pinned) process_thread_list_read_release(process);
         process_termination_cancel(process);
         return false;
     }
-    console_cancel_waiter(main_thread);
-    if (process_exit(process, status)) return true;
-    process_termination_cancel(process);
-    return false;
+
+    flags = spin_lock_irqsave(&process_registry_lock);
+    /* A cooperative exit may finish while the group preflight is running.
+     * Do not republish termination_pending after cleanup has already made the
+     * process reapable. The list pin keeps scheduler records valid until this
+     * operation stops traversing them. */
+    if (process->state == PROCESS_STATE_TERMINATED) {
+        spin_unlock_irqrestore(&process_registry_lock, flags);
+        if (thread_list_pinned) process_thread_list_read_release(process);
+        return true;
+    }
+    if (process->state == PROCESS_STATE_ACTIVE) {
+        process->state = PROCESS_STATE_EXITING;
+        __atomic_store_n(&process->exit_requested, true, __ATOMIC_RELEASE);
+        process->exit_status = status;
+    }
+    process->termination_pending = true;
+    process->external_termination_in_progress = false;
+    for (kernel_thread_t *thread = process->threads; thread;
+         thread = thread->process_next) {
+        __atomic_store_n(&thread->process_exit_requested, true,
+                         __ATOMIC_RELEASE);
+        if (thread->process_state == THREAD_PROCESS_ATTACHED)
+            thread->process_state = THREAD_PROCESS_EXIT_REQUESTED;
+    }
+    bool cleanup_ready = process_thread_list_complete_locked(process);
+    spin_unlock_irqrestore(&process_registry_lock, flags);
+
+    for (kernel_thread_t *thread = process->threads; thread;
+         thread = thread->process_next) {
+        console_cancel_waiter(thread);
+        (void)scheduler_wake_waiter(thread);
+    }
+    if (thread_list_pinned) process_thread_list_read_release(process);
+    if (cleanup_ready) (void)process_cleanup_exit_resources(process);
+    flags = spin_lock_irqsave(&process_registry_lock);
+    bool terminated = process->state == PROCESS_STATE_TERMINATED;
+    spin_unlock_irqrestore(&process_registry_lock, flags);
+    return terminated;
 }
 
 bool process_terminate_session_members(mg_session_id_t session_id)
@@ -1033,7 +1520,7 @@ bool process_terminate_session_members(mg_session_id_t session_id)
         for (process = all_processes; process; process = process->next_all) {
             if (process->session_id == session_id &&
                 (process->state == PROCESS_STATE_ACTIVE ||
-                 !scheduler_thread_exit_complete(process->main_thread)) &&
+                 process->state == PROCESS_STATE_EXITING) &&
                 object_reference(&process->object)) {
                 break;
             }
@@ -1061,17 +1548,35 @@ void process_reap_session_members(mg_session_id_t session_id)
                 process->session_id == session_id &&
                 process->state == PROCESS_STATE_TERMINATED &&
                 process->owner_reference_held &&
-                scheduler_thread_exit_complete(process->main_thread) &&
+                process_thread_list_complete_locked(process) &&
                 __atomic_load_n(&process->object.ref_count, __ATOMIC_ACQUIRE) ==
-                    1U)
+                    process->thread_count + 1U &&
+                object_reference(&process->object))
                 break;
         }
-        if (process) {
+        spin_unlock_irqrestore(&process_registry_lock, flags);
+        if (!process) break;
+
+        if (!process_finalize_exit(process)) {
+            object_release(&process->object);
+            break;
+        }
+        flags = spin_lock_irqsave(&process_registry_lock);
+        bool reap = process->owner_reference_held &&
+            process->state == PROCESS_STATE_TERMINATED &&
+            process->thread_count == 0 &&
+            __atomic_load_n(&process->object.ref_count, __ATOMIC_ACQUIRE) ==
+                2U;
+        if (reap) {
             process_unlink_locked(process);
             process->owner_reference_held = false;
         }
         spin_unlock_irqrestore(&process_registry_lock, flags);
-        if (!process) break;
+        if (!reap) {
+            object_release(&process->object);
+            break;
+        }
+        object_release(&process->object); /* process owner reference */
         object_release(&process->object);
     }
 }
@@ -1088,15 +1593,19 @@ bool process_is_session_shell(const process_t *process)
 
 bool process_take_interrupt(process_t *process)
 {
-    return process && __atomic_exchange_n(&process->interrupt_requested,
-                                           false, __ATOMIC_ACQ_REL);
+    if (!process) return false;
+    /* Process exit is persistent and must interrupt every blocked sibling;
+     * Ctrl+C remains a consumable, one-shot process request. */
+    if (__atomic_load_n(&process->exit_requested, __ATOMIC_ACQUIRE))
+        return true;
+    return __atomic_exchange_n(&process->interrupt_requested,
+                                false, __ATOMIC_ACQ_REL);
 }
 
 bool process_interrupt_foreground_session(void)
 {
     process_t *shell = NULL;
     process_t *target = NULL;
-    kernel_thread_t *thread = NULL;
     usize process_count = 0;
     u64 flags = spin_lock_irqsave(&process_registry_lock);
 
@@ -1131,12 +1640,15 @@ bool process_interrupt_foreground_session(void)
             }
             current = child;
         }
-        if (current && current != shell && current->main_thread &&
-            object_reference(&current->object)) {
-            target = current;
-            thread = current->main_thread;
-            __atomic_store_n(&target->interrupt_requested, true,
-                             __ATOMIC_RELEASE);
+        if (current && current != shell &&
+            process_thread_list_read_acquire_locked(current)) {
+            if (object_reference(&current->object)) {
+                target = current;
+                __atomic_store_n(&target->interrupt_requested, true,
+                                 __ATOMIC_RELEASE);
+            } else {
+                current->thread_list_readers--;
+            }
         }
     }
     spin_unlock_irqrestore(&process_registry_lock, flags);
@@ -1144,7 +1656,10 @@ bool process_interrupt_foreground_session(void)
 
     /* A blocked operation observes the one-shot request after this wake. A
      * running process will observe it at its next interruptible operation. */
-    (void)scheduler_wake_waiter(thread);
+    for (kernel_thread_t *thread = target->threads; thread;
+         thread = thread->process_next)
+        (void)scheduler_wake_waiter(thread);
+    process_thread_list_read_release(target);
     object_release(&target->object);
     return true;
 }
@@ -1203,22 +1718,23 @@ static void process_shutdown_mark_phase(process_t *requester, bool services)
     }
     spin_unlock_irqrestore(&process_registry_lock, flags);
 
-    /* Wake one waiter at a time without holding the registry lock across a
-     * scheduler operation. The process reference keeps its main thread alive. */
+    /* Wake each process-owned waiter without holding the registry lock across
+     * scheduler operations. The process reference pins every list member. */
     for (;;) {
         process_t *target = NULL;
-        kernel_thread_t *thread = NULL;
 
         flags = spin_lock_irqsave(&process_registry_lock);
         for (process_t *process = all_processes; process;
              process = process->next_all) {
             if (process_in_shutdown_phase(process, requester, services) &&
                 process->shutdown_requested && !process->shutdown_wake_sent &&
-                object_reference(&process->object)) {
-                process->shutdown_wake_sent = true;
-                target = process;
-                thread = process->main_thread;
-                break;
+                process_thread_list_read_acquire_locked(process)) {
+                if (object_reference(&process->object)) {
+                    process->shutdown_wake_sent = true;
+                    target = process;
+                    break;
+                }
+                process->thread_list_readers--;
             }
         }
         spin_unlock_irqrestore(&process_registry_lock, flags);
@@ -1226,7 +1742,10 @@ static void process_shutdown_mark_phase(process_t *requester, bool services)
         /* The target may still be running between registering its wait and
          * entering scheduler_block(). Publish a pending wake in that state so
          * the shutdown result cannot be lost in the check-to-sleep window. */
-        if (thread) (void)scheduler_wake_waiter(thread);
+        for (kernel_thread_t *thread = target->threads; thread;
+             thread = thread->process_next)
+            (void)scheduler_wake_waiter(thread);
+        process_thread_list_read_release(target);
         object_release(&target->object);
     }
 }
@@ -1241,9 +1760,7 @@ static process_t *process_shutdown_next_work(process_t *requester,
         bool active = process_in_shutdown_phase(process, requester, services);
         bool exiting = process_matches_shutdown_phase(process, requester,
                                                        services) &&
-            process->state == PROCESS_STATE_TERMINATED &&
-            process->main_thread &&
-            !scheduler_thread_exit_complete(process->main_thread);
+            process->state == PROCESS_STATE_EXITING;
         if ((active || exiting) &&
             object_reference(&process->object)) {
             target = process;
@@ -1493,15 +2010,10 @@ static void process_user_thread_entry(void *argument)
 {
     process_t *process = (process_t *)argument;
     if (!process || process->state != PROCESS_STATE_ACTIVE ||
-        !process->image_loaded) {
-        (void)process_exit(process, -1);
-        (void)scheduler_terminate();
+        !process->image_loaded)
         return;
-    }
     ring3_enter(process->entry_point, process->user_stack_sp,
                 process->user_argc, process->user_argv);
-    (void)process_exit(process, -1);
-    (void)scheduler_terminate();
 }
 
 static int process_spawn_args_with_context_internal(
@@ -1965,15 +2477,22 @@ int process_poll(process_t *parent, process_handle_t handle, i32 *out_status)
         object_release(object);
         return MG_ERR_NOT_CHILD;
     }
-    if (child->state == PROCESS_STATE_ACTIVE) {
+    if (child->state != PROCESS_STATE_TERMINATED) {
         spin_unlock_irqrestore(&process_registry_lock, flags);
         object_release(object);
         return MG_ERR_WOULD_BLOCK;
     }
-    if (!scheduler_thread_exit_complete(child->main_thread)) {
-        spin_unlock_irqrestore(&process_registry_lock, flags);
+    spin_unlock_irqrestore(&process_registry_lock, flags);
+    if (!process_finalize_exit(child)) {
         object_release(object);
         return MG_ERR_WOULD_BLOCK;
+    }
+    flags = spin_lock_irqsave(&process_registry_lock);
+    if (child->parent != parent || child->wait_collected ||
+        child->state != PROCESS_STATE_TERMINATED) {
+        spin_unlock_irqrestore(&process_registry_lock, flags);
+        object_release(object);
+        return MG_ERR_NOT_CHILD;
     }
     *out_status = child->exit_status;
     spin_unlock_irqrestore(&process_registry_lock, flags);
@@ -2011,6 +2530,7 @@ int process_wait(process_t *parent, process_handle_t handle,
     kernel_object_t *object;
     process_t *child;
     kernel_thread_t *thread;
+    u64 flags;
 
     if (!parent || parent->state != PROCESS_STATE_ACTIVE || !out_status) {
         return MG_ERR_BAD_ARGUMENT;
@@ -2026,9 +2546,9 @@ int process_wait(process_t *parent, process_handle_t handle,
         object_release(object);
         return MG_ERR_INVALID_HANDLE;
     }
-    if (child->state == PROCESS_STATE_ACTIVE) {
+    if (child->state != PROCESS_STATE_TERMINATED) {
         thread = thread_current();
-        if (parent->waiting_child || !thread) {
+        if (parent->waiting_child || !thread || child->wait_claimed) {
             spin_unlock(&process_registry_lock);
             process_cli_restore(wait_flags);
             object_release(object);
@@ -2064,26 +2584,38 @@ int process_wait(process_t *parent, process_handle_t handle,
                 MG_ERR_BUSY;
         }
     }
-    /* TERMINATED is published before process_exit() closes resources and
-     * before the final scheduler handoff. A shutdown/event wake may arrive
-     * during that cleanup, including while the child's syscall is suspended.
-     * Keep ownership until the thread cannot ever resume its old frame. */
-    while (!scheduler_thread_exit_complete(child->main_thread)) {
+    if (child->wait_claimed) {
         spin_unlock(&process_registry_lock);
-        if (process_shutdown_requested(parent) || !scheduler_sleep(1U)) {
-            process_cli_restore(wait_flags);
-            object_release(object);
-            return process_shutdown_requested(parent) ? MG_ERR_SHUTDOWN :
-                MG_ERR_BUSY;
-        }
-        spin_lock(&process_registry_lock);
+        process_cli_restore(wait_flags);
+        object_release(object);
+        return MG_ERR_BUSY;
+    }
+    child->wait_claimed = true;
+    spin_unlock(&process_registry_lock);
+    process_cli_restore(wait_flags);
+
+    if (!process_finalize_exit(child)) {
+        flags = spin_lock_irqsave(&process_registry_lock);
+        child->wait_claimed = false;
+        spin_unlock_irqrestore(&process_registry_lock, flags);
+        object_release(object);
+        return MG_ERR_BUSY;
+    }
+
+    flags = spin_lock_irqsave(&process_registry_lock);
+    if (child->parent != parent || child->wait_collected ||
+        child->state != PROCESS_STATE_TERMINATED || !child->wait_claimed) {
+        child->wait_claimed = false;
+        spin_unlock_irqrestore(&process_registry_lock, flags);
+        object_release(object);
+        return MG_ERR_INVALID_HANDLE;
     }
     *out_status = child->exit_status;
     child->wait_collected = true;
+    child->wait_claimed = false;
     process_unlink_locked(child);
     child->owner_reference_held = false;
     spin_unlock(&process_registry_lock);
-    process_cli_restore(wait_flags);
     object_release(&child->object); /* drop the process's owner reference */
     object_release(object);
     return MG_OK;
@@ -2338,6 +2870,7 @@ const char *process_state_name(process_state_t state)
 {
     switch (state) {
         case PROCESS_STATE_ACTIVE: return "active";
+        case PROCESS_STATE_EXITING: return "exiting";
         case PROCESS_STATE_TERMINATED: return "terminated";
         default: return "unknown";
     }
@@ -2380,20 +2913,14 @@ static u32 process_inspection_state(const process_t *process)
 {
     if (!process || process->state == PROCESS_STATE_TERMINATED)
         return MG_PROCESS_INSPECTION_EXITED;
-    if (!process->main_thread)
-        return MG_PROCESS_INSPECTION_BLOCKED;
-    switch (process->main_thread->state) {
-        case THREAD_STATE_RUNNING:
-            return MG_PROCESS_INSPECTION_RUNNING;
-        case THREAD_STATE_READY:
-            return MG_PROCESS_INSPECTION_READY;
-        case THREAD_STATE_BLOCKED:
-            return MG_PROCESS_INSPECTION_BLOCKED;
-        case THREAD_STATE_TERMINATED:
-            return MG_PROCESS_INSPECTION_EXITED;
-        default:
-            return MG_PROCESS_INSPECTION_BLOCKED;
+    bool ready = false;
+    for (kernel_thread_t *thread = process->threads; thread;
+         thread = thread->process_next) {
+        thread_state_t state = scheduler_thread_state_snapshot(thread);
+        if (state == THREAD_STATE_RUNNING) return MG_PROCESS_INSPECTION_RUNNING;
+        if (state == THREAD_STATE_READY) ready = true;
     }
+    return ready ? MG_PROCESS_INSPECTION_READY : MG_PROCESS_INSPECTION_BLOCKED;
 }
 
 u32 process_snapshot_read(u32 offset, mg_process_info_t *output,
@@ -2419,8 +2946,18 @@ u32 process_snapshot_read(u32 offset, mg_process_info_t *output,
             info.parent_pid = process->parent ? process->parent->pid : 0;
             info.session_id = process->session_id;
             info.state = process_inspection_state(process);
-            info.running_cpu = scheduler_thread_running_cpu(
-                process->main_thread);
+            info.running_cpu = MG_PROCESS_CPU_NONE;
+            for (kernel_thread_t *thread = process->threads; thread;
+                 thread = thread->process_next) {
+                u32 running_cpu = scheduler_thread_running_cpu(thread);
+                if (running_cpu == MG_PROCESS_CPU_NONE) continue;
+                if (info.running_cpu == MG_PROCESS_CPU_NONE)
+                    info.running_cpu = running_cpu;
+                else if (info.running_cpu != running_cpu) {
+                    info.running_cpu = MG_PROCESS_CPU_MULTIPLE;
+                    break;
+                }
+            }
             info.flags = (process->system_service
                           ? MG_PROCESS_FLAG_SYSTEM_SERVICE : 0U) |
                          (process->session_shell

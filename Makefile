@@ -3340,3 +3340,11 @@ test-sync: test-process-handles
 test-sync: test-syscall-user-memory
 test-sync: test-process-memory-unmap
 test-sync: test-process-interrupt
+test-sync: test-process-thread-lifecycle test-process-thread-termination
+
+.PHONY: test-process-thread-lifecycle test-process-thread-termination
+test-process-thread-lifecycle:
+	python3 tests/kernel/process_thread_lifecycle_test.py "$(HOST_CC)"
+
+test-process-thread-termination:
+	python3 tests/kernel/process_thread_termination_test.py "$(HOST_CC)"
