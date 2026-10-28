@@ -102,11 +102,18 @@ ordinary anonymous unmap. After worker exit, the scheduler's incoming-stack
 handoff pins the execution record until the outgoing CPU no longer uses its
 kernel stack or register frame. A reaper then releases that kernel stack and
 unmaps the worker's TLS and user stack; VMM leases may defer an unmap until the
-last kernel operation releases its pin. Joinable workers retain only a small
-completion record until join or process exit. Detached records are removed
-automatically after safe handoff and resource release. Process exit can reclaim
-the remaining mappings together with the address space after every thread and
-syscall has stopped.
+last kernel operation releases its pin. Before a worker region is released, the
+kernel revokes admission for new syscall leases on its pages. Existing leases
+remain valid until their normal release; the region reservation and frame
+ownership remain process-owned until unmapping and its cross-CPU TLB handoff
+complete. Failed, still-private worker setup uses the same revocation and
+deferred-reclamation path because sibling threads share the address space and
+may already hold leases on provisionally mapped pages. A syscall epilogue
+retries deferred region cleanup after its lease has been released. Joinable
+workers retain only a small completion record until join or process exit.
+Detached records are removed automatically after safe handoff and resource
+release. Process exit can reclaim the remaining mappings together with the
+address space after every thread and syscall has stopped.
 
 The ELF loader accepts at most one validated nonempty `PT_TLS` segment; an
 all-zero `PT_TLS` emitted by the linker for an image without TLS sections means

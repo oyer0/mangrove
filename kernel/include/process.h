@@ -56,6 +56,8 @@ typedef struct process_user_region {
     uintptr_t mapping_base;
     usize mapping_pages;
     process_user_region_kind_t kind;
+    bool worker_owned;
+    bool release_pending;
     struct process_user_region *next;
 } process_user_region_t;
 
@@ -110,6 +112,10 @@ struct process {
      * syscall epilogues only enter the potentially linear reaper while some
      * completed worker still owns execution resources or a consumed record. */
     bool worker_reap_pending;
+    /* Protected by memory_lock and sampled atomically by syscall epilogues.
+     * Provisional stack/TLS regions can outlive failed setup while a sibling
+     * still holds a kernel user-memory lease. */
+    _Atomic bool user_region_reap_pending;
     /* Pins unlocked walks that wake thread records. Final reap closes reader
      * admission and waits for these short walks before detaching records. */
     u32 thread_list_readers;

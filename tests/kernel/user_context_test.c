@@ -17,6 +17,9 @@ typedef enum { THREAD_PROCESS_UNATTACHED, THREAD_PROCESS_ATTACHED } thread_proce
 typedef enum { PROCESS_USER_REGION_INITIAL_STACK=1,
                PROCESS_USER_REGION_WORKER_STACK,
                PROCESS_USER_REGION_THREAD_TLS } process_user_region_kind_t;
+typedef enum { PROCESS_REGION_RELEASE_INVALID=0,
+               PROCESS_REGION_RELEASE_DEFERRED,
+               PROCESS_REGION_RELEASED } process_region_release_result_t;
 #define PROCESS_USER_STACK_PAGES 8U
 #define VMM_PAGE_SIZE 4096U
 #define PROCESS_USER_THREAD_RETURN_ADDRESS ((uintptr_t)0x00400000U)
@@ -39,6 +42,7 @@ typedef struct process_user_region {
     uintptr_t mapping_base;
     usize mapping_pages;
     process_user_region_kind_t kind;
+    bool worker_owned, release_pending;
 } process_user_region_t;
 typedef void (*thread_entry_t)(void *);
 typedef struct kernel_thread {
@@ -160,11 +164,15 @@ static process_user_region_t *process_user_tls_create(process_t *process,
     assert(process);
     return result;
 }
-static bool process_user_region_release(process_t *process,
-                                        process_user_region_t *r)
+static bool process_user_region_set_worker_owned(
+    process_t *process, process_user_region_t *stack,
+    process_user_region_t *tls, bool worker_owned)
+{ (void)tls; (void)worker_owned; return process && stack; }
+static process_region_release_result_t process_user_region_release(
+    process_t *process, process_user_region_t *r)
 { assert(process&&r);fake_regions_released++;
   if(r->kind==PROCESS_USER_REGION_WORKER_STACK)fake_stack_released=true;
-  return true; }
+  return PROCESS_REGION_RELEASED; }
 static void process_user_thread_entry(void *argument) { (void)argument; }
 
 /* PROCESS_INITIAL_CONTEXT */

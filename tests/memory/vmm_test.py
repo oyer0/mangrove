@@ -98,7 +98,7 @@ typedef struct {u64 entries[512];} page_table_t;
 typedef struct {phys_addr_t physical;u64 generation;u32 slot;} pmm_owned_frame_t;
 typedef pthread_mutex_t mutex_t;
 typedef pthread_mutex_t spinlock_t;
-typedef struct vmm_owned_frame {phys_addr_t physical;u32 user_pin_count;struct vmm_owned_frame*next;} vmm_owned_frame_t;
+typedef struct vmm_owned_frame {phys_addr_t physical;u32 user_pin_count;bool user_revoking;struct vmm_owned_frame*next;} vmm_owned_frame_t;
 typedef struct {page_table_t *root;vmm_owned_frame_t *tables,*leaves;mutex_t operation_lock;u64 active_user_leases;bool destroy_pending,shootdown_pending;} vmm_address_space_metadata_t;
 typedef struct {page_table_t *address_space;uintptr_t first_page;usize page_count;bool active;} vmm_user_range_lease_t;
 static page_table_t *kernel_pml4,*active_pml4;static spinlock_t vmm_metadata_lock=PTHREAD_MUTEX_INITIALIZER,vmm_kernel_lock=PTHREAD_MUTEX_INITIALIZER;
@@ -126,7 +126,7 @@ static vmm_address_space_metadata_t*vmm_metadata_find(const page_table_t*p){retu
 static bool vmm_owned_contains(const vmm_owned_frame_t*n,u64 p){for(;n;n=n->next)if(n->physical==p)return true;return false;}
 static vmm_owned_frame_t*vmm_owned_find(vmm_owned_frame_t*n,u64 p){for(;n;n=n->next)if(n->physical==p)return n;return NULL;}
 static vmm_owned_frame_t*vmm_owned_detach(vmm_owned_frame_t**list,u64 p){while(*list){if((*list)->physical==p){vmm_owned_frame_t*n=*list;*list=n->next;n->next=NULL;return n;}list=&(*list)->next;}return NULL;}
-static void vmm_owned_insert(vmm_owned_frame_t**list,vmm_owned_frame_t*n,u64 p){n->physical=p;n->user_pin_count=0;n->next=*list;*list=n;}
+static void vmm_owned_insert(vmm_owned_frame_t**list,vmm_owned_frame_t*n,u64 p){n->physical=p;n->user_pin_count=0;n->user_revoking=false;n->next=*list;*list=n;}
 static bool vmm_address_space_validate_locked(page_table_t*p){return p==meta.root;}
 static void vmm_capture_active_targets_locked(vmm_address_space_metadata_t*m,u64*out){(void)m;out[0]=0;}
 static void vmm_tlb_shootdown(u64*targets,page_table_t*p){(void)targets;(void)p;}
@@ -141,7 +141,8 @@ for name in ['vmm_framebuffer_page','vmm_user_child_reserved','vmm_user_path_ava
              'vmm_user_range_unmapped',
              'vmm_user_page_executable_locked','vmm_user_range_executable',
              'vmm_user_range_lease',
-             'vmm_user_range_release','vmm_unmap_user_page',
+             'vmm_user_range_release','vmm_user_range_revoke',
+             'vmm_unmap_user_page',
              'vmm_unmap_user_range']:
     code = function('kernel/src/vmm.c', name)
     code = re.sub(r'__asm__ volatile\("invlpg.*?;', 'invalidate_page(virtual_addr);', code, flags=re.S)
@@ -193,6 +194,11 @@ int main(void){
  assert(!vmm_unmap_user_page(meta.root,(void*)0x800000,&leased_first));
  assert(!vmm_unmap_user_range(meta.root,(void*)0x800000,2));
  assert((meta.active_user_leases==2)&&vmm_user_range_writable((void*)0x800000,8192));
+ assert(vmm_user_range_revoke(meta.root,(void*)0x800000,2));
+ assert(!vmm_user_range_lease(meta.root,(void*)0x800000,4,true,
+                              &(vmm_user_range_lease_t){0}));
+ assert(!vmm_user_range_valid((void*)0x800000,1));
+ assert(!vmm_unmap_user_range(meta.root,(void*)0x800000,2));
  sync_result=pthread_barrier_wait(&race.release);assert(sync_result==0||sync_result==PTHREAD_BARRIER_SERIAL_THREAD);
  assert(pthread_join(lease_thread,NULL)==0&&meta.active_user_leases==0);
  assert(pthread_barrier_destroy(&race.held)==0&&pthread_barrier_destroy(&race.release)==0);

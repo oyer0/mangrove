@@ -82,6 +82,12 @@ typedef struct process_memory_mapping {
 #define PROCESS_TLS_MIN_ALIGNMENT 1U
 #define PROCESS_TLS_TCB_BYTES (2U * sizeof(uintptr_t))
 
+typedef enum {
+    PROCESS_REGION_RELEASE_INVALID = 0,
+    PROCESS_REGION_RELEASE_DEFERRED,
+    PROCESS_REGION_RELEASED,
+} process_region_release_result_t;
+
 static bool process_size_align_up(usize value, usize alignment,
                                   usize *out_value)
 {
@@ -1264,13 +1270,29 @@ static process_user_region_t *process_user_region_create(
             break;
     }
     if (mapped != mapping_pages) {
-        if (mapped && !vmm_unmap_user_range(process->address_space,
-                (void *)mapping_base, mapped))
-            panic("process: user-region mapping rollback failed");
+        bool deferred = false;
+        if (mapped) {
+            if (!vmm_user_range_revoke(process->address_space,
+                    (void *)mapping_base, mapped))
+                panic("process: partial user-region revoke failed");
+            if (!vmm_unmap_user_range(process->address_space,
+                    (void *)mapping_base, mapped)) {
+                /* A sibling may already hold a syscall lease on a page
+                 * exposed by the shared address space. Keep both its frame
+                 * ownership and the reservation in the process list until
+                 * that lease drains. */
+                region->mapping_pages = mapped;
+                region->release_pending = true;
+                process_user_region_insert_locked(process, region);
+                __atomic_store_n(&process->user_region_reap_pending, true,
+                                 __ATOMIC_RELEASE);
+                deferred = true;
+            }
+        }
         for (i = mapped; i < mapping_pages; i++) pmm_free_frame(frames[i]);
         mutex_unlock(&process->memory_lock);
         kfree(frames);
-        kfree(region);
+        if (!deferred) kfree(region);
         return NULL;
     }
     process_user_region_insert_locked(process, region);
@@ -1349,23 +1371,113 @@ static bool process_thread_handle_deactivate_locked(process_t *process,
     return true;
 }
 
-static bool process_user_region_release(
+static process_region_release_result_t process_user_region_release(
     process_t *process, process_user_region_t *region)
 {
     process_user_region_t **cursor;
     if (!process || !region || !mutex_lock(&process->memory_lock))
-        return false;
+        return PROCESS_REGION_RELEASE_INVALID;
     cursor = &process->user_regions;
     while (*cursor && *cursor != region) cursor = &(*cursor)->next;
-    if (*cursor != region || !vmm_unmap_user_range(process->address_space,
-            (void *)region->mapping_base, region->mapping_pages)) {
+    if (*cursor != region) {
         mutex_unlock(&process->memory_lock);
-        return false;
+        return PROCESS_REGION_RELEASE_INVALID;
+    }
+    if (!region->release_pending) {
+        if (!vmm_user_range_revoke(process->address_space,
+                (void *)region->mapping_base, region->mapping_pages)) {
+            mutex_unlock(&process->memory_lock);
+            return PROCESS_REGION_RELEASE_INVALID;
+        }
+        region->release_pending = true;
+    }
+    if (!vmm_unmap_user_range(process->address_space,
+            (void *)region->mapping_base, region->mapping_pages)) {
+        __atomic_store_n(&process->user_region_reap_pending, true,
+                         __ATOMIC_RELEASE);
+        mutex_unlock(&process->memory_lock);
+        return PROCESS_REGION_RELEASE_DEFERRED;
     }
     *cursor = region->next;
+    region->next = NULL;
+    bool pending = false;
+    for (process_user_region_t *item = process->user_regions; item;
+         item = item->next) {
+        if (item->release_pending) {
+            pending = true;
+            break;
+        }
+    }
+    __atomic_store_n(&process->user_region_reap_pending, pending,
+                     __ATOMIC_RELEASE);
     mutex_unlock(&process->memory_lock);
     kfree(region);
-    return true;
+    return PROCESS_REGION_RELEASED;
+}
+
+static bool process_user_region_set_worker_owned(
+    process_t *process, process_user_region_t *stack_region,
+    process_user_region_t *tls_region, bool worker_owned)
+{
+    bool stack_found = false;
+    bool tls_found = tls_region == NULL;
+
+    if (!process || !stack_region ||
+        !mutex_lock(&process->memory_lock))
+        return false;
+    for (process_user_region_t *region = process->user_regions; region;
+         region = region->next) {
+        if (region == stack_region) stack_found = true;
+        if (region == tls_region) tls_found = true;
+    }
+    if (stack_found && tls_found) {
+        stack_region->worker_owned = worker_owned;
+        if (tls_region) tls_region->worker_owned = worker_owned;
+    }
+    mutex_unlock(&process->memory_lock);
+    return stack_found && tls_found;
+}
+
+static void process_user_regions_reap_pending(process_t *process)
+{
+    process_user_region_t *released = NULL;
+    process_user_region_t **cursor;
+    bool pending = false;
+
+    if (!process || !__atomic_load_n(&process->user_region_reap_pending,
+                                     __ATOMIC_ACQUIRE) ||
+        !mutex_lock(&process->memory_lock))
+        return;
+    cursor = &process->user_regions;
+    while (*cursor) {
+        process_user_region_t *region = *cursor;
+        if (!region->release_pending) {
+            cursor = &region->next;
+            continue;
+        }
+        if (region->worker_owned) {
+            pending = true;
+            cursor = &region->next;
+            continue;
+        }
+        if (!vmm_unmap_user_range(process->address_space,
+                (void *)region->mapping_base, region->mapping_pages)) {
+            pending = true;
+            cursor = &region->next;
+            continue;
+        }
+        *cursor = region->next;
+        region->next = released;
+        released = region;
+    }
+    __atomic_store_n(&process->user_region_reap_pending, pending,
+                     __ATOMIC_RELEASE);
+    mutex_unlock(&process->memory_lock);
+    while (released) {
+        process_user_region_t *next = released->next;
+        kfree(released);
+        released = next;
+    }
 }
 
 /* Caller holds process_registry_lock. This flag avoids a process-wide record
@@ -1379,7 +1491,8 @@ static bool process_worker_reap_needed_locked(process_t *process)
         if (record->completed &&
             (record->reclaiming || !record->kernel_stack_released ||
              record->stack_region || record->tls_region ||
-             record->execution))
+             record->execution ||
+             (record->listed && (record->joined || record->detached))))
             return true;
     }
     return false;
@@ -1424,11 +1537,15 @@ void process_worker_reclaim_pending(process_t *process)
     u64 flags;
     bool retry_available = true;
 
-    if (!process || !__atomic_load_n(&process->worker_reap_pending,
-                                     __ATOMIC_ACQUIRE) ||
+    if (!process ||
+        (!__atomic_load_n(&process->worker_reap_pending, __ATOMIC_ACQUIRE) &&
+         !__atomic_load_n(&process->user_region_reap_pending,
+                          __ATOMIC_ACQUIRE)) ||
         !process_worker_reclaim_context_valid() ||
         !object_reference(&process->object))
         return;
+
+    process_user_regions_reap_pending(process);
 
     for (;;) {
       flags = spin_lock_irqsave(&process_registry_lock);
@@ -1449,6 +1566,10 @@ void process_worker_reclaim_pending(process_t *process)
         bool drop_list_reference = false;
         bool cleanup_ready = false;
         kernel_thread_t *terminated_waiter = NULL;
+        process_region_release_result_t stack_release_result =
+            PROCESS_REGION_RELEASED;
+        process_region_release_result_t tls_release_result =
+            PROCESS_REGION_RELEASED;
 
         flags = spin_lock_irqsave(&process_registry_lock);
         next = record->next;
@@ -1474,11 +1595,17 @@ void process_worker_reclaim_pending(process_t *process)
                 execution_stack_released =
                     thread_release_terminated_stack(execution);
             if (tls_region)
-                tls_released = process_user_region_release(
+                tls_release_result = process_user_region_release(
                     process, tls_region);
             if (stack_region)
-                stack_released = process_user_region_release(
+                stack_release_result = process_user_region_release(
                     process, stack_region);
+            if (tls_release_result == PROCESS_REGION_RELEASE_INVALID ||
+                stack_release_result == PROCESS_REGION_RELEASE_INVALID)
+                panic("process: worker region ownership lost during reap");
+            tls_released = tls_release_result == PROCESS_REGION_RELEASED;
+            stack_released = stack_release_result ==
+                PROCESS_REGION_RELEASED;
 
             /* User mappings can remain deferred while a sibling's VMM lease
              * pins them; the completion record retains those region nodes
@@ -2015,6 +2142,7 @@ void process_scheduler_handoff_complete(struct kernel_thread *raw_thread)
     process_t *process;
     kernel_thread_t *waiter = NULL;
     kernel_thread_t *join_waiter = NULL;
+    bool join_waiter_pinned = false;
     bool cleanup_ready = false;
     u64 flags;
 
@@ -2037,8 +2165,19 @@ void process_scheduler_handoff_complete(struct kernel_thread *raw_thread)
                 record->kernel_stack_released = false;
                 __atomic_store_n(&process->worker_reap_pending, true,
                                  __ATOMIC_RELEASE);
-                join_waiter = record->join_waiter;
-                record->join_waiter = NULL;
+                /* The waiter is a scheduler-thread pointer, not owned by
+                 * the completion record. Keep process thread-list readers
+                 * pinned through wake delivery so a detached waiter cannot
+                 * be removed and freed in the unlocked interval. Retain the
+                 * claim pointer until the join call consumes or abandons it,
+                 * so its failure path can release the claim after a racing
+                 * completion. If process termination has already closed
+                 * reader admission, its process-wide wake handles the waiter. */
+                if (record->join_waiter &&
+                    process_thread_list_read_acquire_locked(process)) {
+                    join_waiter = record->join_waiter;
+                    join_waiter_pinned = true;
+                }
             }
         }
     }
@@ -2052,8 +2191,12 @@ void process_scheduler_handoff_complete(struct kernel_thread *raw_thread)
     waiter = process_publish_terminated_locked(process);
     spin_unlock_irqrestore(&process_registry_lock, flags);
 
-    if (join_waiter && !scheduler_wake_waiter(join_waiter))
-        panic("process: failed to wake completed worker joiner");
+    if (join_waiter) {
+        if (!scheduler_wake_waiter(join_waiter))
+            panic("process: failed to wake completed worker joiner");
+        if (join_waiter_pinned)
+            process_thread_list_read_release(process);
+    }
     if (cleanup_ready) (void)process_cleanup_exit_resources(process);
     if (waiter) (void)scheduler_unblock(waiter);
 }
@@ -2772,7 +2915,8 @@ static process_user_region_t *process_user_tls_create(process_t *process,
         &tls_start);
     if (!region) return NULL;
     if (tls_start > VMM_USER_ADDRESS_LIMIT - module_size) {
-        if (!process_user_region_release(process, region))
+        if (process_user_region_release(process, region) ==
+            PROCESS_REGION_RELEASE_INVALID)
             panic("process: TLS range rollback failed");
         return NULL;
     }
@@ -2856,8 +3000,8 @@ bool process_user_context_prepare_worker(process_t *process,
     if (process->tls_present) {
         tls_region = process_user_tls_create(process, &fs_base);
         if (!tls_region) {
-            if (!process_user_region_release(process,
-                                                         stack_region))
+            if (process_user_region_release(process, stack_region) ==
+                PROCESS_REGION_RELEASE_INVALID)
                 panic("process: worker-stack rollback failed");
             return false;
         }
@@ -2869,10 +3013,11 @@ bool process_user_context_prepare_worker(process_t *process,
      * for an exit racing after this point. */
     if (process->state != PROCESS_STATE_ACTIVE ||
         __atomic_load_n(&process->exit_requested, __ATOMIC_ACQUIRE)) {
-        if (tls_region && !process_user_region_release(
-                process, tls_region))
+        if (tls_region && process_user_region_release(process, tls_region) ==
+                PROCESS_REGION_RELEASE_INVALID)
             panic("process: worker-TLS termination rollback failed");
-        if (!process_user_region_release(process, stack_region))
+        if (process_user_region_release(process, stack_region) ==
+                PROCESS_REGION_RELEASE_INVALID)
             panic("process: worker-stack termination rollback failed");
         return false;
     }
@@ -2907,12 +3052,17 @@ bool process_user_context_discard_worker(process_t *process,
     tls_region = thread->user_context.tls_region;
     if (!stack_region || stack_region->kind != PROCESS_USER_REGION_WORKER_STACK)
         return false;
+    if (!process_user_region_set_worker_owned(process, stack_region,
+                                              tls_region, false))
+        return false;
     if (tls_region &&
         (tls_region->kind != PROCESS_USER_REGION_THREAD_TLS ||
-         !process_user_region_release(process, tls_region)))
+         process_user_region_release(process, tls_region) ==
+             PROCESS_REGION_RELEASE_INVALID))
         return false;
-    if (!process_user_region_release(process, stack_region))
-        panic("process: unpublished worker-stack release failed");
+    if (process_user_region_release(process, stack_region) ==
+        PROCESS_REGION_RELEASE_INVALID)
+        return false;
     memset(&thread->user_context, 0, sizeof(thread->user_context));
     thread->user_fs_base = 0;
     thread->entry = NULL;
@@ -2933,6 +3083,7 @@ int process_thread_create(process_t *process, uintptr_t entry,
     bool published = false;
     bool release_process_reference = false;
     int rollback_error = MG_ERR_NO_MEMORY;
+    u64 thread_id;
     u64 flags;
 
     if (!process || !entry || !out_handle || !out_thread_id)
@@ -2971,8 +3122,15 @@ int process_thread_create(process_t *process, uintptr_t entry,
 
     record->execution = thread;
     record->id = thread->id;
+    /* The completion record may be detached and reclaimed as soon as the
+     * handle becomes visible to a sibling. Keep the returned identity in
+     * creator-owned storage before publishing either record or handle. */
+    thread_id = record->id;
     record->stack_region = thread->user_context.stack_region;
     record->tls_region = thread->user_context.tls_region;
+    if (!process_user_region_set_worker_owned(process,
+            record->stack_region, record->tls_region, true))
+        goto rollback_private;
 
     /* The initial reference becomes process-list ownership on commit.  A
      * second reference is transferred into the hidden, reserved handle. */
@@ -3023,7 +3181,7 @@ int process_thread_create(process_t *process, uintptr_t entry,
 
     if (published) {
         *out_handle = handle;
-        *out_thread_id = record->id;
+        *out_thread_id = thread_id;
         return MG_OK;
     }
     if (release_process_reference) object_release(&process->object);
