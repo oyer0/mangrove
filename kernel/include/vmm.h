@@ -142,6 +142,10 @@ bool vmm_user_range_lease(page_table_t *pml4, const void *address,
                           usize length, bool writable,
                           vmm_user_range_lease_t *out_lease);
 void vmm_user_range_release(vmm_user_range_lease_t *lease);
+/* Prevent new syscall leases on a mapped owned range. Existing leases remain
+ * valid and must drain before vmm_unmap_user_range() can reclaim its frames. */
+bool vmm_user_range_revoke(page_table_t *pml4, void *virtual_addr,
+                           usize page_count);
 phys_addr_t vmm_virtual_to_physical(void *virtual_addr);
 
 /* Stage-4 ownership checks.  These are intentionally independent from

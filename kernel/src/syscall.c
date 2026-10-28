@@ -4221,8 +4221,10 @@ void syscall_dispatch(void *raw_frame)
     thread->syscall_user_access_context = previous_context;
     if (tracked) scheduler_syscall_leave();
     if (tracked) process_syscall_leave(process);
-    if (tracked && __atomic_load_n(&process->worker_reap_pending,
-                                   __ATOMIC_ACQUIRE)) {
+    if (tracked &&
+        (__atomic_load_n(&process->worker_reap_pending, __ATOMIC_ACQUIRE) ||
+         __atomic_load_n(&process->user_region_reap_pending,
+                         __ATOMIC_ACQUIRE))) {
         /* Worker stack reclamation may wait for cross-CPU TLB shootdowns.
          * All syscall leases are gone and no kernel lock is held here. The
          * syscall frame remains on this thread's protected kernel stack. */

@@ -33,7 +33,8 @@ names = (
     "process_memory_size_to_pages", "process_memory_find_space",
     "process_user_region_insert_locked", "process_user_register_initial_stack",
     "process_user_region_copy_to_frames", "process_user_region_create",
-    "process_user_region_release", "process_user_tls_create",
+    "process_user_region_release", "process_user_regions_reap_pending",
+    "process_user_tls_create",
     "process_memory_unmap",
 )
 production = "\n".join(function(name) for name in names)
@@ -54,6 +55,9 @@ typedef enum { PROCESS_STATE_ACTIVE=0, PROCESS_STATE_EXITING=1 } process_state_t
 typedef enum { PROCESS_USER_REGION_INITIAL_STACK=1,
     PROCESS_USER_REGION_WORKER_STACK, PROCESS_USER_REGION_THREAD_TLS
 } process_user_region_kind_t;
+typedef enum { PROCESS_REGION_RELEASE_INVALID=0,
+    PROCESS_REGION_RELEASE_DEFERRED, PROCESS_REGION_RELEASED
+} process_region_release_result_t;
 #define VMM_PAGE_SIZE 4096U
 #define VMM_USER_ANON_BASE 0x0000400000000000ULL
 #define VMM_USER_ANON_LIMIT 0x00007fff00000000ULL
@@ -75,20 +79,22 @@ typedef struct process_memory_mapping {
 typedef struct process_user_region {
     uintptr_t reservation_base; usize reservation_pages;
     uintptr_t mapping_base; usize mapping_pages;
-    process_user_region_kind_t kind; struct process_user_region *next;
+    process_user_region_kind_t kind; bool worker_owned, release_pending;
+    struct process_user_region *next;
 } process_user_region_t;
 typedef struct process {
     process_state_t state; bool exit_requested; void *address_space;
     mutex_t memory_lock; process_memory_mapping_t *memory_mappings;
-    process_user_region_t *user_regions;
+    process_user_region_t *user_regions; bool user_region_reap_pending;
     u8 *tls_image; usize tls_file_size, tls_memory_size, tls_alignment;
     bool tls_present;
 } process_t;
-typedef struct {uintptr_t address;phys_addr_t frame;} mapping_t;
+typedef struct {uintptr_t address;phys_addr_t frame;unsigned leases;
+                bool revoking;} mapping_t;
 static mapping_t mappings[512]; static unsigned mapping_count;
 static unsigned live_frames, map_calls, fail_map_after;
 static int fail_frame_after=-1, fail_malloc_after=-1;
-static bool fail_map;
+static bool fail_map,lease_on_first_map,lease_active;
 static void *kmalloc(usize n){if(fail_malloc_after==0)return NULL;if(fail_malloc_after>0)fail_malloc_after--;return malloc(n);}
 static void kfree(void*p){free(p);}
 static bool mutex_lock(mutex_t*m){return pthread_mutex_lock(m)==0;}
@@ -98,12 +104,14 @@ static void pmm_free_frame(phys_addr_t f){assert(f&&live_frames);live_frames--;f
 static bool vmm_direct_map_valid(phys_addr_t f){return f!=0;}
 static void *phys_to_virt(phys_addr_t f){return (void*)f;}
 static bool vmm_user_range_unmapped(void*as,uintptr_t start,usize length){assert(as&&start%VMM_PAGE_SIZE==0&&length%VMM_PAGE_SIZE==0);for(uintptr_t a=start;a<start+length;a+=VMM_PAGE_SIZE)for(unsigned i=0;i<mapping_count;i++)if(mappings[i].address==a)return false;return true;}
-static bool vmm_map_user_page(void*as,void*va,phys_addr_t frame,u64 flags){assert(as&&frame&&(flags&PTE_USER));map_calls++;if(fail_map&&map_calls==fail_map_after)return false;assert(mapping_count<512);uintptr_t a=(uintptr_t)va;for(unsigned i=0;i<mapping_count;i++)assert(mappings[i].address!=a);mappings[mapping_count++]=(mapping_t){a,frame};return true;}
-static bool vmm_unmap_user_range(void*as,void*va,usize pages){assert(as);uintptr_t start=(uintptr_t)va;for(usize p=0;p<pages;p++){uintptr_t a=start+p*VMM_PAGE_SIZE;unsigned i;for(i=0;i<mapping_count;i++)if(mappings[i].address==a)break;if(i==mapping_count)return false;phys_addr_t f=mappings[i].frame;mappings[i]=mappings[--mapping_count];pmm_free_frame(f);}return true;}
+static bool vmm_map_user_page(void*as,void*va,phys_addr_t frame,u64 flags){assert(as&&frame&&(flags&PTE_USER));map_calls++;if(fail_map&&map_calls==fail_map_after)return false;assert(mapping_count<512);uintptr_t a=(uintptr_t)va;for(unsigned i=0;i<mapping_count;i++)assert(mappings[i].address!=a);mappings[mapping_count++]=(mapping_t){.address=a,.frame=frame};if(lease_on_first_map){lease_on_first_map=false;mappings[mapping_count-1U].leases=1;lease_active=true;}return true;}
+static bool vmm_user_range_revoke(void*as,void*va,usize pages){assert(as);uintptr_t start=(uintptr_t)va;for(usize p=0;p<pages;p++){uintptr_t a=start+p*VMM_PAGE_SIZE;unsigned i;for(i=0;i<mapping_count;i++)if(mappings[i].address==a)break;if(i==mapping_count)return false;}for(usize p=0;p<pages;p++){uintptr_t a=start+p*VMM_PAGE_SIZE;for(unsigned i=0;i<mapping_count;i++)if(mappings[i].address==a)mappings[i].revoking=true;}return true;}
+static bool vmm_unmap_user_range(void*as,void*va,usize pages){assert(as);uintptr_t start=(uintptr_t)va;for(usize p=0;p<pages;p++){uintptr_t a=start+p*VMM_PAGE_SIZE;unsigned i;for(i=0;i<mapping_count;i++)if(mappings[i].address==a)break;if(i==mapping_count||mappings[i].leases)return false;}for(usize p=0;p<pages;p++){uintptr_t a=start+p*VMM_PAGE_SIZE;for(unsigned i=0;i<mapping_count;i++)if(mappings[i].address==a){phys_addr_t f=mappings[i].frame;mappings[i]=mappings[--mapping_count];pmm_free_frame(f);break;}}return true;}
+static void test_lease_release(void){assert(lease_active);for(unsigned i=0;i<mapping_count;i++)if(mappings[i].leases){mappings[i].leases--;lease_active=false;return;}assert(false);}
 static uint8_t *mapped_bytes(uintptr_t address){uintptr_t page=address&~(uintptr_t)(VMM_PAGE_SIZE-1U);for(unsigned i=0;i<mapping_count;i++)if(mappings[i].address==page)return (uint8_t*)mappings[i].frame+(address-page);return NULL;}
 static void panic(const char*m){fprintf(stderr,"%s\n",m);abort();}
 '''+production+r'''
-static void reset_failures(void){fail_frame_after=-1;fail_malloc_after=-1;fail_map=false;}
+static void reset_failures(void){fail_frame_after=-1;fail_malloc_after=-1;fail_map=false;lease_on_first_map=false;}
 static void test_stack_guard_reservation_and_unmap(void)
 {
     process_t p={.state=PROCESS_STATE_ACTIVE,.address_space=(void*)1};
@@ -131,8 +139,8 @@ static void test_stack_guard_reservation_and_unmap(void)
         PROCESS_USER_REGION_WORKER_STACK,1U,8U,VMM_PAGE_SIZE,NULL,0,0,0,NULL);
     assert(b&&b->reservation_base==a->reservation_base+9U*VMM_PAGE_SIZE);
     assert(a->reservation_base+a->reservation_pages*VMM_PAGE_SIZE<=b->reservation_base);
-    assert(process_user_region_release(&p,b));
-    assert(process_user_region_release(&p,a));
+    assert(process_user_region_release(&p,b)==PROCESS_REGION_RELEASED);
+    assert(process_user_region_release(&p,a)==PROCESS_REGION_RELEASED);
     assert(p.user_regions&&p.user_regions->kind==PROCESS_USER_REGION_INITIAL_STACK&&
            !p.user_regions->next);
     assert(vmm_unmap_user_range(p.address_space,(void*)stack_base,8U));
@@ -208,6 +216,26 @@ static void test_allocation_failures_roll_back(void)
     assert(!process_user_region_create(&p,PROCESS_USER_REGION_WORKER_STACK,
         1U,8U,VMM_PAGE_SIZE,NULL,0,0,0,NULL));
     reset_failures();assert(!p.user_regions&&live_frames==0&&mapping_count==0);
+
+    /* A sibling acquires a kernel lease after the first provisional page is
+     * mapped. Failing a later page must defer cleanup and preserve reservation
+     * ownership instead of panicking or freeing the leased frame. */
+    fail_map=true;map_calls=0;fail_map_after=2;lease_on_first_map=true;
+    assert(!process_user_region_create(&p,PROCESS_USER_REGION_WORKER_STACK,
+        1U,3U,VMM_PAGE_SIZE,NULL,0,0,0,NULL));
+    reset_failures();
+    assert(p.user_regions&&p.user_regions->release_pending&&
+           p.user_regions->mapping_pages==1&&
+           p.user_region_reap_pending&&lease_active&&live_frames==1&&
+           mapping_count==1&&mappings[0].revoking);
+    uintptr_t candidate=process_memory_find_space(&p,1U);
+    uintptr_t reserved_end=p.user_regions->reservation_base+
+        p.user_regions->reservation_pages*VMM_PAGE_SIZE;
+    assert(candidate<p.user_regions->reservation_base||candidate>=reserved_end);
+    test_lease_release();
+    process_user_regions_reap_pending(&p);
+    assert(!p.user_regions&&!p.user_region_reap_pending&&
+           live_frames==0&&mapping_count==0);
     assert(pthread_mutex_destroy(&p.memory_lock)==0);
 }
 int main(void)

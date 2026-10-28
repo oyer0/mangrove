@@ -66,7 +66,12 @@ typedef enum { OBJECT_TYPE_INVALID, OBJECT_TYPE_PROCESS, OBJECT_TYPE_THREAD }
 enum { MG_OK=0, MG_ERR_INVALID_HANDLE=-3, MG_ERR_BAD_ARGUMENT=-4,
        MG_ERR_NO_MEMORY=-6, MG_ERR_BUSY=-14, MG_ERR_INVALID_EXEC=-15,
        MG_ERR_SHUTDOWN=-38, MG_ERR_INTERRUPTED=-39 };
-enum { PROCESS_USER_REGION_WORKER_STACK, PROCESS_USER_REGION_THREAD_TLS };
+enum { PROCESS_USER_REGION_INITIAL_STACK=1,
+       PROCESS_USER_REGION_WORKER_STACK,
+       PROCESS_USER_REGION_THREAD_TLS };
+typedef enum { PROCESS_REGION_RELEASE_INVALID,
+               PROCESS_REGION_RELEASE_DEFERRED,
+               PROCESS_REGION_RELEASED } process_region_release_result_t;
 enum { THREAD_CPU_NONE = UINT32_MAX };
 struct kernel_object {
     u32 ref_count;
@@ -77,6 +82,8 @@ struct process_user_region {
     uintptr_t reservation_base, mapping_base;
     usize reservation_pages, mapping_pages;
     u32 kind, leases;
+    bool worker_owned;
+    bool release_pending;
     process_user_region_t *next;
 };
 typedef struct { bool valid; process_user_region_t *stack_region,*tls_region;
@@ -119,6 +126,7 @@ struct process {
     bool exit_requested, termination_pending, launch_ready;
     bool exit_cleanup_complete, exit_cleanup_in_progress;
     bool thread_reap_in_progress,worker_reap_pending;
+    bool user_region_reap_pending;
     u32 active_syscalls,thread_count,live_thread_count,thread_list_readers;
     u32 worker_reapers;
     kernel_thread_t *main_thread,*threads;
@@ -138,18 +146,33 @@ static pthread_mutex_t event_lock=PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t event_changed=PTHREAD_COND_INITIALIZER;
 static bool block_entered;
 static bool reap_race_armed,reap_race_paused,reap_race_done;
+static bool lost_race_armed,lost_race_paused,lost_race_done;
+static bool create_reap_after_publish;
+static process_handle_t last_reserved_handle;
+static kernel_thread_t *wake_pause_thread;
+static bool wake_pause_armed,wake_pause_entered,wake_pause_release;
 static usize allocation_count,fail_allocation_at;
 static unsigned created_threads,destroyed_threads,stack_releases;
 static unsigned region_releases,handle_cancels;
 static bool fail_thread_create,fail_prepare,fail_reserve,fail_enqueue;
+static u32 lease_on_revoke_kind;
 static bool pause_prepare,prepare_entered,allow_prepare;
 static bool interrupt_pending;
 static process_user_region_t *leased_region;
 static u64 next_thread_id=100;
 static _Thread_local u64 fixture_eflags=1ULL<<9;
 static process_t *test_process;
-static bool process_user_region_release(process_t*,
-                                                     process_user_region_t*);
+static process_region_release_result_t process_user_region_release(
+    process_t*,process_user_region_t*);
+static bool process_user_region_set_worker_owned(process_t*,
+    process_user_region_t*,process_user_region_t*,bool);
+static void process_worker_reclaim_pending(process_t*);
+static int process_thread_detach(process_t*,process_handle_t);
+static void process_worker_exit(struct kernel_thread*,u64);
+static void process_scheduler_handoff_complete(struct kernel_thread*);
+static void worker_complete(process_thread_record_t*,u64);
+static void test_after_created_handle_is_visible(void);
+static bool process_finish_termination(process_t*);
 static void process_user_thread_entry(void *argument){(void)argument;}
 static void panic(const char *message)
 {fprintf(stderr,"unexpected panic: %s\n",message);abort();}
@@ -168,7 +191,20 @@ static void spin_unlock_irqrestore(spinlock_t *lock,u64 flags)
     while(!reap_race_done)pthread_cond_wait(&event_changed,&event_lock);
     pthread_mutex_unlock(&event_lock);
    }
-  } }
+  }
+  if(lock==&process_registry_lock&&lost_race_armed&&test_process&&
+     test_process->thread_records){
+   process_thread_record_t*r=test_process->thread_records;
+   if(r->listed&&r->completed&&!r->reclaiming&&!r->execution&&
+      r->kernel_stack_released&&!r->stack_region&&!r->tls_region&&
+      !r->joined&&!r->detached&&!test_process->worker_reapers){
+    pthread_mutex_lock(&event_lock);lost_race_armed=false;
+    lost_race_paused=true;pthread_cond_broadcast(&event_changed);
+    while(!lost_race_done)pthread_cond_wait(&event_changed,&event_lock);
+    pthread_mutex_unlock(&event_lock);
+   }
+  }
+ }
 static bool mutex_lock(mutex_t *lock){return pthread_mutex_lock(lock)==0;}
 static void mutex_unlock(mutex_t *lock){assert(pthread_mutex_unlock(lock)==0);}
 static void *kmalloc(usize size)
@@ -215,7 +251,8 @@ static bool process_handle_reserve(process_t *p,kernel_object_t *o,u32 rights,
  for(usize i=0;i<p->handle_capacity;i++)if(!s[i].active&&!s[i].reserved){
   u16 g=(u16)(s[i].generation+1U);if(!g)g=1;s[i].object=o;s[i].rights=rights;
   s[i].generation=g;s[i].reserved=true;p->next_handle_slot=i+1U;
-  *out=encode_handle((u32)i,g);spin_unlock_irqrestore(&p->handle_lock,f);
+  *out=encode_handle((u32)i,g);last_reserved_handle=*out;
+  spin_unlock_irqrestore(&p->handle_lock,f);
   return true;}
  spin_unlock_irqrestore(&p->handle_lock,f);return false;}
 static bool process_handle_cancel(process_t *p,process_handle_t h)
@@ -252,9 +289,16 @@ static bool process_user_context_discard_worker(process_t*p,kernel_thread_t*t);
 static kernel_thread_t *process_publish_terminated_locked(process_t*p)
 {(void)p;return NULL;}
 static bool process_cleanup_exit_resources(process_t*p){(void)p;return true;}
+static bool process_finish_termination(process_t*p){(void)p;return true;}
 static bool scheduler_unblock(kernel_thread_t*t){(void)t;return true;}
 static bool scheduler_wake_waiter(kernel_thread_t*t)
-{if(!t)return false;pthread_mutex_lock(&event_lock);
+{if(!t)return false;
+ if(wake_pause_armed&&t==wake_pause_thread){wake_pause_armed=false;
+  pthread_mutex_lock(&event_lock);wake_pause_entered=true;
+  pthread_cond_broadcast(&event_changed);
+  while(!wake_pause_release)pthread_cond_wait(&event_changed,&event_lock);
+  pthread_mutex_unlock(&event_lock);}
+ pthread_mutex_lock(&event_lock);
  __atomic_store_n(&t->event_wake_pending,true,__ATOMIC_RELEASE);
  pthread_cond_broadcast(&event_changed);pthread_mutex_unlock(&event_lock);return true;}
 static bool scheduler_block(void)
@@ -293,13 +337,21 @@ static bool vmm_unmap_user_range(void*as,void*base,usize pages)
 {(void)as;(void)pages;
  if(leased_region&&leased_region->mapping_base==(uintptr_t)base)return false;
  region_releases++;return true;}
+static bool vmm_user_range_revoke(void*as,void*base,usize pages)
+{(void)as;(void)pages;for(process_user_region_t*r=test_process->user_regions;r;
+ r=r->next)if(r->mapping_base==(uintptr_t)base){
+  if(lease_on_revoke_kind&&r->kind==lease_on_revoke_kind){
+   leased_region=r;lease_on_revoke_kind=0;}
+  return true;}return false;}
 static bool process_user_context_discard_worker(process_t*p,kernel_thread_t*t)
 {
- if(t->user_context.tls_region&&
-    !process_user_region_release(p,t->user_context.tls_region))
+ if(!process_user_region_set_worker_owned(p,t->user_context.stack_region,
+       t->user_context.tls_region,false))return false;
+ if(t->user_context.tls_region&&process_user_region_release(
+      p,t->user_context.tls_region)==PROCESS_REGION_RELEASE_INVALID)
      return false;
- if(t->user_context.stack_region&&
-    !process_user_region_release(p,t->user_context.stack_region))
+ if(t->user_context.stack_region&&process_user_region_release(
+      p,t->user_context.stack_region)==PROCESS_REGION_RELEASE_INVALID)
      return false;
  memset(&t->user_context,0,sizeof(t->user_context));t->user_fs_base=0;
  return true;
@@ -312,12 +364,16 @@ names = (
     ("kernel/src/process.c", "process_thread_list_complete_locked"),
     ("kernel/src/process.c", "process_thread_record_destroy"),
     ("kernel/src/process.c", "process_user_region_release"),
+    ("kernel/src/process.c", "process_user_regions_reap_pending"),
+    ("kernel/src/process.c", "process_user_region_set_worker_owned"),
     ("kernel/src/process.c", "process_thread_handle_activate_locked"),
     ("kernel/src/process.c", "process_thread_handle_deactivate_locked"),
     ("kernel/src/process.c", "process_thread_create"),
     ("kernel/src/process.c", "process_worker_exit"),
     ("kernel/src/process.c", "process_detach_thread_owned"),
     ("kernel/src/process.c", "process_detach_thread"),
+    ("kernel/src/process.c", "process_thread_list_read_acquire_locked"),
+    ("kernel/src/process.c", "process_thread_list_read_release"),
     ("kernel/src/process.c", "process_scheduler_handoff_complete"),
     ("kernel/src/process.c", "process_worker_reap_needed_locked"),
     ("kernel/src/process.c", "process_worker_reap_immediate_locked"),
@@ -357,13 +413,13 @@ static void clear(process_t*p)
  free(p->handle_table);pthread_mutex_destroy(&p->handle_growth_mutex);
  pthread_mutex_destroy(&p->memory_lock);pthread_mutex_destroy(&p->handle_lock);}
 typedef struct {process_t*p;process_handle_t h;mg_thread_result_t result;
-                mg_result_t status;} join_call_t;
+                kernel_thread_t *caller;mg_result_t status;} join_call_t;
 typedef struct {process_t*p;process_handle_t h;mg_result_t status;}
     detach_call_t;
 typedef struct {process_t*p;mg_thread_created_t made;mg_result_t status;}
     create_call_t;
 static void *join_host(void*raw)
-{join_call_t*c=raw;local_thread=test_process->main_thread;
+{join_call_t*c=raw;local_thread=c->caller?c->caller:test_process->main_thread;
  c->status=process_thread_join(c->p,c->h,&c->result);return NULL;}
 static void *create_host(void *raw)
 {create_call_t*c=raw;
@@ -371,12 +427,32 @@ static void *create_host(void *raw)
                                  &c->made.id);return NULL;}
 static void *reap_host(void *raw)
 {process_worker_reclaim_pending((process_t*)raw);return NULL;}
+static void *complete_host(void *raw)
+{worker_complete((process_thread_record_t*)raw,0x7788U);return NULL;}
 static void *detach_host(void *raw)
 {detach_call_t*c=raw;local_thread=test_process->main_thread;
  c->status=process_thread_detach(c->p,c->h);
  pthread_mutex_lock(&event_lock);reap_race_done=true;
  pthread_cond_broadcast(&event_changed);pthread_mutex_unlock(&event_lock);
  return NULL;}
+static void *lost_detach_host(void *raw)
+{detach_call_t*c=raw;local_thread=test_process->main_thread;
+ c->status=process_thread_detach(c->p,c->h);
+ pthread_mutex_lock(&event_lock);lost_race_done=true;
+ pthread_cond_broadcast(&event_changed);pthread_mutex_unlock(&event_lock);
+ return NULL;}
+static void test_after_created_handle_is_visible(void)
+{
+ if(!create_reap_after_publish)return;
+ create_reap_after_publish=false;
+ process_thread_record_t *record=test_process->thread_records;
+ assert(record&&record->execution&&record->execution->queued);
+ /* The creator has stored out_handle, so a sibling sharing the output
+  * object can consume it before the creator stores out_thread_id. */
+ assert(process_thread_detach(test_process,last_reserved_handle)==MG_OK);
+ worker_complete(record,0x9911U);
+ process_worker_reclaim_pending(test_process);
+}
 int main(void)
 {
  process_t p;kernel_thread_t main_thread;mg_thread_created_t made;
@@ -403,6 +479,32 @@ int main(void)
  assert(p.thread_count==1&&p.live_thread_count==1&&!p.thread_records&&
         !p.user_regions&&region_releases==before_regions+2&&
         handle_cancels==1);
+
+ /* Fail worker publication while a sibling holds a lease on its provisional
+  * stack. Rollback must retain the region in the process reservation list,
+  * return a normal creation error, then reclaim it after the lease drains. */
+ lease_on_revoke_kind=PROCESS_USER_REGION_WORKER_STACK;
+ fail_enqueue=true;
+ assert(process_thread_create(&p,0x400100,0x708,&made.handle,&made.id)==
+        MG_ERR_BUSY);
+ fail_enqueue=false;
+ assert(!lease_on_revoke_kind&&leased_region&&p.user_regions==leased_region&&
+        p.user_regions->release_pending&&p.user_region_reap_pending&&
+        !p.thread_records&&p.thread_count==1&&p.live_thread_count==1);
+ leased_region=NULL;
+ process_worker_reclaim_pending(&p);
+ assert(!p.user_regions&&!p.user_region_reap_pending&&
+        p.thread_count==1&&!p.thread_records);
+
+ /* Deterministically consume and reap a newly published worker after its
+  * handle is stored to shared output, but before the creator stores its ID.
+  * The ID must have been captured before publication. */
+ u64 expected_published_id=next_thread_id+1U;
+ create_reap_after_publish=true;
+ assert(process_thread_create(&p,0x400100,0x9911,&made.handle,&made.id)==MG_OK);
+ assert(!create_reap_after_publish&&made.handle&&
+        made.id==expected_published_id&&!p.thread_records&&
+        p.thread_count==1&&p.live_thread_count==1&&!p.worker_reap_pending);
 
  unsigned destroyed_before_success=destroyed_threads;
  unsigned stacks_before_success=stack_releases;
@@ -499,6 +601,55 @@ int main(void)
  process_worker_reclaim_pending(&p);
  assert(!p.thread_records&&p.thread_count==1);
 
+ /* A distinct detached worker joins another worker. Pause the completion
+  * wake after publication, interrupt the joiner, and finish/reap it while the
+  * completion path still holds the process-list reader pin. The delayed wake
+  * must finish before that pin permits the scheduler object to be reclaimed. */
+ process_handle_t target_handle;
+ assert(process_thread_create(&p,0x400100,0x21,&target_handle,&made.id)==MG_OK);
+ process_thread_record_t *target_record=p.thread_records;
+ process_handle_t joining_handle;
+ assert(process_thread_create(&p,0x400100,0x22,&joining_handle,&made.id)==MG_OK);
+ process_thread_record_t *joining_record=p.thread_records;
+ assert(joining_record!=target_record&&joining_record->execution);
+ assert(object_reference(&joining_record->object));
+ kernel_thread_t *joining_thread=joining_record->execution;
+ assert(process_thread_detach(&p,joining_handle)==MG_OK);
+ join_call_t detached_join={.p=&p,.h=target_handle,
+                            .caller=joining_thread};
+ block_entered=false;
+ assert(pthread_create(&ta,NULL,join_host,&detached_join)==0);
+ pthread_mutex_lock(&event_lock);
+ while(!block_entered)pthread_cond_wait(&event_changed,&event_lock);
+ block_entered=false;
+ pthread_mutex_unlock(&event_lock);
+ wake_pause_thread=joining_thread;wake_pause_armed=true;
+ wake_pause_entered=false;wake_pause_release=false;
+ assert(pthread_create(&tb,NULL,complete_host,target_record)==0);
+ pthread_mutex_lock(&event_lock);
+ while(!wake_pause_entered)pthread_cond_wait(&event_changed,&event_lock);
+ pthread_mutex_unlock(&event_lock);
+ assert(p.thread_list_readers==1&&target_record->completed&&
+        target_record->join_waiter==joining_thread);
+ __atomic_store_n(&joining_thread->process_exit_requested,true,
+                  __ATOMIC_RELEASE);
+ assert(scheduler_wake_waiter(joining_thread));
+ assert(pthread_join(ta,NULL)==0&&detached_join.status==MG_ERR_SHUTDOWN);
+ assert(!target_record->join_claimed&&!target_record->join_waiter);
+ worker_complete(joining_record,0x2233U);
+ process_worker_reclaim_pending(&p);
+ assert(joining_record->listed&&joining_record->execution==joining_thread&&
+        joining_record->detached&&p.thread_list_readers==1);
+ pthread_mutex_lock(&event_lock);wake_pause_release=true;
+ pthread_cond_broadcast(&event_changed);pthread_mutex_unlock(&event_lock);
+ assert(pthread_join(tb,NULL)==0&&p.thread_list_readers==0);
+ assert(p.thread_records==target_record&&target_record->listed&&
+        !joining_record->listed&&p.thread_count==1);
+ object_release(&joining_record->object);
+ assert(process_thread_detach(&p,target_handle)==MG_OK);
+ process_worker_reclaim_pending(&p);
+ assert(!p.thread_records&&p.thread_count==1);
+
  /* Detachment closes the handle but retains the process-owned record until
   * final scheduler handoff; completion then frees stack, TLS and record. */
  unsigned destroyed_before_detach=destroyed_threads;
@@ -531,6 +682,24 @@ int main(void)
  assert(pthread_join(reaper,NULL)==0);
  assert(!p.thread_records&&p.thread_count==1&&p.live_thread_count==1&&
         !p.worker_reap_pending);
+
+ /* Consume a join entitlement after the per-record reaper scan has decided
+  * to retain a completed joinable record, but before it recomputes the work
+  * hint. That final hint must still request another reap pass. */
+ assert(process_thread_create(&p,0x400100,0x141,&made.handle,&made.id)==MG_OK);
+ r=p.thread_records;worker_complete(r,0x141);
+ lost_race_armed=true;lost_race_paused=false;lost_race_done=false;
+ detach_call_t lost_detach={.p=&p,.h=made.handle};
+ assert(pthread_create(&reaper,NULL,reap_host,&p)==0);
+ pthread_mutex_lock(&event_lock);
+ while(!lost_race_paused)pthread_cond_wait(&event_changed,&event_lock);
+ pthread_mutex_unlock(&event_lock);
+ assert(pthread_create(&detacher,NULL,lost_detach_host,&lost_detach)==0);
+ assert(pthread_join(detacher,NULL)==0&&lost_detach.status==MG_OK);
+ assert(pthread_join(reaper,NULL)==0&&p.thread_records==r&&
+        r->detached&&p.worker_reap_pending);
+ process_worker_reclaim_pending(&p);
+ assert(!p.thread_records&&p.thread_count==1&&!p.worker_reap_pending);
 
  /* If join consumes the right while another thread still holds a user-stack
   * lease, the execution object is reaped first and the completion record must
@@ -572,7 +741,20 @@ int main(void)
 }
 '''
 
-code = prefix + "\n".join(function(path, name) for path, name in names) + suffix
+functions = []
+for source_path, name in names:
+    source = function(source_path, name)
+    if name == "process_thread_create":
+        old = ("if (published) {\n        *out_handle = handle;\n"
+               "        *out_thread_id = thread_id;")
+        new = ("if (published) {\n        *out_handle = handle;\n"
+               "        test_after_created_handle_is_visible();\n"
+               "        *out_thread_id = thread_id;")
+        if old not in source:
+            raise AssertionError("thread-create publication hook point changed")
+        source = source.replace(old, new, 1)
+    functions.append(source)
+code = prefix + "\n".join(functions) + suffix
 with tempfile.TemporaryDirectory(prefix="mangrove-thread-api-") as directory:
     path = Path(directory) / "process_thread_api.c"
     binary = Path(directory) / "process_thread_api"

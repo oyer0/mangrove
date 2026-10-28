@@ -45,6 +45,7 @@ _Static_assert(((KERNEL_VMM_RANGE_LIMIT - 1ULL) >> 39 & 0x1ffULL) ==
 typedef struct vmm_owned_frame {
     phys_addr_t physical;
     u32 user_pin_count;
+    bool user_revoking;
     struct vmm_owned_frame *next;
 } vmm_owned_frame_t;
 
@@ -616,6 +617,7 @@ static bool vmm_owned_add(vmm_owned_frame_t **frames, phys_addr_t physical)
     if (!node) return false;
     node->physical = physical;
     node->user_pin_count = 0;
+    node->user_revoking = false;
     node->next = *frames;
     *frames = node;
     return true;
@@ -627,6 +629,7 @@ static void vmm_owned_insert(vmm_owned_frame_t **frames,
 {
     node->physical = physical & PTE_FRAME_MASK;
     node->user_pin_count = 0;
+    node->user_revoking = false;
     node->next = *frames;
     *frames = node;
 }
@@ -2843,8 +2846,9 @@ static bool vmm_user_range_accessible(const void *address, usize length,
         return false;
     }
     for (uintptr_t page = first_page; page < end; page += VMM_PAGE_SIZE) {
-        if (!vmm_user_range_leaf_locked(metadata, active_pml4, page,
-                                        writable)) {
+        vmm_owned_frame_t *leaf = vmm_user_range_leaf_locked(
+            metadata, active_pml4, page, writable);
+        if (!leaf || leaf->user_revoking) {
             accessible = false;
             break;
         }
@@ -3020,7 +3024,8 @@ bool vmm_user_range_lease(page_table_t *pml4, const void *address,
             ? vmm_user_range_leaf_locked(metadata, pml4, page, writable)
             : NULL;
         if (!leaf || leaf->user_pin_count == ~(u32)0 ||
-            metadata->active_user_leases == ~(u64)0) {
+            metadata->active_user_leases == ~(u64)0 ||
+            leaf->user_revoking) {
             spin_unlock_irqrestore(&vmm_metadata_lock, flags);
             break;
         }
@@ -3077,4 +3082,64 @@ void vmm_user_range_release(vmm_user_range_lease_t *lease)
     lease->first_page = 0;
     lease->page_count = 0;
     spin_unlock_irqrestore(&vmm_metadata_lock, flags);
+}
+
+bool vmm_user_range_revoke(page_table_t *pml4, void *virtual_addr,
+                           usize page_count)
+{
+    uintptr_t start = (uintptr_t)virtual_addr;
+    vmm_address_space_metadata_t *metadata;
+    vmm_address_space_metadata_t *operation_metadata;
+
+    if (!pml4 || pml4 == kernel_pml4 || !virtual_addr || !page_count ||
+        (start & (VMM_PAGE_SIZE - 1U)) ||
+        start >= VMM_USER_ADDRESS_LIMIT ||
+        page_count > (VMM_USER_ADDRESS_LIMIT - start) / VMM_PAGE_SIZE ||
+        ((start >> 39) & 0x1ffU) >= 256U)
+        return false;
+
+    u64 flags = spin_lock_irqsave(&vmm_metadata_lock);
+    metadata = vmm_metadata_find(pml4);
+    if (!metadata || metadata->destroy_pending) {
+        spin_unlock_irqrestore(&vmm_metadata_lock, flags);
+        return false;
+    }
+    operation_metadata = metadata;
+    spin_unlock_irqrestore(&vmm_metadata_lock, flags);
+    if (!mutex_lock(&operation_metadata->operation_lock)) return false;
+
+    flags = spin_lock_irqsave(&vmm_metadata_lock);
+    metadata = vmm_metadata_find(pml4);
+    if (!metadata || metadata->destroy_pending) {
+        spin_unlock_irqrestore(&vmm_metadata_lock, flags);
+        mutex_unlock(&operation_metadata->operation_lock);
+        return false;
+    }
+
+    /* Validate the complete range before making any page inaccessible to
+     * future leases. operation_lock serializes this transition with lease
+     * acquisition and mapping changes; metadata_lock makes the publication
+     * atomic with respect to per-page pin counts. */
+    for (usize index = 0; index < page_count; index++) {
+        uintptr_t page = start + index * VMM_PAGE_SIZE;
+        if (!vmm_user_range_leaf_locked(metadata, pml4, page, false)) {
+            spin_unlock_irqrestore(&vmm_metadata_lock, flags);
+            mutex_unlock(&operation_metadata->operation_lock);
+            return false;
+        }
+    }
+    for (usize index = 0; index < page_count; index++) {
+        uintptr_t page = start + index * VMM_PAGE_SIZE;
+        vmm_owned_frame_t *leaf = vmm_user_range_leaf_locked(
+            metadata, pml4, page, false);
+        if (!leaf) {
+            spin_unlock_irqrestore(&vmm_metadata_lock, flags);
+            mutex_unlock(&operation_metadata->operation_lock);
+            panic("vmm: validated revocation range changed");
+        }
+        leaf->user_revoking = true;
+    }
+    spin_unlock_irqrestore(&vmm_metadata_lock, flags);
+    mutex_unlock(&operation_metadata->operation_lock);
+    return true;
 }

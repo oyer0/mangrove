@@ -108,6 +108,13 @@ static jmp_buf panic_environment;
 static bool scheduler_thread_exit_complete(const kernel_thread_t *thread);
 static void process_scheduler_handoff_complete(kernel_thread_t *thread);
 static bool process_cleanup_exit_resources(process_t *process);
+/* This fixture covers process completion for its initial thread and does not
+ * model worker-record readers; worker wake lifetime is exercised in the
+ * process-thread API production-source concurrency fixture. */
+static bool process_thread_list_read_acquire_locked(process_t *process)
+{(void)process;return false;}
+static void process_thread_list_read_release(process_t *process)
+{(void)process;}
 static u64 spin_lock_irqsave(u32 *lock)
 {assert(!*lock);*lock=1;return 1;}
 static void spin_unlock_irqrestore(u32 *lock,u64 flags)
