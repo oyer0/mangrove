@@ -5,7 +5,9 @@
 #include <inttypes.h>
 #include <fenv.h>
 #include <math.h>
+#include <mg/sync.h>
 #include <stdio.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -15,6 +17,7 @@
 /* Ensures the native executable link preserves the compiler's static TLS
  * relocation and emits a PT_TLS image for the kernel loader. */
 static _Thread_local int runtime_tls_probe = 7;
+static atomic_uint runtime_atomic_probe = ATOMIC_VAR_INIT(1U);
 volatile int *runtime_tls_probe_address(void)
 {
     return &runtime_tls_probe;
@@ -100,6 +103,12 @@ API(remainder); API(remainderf); API(remainderl); API(remquo); API(remquof); API
 API(feclearexcept); API(fegetexceptflag); API(feraiseexcept);
 API(fesetexceptflag); API(fetestexcept); API(fegetround); API(fesetround);
 API(fegetenv); API(feholdexcept); API(fesetenv); API(feupdateenv);
+API(mg_sync_wait_u32); API(mg_sync_wake_u32);
+API(mg_mutex_init); API(mg_mutex_destroy); API(mg_mutex_try_lock);
+API(mg_mutex_lock); API(mg_mutex_unlock);
+API(mg_condition_init); API(mg_condition_destroy); API(mg_condition_wait);
+API(mg_condition_timed_wait); API(mg_condition_signal);
+API(mg_condition_broadcast);
 
 FILE * volatile *runtime_api_stdin = &stdin;
 FILE * volatile *runtime_api_stdout = &stdout;
@@ -107,5 +116,10 @@ FILE * volatile *runtime_api_stderr = &stderr;
 
 int main(void)
 {
+    unsigned expected = 1U;
+    if (!atomic_compare_exchange_strong_explicit(
+            &runtime_atomic_probe, &expected, 2U, memory_order_acq_rel,
+            memory_order_acquire))
+        return 1;
     return runtime_api_malloc == NULL || runtime_api_fopen == NULL;
 }

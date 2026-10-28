@@ -106,13 +106,16 @@ not supported. FS base is saved per scheduler thread and restored on the
 incoming stack after context switches, including migration, while kernel GS
 and syscall-entry stack state retain their existing ownership.
 
-This remains an internal execution foundation, not a usable multithreading
-API. Public thread creation, IDs/handles, join/detach semantics, thread
-reaping, and user synchronization primitives remain outstanding. The parent
-wait slot and IPC outstanding-request slot are process-wide, so concurrent
-waits and independent blocking IPC calls also need per-thread ownership or
-explicit serialization. loam's `errno` is now TLS, but its allocator, stdio,
-streams, and other mutable state do not yet have a concurrent-use contract.
+This remains an internal execution foundation, not a complete multithreading
+API. C17 atomics and native process-local wait/wake, mutex, and condition
+primitives are available through `<stdatomic.h>` and `<mg/sync.h>`; see the
+[userspace synchronization contract](userspace-synchronization.md). Public
+thread creation, IDs/handles, join/detach semantics, and thread reaping remain
+outstanding. The parent wait slot and IPC outstanding-request slot are
+process-wide, so concurrent waits and independent blocking IPC calls also
+need per-thread ownership or explicit serialization. loam's `errno` is TLS,
+but its allocator, stdio, streams, and other mutable state do not yet have a
+concurrent-use contract.
 
 Process credentials and launch/session metadata are published under the
 process registry lock. Lifecycle state is atomically readable outside that

@@ -29,6 +29,7 @@
 #include <timekeeping.h>
 #include <csprng.h>
 #include <random_syscall.h>
+#include <user_sync.h>
 #include <platform_power.h>
 #include <identity.h>
 #include <pass.h>
@@ -4012,6 +4013,38 @@ static void syscall_dispatch_inner(syscall_frame_t *frame)
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
             }
+            return;
+        }
+        case SYSCALL_SYNC_WAIT_U32: {
+            if (frame->rsi > UINT32_MAX) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            mg_result_t result = user_sync_wait_u32(
+                process_current(), thread_current(),
+                (volatile u32 *)(uintptr_t)frame->rdi,
+                (u32)frame->rsi, frame->rdx);
+            if (result < 0) {
+                syscall_fail(frame, result);
+                return;
+            }
+            frame->rax = (u64)result;
+            return;
+        }
+        case SYSCALL_SYNC_WAKE_U32: {
+            if (frame->rsi > UINT32_MAX) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            mg_result_t result = user_sync_wake_u32(
+                process_current(),
+                (volatile u32 *)(uintptr_t)frame->rdi,
+                (u32)frame->rsi);
+            if (result < 0) {
+                syscall_fail(frame, result);
+                return;
+            }
+            frame->rax = (u64)result;
             return;
         }
         default:

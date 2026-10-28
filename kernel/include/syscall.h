@@ -118,6 +118,9 @@ enum syscall_number {
     /* Private CRT return path for a future non-initial process thread. Not a
      * public thread-creation or join/detach interface. */
     SYSCALL_THREAD_RETURN = 105,
+    /* Address-keyed, same-process userspace synchronization operations. */
+    SYSCALL_SYNC_WAIT_U32 = 106,
+    SYSCALL_SYNC_WAKE_U32 = 107,
 };
 
 /* Initialize the native syscall MSRs for the CPU executing this function. */
