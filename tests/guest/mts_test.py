@@ -138,7 +138,11 @@ class Orchestration(unittest.TestCase):
     def test_cli_missing_firmware(self):
         import subprocess
         output = self.output / "cli"
+        # This case verifies the missing-firmware diagnostic and never boots a
+        # guest. Select TCG explicitly so the test remains independent of host
+        # KVM access without changing the native guest qualification default.
         result = subprocess.run([sys.executable, str(Path(mts.__file__)), "guest",
+                                 "--accel", "tcg",
                                  "--output", str(output), "--ovmf-code", str(self.output / "absent-code"),
                                  "--ovmf-vars", str(self.output / "absent-vars")],
                                 capture_output=True, text=True, timeout=10)
