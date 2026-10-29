@@ -48,8 +48,9 @@ typedef enum {
 
 /* Process-owned reservation metadata. The complete reservation includes the
  * unmapped guard pages; only [mapping_base, mapping_base + mapping_pages)
- * has user leaves. Reservations outlive individual thread completion and are
- * released with the address space after all scheduler handoffs. */
+ * has user leaves. release_pending records deferred disposal; revoked records
+ * that new syscall leases are denied. Reservations and frames remain owned
+ * until unmap and its TLB handoff complete. */
 typedef struct process_user_region {
     uintptr_t reservation_base;
     usize reservation_pages;
@@ -58,6 +59,7 @@ typedef struct process_user_region {
     process_user_region_kind_t kind;
     bool worker_owned;
     bool release_pending;
+    bool revoked;
     struct process_user_region *next;
 } process_user_region_t;
 
@@ -225,6 +227,9 @@ bool process_attach_thread(process_t *process, struct kernel_thread *thread);
 bool process_detach_thread(process_t *process, struct kernel_thread *thread);
 /* Scheduler lifecycle hook, called only after the outgoing stack handoff. */
 void process_scheduler_handoff_complete(struct kernel_thread *thread);
+/* Runs after the incoming interrupt state is restored. Process teardown may
+ * unmap user memory and wait for remote TLB shootdowns. */
+void process_scheduler_post_handoff(process_t *process);
 /* Called when a process-owned kernel entry returns, before scheduler exit. */
 void process_thread_entry_completed(struct kernel_thread *thread,
                                     i32 status);

@@ -3084,36 +3084,45 @@ void vmm_user_range_release(vmm_user_range_lease_t *lease)
     spin_unlock_irqrestore(&vmm_metadata_lock, flags);
 }
 
-bool vmm_user_range_revoke(page_table_t *pml4, void *virtual_addr,
-                           usize page_count)
+vmm_user_range_revoke_result_t vmm_user_range_revoke(
+    page_table_t *pml4, void *virtual_addr, usize page_count)
 {
     uintptr_t start = (uintptr_t)virtual_addr;
     vmm_address_space_metadata_t *metadata;
     vmm_address_space_metadata_t *operation_metadata;
+    kernel_thread_t *current;
 
     if (!pml4 || pml4 == kernel_pml4 || !virtual_addr || !page_count ||
         (start & (VMM_PAGE_SIZE - 1U)) ||
         start >= VMM_USER_ADDRESS_LIMIT ||
         page_count > (VMM_USER_ADDRESS_LIMIT - start) / VMM_PAGE_SIZE ||
         ((start >> 39) & 0x1ffU) >= 256U)
-        return false;
+        return VMM_USER_RANGE_REVOKE_INVALID;
 
     u64 flags = spin_lock_irqsave(&vmm_metadata_lock);
     metadata = vmm_metadata_find(pml4);
     if (!metadata || metadata->destroy_pending) {
         spin_unlock_irqrestore(&vmm_metadata_lock, flags);
-        return false;
+        return VMM_USER_RANGE_REVOKE_INVALID;
     }
     operation_metadata = metadata;
     spin_unlock_irqrestore(&vmm_metadata_lock, flags);
-    if (!mutex_lock(&operation_metadata->operation_lock)) return false;
+    /* The current thread may be entering the scheduler post-switch hook
+     * before its interrupted mutex_lock() continuation consumes a handoff.
+     * Do not consume that handoff on its behalf, even if it names this lock. */
+    current = thread_current();
+    if (!current) return VMM_USER_RANGE_REVOKE_INVALID;
+    if (current->waiting_mutex)
+        return VMM_USER_RANGE_REVOKE_RETRY;
+    if (!mutex_lock(&operation_metadata->operation_lock))
+        return VMM_USER_RANGE_REVOKE_RETRY;
 
     flags = spin_lock_irqsave(&vmm_metadata_lock);
     metadata = vmm_metadata_find(pml4);
     if (!metadata || metadata->destroy_pending) {
         spin_unlock_irqrestore(&vmm_metadata_lock, flags);
         mutex_unlock(&operation_metadata->operation_lock);
-        return false;
+        return VMM_USER_RANGE_REVOKE_INVALID;
     }
 
     /* Validate the complete range before making any page inaccessible to
@@ -3125,7 +3134,7 @@ bool vmm_user_range_revoke(page_table_t *pml4, void *virtual_addr,
         if (!vmm_user_range_leaf_locked(metadata, pml4, page, false)) {
             spin_unlock_irqrestore(&vmm_metadata_lock, flags);
             mutex_unlock(&operation_metadata->operation_lock);
-            return false;
+            return VMM_USER_RANGE_REVOKE_INVALID;
         }
     }
     for (usize index = 0; index < page_count; index++) {
@@ -3141,5 +3150,5 @@ bool vmm_user_range_revoke(page_table_t *pml4, void *virtual_addr,
     }
     spin_unlock_irqrestore(&vmm_metadata_lock, flags);
     mutex_unlock(&operation_metadata->operation_lock);
-    return true;
+    return VMM_USER_RANGE_REVOKED;
 }

@@ -123,6 +123,10 @@ int main(void){
   scheduler_context_switch_complete(&outgoing.saved_stack_pointer);
   assert(!outgoing.queued && outgoing.running_cpu==THREAD_CPU_NONE && !outgoing.context_switch_pending);
  }
+ /* Terminating any process-owned thread stages its process for post-RFLAGS
+  * cleanup, even when it is the initial thread rather than a worker. */
+ assert(cpu.scheduler_post_handoff_process==&process &&
+        process.object.references==1);
  assert(process.handoffs==1);
  kernel_thread_t guarded={.state=THREAD_STATE_READY,.running_cpu=0,
    .saved_stack_pointer=0x3000,.kernel_stack={.active=true}};

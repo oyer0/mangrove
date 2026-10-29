@@ -98,15 +98,23 @@ typedef struct {u64 entries[512];} page_table_t;
 typedef struct {phys_addr_t physical;u64 generation;u32 slot;} pmm_owned_frame_t;
 typedef pthread_mutex_t mutex_t;
 typedef pthread_mutex_t spinlock_t;
+typedef struct {mutex_t *waiting_mutex;} kernel_thread_t;
+static kernel_thread_t test_current_thread;
+static kernel_thread_t *thread_current(void){return &test_current_thread;}
 typedef struct vmm_owned_frame {phys_addr_t physical;u32 user_pin_count;bool user_revoking;struct vmm_owned_frame*next;} vmm_owned_frame_t;
 typedef struct {page_table_t *root;vmm_owned_frame_t *tables,*leaves;mutex_t operation_lock;u64 active_user_leases;bool destroy_pending,shootdown_pending;} vmm_address_space_metadata_t;
 typedef struct {page_table_t *address_space;uintptr_t first_page;usize page_count;bool active;} vmm_user_range_lease_t;
+typedef enum {VMM_USER_RANGE_REVOKE_INVALID=0,
+ VMM_USER_RANGE_REVOKE_RETRY,VMM_USER_RANGE_REVOKED}
+ vmm_user_range_revoke_result_t;
 static page_table_t *kernel_pml4,*active_pml4;static spinlock_t vmm_metadata_lock=PTHREAD_MUTEX_INITIALIZER,vmm_kernel_lock=PTHREAD_MUTEX_INITIALIZER;
 static phys_addr_t framebuffer_first,framebuffer_limit;
 static phys_addr_t owned_frame_physical;
 static vmm_address_space_metadata_t meta;
+static mutex_t *refused_mutex;
+static unsigned mutex_lock_calls;
 static unsigned table_allocations,table_frees;static int fail_after=-1;
-static bool mutex_lock(mutex_t*m){return pthread_mutex_lock(m)==0;}
+static bool mutex_lock(mutex_t*m){mutex_lock_calls++;if(m==refused_mutex)return false;return pthread_mutex_lock(m)==0;}
 static void mutex_unlock(mutex_t*m){assert(pthread_mutex_unlock(m)==0);}
 static void assert_mutex_unlocked(mutex_t*m){assert(pthread_mutex_trylock(m)==0);assert(pthread_mutex_unlock(m)==0);}
 static u64 spin_lock_irqsave(spinlock_t*l){assert(pthread_mutex_lock(l)==0);return 0;}
@@ -194,7 +202,27 @@ int main(void){
  assert(!vmm_unmap_user_page(meta.root,(void*)0x800000,&leased_first));
  assert(!vmm_unmap_user_range(meta.root,(void*)0x800000,2));
  assert((meta.active_user_leases==2)&&vmm_user_range_writable((void*)0x800000,8192));
- assert(vmm_user_range_revoke(meta.root,(void*)0x800000,2));
+ mutex_t unrelated_handoff_mutex;
+ refused_mutex=&meta.operation_lock;
+ test_current_thread.waiting_mutex=&unrelated_handoff_mutex;
+ unsigned lock_calls_before_revoke=mutex_lock_calls;
+ assert(vmm_user_range_revoke(meta.root,(void*)0x800000,2)==
+        VMM_USER_RANGE_REVOKE_RETRY);
+ assert(mutex_lock_calls==lock_calls_before_revoke);
+ assert(!vmm_user_range_leaf_locked(&meta,meta.root,0x800000,false)->user_revoking);
+ test_current_thread.waiting_mutex=&meta.operation_lock;
+ assert(vmm_user_range_revoke(meta.root,(void*)0x800000,2)==
+        VMM_USER_RANGE_REVOKE_RETRY);
+ assert(mutex_lock_calls==lock_calls_before_revoke);
+ test_current_thread.waiting_mutex=NULL;
+ refused_mutex=&meta.operation_lock;
+ assert(vmm_user_range_revoke(meta.root,(void*)0x800000,2)==
+        VMM_USER_RANGE_REVOKE_RETRY);
+ assert(mutex_lock_calls==lock_calls_before_revoke+1U);
+ assert(!vmm_user_range_leaf_locked(&meta,meta.root,0x800000,false)->user_revoking);
+ refused_mutex=NULL;
+ assert(vmm_user_range_revoke(meta.root,(void*)0x800000,2)==
+        VMM_USER_RANGE_REVOKED);
  assert(!vmm_user_range_lease(meta.root,(void*)0x800000,4,true,
                               &(vmm_user_range_lease_t){0}));
  assert(!vmm_user_range_valid((void*)0x800000,1));
@@ -206,6 +234,8 @@ int main(void){
  assert(table_frees==range_frame_frees+2U);
  (void)leased_second;
  assert(!vmm_user_range_valid((void*)0x800000,1));
+ assert(vmm_user_range_revoke(meta.root,(void*)0x800000,1)==
+        VMM_USER_RANGE_REVOKE_INVALID);
  u64 intact_first=map(0x800000),intact_second=map(0x801000);
  u64 intact_third=map(0x802000);
  assert(!vmm_unmap_user_range(meta.root,(void*)0x800000,4));

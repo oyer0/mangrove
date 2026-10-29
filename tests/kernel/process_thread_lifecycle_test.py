@@ -45,9 +45,14 @@ def function_from(path, name):
 dispatch = function_from("kernel/src/syscall.c", "syscall_dispatch")
 lease_release = dispatch.index("syscall_user_lease_release_all(&context)")
 syscall_leave = dispatch.index("process_syscall_leave(process)", lease_release)
+worker_reap_retry = dispatch.index("process_worker_reclaim_pending(process)",
+                                   syscall_leave)
 thread_exit_check = dispatch.index(
     "if (tracked && process_thread_exit_requested(thread))", syscall_leave)
-assert lease_release < syscall_leave < thread_exit_check
+assert lease_release < syscall_leave < worker_reap_retry < thread_exit_check
+assert "worker_reap_pending" in dispatch[syscall_leave:worker_reap_retry]
+assert "user_region_reap_pending" in dispatch[
+    syscall_leave:worker_reap_retry]
 
 
 prefix = r'''
@@ -133,6 +138,7 @@ static bool syscall_lease_live;
 static unsigned wake_calls, console_cancels, cleanup_calls, freed_threads;
 static unsigned terminal_finishes, alternate_leaves, handle_closes, cwd_clears;
 static unsigned exit_notifications, unblocks;
+static bool fixture_interrupts_enabled=true;
 static bool process_finish_termination(process_t *process);
 static void process_worker_reclaim_pending(process_t *process);
 static bool scheduler_terminate_thread(kernel_thread_t *thread);
@@ -194,7 +200,7 @@ static bool terminal_alternate_leave_process(u64 pid)
 {(void)pid;alternate_leaves++;return true;}
 static void terminal_force_end_batch(void){}
 static void ipc_process_exit(process_t *process)
-{(void)process;cleanup_calls++;}
+{(void)process;assert(fixture_interrupts_enabled);cleanup_calls++;}
 static void process_memory_release_all(process_t *process){(void)process;}
 static void process_handle_close_all(process_t *process)
 {(void)process;handle_closes++;}
@@ -224,6 +230,7 @@ names = (
     "process_thread_entry_completed",
     "process_worker_exit",
     "process_scheduler_handoff_complete",
+    "process_scheduler_post_handoff",
     "process_abort",
     "process_finalize_exit",
 )
@@ -265,6 +272,7 @@ static void reset_process(process_t *process,kernel_thread_t *initial,
     wake_calls=console_cancels=cleanup_calls=freed_threads=0;
     terminal_finishes=alternate_leaves=handle_closes=cwd_clears=0;
     exit_notifications=unblocks=0;
+    fixture_interrupts_enabled=true;
 }
 static void finish_thread(process_t *process,kernel_thread_t *thread,
                           i32 status)
@@ -364,7 +372,12 @@ int main(void)
     assert(cleanup_calls==0 && !process.exit_cleanup_complete &&
            process.state==PROCESS_STATE_EXITING);
     thread_stopped(&initial);
+    fixture_interrupts_enabled=false;
     process_scheduler_handoff_complete(&initial);
+    assert(process.state==PROCESS_STATE_EXITING && cleanup_calls==0 &&
+           !process.exit_cleanup_complete);
+    fixture_interrupts_enabled=true;
+    process_scheduler_post_handoff(&process);
     assert(process.state==PROCESS_STATE_EXITING && cleanup_calls==1 &&
            process.exit_cleanup_complete &&
            process.live_thread_count==0 && process.thread_count==2 &&
@@ -419,6 +432,7 @@ int main(void)
     process_thread_entry_completed(&initial,0);
     thread_stopped(&initial);
     process_scheduler_handoff_complete(&initial);
+    process_scheduler_post_handoff(&process);
     assert(process.state==PROCESS_STATE_TERMINATED && cleanup_calls==1 &&
            process_finalize_exit(&process) && process.thread_count==0 &&
            exit_notifications==1);
@@ -451,6 +465,7 @@ int main(void)
     process_thread_entry_completed(&initial,14);
     thread_stopped(&initial);
     process_scheduler_handoff_complete(&initial);
+    process_scheduler_post_handoff(&process);
     assert(process.state==PROCESS_STATE_TERMINATED && cleanup_calls==1 &&
            process_finalize_exit(&process));
 
@@ -472,6 +487,7 @@ int main(void)
            process.state==PROCESS_STATE_EXITING);
     thread_stopped(&initial);
     process_scheduler_handoff_complete(&initial);
+    process_scheduler_post_handoff(&process);
     assert(process.state==PROCESS_STATE_TERMINATED &&
            process_finalize_exit(&process));
     assert(process.thread_count==0 && process.main_thread==NULL &&
@@ -520,6 +536,7 @@ int main(void)
     process_thread_entry_completed(&initial,process.exit_status);
     thread_stopped(&initial);
     process_scheduler_handoff_complete(&initial);
+    process_scheduler_post_handoff(&process);
     assert(process.state==PROCESS_STATE_TERMINATED &&
            process.live_thread_count==0 && cleanup_calls==1);
     assert(process_finalize_exit(&process) && process.thread_count==0 &&
@@ -545,6 +562,7 @@ int main(void)
     process_thread_entry_completed(&initial,9);
     thread_stopped(&initial);
     process_scheduler_handoff_complete(&initial);
+    process_scheduler_post_handoff(&process);
     assert(cleanup_calls==1 && process.state==PROCESS_STATE_TERMINATED);
     assert(process_finalize_exit(&process) && process.thread_count==0);
 
