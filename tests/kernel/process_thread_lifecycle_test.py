@@ -80,6 +80,7 @@ struct kernel_thread {
     u32 state, running_cpu;
     bool context_switch_pending, syscall_active, sleeping, stack_external;
     uintptr_t preempt_return_rip;
+    u64 id;
     process_t *process;
     kernel_thread_t *process_next;
     int process_state;
@@ -111,6 +112,9 @@ struct process {
     bool worker_reap_pending;
     process_thread_record_t *thread_records;
     u32 thread_list_readers;
+    u32 storage_authorized_operation;
+    u64 storage_authorized_thread_id;
+    bool storage_management_session, storage_management_authorizing;
     bool exit_requested, exit_cleanup_in_progress, exit_cleanup_complete;
     bool thread_reap_in_progress, exit_notification_sent, wait_claimed;
     bool owner_reference_held;
@@ -201,6 +205,8 @@ static void session_process_exited(process_t *process)
 '''
 
 names = (
+    "process_storage_authorization_clear_locked",
+    "process_storage_authorization_revoke_thread_locked",
     "process_thread_register_locked",
     "process_thread_list_complete_locked",
     "process_thread_list_read_acquire_locked",

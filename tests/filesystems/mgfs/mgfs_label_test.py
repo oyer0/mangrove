@@ -45,12 +45,20 @@ with tempfile.TemporaryDirectory(prefix='mangrove-mgfs-label-') as temp:
     start = syscall.index('        case SYSCALL_STORAGE_LABEL: {')
     end = syscall.index('        case SYSCALL_STORAGE_GPT_INFO:', start)
     native = r'''
-typedef struct { bool storage_management_session; u32 storage_authorized_operation; } label_process_t;
+typedef struct { bool storage_management_session; u32 storage_authorized_operation; u64 storage_authorized_thread_id; } label_process_t;
 static label_process_t requester;
 #define process_t label_process_t
 #define process_current label_process_current
+#define process_current_thread_id label_process_thread_id
+#define process_storage_authorization_consume label_storage_auth_consume
 static label_process_t *label_process_current(void) { return &requester; }
 static bool syscall_is_diskutil(label_process_t *p) { return p == &requester; }
+static u64 process_current_thread_id(void) { return 1U; }
+static bool process_storage_authorization_consume(label_process_t *p,u64 id,u32 op) {
+    if (!p || !p->storage_management_session || p->storage_authorized_thread_id != id ||
+        p->storage_authorized_operation != op) return false;
+    p->storage_authorized_operation=0U; p->storage_authorized_thread_id=0U; return true;
+}
 static bool syscall_user_buffer_valid(const void *p, usize n) { return p && n; }
 static bool syscall_storage_system_managed(block_device_t *d) {
     if (replace_dispatch) {
@@ -67,7 +75,7 @@ static void syscall_fail(label_frame_t *f,i64 result) { f->rax=(u64)result; }
 '''
     native += function(syscall, 'syscall_fixed_text_valid') + function(syscall, 'syscall_vfs_error')
     native += function(syscall, 'syscall_storage_device_matches')
-    native += 'static void label_dispatch(label_frame_t *frame) { switch(frame->rax) {\n' + syscall[start:end] + 'default: assert(0); } }\n#undef process_t\n#undef process_current\n'
+    native += 'static void label_dispatch(label_frame_t *frame) { switch(frame->rax) {\n' + syscall[start:end] + 'default: assert(0); } }\n#undef process_t\n#undef process_current\n#undef process_current_thread_id\n#undef process_storage_authorization_consume\n'
     native += r'''
 static int native_label(const char *text) {
     mg_storage_label_request_t request={.instance_id=BLOCK_DEVICE_ID_BASE | (device->id+1U)};
@@ -77,8 +85,10 @@ static int native_label(const char *text) {
     }
     strcpy(request.filesystem,"mgfs"); strcpy(request.label,text);
     requester.storage_management_session=true;requester.storage_authorized_operation=MG_STORAGE_OP_LABEL;
+    requester.storage_authorized_thread_id=1U;
     label_frame_t frame={.rax=SYSCALL_STORAGE_LABEL,.rdi=(u64)(usize)&request};
-    label_dispatch(&frame);assert(!requester.storage_authorized_operation);return (int)(i64)frame.rax;
+    label_dispatch(&frame);assert(!requester.storage_authorized_operation &&
+        !requester.storage_authorized_thread_id);return (int)(i64)frame.rax;
 }
 '''
     (directory / 'mgfs_label_native.inc').write_text(native)

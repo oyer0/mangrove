@@ -71,11 +71,17 @@ with tempfile.TemporaryDirectory(prefix="mangrove-format-") as temporary:
     start = native.index("        case SYSCALL_STORAGE_FORMAT: {")
     end = native.index("        case SYSCALL_STORAGE_LABEL:", start)
     syscall = r'''
-typedef struct { bool storage_management_session; u32 storage_authorized_operation; } format_process_t;
+typedef struct { bool storage_management_session; u32 storage_authorized_operation; u64 storage_authorized_thread_id; } format_process_t;
 #define process_t format_process_t
 static format_process_t requester;
 static format_process_t *process_current(void) { return &requester; }
 static bool syscall_is_diskutil(format_process_t *p) { return p == &requester; }
+static u64 process_current_thread_id(void) { return 1U; }
+static bool process_storage_authorization_consume(format_process_t *p,u64 id,u32 op) {
+    if (!p || !p->storage_management_session || p->storage_authorized_thread_id != id ||
+        p->storage_authorized_operation != op) return false;
+    p->storage_authorized_operation=0U; p->storage_authorized_thread_id=0U; return true;
+}
 static bool syscall_user_buffer_valid(const void *p, usize n) { return p && n; }
 block_device_t *block_get_device_by_public_id(u64 id) { return id == (BLOCK_DEVICE_ID_BASE | (device.id + 1U)) ? &device : NULL; }
 static bool syscall_storage_device_matches(block_device_t *d,u64 parent) { return d == &device && !parent; }
@@ -91,12 +97,15 @@ static void syscall_fail(format_frame_t *f,i64 result) { f->rax=(u64)result; }
 static i64 native_format(u32 selection) {
     mg_storage_format_request_t req={.instance_id=BLOCK_DEVICE_ID_BASE | (device.id+1U),.filesystem=selection};
     requester.storage_management_session=true; requester.storage_authorized_operation=MG_STORAGE_OP_FORMAT;
+    requester.storage_authorized_thread_id=1U;
     format_frame_t f={.rax=SYSCALL_STORAGE_FORMAT,.rdi=(u64)(usize)&req};
-    native_dispatch(&f); assert(!requester.storage_authorized_operation); return (i64)f.rax;
+    native_dispatch(&f); assert(!requester.storage_authorized_operation &&
+        !requester.storage_authorized_thread_id); return (i64)f.rax;
 }
 static i64 native_format_unauthorized(void) {
     mg_storage_format_request_t req={.instance_id=BLOCK_DEVICE_ID_BASE | (device.id+1U),.filesystem=MG_STORAGE_FILESYSTEM_EXFAT};
     requester.storage_management_session=false; requester.storage_authorized_operation=0;
+    requester.storage_authorized_thread_id=0;
     format_frame_t f={.rax=SYSCALL_STORAGE_FORMAT,.rdi=(u64)(usize)&req};
     native_dispatch(&f); return (i64)f.rax;
 }

@@ -3483,7 +3483,6 @@ static void syscall_dispatch_inner(syscall_frame_t *frame)
             process_t *requester = process_current();
             u32 operation = (u32)frame->rdi;
             if (!syscall_is_diskutil(requester) ||
-                !requester->storage_management_session ||
                 (operation != MG_STORAGE_OP_FORMAT &&
                  operation != MG_STORAGE_OP_LABEL &&
                  operation != MG_STORAGE_OP_GPT_INITIALIZE &&
@@ -3492,17 +3491,23 @@ static void syscall_dispatch_inner(syscall_frame_t *frame)
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
             }
-            requester->storage_authorized_operation = operation;
+            i64 result = process_storage_authorization_grant(
+                requester, process_current_thread_id(), operation);
+            if (result != MG_OK) {
+                syscall_fail(frame, result);
+                return;
+            }
             frame->rax = MG_OK;
             return;
         }
         case SYSCALL_STORAGE_AUTHORIZE_CANCEL: {
             process_t *requester = process_current();
-            if (!requester) {
-                syscall_fail(frame, MG_ERR_PRIVILEGE_REQUIRED);
+            i64 result = process_storage_authorization_cancel(
+                requester, process_current_thread_id());
+            if (result != MG_OK) {
+                syscall_fail(frame, result);
                 return;
             }
-            requester->storage_authorized_operation = 0U;
             frame->rax = MG_OK;
             return;
         }
@@ -3511,7 +3516,7 @@ static void syscall_dispatch_inner(syscall_frame_t *frame)
             i64 result;
 
             if (!syscall_is_diskutil(requester) ||
-                requester->storage_management_session) {
+                !process_storage_management_begin(requester)) {
                 syscall_fail(frame, MG_ERR_PRIVILEGE_REQUIRED);
                 return;
             }
@@ -3519,10 +3524,14 @@ static void syscall_dispatch_inner(syscall_frame_t *frame)
                 IDENTITY_PRIVILEGE_MANAGE_STORAGE,
                 "Open disk administration.");
             if (result != MG_OK) {
+                (void)process_storage_management_finish(requester, false);
                 syscall_fail(frame, result);
                 return;
             }
-            requester->storage_management_session = true;
+            if (!process_storage_management_finish(requester, true)) {
+                syscall_fail(frame, MG_ERR_INTERRUPTED);
+                return;
+            }
             frame->rax = MG_OK;
             return;
         }
@@ -3536,8 +3545,8 @@ static void syscall_dispatch_inner(syscall_frame_t *frame)
             int result;
 
             if (!syscall_is_diskutil(requester) ||
-                !requester->storage_management_session ||
-                requester->storage_authorized_operation != MG_STORAGE_OP_FORMAT ||
+                !process_storage_authorization_consume(requester,
+                    process_current_thread_id(), MG_STORAGE_OP_FORMAT) ||
                 !user_request ||
                 !syscall_user_buffer_valid(user_request, sizeof(request))) {
                 syscall_fail(frame, MG_ERR_PRIVILEGE_REQUIRED);
@@ -3548,26 +3557,22 @@ static void syscall_dispatch_inner(syscall_frame_t *frame)
                 (request.filesystem != MG_STORAGE_FILESYSTEM_FAT32 &&
                  request.filesystem != MG_STORAGE_FILESYSTEM_MGFS &&
                  request.filesystem != MG_STORAGE_FILESYSTEM_EXFAT)) {
-                requester->storage_authorized_operation = 0U;
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
             }
             device = block_get_device_by_public_id(request.instance_id);
             if (!syscall_storage_device_matches(device,
                                                 request.parent_instance_id)) {
-                requester->storage_authorized_operation = 0U;
                 syscall_fail(frame, MG_ERR_DEVICE_GONE);
                 return;
             }
             if (syscall_storage_system_managed(device)) {
-                requester->storage_authorized_operation = 0U;
                 syscall_fail(frame, MG_ERR_ACCESS_DENIED);
                 return;
             }
             filesystem = request.filesystem == MG_STORAGE_FILESYSTEM_FAT32
                 ? "fat32" : request.filesystem == MG_STORAGE_FILESYSTEM_MGFS
                 ? "mgfs" : "exfat";
-            requester->storage_authorized_operation = 0U;
             result = storage_format_filesystem_for_id(device,
                 request.instance_id - BLOCK_DEVICE_ID_BASE - 1ULL, filesystem);
             if (result != VFS_OK) {
@@ -3591,8 +3596,8 @@ static void syscall_dispatch_inner(syscall_frame_t *frame)
             int result;
 
             if (!syscall_is_diskutil(requester) ||
-                !requester->storage_management_session ||
-                requester->storage_authorized_operation != MG_STORAGE_OP_LABEL ||
+                !process_storage_authorization_consume(requester,
+                    process_current_thread_id(), MG_STORAGE_OP_LABEL) ||
                 !user_request ||
                 !syscall_user_buffer_valid(user_request, sizeof(request))) {
                 syscall_fail(frame, MG_ERR_PRIVILEGE_REQUIRED);
@@ -3607,23 +3612,19 @@ static void syscall_dispatch_inner(syscall_frame_t *frame)
                 (strcmp(request.filesystem, "fat32") != 0 &&
                  strcmp(request.filesystem, "mgfs") != 0 &&
                  strcmp(request.filesystem, "exfat") != 0)) {
-                requester->storage_authorized_operation = 0U;
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
             }
             device = block_get_device_by_public_id(request.instance_id);
             if (!syscall_storage_device_matches(device,
                                                 request.parent_instance_id)) {
-                requester->storage_authorized_operation = 0U;
                 syscall_fail(frame, MG_ERR_DEVICE_GONE);
                 return;
             }
             if (syscall_storage_system_managed(device)) {
-                requester->storage_authorized_operation = 0U;
                 syscall_fail(frame, MG_ERR_ACCESS_DENIED);
                 return;
             }
-            requester->storage_authorized_operation = 0U;
             result = storage_set_filesystem_label_for_id(
                 device, request.instance_id - BLOCK_DEVICE_ID_BASE - 1ULL,
                 request.filesystem, request.label);
@@ -3730,24 +3731,21 @@ static void syscall_dispatch_inner(syscall_frame_t *frame)
             int result;
 
             if (!syscall_is_diskutil(requester) ||
-                !requester->storage_management_session ||
-                requester->storage_authorized_operation !=
-                    MG_STORAGE_OP_GPT_INITIALIZE) {
+                !process_storage_authorization_consume(requester,
+                    process_current_thread_id(),
+                    MG_STORAGE_OP_GPT_INITIALIZE)) {
                 syscall_fail(frame, MG_ERR_PRIVILEGE_REQUIRED);
                 return;
             }
             device = block_get_device_by_public_id(frame->rdi);
             if (!device || device->type == BLOCK_DEVICE_PARTITION) {
-                requester->storage_authorized_operation = 0U;
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
             }
             if (syscall_storage_system_managed(device)) {
-                requester->storage_authorized_operation = 0U;
                 syscall_fail(frame, MG_ERR_ACCESS_DENIED);
                 return;
             }
-            requester->storage_authorized_operation = 0U;
             result = gpt_initialize_device_for_id(device,
                 frame->rdi - BLOCK_DEVICE_ID_BASE - 1ULL);
             if (result != VFS_OK) {
@@ -3766,9 +3764,9 @@ static void syscall_dispatch_inner(syscall_frame_t *frame)
             int result;
 
             if (!syscall_is_diskutil(requester) ||
-                !requester->storage_management_session ||
-                requester->storage_authorized_operation !=
-                    MG_STORAGE_OP_GPT_CREATE || !user_request ||
+                !process_storage_authorization_consume(requester,
+                    process_current_thread_id(), MG_STORAGE_OP_GPT_CREATE) ||
+                !user_request ||
                 !syscall_user_buffer_valid(user_request, sizeof(request))) {
                 syscall_fail(frame, MG_ERR_PRIVILEGE_REQUIRED);
                 return;
@@ -3777,22 +3775,18 @@ static void syscall_dispatch_inner(syscall_frame_t *frame)
             if (!request.instance_id || request.reserved || !request.partition_number ||
                 request.partition_number > GPT_MAX_PARTITION_ENTRIES ||
                 request.first_lba > request.last_lba) {
-                requester->storage_authorized_operation = 0U;
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
             }
             device = block_get_device_by_public_id(request.instance_id);
             if (!device || device->type == BLOCK_DEVICE_PARTITION) {
-                requester->storage_authorized_operation = 0U;
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
             }
             if (syscall_storage_system_managed(device)) {
-                requester->storage_authorized_operation = 0U;
                 syscall_fail(frame, MG_ERR_ACCESS_DENIED);
                 return;
             }
-            requester->storage_authorized_operation = 0U;
             result = gpt_create_partition_for_id(device,
                 request.instance_id - BLOCK_DEVICE_ID_BASE - 1ULL, request.partition_number,
                                           request.first_lba, request.last_lba);
@@ -3813,8 +3807,8 @@ static void syscall_dispatch_inner(syscall_frame_t *frame)
             int result;
 
             if (!syscall_is_diskutil(requester) ||
-                !requester->storage_management_session ||
-                requester->storage_authorized_operation != MG_STORAGE_OP_GPT_DELETE ||
+                !process_storage_authorization_consume(requester,
+                    process_current_thread_id(), MG_STORAGE_OP_GPT_DELETE) ||
                 !user_request ||
                 !syscall_user_buffer_valid(user_request, sizeof(request))) {
                 syscall_fail(frame, MG_ERR_PRIVILEGE_REQUIRED);
@@ -3824,7 +3818,6 @@ static void syscall_dispatch_inner(syscall_frame_t *frame)
             if (!request.instance_id || !request.partition_instance_id ||
                 request.reserved || !request.partition_number ||
                 request.partition_number > GPT_MAX_PARTITION_ENTRIES) {
-                requester->storage_authorized_operation = 0U;
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
             }
@@ -3832,17 +3825,14 @@ static void syscall_dispatch_inner(syscall_frame_t *frame)
             partition = block_get_device_by_public_id(request.partition_instance_id);
             if (!device || device->type == BLOCK_DEVICE_PARTITION || !partition ||
                 partition->type != BLOCK_DEVICE_PARTITION) {
-                requester->storage_authorized_operation = 0U;
                 syscall_fail(frame, MG_ERR_DEVICE_GONE);
                 return;
             }
             if (syscall_storage_system_managed(device) ||
                 syscall_storage_system_managed(partition)) {
-                requester->storage_authorized_operation = 0U;
                 syscall_fail(frame, MG_ERR_ACCESS_DENIED);
                 return;
             }
-            requester->storage_authorized_operation = 0U;
             result = gpt_delete_partition_for_id(device,
                 request.instance_id - BLOCK_DEVICE_ID_BASE - 1ULL, partition,
                 request.partition_instance_id - BLOCK_DEVICE_ID_BASE - 1ULL,

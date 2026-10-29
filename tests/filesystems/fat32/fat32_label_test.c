@@ -91,9 +91,11 @@ static i64 native_label(const char *text) {
     strcpy(request.filesystem,"fat32"); strcpy(request.label,text);
     requester.storage_management_session = true;
     requester.storage_authorized_operation = MG_STORAGE_OP_LABEL;
+    requester.storage_authorized_thread_id = 1U;
     label_frame_t frame = {.rax=SYSCALL_STORAGE_LABEL,.rdi=(u64)(usize)&request};
     label_syscall(&frame);
-    assert(!requester.storage_authorized_operation);
+    assert(!requester.storage_authorized_operation &&
+           !requester.storage_authorized_thread_id);
     return (i64)frame.rax;
 }
 static void prepare(void) {
@@ -198,6 +200,7 @@ int main(int argc, char **argv) {
     }
     prepare(); requester.storage_management_session=false;
     requester.storage_authorized_operation=MG_STORAGE_OP_LABEL;
+    requester.storage_authorized_thread_id=1U;
     mg_storage_label_request_t unauthorized={.instance_id=BLOCK_DEVICE_ID_BASE | (device.id+1U)};
     strcpy(unauthorized.filesystem,"fat32"); strcpy(unauthorized.label,"DENIED");
     label_frame_t denied={.rax=SYSCALL_STORAGE_LABEL,.rdi=(u64)(usize)&unauthorized};
