@@ -1836,7 +1836,7 @@ test-ipc-capacity:
 	ASAN_OPTIONS=detect_leaks=0 "$(BUILD_DIR)/tests/ipc_capacity_test"
 
 test-sync: test-spinlock-context test-ipc-capacity test-preemption-accounting \
-		test-irq-lifecycle test-atomics test-user-sync
+		test-irq-lifecycle test-atomics test-user-sync test-storage-authorization
 	python3 tests/filesystems/mgfs/mgfs_handoff_test.py "$(HOST_CC)"
 	python3 tests/filesystems/fat32/fat_handoff_test.py "$(HOST_CC)"
 	python3 tests/filesystems/vfs/vfs_location_test.py "$(HOST_CC)"
@@ -1869,7 +1869,11 @@ test-sync: test-spinlock-context test-ipc-capacity test-preemption-accounting \
 	python3 tests/kernel/mutex_test.py
 	python3 tests/storage/block_gate_test.py
 
-test-storage:
+.PHONY: test-storage-authorization
+test-storage-authorization:
+	python3 tests/kernel/storage_authorization_test.py "$(HOST_CC)"
+
+test-storage: test-storage-authorization
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -Werror=address-of-packed-member \
 		-Ikernel/include -Ikernel/include/usb -Iinclude \
 		tests/storage/xhci_regs_layout_test.c \

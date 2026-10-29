@@ -89,8 +89,13 @@ typedef struct PACKED {
     u32 reserved;
 } mg_storage_gpt_delete_request_t;
 
+/* After storage_session_authorize(), arm one mutation for the calling thread.
+ * The matching syscall consumes it at admission, including when later request
+ * validation or storage work fails. Sibling threads cannot use or cancel it. */
 mg_result_t storage_authorize(u32 operation);
 mg_result_t storage_session_authorize(void);
+/* Idempotently cancel this thread's still-pending mutation authorization.
+ * A grant is also revoked automatically if its owning thread exits. */
 mg_result_t storage_authorize_cancel(void);
 mg_result_t storage_format(const mg_storage_format_request_t *request);
 mg_result_t storage_set_label(const mg_storage_label_request_t *request);

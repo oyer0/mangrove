@@ -92,6 +92,8 @@ struct process {
  u32 worker_reapers;
  process_thread_record_t *thread_records;
  bool worker_reap_pending;
+ u32 storage_authorized_operation; u64 storage_authorized_thread_id;
+ bool storage_management_session, storage_management_authorizing;
  kernel_object_t object;
  void *address_space, *handle_table;
 };
@@ -215,6 +217,7 @@ running = function(scheduler, 'scheduler_thread_is_running')
 running = running.replace('bool scheduler_thread_is_running(',
                           'static __attribute__((unused)) bool scheduler_thread_is_running(', 1)
 code = prefix + completion + running
+code += function(source, 'process_storage_authorization_clear_locked')
 for name in ('process_thread_list_complete_locked',
              'process_worker_records_release_all',
              'process_publish_terminated_locked',

@@ -165,10 +165,15 @@ the requested privilege; they do not trigger a human prompt.
 PASS authorization is distinct from command-specific destructive confirmation.
 For example, `diskutil` requires `MANAGE_STORAGE` and PASS once when the
 process enters its management session. The kernel marks only that current
-`diskutil` process. Individual format and GPT mutations arm one bounded
-operation for that process and still require their exact `FORMAT`,
-`INITIALIZE`, `CREATE`, or `DELETE` confirmation in userspace. The session
-authorization cannot be transferred and disappears when the process exits.
+`diskutil` process. Individual format, label, and GPT mutations arm one
+bounded operation for the thread that requested it. A sibling thread cannot
+spend, replace, or cancel that grant. The matching mutation syscall consumes
+the grant atomically at admission, before request validation or storage I/O;
+later validation, device, or I/O failures do not restore it. A wrong
+operation leaves the grant available for its owner to cancel or use correctly.
+An exiting worker's pending grant is revoked so it cannot strand the session;
+the management session and any remaining grant are revoked when process exit
+begins.
 
 Standalone mount, unmount, eject, network, account, and service-control paths
 authorize their logical request through their trusted service or kernel

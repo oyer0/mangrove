@@ -40,11 +40,17 @@ registry += vfs[start:vfs.index("\n};", start) + 4] + "\n"
 case_start = sc.index('        case SYSCALL_STORAGE_LABEL: {')
 case_end = sc.index('        case SYSCALL_STORAGE_GPT_INFO:',case_start)
 native = r'''
-typedef struct { bool storage_management_session; u32 storage_authorized_operation; } label_process_t;
+typedef struct { bool storage_management_session; u32 storage_authorized_operation; u64 storage_authorized_thread_id; } label_process_t;
 #define process_t label_process_t
 static label_process_t requester;
 static label_process_t *process_current(void) { return &requester; }
 static bool syscall_is_diskutil(label_process_t *p) { return p == &requester; }
+static u64 process_current_thread_id(void) { return 1U; }
+static bool process_storage_authorization_consume(label_process_t *p,u64 id,u32 op) {
+    if (!p || !p->storage_management_session || p->storage_authorized_thread_id != id ||
+        p->storage_authorized_operation != op) return false;
+    p->storage_authorized_operation=0U; p->storage_authorized_thread_id=0U; return true;
+}
 static bool syscall_user_buffer_valid(const void *p, usize n) { return p && n; }
 static bool syscall_fixed_text_valid(const char *p, usize n, bool empty) {
     return p && (empty || *p) && memchr(p,0,n);

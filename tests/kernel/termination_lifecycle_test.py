@@ -77,6 +77,8 @@ typedef struct process_thread_record {
 struct process {int state; kernel_thread_t *main_thread, *threads;
  u32 thread_count, live_thread_count, active_syscalls;
  u32 thread_list_readers;
+ u32 storage_authorized_operation; u64 storage_authorized_thread_id;
+ bool storage_management_session, storage_management_authorizing;
  process_thread_record_t *thread_records;
  u32 worker_reapers;
  bool termination_pending, external_termination_in_progress, launch_ready;
@@ -203,6 +205,7 @@ scheduler_functions = "".join(function(path, name) for path, name in (
     ("kernel/src/process.c", "process_thread_list_complete_locked"),
     ("kernel/src/process.c", "process_thread_list_read_acquire_locked"),
     ("kernel/src/process.c", "process_thread_list_read_release"),
+    ("kernel/src/process.c", "process_storage_authorization_clear_locked"),
     ("kernel/src/process.c", "process_publish_terminated_locked"),
     ("kernel/src/process.c", "process_finish_termination"),
     ("kernel/src/process.c", "process_scheduler_handoff_complete"),

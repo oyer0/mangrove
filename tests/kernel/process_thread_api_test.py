@@ -136,6 +136,9 @@ struct process {
     kernel_thread_t *main_thread,*threads;
     process_thread_record_t *thread_records;
     process_user_region_t *user_regions;
+    u32 storage_authorized_operation;
+    u64 storage_authorized_thread_id;
+    bool storage_management_session, storage_management_authorizing;
     void *address_space;
     bool image_loaded,tls_present;
     kernel_object_t *handle_table;
@@ -374,6 +377,7 @@ names = (
     ("kernel/src/process.c", "process_thread_handle_activate_locked"),
     ("kernel/src/process.c", "process_thread_handle_deactivate_locked"),
     ("kernel/src/process.c", "process_thread_create"),
+    ("kernel/src/process.c", "process_storage_authorization_revoke_thread_locked"),
     ("kernel/src/process.c", "process_worker_exit"),
     ("kernel/src/process.c", "process_detach_thread_owned"),
     ("kernel/src/process.c", "process_detach_thread"),

@@ -169,12 +169,15 @@ struct process {
     /* ESC formatting state belongs to the process that emits console bytes,
      * not to a shared inherited stdout object. */
     terminal_output_state_t terminal_output;
-    /* One-shot PASS authorization for the immediately following storage
-     * mutation.  It is process-local and never supplied by userspace. */
+    /* Storage authorization state is protected by process_registry_lock.
+     * A one-shot mutation grant is bound to the thread that requested it so
+     * a sibling cannot spend or cancel another thread's grant. */
     u32 storage_authorized_operation;
-    /* Set only by the diskutil executable after kernel-authenticated PASS
-     * authorization.  This capability dies with that process. */
+    u64 storage_authorized_thread_id;
+    /* PASS session state is process-wide, but its grant-in-progress and
+     * lifetime are registry-locked and end when the process begins exiting. */
     bool storage_management_session;
+    bool storage_management_authorizing;
     struct ipc_request *ipc_outstanding;
     bool owner_reference_held;
     process_t *next_all;
@@ -204,6 +207,17 @@ bool process_assign_system_credentials(process_t *process);
 bool process_assign_system_service(process_t *process, u32 service_id);
 bool process_get_credentials(const process_t *process,
                              process_credentials_t *credentials);
+/* Storage-session and one-shot mutation authority is serialized with process
+ * exit under process_registry_lock. Mutation grants are single-use and bound
+ * to a kernel-supplied thread identity. No helper holds the lock over I/O. */
+bool process_storage_management_begin(process_t *process);
+bool process_storage_management_finish(process_t *process,
+                                       bool pass_authorized);
+int process_storage_authorization_grant(process_t *process,
+                                        u64 thread_id, u32 operation);
+bool process_storage_authorization_consume(process_t *process,
+                                           u64 thread_id, u32 operation);
+int process_storage_authorization_cancel(process_t *process, u64 thread_id);
 bool process_attach_thread(process_t *process, struct kernel_thread *thread);
 /* Transfers a completed non-current thread out of its process owner list.
  * The caller must hold a process reference and may destroy the thread only

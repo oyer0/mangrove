@@ -440,6 +440,30 @@ static void process_thread_list_read_release(process_t *process)
     if (finish_exit) (void)process_finish_termination(process);
 }
 
+/* Caller holds process_registry_lock.  Revoking this state at the first
+ * process-exit transition prevents an admitted sibling syscall from using a
+ * grant after process-wide teardown has begun. */
+static void process_storage_authorization_clear_locked(process_t *process)
+{
+    if (!process) return;
+    process->storage_authorized_operation = 0U;
+    process->storage_authorized_thread_id = 0U;
+    process->storage_management_session = false;
+    process->storage_management_authorizing = false;
+}
+
+/* A worker may leave the process active. Do not strand a one-shot grant on
+ * the exited thread identity, where no sibling can consume or cancel it. */
+static void process_storage_authorization_revoke_thread_locked(
+    process_t *process, u64 thread_id)
+{
+    if (process && thread_id &&
+        process->storage_authorized_thread_id == thread_id) {
+        process->storage_authorized_operation = 0U;
+        process->storage_authorized_thread_id = 0U;
+    }
+}
+
 static kernel_thread_t *process_publish_terminated_locked(process_t *process)
 {
     kernel_thread_t *waiter = NULL;
@@ -452,6 +476,7 @@ static kernel_thread_t *process_publish_terminated_locked(process_t *process)
     process->state = PROCESS_STATE_TERMINATED;
     process->termination_pending = false;
     process->external_termination_in_progress = false;
+    process_storage_authorization_clear_locked(process);
     if (process->parent && process->parent->state == PROCESS_STATE_ACTIVE &&
         process->parent->waiting_child == process &&
         process->parent->waiting_thread) {
@@ -787,6 +812,119 @@ u64 process_current_thread_id(void)
 {
     kernel_thread_t *thread = thread_current();
     return thread && thread->process ? thread->id : 0;
+}
+
+bool process_storage_management_begin(process_t *process)
+{
+    bool admitted = false;
+    u64 flags;
+
+    if (!process) return false;
+    flags = spin_lock_irqsave(&process_registry_lock);
+    if (process->state == PROCESS_STATE_ACTIVE &&
+        !process->termination_pending &&
+        !__atomic_load_n(&process->exit_requested, __ATOMIC_ACQUIRE) &&
+        !process->storage_management_session &&
+        !process->storage_management_authorizing) {
+        process->storage_management_authorizing = true;
+        admitted = true;
+    }
+    spin_unlock_irqrestore(&process_registry_lock, flags);
+    return admitted;
+}
+
+bool process_storage_management_finish(process_t *process,
+                                       bool pass_authorized)
+{
+    bool authorized = false;
+    u64 flags;
+
+    if (!process) return false;
+    flags = spin_lock_irqsave(&process_registry_lock);
+    if (process->storage_management_authorizing) {
+        if (pass_authorized && process->state == PROCESS_STATE_ACTIVE &&
+            !process->termination_pending &&
+            !__atomic_load_n(&process->exit_requested, __ATOMIC_ACQUIRE)) {
+            process->storage_management_session = true;
+            authorized = true;
+        }
+        process->storage_management_authorizing = false;
+    }
+    spin_unlock_irqrestore(&process_registry_lock, flags);
+    return authorized;
+}
+
+int process_storage_authorization_grant(process_t *process, u64 thread_id,
+                                        u32 operation)
+{
+    int result = MG_ERR_PRIVILEGE_REQUIRED;
+    u64 flags;
+
+    if (!process || !thread_id || !operation) return MG_ERR_BAD_ARGUMENT;
+    flags = spin_lock_irqsave(&process_registry_lock);
+    if (process->state == PROCESS_STATE_ACTIVE &&
+        !process->termination_pending &&
+        !__atomic_load_n(&process->exit_requested, __ATOMIC_ACQUIRE) &&
+        process->storage_management_session) {
+        if (process->storage_authorized_operation) {
+            result = MG_ERR_BUSY;
+        } else {
+            process->storage_authorized_thread_id = thread_id;
+            process->storage_authorized_operation = operation;
+            result = MG_OK;
+        }
+    }
+    spin_unlock_irqrestore(&process_registry_lock, flags);
+    return result;
+}
+
+bool process_storage_authorization_consume(process_t *process, u64 thread_id,
+                                           u32 operation)
+{
+    bool consumed = false;
+    u64 flags;
+
+    if (!process || !thread_id || !operation) return false;
+    flags = spin_lock_irqsave(&process_registry_lock);
+    if (process->state == PROCESS_STATE_ACTIVE &&
+        !process->termination_pending &&
+        !__atomic_load_n(&process->exit_requested, __ATOMIC_ACQUIRE) &&
+        process->storage_management_session &&
+        process->storage_authorized_operation == operation &&
+        process->storage_authorized_thread_id == thread_id) {
+        process->storage_authorized_operation = 0U;
+        process->storage_authorized_thread_id = 0U;
+        consumed = true;
+    }
+    spin_unlock_irqrestore(&process_registry_lock, flags);
+    return consumed;
+}
+
+int process_storage_authorization_cancel(process_t *process, u64 thread_id)
+{
+    int result = MG_ERR_PRIVILEGE_REQUIRED;
+    u64 flags;
+
+    if (!process || !thread_id) return MG_ERR_PRIVILEGE_REQUIRED;
+    flags = spin_lock_irqsave(&process_registry_lock);
+    if (process->state == PROCESS_STATE_ACTIVE &&
+        !process->termination_pending &&
+        !__atomic_load_n(&process->exit_requested, __ATOMIC_ACQUIRE) &&
+        process->storage_management_session) {
+        if (!process->storage_authorized_operation) {
+            /* Cancellation after a successful or failed attempt is
+             * idempotent within the authorized management session. */
+            result = MG_OK;
+        } else if (process->storage_authorized_thread_id == thread_id) {
+            process->storage_authorized_operation = 0U;
+            process->storage_authorized_thread_id = 0U;
+            result = MG_OK;
+        } else {
+            result = MG_ERR_ACCESS_DENIED;
+        }
+    }
+    spin_unlock_irqrestore(&process_registry_lock, flags);
+    return result;
 }
 
 static bool process_path_access(const vfs_node_t *node, void *context)
@@ -1946,6 +2084,7 @@ bool process_exit(process_t *process, i32 status)
     if (process->state == PROCESS_STATE_ACTIVE) {
         process->state = PROCESS_STATE_EXITING;
         process->termination_pending = true;
+        process_storage_authorization_clear_locked(process);
         /* A self-exit may win against an external termination reservation.
          * The scheduler's group preflight cannot concurrently commit while
          * this process thread is running, so the external attempt will fail
@@ -2104,6 +2243,8 @@ void process_thread_entry_completed(struct kernel_thread *thread, i32 status)
         u64 flags = spin_lock_irqsave(&process_registry_lock);
         if (thread->process == process &&
             thread->process_state != THREAD_PROCESS_HANDOFF_COMPLETE) {
+            process_storage_authorization_revoke_thread_locked(
+                process, thread->id);
             thread->process_exit_status = status;
             thread->process_exit_status_valid = true;
             thread->process_state = THREAD_PROCESS_EXIT_REQUESTED;
@@ -2128,6 +2269,8 @@ void process_worker_exit(struct kernel_thread *raw_thread, u64 result)
     if (thread->process == process && record &&
         record->process == process && record->execution == thread &&
         thread->process_state != THREAD_PROCESS_HANDOFF_COMPLETE) {
+        process_storage_authorization_revoke_thread_locked(
+            process, thread->id);
         thread->process_exit_status = (i32)result;
         thread->process_exit_status_valid = true;
         record->result = result;
@@ -2259,6 +2402,7 @@ static void process_abort(process_t *process)
     thread = process->main_thread;
     process->state = PROCESS_STATE_EXITING;
     process->termination_pending = true;
+    process_storage_authorization_clear_locked(process);
     __atomic_store_n(&process->exit_requested, true, __ATOMIC_RELEASE);
     __atomic_store_n(&thread->process_exit_requested, true, __ATOMIC_RELEASE);
     spin_unlock_irqrestore(&process_registry_lock, flags);
@@ -2357,6 +2501,7 @@ bool process_terminate_external(process_t *process, i32 status)
     }
     if (process->state == PROCESS_STATE_ACTIVE) {
         process->state = PROCESS_STATE_EXITING;
+        process_storage_authorization_clear_locked(process);
         __atomic_store_n(&process->exit_requested, true, __ATOMIC_RELEASE);
         process->exit_status = status;
     }
