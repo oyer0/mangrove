@@ -55,6 +55,12 @@ def fixture_prefix():
                             '#define PROCESS_HANDOFF_RELEASE_BATCH 16U\n'
                             '#define PROCESS_DEFERRED_REFERENCE_RELEASE_BATCH 16U')
     prefix = prefix.replace(
+        'enum {THREAD_STATE_RUNNING, THREAD_STATE_READY, THREAD_STATE_BLOCKED,\n'
+        '      THREAD_STATE_TERMINATED};',
+        'enum {THREAD_STATE_RUNNING, THREAD_STATE_READY, THREAD_STATE_BLOCKED,\n'
+        '      THREAD_STATE_TERMINATED};\n'
+        'typedef int thread_state_t;')
+    prefix = prefix.replace(
         'static process_t parent, child, *all_processes;',
         'static process_t parent, child, *all_processes;\n'
         'static process_handle_slot_t pid_handle_slot;\n'
@@ -291,7 +297,9 @@ completion = c_function(scheduler_source,
                         'scheduler_thread_handoff_callback_valid')
 completion = completion.replace('bool scheduler_thread_handoff_callback_valid(',
                                 'static bool scheduler_thread_handoff_callback_valid(', 1)
-functions = completion + r'''
+thread_state_snapshot = c_function(
+    scheduler_source, 'scheduler_thread_state_snapshot')
+functions = completion + thread_state_snapshot + r'''
 static bool scheduler_thread_exit_complete(const kernel_thread_t *thread)
 {return thread && thread->state==THREAD_STATE_TERMINATED &&
  thread->running_cpu==THREAD_CPU_NONE && !thread->context_switch_pending &&
@@ -482,15 +490,15 @@ static void exact_last_reference_case(void)
      * token on CPU A is now the process's only remaining reference. */
     assert(process_wait(&parent,7,&status)==MG_OK && status==23);
     assert(child.thread_count==0 && !child.owner_reference_held &&
-           child.object.ref_count==3 && child.scheduler_handoff_references==1 &&
-           atomic_load_explicit(&child.deferred_reference_releases_pending,
-                                memory_order_acquire)==1U);
+           child.object.ref_count==2 && child.scheduler_handoff_references==1 &&
+           !atomic_load_explicit(&child.deferred_reference_releases_pending,
+                                 memory_order_acquire));
     object_release(&child.object);
-    assert(child.object.ref_count==2 && destroyed_roots==0);
+    assert(child.object.ref_count==1 && destroyed_roots==0);
 
     enter_callback_context();
     scheduler_context_switch_post_complete(&child);
-    assert(child.object.ref_count==2 && destroyed_roots==0 &&
+    assert(child.object.ref_count==1 && destroyed_roots==0 &&
            child.scheduler_handoff_references==1 &&
            atomic_load_explicit(&child.scheduler_handoff_releases_pending,
                                 memory_order_acquire)==1);
@@ -498,15 +506,14 @@ static void exact_last_reference_case(void)
 
     enter_worker_context();
     assert(process_cleanup_worker_release_handoffs_once());
-    assert(child.object.ref_count==1 && destroyed_roots==0);
-    assert(process_cleanup_worker_release_deferred_references_once());
-    leave_worker_context();
-    assert(child.object.ref_count==0 && child.scheduler_handoff_references==0 &&
-           atomic_load_explicit(&child.scheduler_handoff_releases_pending,
-                                memory_order_acquire)==0 &&
-           !atomic_load_explicit(&child.deferred_reference_releases_pending,
+    assert(child.object.ref_count==0 && destroyed_roots==1 &&
+           child.scheduler_handoff_references==0 &&
+           !atomic_load_explicit(&child.scheduler_handoff_releases_pending,
                                  memory_order_acquire) &&
-           destroyed_roots==1 && released_memory==1 &&
+           !atomic_load_explicit(&child.deferred_reference_releases_pending,
+                                 memory_order_acquire));
+    leave_worker_context();
+    assert(released_memory==1 &&
            user_region_metadata_releases==1);
 }
 
@@ -933,13 +940,15 @@ static void wait_and_close_before_locked_pid_release_case(void)
     fixture_interrupts_enabled=true;
     assert(process_wait(&parent,0x10001U,&status)==MG_OK && status==23);
     assert(!child.owner_reference_held && child.wait_collected &&
-           child.object.ref_count==3 && !destroyed_roots);
+           child.object.ref_count==2 && !destroyed_roots &&
+           !atomic_load_explicit(&child.deferred_reference_releases_pending,
+                                 memory_order_acquire));
     /* Model the wait and handle-close operations on CPU B, independently of
      * CPU A's interrupt-disabled PID lookup. */
     fixture_interrupts_enabled=true;
     assert(process_handle_close(&parent,0x10001U));
     assert(!pid_handle_slot.active && !pid_handle_slot.object &&
-           child.object.ref_count==2 && !destroyed_roots);
+           child.object.ref_count==1 && !destroyed_roots);
 
     pthread_mutex_lock(&pid_gate_lock);
     pid_close_done=true;
@@ -947,12 +956,12 @@ static void wait_and_close_before_locked_pid_release_case(void)
     pthread_mutex_unlock(&pid_gate_lock);
     assert(!pthread_join(lookup,NULL));
 
-    /* process_wait's own reference and the PID reference were both
-     * transferred rather than dropped in interrupt-disabled/locked contexts.
-     * Their exact ownership remains represented until the safe worker drains. */
-    assert(!child.owner_reference_held && child.object.ref_count==2 &&
+    /* process_wait has restored IF before dropping its operation pin, so only
+     * the still-locked PID lookup needs a deferred release. Its reference
+     * remains owned until the safe worker drains it. */
+    assert(!child.owner_reference_held && child.object.ref_count==1 &&
            atomic_load_explicit(&child.deferred_reference_releases_pending,
-                                memory_order_acquire)==2U &&
+                                memory_order_acquire)==1U &&
            !destroyed_roots && !unsafe_destructor_entries &&
            atomic_load_explicit(&process_session_collection_retry_pending,
                                 memory_order_acquire));

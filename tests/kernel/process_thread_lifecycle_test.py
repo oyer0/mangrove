@@ -78,6 +78,7 @@ enum {THREAD_STATE_RUNNING, THREAD_STATE_READY, THREAD_STATE_BLOCKED,
 enum {PROCESS_STATE_ACTIVE, PROCESS_STATE_EXITING, PROCESS_STATE_TERMINATED};
 enum {THREAD_PROCESS_UNATTACHED, THREAD_PROCESS_ATTACHED,
       THREAD_PROCESS_EXIT_REQUESTED, THREAD_PROCESS_HANDOFF_COMPLETE};
+typedef int thread_state_t;
 typedef struct process process_t;
 typedef struct kernel_thread kernel_thread_t;
 typedef struct {u32 ref_count;} kernel_object_t;
@@ -638,7 +639,10 @@ int main(void)
 }
 '''
 
-code = prefix + "".join(function(name) for name in names) + suffix
+scheduler_state_snapshot = function_from(
+    "kernel/src/scheduler.c", "scheduler_thread_state_snapshot")
+code = prefix + scheduler_state_snapshot + \
+       "".join(function(name) for name in names) + suffix
 with tempfile.TemporaryDirectory(prefix="mangrove-process-thread-") as directory:
     path = Path(directory) / "process_thread_lifecycle.c"
     binary = Path(directory) / "process_thread_lifecycle"
