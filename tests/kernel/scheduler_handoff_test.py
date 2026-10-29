@@ -84,8 +84,6 @@ static bool process_scheduler_context_handoff_complete(kernel_thread_t *thread)
  thread->process->handoffs++;return true;}
 static void process_scheduler_post_handoff(process_t *process)
 {assert(process && !scheduler_lock);process->post_wakes++;}
-static void object_release(kernel_object_t *object)
-{assert(object && object->references);object->references--;}
 static cpu_local_t *scheduler_cpu_local(void){return &cpu;}
 static void fpu_state_save(unsigned *s){(void)s;}
 static void fpu_state_restore(unsigned *s){(void)s;}
@@ -133,8 +131,9 @@ int main(void){
   assert(!outgoing.queued && outgoing.running_cpu==THREAD_CPU_NONE && !outgoing.context_switch_pending);
  }
  /* Process accounting runs while the descriptor barrier is held; the
-  * returned process reference is released by its stack-local post hook. */
- assert(process.object.references==0 && process.handoffs==1 &&
+  * returned reference remains owned by the deferred cleanup worker after
+  * the stack-local post hook. */
+ assert(process.object.references==1 && process.handoffs==1 &&
         process.post_wakes==1);
  /* Model an interrupt after IF restoration but before the first post hook:
   * both process references remain independently owned by their stack frames. */
@@ -149,13 +148,14 @@ int main(void){
  assert(first_handoff==&process);
  process_t *second_handoff=scheduler_context_switch_complete(
      &second.saved_stack_pointer);
- assert(second_handoff==&second_process && process.object.references==1 &&
+ assert(second_handoff==&second_process && process.object.references==2 &&
         second_process.object.references==1 && outgoing.context_switch_pending==false &&
         second.context_switch_pending==false);
  scheduler_context_switch_post_complete(second_handoff);
  scheduler_context_switch_post_complete(first_handoff);
  assert(second_process.handoffs==1 &&
-        second_process.post_wakes==1 && second_process.object.references==0);
+        second_process.post_wakes==1 && second_process.object.references==1 &&
+        process.object.references==2);
  kernel_thread_t guarded={.state=THREAD_STATE_READY,.running_cpu=0,
    .saved_stack_pointer=0x3000,.kernel_stack={.active=true}};
  incoming.saved_stack_pointer=0x3000;current_thread=&incoming;

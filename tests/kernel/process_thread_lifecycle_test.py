@@ -69,6 +69,9 @@ typedef int64_t i64;
 typedef uint32_t u32;
 typedef int32_t i32;
 typedef size_t usize;
+typedef u64 mg_session_id_t;
+#define PROCESS_NO_SESSION ((mg_session_id_t)0)
+#define PROCESS_HANDOFF_RELEASE_BATCH 16U
 typedef pthread_mutex_t spinlock_t;
 enum {THREAD_STATE_RUNNING, THREAD_STATE_READY, THREAD_STATE_BLOCKED,
       THREAD_STATE_TERMINATED};
@@ -114,6 +117,9 @@ struct process {
     bool launch_ready;
     kernel_thread_t *main_thread, *threads;
     u32 thread_count, live_thread_count;
+    u32 scheduler_handoff_references;
+    _Atomic u32 scheduler_handoff_releases_pending;
+    mg_session_id_t session_id;
     u32 worker_reapers;
     bool worker_reap_pending;
     process_thread_record_t *thread_records;
@@ -145,7 +151,7 @@ static bool fixture_interrupts_enabled=true;
 static bool process_finish_termination(process_t *process);
 static void process_worker_reclaim_pending(process_t *process);
 static bool process_cleanup_exit_resources(process_t *process);
-static void process_cleanup_worker_wake(process_t *process);
+static bool process_cleanup_worker_wake(process_t *process);
 static bool scheduler_terminate_thread(kernel_thread_t *thread);
 void process_worker_exit(struct kernel_thread *thread, u64 result);
 static void process_worker_reclaim_pending(process_t *process)
@@ -223,8 +229,10 @@ static void session_process_exited(process_t *process)
 {(void)process;__atomic_add_fetch(&exit_notifications,1U,__ATOMIC_RELAXED);}
 static kernel_thread_t cleanup_worker_thread={.state=THREAD_STATE_RUNNING,
                                                .running_cpu=0};
-static void process_cleanup_worker_wake(process_t *process)
-{assert(process);cleanup_wake_calls++;}
+static bool process_cleanup_worker_wake(process_t *process)
+{assert(process);cleanup_wake_calls++;return true;}
+static void process_reap_session_members(mg_session_id_t session_id)
+{assert(session_id==PROCESS_NO_SESSION);}
 static bool process_cleanup_worker_run_once(void);
 static bool run_cleanup_worker_once(process_t *process)
 {kernel_thread_t *previous=local_thread;all_processes=process;
@@ -241,6 +249,7 @@ names = (
     "process_thread_list_read_acquire_locked",
     "process_thread_list_read_release",
     "process_cleanup_candidate_locked",
+    "process_cleanup_worker_release_handoffs_once",
     "process_cleanup_worker_run_once",
     "process_publish_terminated_locked",
     "process_attach_thread",
@@ -301,6 +310,20 @@ static void reset_process(process_t *process,kernel_thread_t *initial,
     terminal_finishes=alternate_leaves=handle_closes=cwd_clears=0;
     exit_notifications=unblocks=0;
     fixture_interrupts_enabled=true;
+}
+static void begin_scheduler_handoff(kernel_thread_t *thread)
+{
+    thread->context_switch_pending=true;
+    assert(object_reference(&thread->process->object));
+    assert(process_scheduler_context_handoff_complete(thread));
+    thread->context_switch_pending=false;
+}
+static void handoff_with_deferred_release(kernel_thread_t *thread)
+{
+    process_t *process=thread->process;
+    assert(process);
+    begin_scheduler_handoff(thread);
+    process_scheduler_post_handoff(process);
 }
 static void finish_thread(process_t *process,kernel_thread_t *thread,
                           i32 status)
@@ -401,7 +424,7 @@ int main(void)
            process.state==PROCESS_STATE_EXITING);
     thread_stopped(&initial);
     fixture_interrupts_enabled=false;
-    process_scheduler_handoff_complete(&initial);
+    begin_scheduler_handoff(&initial);
     assert(process.state==PROCESS_STATE_EXITING && cleanup_calls==0 &&
            !process.exit_cleanup_complete);
     fixture_interrupts_enabled=true;
@@ -464,8 +487,7 @@ int main(void)
     local_thread=&initial;
     process_thread_entry_completed(&initial,0);
     thread_stopped(&initial);
-    process_scheduler_handoff_complete(&initial);
-    process_scheduler_post_handoff(&process);
+    handoff_with_deferred_release(&initial);
     assert(run_cleanup_worker_once(&process));
     assert(process.state==PROCESS_STATE_TERMINATED && cleanup_calls==1 &&
            process_finalize_exit(&process) && process.thread_count==0 &&
@@ -498,8 +520,7 @@ int main(void)
     local_thread=&initial;
     process_thread_entry_completed(&initial,14);
     thread_stopped(&initial);
-    process_scheduler_handoff_complete(&initial);
-    process_scheduler_post_handoff(&process);
+    handoff_with_deferred_release(&initial);
     assert(run_cleanup_worker_once(&process));
     assert(process.state==PROCESS_STATE_TERMINATED && cleanup_calls==1 &&
            process_finalize_exit(&process));
@@ -521,8 +542,7 @@ int main(void)
     assert(!process.exit_cleanup_complete && cleanup_calls==0 &&
            process.state==PROCESS_STATE_EXITING);
     thread_stopped(&initial);
-    process_scheduler_handoff_complete(&initial);
-    process_scheduler_post_handoff(&process);
+    handoff_with_deferred_release(&initial);
     assert(run_cleanup_worker_once(&process));
     assert(process.state==PROCESS_STATE_TERMINATED &&
            process_finalize_exit(&process));
@@ -571,8 +591,7 @@ int main(void)
     local_thread=&initial;
     process_thread_entry_completed(&initial,process.exit_status);
     thread_stopped(&initial);
-    process_scheduler_handoff_complete(&initial);
-    process_scheduler_post_handoff(&process);
+    handoff_with_deferred_release(&initial);
     assert(run_cleanup_worker_once(&process));
     assert(process.state==PROCESS_STATE_TERMINATED &&
            process.live_thread_count==0 && cleanup_calls==1);
@@ -598,8 +617,7 @@ int main(void)
     local_thread=&initial;
     process_thread_entry_completed(&initial,9);
     thread_stopped(&initial);
-    process_scheduler_handoff_complete(&initial);
-    process_scheduler_post_handoff(&process);
+    handoff_with_deferred_release(&initial);
     assert(run_cleanup_worker_once(&process));
     assert(cleanup_calls==1 && process.state==PROCESS_STATE_TERMINATED);
     assert(process_finalize_exit(&process) && process.thread_count==0);

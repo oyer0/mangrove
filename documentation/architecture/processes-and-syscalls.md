@@ -133,14 +133,20 @@ The scheduler handoff callback runs with interrupts masked. It accounts the
 stopped thread while its scheduler record is still protected by the pending
 handoff barrier; that barrier is released only after the callback's final
 thread-record access. The callback returns a retained process reference on the
-incoming thread's own stack. The post-switch hook only signals the process
-cleanup worker and releases that reference, so an interrupt or nested switch
-cannot overwrite a per-CPU cleanup slot. Process-wide resource cleanup runs
-on the dedicated ordinary kernel worker, outside the handoff callback, where
-mutex operations and remote TLB shootdowns can make progress. The worker scans
-the process registry for fully stopped exiting processes; its latched event
-wake closes the scan-to-park race. The scheduler callback and post hook never
-perform process resource teardown.
+incoming thread's own stack. The post-switch hook transfers that reference to
+the existing process cleanup worker through a per-process pending count and
+signals the worker; it never releases the reference itself, because the release
+could synchronously invoke the process destructor before an incoming mutex
+handoff has resumed. The worker claims and drops at most 16 handoff references
+per pass under the process registry lock while holding an extra object pin;
+it releases that pin outside locks, where it may safely run the destructor,
+mutex operations, or remote TLB shootdowns. The registry scan plus the retained
+references is the deferred-work list, so concurrent callbacks cannot
+overwrite one another and no separate queue allocation is needed. Session
+reaping accounts for registered handoff references and is retried after the
+worker drops its temporary scan pin. The worker's latched event wake closes
+the scan-to-park race. The scheduler callback and post hook never perform
+process resource teardown or final object release.
 
 The ELF loader accepts at most one validated nonempty `PT_TLS` segment; an
 all-zero `PT_TLS` emitted by the linker for an image without TLS sections means

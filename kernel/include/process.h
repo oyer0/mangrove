@@ -108,6 +108,13 @@ struct process {
     struct kernel_thread *threads;
     u32 thread_count;
     u32 live_thread_count;
+    /* Protected by process_registry_lock. Each retained scheduler handoff
+     * reference is counted before its thread's handoff barrier is released,
+     * then remains counted until the cleanup worker releases it safely. */
+    u32 scheduler_handoff_references;
+    /* Atomic subset published for the cleanup worker to release. Each such
+     * reference keeps this process discoverable in all_processes. */
+    _Atomic u32 scheduler_handoff_releases_pending;
     process_thread_record_t *thread_records;
     u32 worker_reapers;
     /* Atomic fast-path hint. The intrusive list remains registry-locked;
@@ -230,8 +237,9 @@ void process_scheduler_handoff_complete(struct kernel_thread *thread);
 /* Scheduler-only variant: the outgoing record remains protected by its
  * context-switch barrier while this callback accounts completion. */
 bool process_scheduler_context_handoff_complete(struct kernel_thread *thread);
-/* Runs after the incoming interrupt state is restored. This hook only wakes
- * the process cleanup worker; it must not perform blocking teardown. */
+/* Transfers one retained scheduler handoff reference to the process cleanup
+ * worker and wakes it. This hook runs before the incoming mutex continuation
+ * is consumed and must not release the reference or perform teardown. */
 void process_scheduler_post_handoff(process_t *process);
 /* Start the single process teardown worker after scheduler initialization. */
 bool process_start_cleanup_worker(void);

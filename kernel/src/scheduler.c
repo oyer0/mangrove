@@ -408,13 +408,13 @@ void scheduler_context_switch_post_complete(process_t *process)
 {
     if (!process) return;
     /* This runs before the suspended mutex_lock continuation consumes its
-     * handoff marker. It is deliberately limited to an event wake; the
-     * process cleanup worker performs mutex and VMM operations on its own
-     * ordinary kernel stack. A process pointer is carried by this stack
-     * frame, so nested/preempted context switches cannot collide in a CPU
-     * singleton slot. */
+     * handoff marker. It only transfers the retained reference into the
+     * cleanup worker's pending count and signals that worker. It must never
+     * drop the final reference here: that could synchronously run process
+     * destruction and VMM teardown in this callback context. A process
+     * pointer is carried by this stack frame, so nested/preempted context
+     * switches cannot collide in a CPU singleton slot. */
     process_scheduler_post_handoff(process);
-    object_release(&process->object);
 }
 
 static void scheduler_validate_saved_context(const kernel_thread_t *thread)
