@@ -59,6 +59,7 @@ process_functions=(
  'process_storage_authorization_clear_locked',
  'process_thread_register_locked',
  'process_thread_list_complete_locked',
+ 'process_thread_member_locked',
  'process_thread_list_read_acquire_locked',
  'process_thread_list_read_release',
  'process_waiter_wake_release',

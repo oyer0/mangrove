@@ -326,6 +326,7 @@ static void object_release(kernel_object_t *object)
 for name in (
         'process_storage_authorization_clear_locked',
         'process_thread_list_complete_locked',
+        'process_thread_member_locked',
         'process_session_collection_ready_locked',
         'process_worker_records_release_all',
         'process_waiter_wake_release',

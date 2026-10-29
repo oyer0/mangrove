@@ -23,6 +23,15 @@ typedef enum {
     THREAD_STATE_TERMINATED,
 } thread_state_t;
 
+/* Event delivery distinguishes a terminal waiter from a live scheduling
+ * failure. Callers with a cancellation contract may accept the former, but
+ * must not treat a failed blocked-to-ready enqueue as cancellation. */
+typedef enum {
+    SCHEDULER_WAKE_FAILED = 0,
+    SCHEDULER_WAKE_DELIVERED,
+    SCHEDULER_WAKE_ALREADY_TERMINATED,
+} scheduler_wake_result_t;
+
 /* Process ownership is distinct from scheduler state. A completed thread
  * remains process-owned until a join/reap path detaches its record. */
 typedef enum {
@@ -203,6 +212,8 @@ bool scheduler_unblock(kernel_thread_t *thread);
 bool scheduler_mutex_wake(kernel_thread_t *thread);
 /* Wake an event waiter without losing a notification before it can park. */
 bool scheduler_wake_waiter(kernel_thread_t *thread);
+scheduler_wake_result_t scheduler_wake_waiter_result(
+    kernel_thread_t *thread);
 /* Clear the event notification after its durable queue/state was consumed. */
 void scheduler_clear_event_wake(kernel_thread_t *thread);
 /* Terminates a non-current thread from a trusted kernel lifecycle path. */

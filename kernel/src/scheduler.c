@@ -1730,21 +1730,31 @@ bool scheduler_mutex_wake(kernel_thread_t *thread)
 /* Event sources publish waiter state under their own lock, then take
  * scheduler_lock here. A RUNNING waiter may not yet have called its blocking
  * primitive; publish a pending wake so it cannot park after the event. */
-bool scheduler_wake_waiter(kernel_thread_t *thread)
+scheduler_wake_result_t scheduler_wake_waiter_result(
+    kernel_thread_t *thread)
 {
     u64 flags = spin_lock_irqsave(&scheduler_lock);
-    bool result = false;
+    scheduler_wake_result_t result = SCHEDULER_WAKE_FAILED;
 
     if (thread && thread->state == THREAD_STATE_BLOCKED) {
-        result = scheduler_unblock_locked(thread);
+        if (scheduler_unblock_locked(thread))
+            result = SCHEDULER_WAKE_DELIVERED;
     } else if (thread && (thread->state == THREAD_STATE_RUNNING ||
                           thread->state == THREAD_STATE_READY)) {
         __atomic_store_n(&thread->event_wake_pending, true,
                          __ATOMIC_RELEASE);
-        result = true;
+        result = SCHEDULER_WAKE_DELIVERED;
+    } else if (thread && thread->state == THREAD_STATE_TERMINATED) {
+        result = SCHEDULER_WAKE_ALREADY_TERMINATED;
     }
     spin_unlock_irqrestore(&scheduler_lock, flags);
     return result;
+}
+
+bool scheduler_wake_waiter(kernel_thread_t *thread)
+{
+    return scheduler_wake_waiter_result(thread) ==
+        SCHEDULER_WAKE_DELIVERED;
 }
 
 void scheduler_clear_event_wake(kernel_thread_t *thread)

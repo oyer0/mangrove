@@ -41,6 +41,8 @@ typedef uintptr_t usize;
 enum { PROCESS_STATE_ACTIVE, PROCESS_STATE_EXITING, PROCESS_STATE_TERMINATED };
 enum { THREAD_STATE_RUNNING, THREAD_STATE_READY, THREAD_STATE_BLOCKED,
        THREAD_STATE_TERMINATED };
+typedef enum { SCHEDULER_WAKE_FAILED=0, SCHEDULER_WAKE_DELIVERED,
+               SCHEDULER_WAKE_ALREADY_TERMINATED } scheduler_wake_result_t;
 enum { THREAD_PROCESS_UNATTACHED, THREAD_PROCESS_ATTACHED,
        THREAD_PROCESS_EXIT_REQUESTED, THREAD_PROCESS_HANDOFF_COMPLETE };
 enum { THREAD_PRIORITY_HIGH, THREAD_PRIORITY_NORMAL,
@@ -84,6 +86,7 @@ typedef struct process_thread_record {
     process_t *process;
     kernel_thread_t *execution;
     kernel_thread_t *join_waiter;
+    bool join_claimed, listed;
     bool completed, kernel_stack_released;
 } process_thread_record_t;
 struct process {
@@ -299,7 +302,8 @@ for name in ('scheduler_thread_exit_complete',
              'scheduler_thread_handoff_callback_valid',
              'scheduler_thread_state_snapshot',
              'scheduler_unblock_locked',
-             'scheduler_wake_waiter', 'scheduler_consume_pending_wake_locked',
+             'scheduler_wake_waiter_result', 'scheduler_wake_waiter',
+             'scheduler_consume_pending_wake_locked',
              'scheduler_block', 'scheduler_terminate'):
     item = function(scheduler, name)
     if name == 'scheduler_thread_exit_complete':
@@ -308,9 +312,13 @@ for name in ('scheduler_thread_exit_complete',
     if name == 'scheduler_unblock_locked':
         item = item.replace('static bool scheduler_unblock_locked(',
                             'static bool scheduler_unblock_locked(', 1)
-    if name in ('scheduler_wake_waiter', 'scheduler_block',
+    if name in ('scheduler_wake_waiter_result', 'scheduler_wake_waiter',
+                'scheduler_block',
                 'scheduler_terminate'):
-        item = item.replace('bool ' + name + '(', 'static bool ' + name + '(', 1)
+        return_type = ('scheduler_wake_result_t' if
+                       name == 'scheduler_wake_waiter_result' else 'bool')
+        item = item.replace(return_type + ' ' + name + '(',
+                            'static ' + return_type + ' ' + name + '(', 1)
     code += item
 for name in ('object_reference', 'object_release'):
     item = function(objects, name)
@@ -323,6 +331,7 @@ for name in ('object_reference', 'object_release'):
     code += item
 for name in ('process_storage_authorization_clear_locked',
              'process_thread_list_complete_locked',
+             'process_thread_member_locked',
              'process_thread_list_read_acquire_locked',
              'process_thread_list_read_release',
              'process_waiter_wake_release',

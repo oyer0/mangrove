@@ -70,6 +70,15 @@ custom size in this API. Creation passes its argument pointer unchanged; the
 caller must keep the referenced object valid until the worker has finished
 using it. Thread return values are 64-bit process-local completion results.
 
+Join registration, cancellation, result consumption, and completion wake
+publication are serialized by the process registry lock. The scheduler wake is
+published before completion releases that lock, so a canceled join cannot
+receive a stale event during a later wait. A process-owned joiner that has
+already terminated is treated as a canceled registration; completion and its
+result remain available to a later join. Invalid waiter ownership and a wake
+failure for a live waiter remain kernel errors. The completion wake is only a
+notification: join rechecks the retained result predicate before returning.
+
 Process-owned handles, mappings, IPC state, CWD, and terminal/session state
 are released only after admitted syscalls have unwound and every owned thread,
 including the initiating thread, has completed its scheduler/CR3 handoff. The

@@ -53,6 +53,8 @@ typedef int32_t i32;
 typedef u32 process_handle_t;
 enum {THREAD_STATE_RUNNING, THREAD_STATE_READY, THREAD_STATE_BLOCKED,
       THREAD_STATE_TERMINATED};
+typedef enum {SCHEDULER_WAKE_FAILED=0, SCHEDULER_WAKE_DELIVERED,
+               SCHEDULER_WAKE_ALREADY_TERMINATED} scheduler_wake_result_t;
 typedef int thread_state_t;
 enum {PROCESS_STATE_ACTIVE, PROCESS_STATE_EXITING, PROCESS_STATE_TERMINATED};
 enum {THREAD_PROCESS_UNATTACHED, THREAD_PROCESS_ATTACHED,
@@ -73,7 +75,7 @@ typedef struct {bool active;} kernel_stack_t;
 typedef struct {process_t *process; u32 references;} kernel_object_t;
 typedef struct process_thread_record {
  process_t *process; kernel_thread_t *execution, *join_waiter;
- bool completed, kernel_stack_released;
+ bool completed, kernel_stack_released, join_claimed, listed;
 } process_thread_record_t;
 struct process {int state; kernel_thread_t *main_thread, *threads;
  u32 thread_count, live_thread_count, active_syscalls;
@@ -195,6 +197,13 @@ static void process_cleanup_exit_resources(process_t *process);
 static void console_cancel_waiter(kernel_thread_t *thread) {(void)thread;}
 static bool scheduler_wake_waiter(kernel_thread_t *thread)
 {(void)thread; return true;}
+static scheduler_wake_result_t scheduler_wake_waiter_result(
+    kernel_thread_t *thread)
+{if(!thread)return SCHEDULER_WAKE_FAILED;
+ if(thread->state==THREAD_STATE_TERMINATED)
+  return SCHEDULER_WAKE_ALREADY_TERMINATED;
+ return scheduler_wake_waiter(thread)?SCHEDULER_WAKE_DELIVERED:
+        SCHEDULER_WAKE_FAILED;}
 static void process_worker_reclaim_pending(process_t *process)
 {assert(process && !process_registry_lock); worker_reap_calls++;}
 static void process_cleanup_worker_wake(process_t *process)
@@ -213,6 +222,7 @@ scheduler_functions = "".join(function(path, name) for path, name in (
     ("kernel/src/scheduler.c", "thread_destroy"),
     ("kernel/src/process.c", "process_thread_register_locked"),
     ("kernel/src/process.c", "process_thread_list_complete_locked"),
+    ("kernel/src/process.c", "process_thread_member_locked"),
     ("kernel/src/process.c", "process_thread_list_read_acquire_locked"),
     ("kernel/src/process.c", "process_thread_list_read_release"),
     ("kernel/src/scheduler.c", "scheduler_thread_state_snapshot"),

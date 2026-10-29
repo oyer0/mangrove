@@ -4,6 +4,7 @@
 from pathlib import Path
 import os
 import re
+import resource
 import subprocess
 import sys
 import tempfile
@@ -29,6 +30,7 @@ def function(path, name):
 
 prefix = r'''
 #include <assert.h>
+#include <errno.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -65,6 +67,8 @@ typedef enum { THREAD_PROCESS_UNATTACHED, THREAD_PROCESS_ATTACHED,
                THREAD_PROCESS_HANDOFF_COMPLETE } thread_process_state_t;
 typedef enum { THREAD_STATE_READY, THREAD_STATE_RUNNING,
                THREAD_STATE_BLOCKED, THREAD_STATE_TERMINATED } thread_state_t;
+typedef enum { SCHEDULER_WAKE_FAILED=0, SCHEDULER_WAKE_DELIVERED,
+               SCHEDULER_WAKE_ALREADY_TERMINATED } scheduler_wake_result_t;
 typedef enum { OBJECT_TYPE_INVALID, OBJECT_TYPE_PROCESS, OBJECT_TYPE_THREAD }
     kernel_object_type_t;
 enum { MG_OK=0, MG_ERR_INVALID_HANDLE=-3, MG_ERR_BAD_ARGUMENT=-4,
@@ -160,6 +164,7 @@ struct process {
     mutex_t handle_growth_mutex,memory_lock;
 };
 static spinlock_t process_registry_lock=PTHREAD_MUTEX_INITIALIZER;
+static spinlock_t scheduler_lock=PTHREAD_MUTEX_INITIALIZER;
 static _Thread_local kernel_thread_t *local_thread;
 static pthread_mutex_t event_lock=PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t event_changed=PTHREAD_COND_INITIALIZER;
@@ -168,8 +173,11 @@ static bool reap_race_armed,reap_race_paused,reap_race_done;
 static bool lost_race_armed,lost_race_paused,lost_race_done;
 static bool create_reap_after_publish;
 static process_handle_t last_reserved_handle;
-static kernel_thread_t *wake_pause_thread;
-static bool wake_pause_armed,wake_pause_entered,wake_pause_release;
+static bool scheduler_enqueue_failure;
+static bool wake_delivery_pause_armed,wake_delivery_paused;
+static bool wake_delivery_resume;
+static kernel_thread_t *registry_attempt_watch;
+static bool registry_attempt_seen;
 static usize allocation_count,fail_allocation_at;
 static unsigned created_threads,destroyed_threads,stack_releases;
 static unsigned region_releases,handle_cancels;
@@ -188,6 +196,10 @@ static process_t *test_process;
 void mutex_init(mutex_t *);
 bool mutex_lock(mutex_t *);
 bool mutex_unlock(mutex_t *);
+static scheduler_wake_result_t scheduler_wake_waiter_result(
+    kernel_thread_t *);
+static bool scheduler_unblock_locked(kernel_thread_t *);
+static bool scheduler_consume_pending_wake_locked(kernel_thread_t *,bool);
 static process_region_release_result_t process_user_region_release(
     process_t*,process_user_region_t*);
 static bool process_user_region_set_worker_owned(process_t*,
@@ -198,15 +210,28 @@ static void process_worker_exit(struct kernel_thread*,u64);
 static void process_scheduler_handoff_complete(struct kernel_thread*);
 static void worker_complete(process_thread_record_t*,u64);
 static void test_after_created_handle_is_visible(void);
-static bool process_finish_termination(process_t*);
 static void process_user_thread_entry(void *argument){(void)argument;}
 static void panic(const char *message)
 {fprintf(stderr,"unexpected panic: %s\n",message);abort();}
 
 static u64 spin_lock_irqsave(spinlock_t *lock)
-{ assert(pthread_mutex_lock(lock)==0); return 0; }
+{ if(lock==&process_registry_lock&&registry_attempt_watch&&
+      local_thread==registry_attempt_watch){
+    pthread_mutex_lock(&event_lock);registry_attempt_seen=true;
+    pthread_cond_broadcast(&event_changed);pthread_mutex_unlock(&event_lock);
+  }
+  assert(pthread_mutex_lock(lock)==0); return 0; }
 static void spin_unlock_irqrestore(spinlock_t *lock,u64 flags)
 { (void)flags; assert(pthread_mutex_unlock(lock)==0);
+  if(lock==&scheduler_lock){
+   pthread_mutex_lock(&event_lock);pthread_cond_broadcast(&event_changed);
+   if(wake_delivery_pause_armed){wake_delivery_pause_armed=false;
+    wake_delivery_paused=true;pthread_cond_broadcast(&event_changed);
+    while(!wake_delivery_resume)
+     pthread_cond_wait(&event_changed,&event_lock);
+   }
+   pthread_mutex_unlock(&event_lock);
+  }
   if(lock==&process_registry_lock&&reap_race_armed&&test_process&&
      test_process->thread_records){
    process_thread_record_t*r=test_process->thread_records;
@@ -329,18 +354,12 @@ static kernel_thread_t *process_publish_terminated_locked(process_t*p,
 static void process_waiter_wake_release(process_t*p,kernel_thread_t*t)
 {(void)p;(void)t;}
 static bool process_cleanup_exit_resources(process_t*p){(void)p;return true;}
-static bool process_finish_termination(process_t*p){(void)p;return true;}
-static void process_cleanup_worker_wake(process_t*p){assert(p);}
+static bool scheduler_unblock_locked(kernel_thread_t*t)
+{if(!t||t->state!=THREAD_STATE_BLOCKED||t->queued||
+    scheduler_enqueue_failure)return false;
+ t->state=THREAD_STATE_READY;t->queued=true;t->sleeping=false;return true;}
 static bool scheduler_wake_waiter(kernel_thread_t*t)
-{if(!t)return false;
- if(wake_pause_armed&&t==wake_pause_thread){wake_pause_armed=false;
-  pthread_mutex_lock(&event_lock);wake_pause_entered=true;
-  pthread_cond_broadcast(&event_changed);
-  while(!wake_pause_release)pthread_cond_wait(&event_changed,&event_lock);
-  pthread_mutex_unlock(&event_lock);}
- pthread_mutex_lock(&event_lock);
- __atomic_store_n(&t->event_wake_pending,true,__ATOMIC_RELEASE);
- pthread_cond_broadcast(&event_changed);pthread_mutex_unlock(&event_lock);return true;}
+{return scheduler_wake_waiter_result(t)==SCHEDULER_WAKE_DELIVERED;}
 static bool scheduler_mutex_wake(kernel_thread_t*t)
 {if(!t)return false;
  __atomic_store_n(&t->mutex_wake_pending,true,__ATOMIC_RELEASE);
@@ -430,6 +449,7 @@ names = (
     ("kernel/src/process.c", "process_handle_revision_advance"),
     ("kernel/src/process.c", "process_thread_register_locked"),
     ("kernel/src/process.c", "process_thread_list_complete_locked"),
+    ("kernel/src/process.c", "process_thread_member_locked"),
     ("kernel/src/process.c", "process_thread_record_destroy"),
     ("kernel/src/process.c", "process_snapshot_reap_flags_locked"),
     ("kernel/src/process.c", "process_user_region_release"),
@@ -442,8 +462,6 @@ names = (
     ("kernel/src/process.c", "process_worker_exit"),
     ("kernel/src/process.c", "process_detach_thread_owned"),
     ("kernel/src/process.c", "process_detach_thread"),
-    ("kernel/src/process.c", "process_thread_list_read_acquire_locked"),
-    ("kernel/src/process.c", "process_thread_list_read_release"),
     ("kernel/src/process.c", "process_scheduler_handoff_complete_internal"),
     ("kernel/src/process.c", "process_scheduler_handoff_complete"),
     ("kernel/src/process.c", "process_worker_reap_needed_locked"),
@@ -457,6 +475,8 @@ names = (
     ("kernel/src/process.c", "process_thread_join"),
     ("kernel/src/process.c", "process_thread_detach"),
     ("kernel/src/process.c", "process_handle_close"),
+    ("kernel/src/scheduler.c", "scheduler_wake_waiter_result"),
+    ("kernel/src/scheduler.c", "scheduler_consume_pending_wake_locked"),
 )
 
 suffix = r'''
@@ -479,6 +499,10 @@ static void worker_complete(process_thread_record_t*r,u64 value)
 {kernel_thread_t*t=r->execution;process_worker_exit(t,value);
  t->state=THREAD_STATE_TERMINATED;t->running_cpu=THREAD_CPU_NONE;
  process_scheduler_handoff_complete(t);}
+static bool fixture_sleep_consumes_event(kernel_thread_t *thread)
+{u64 flags=spin_lock_irqsave(&scheduler_lock);
+ bool consumed=scheduler_consume_pending_wake_locked(thread,false);
+ spin_unlock_irqrestore(&scheduler_lock,flags);return consumed;}
 static void clear(process_t*p)
 {assert(!p->threads||p->threads==p->main_thread);
  free(p->handle_table);
@@ -528,9 +552,52 @@ static void test_after_created_handle_is_visible(void)
  worker_complete(record,0x9911U);
  process_worker_reclaim_pending(test_process);
 }
-int main(void)
+static void run_wake_failure_case(const char *mode)
+{
+ process_t p;kernel_thread_t main_thread;mg_thread_created_t target;
+ process_thread_record_t *target_record;
+ init(&p,&main_thread);
+ assert(process_thread_create(&p,0x400100,0x51,&target.handle,&target.id)==MG_OK);
+ target_record=p.thread_records;
+ if(!strcmp(mode,"--bad-join-pair")){
+  target_record->join_claimed=true;
+ }else if(!strcmp(mode,"--bad-join-owner")){
+  static kernel_thread_t foreign;
+  memset(&foreign,0,sizeof(foreign));foreign.state=THREAD_STATE_READY;
+  target_record->join_claimed=true;target_record->join_waiter=&foreign;
+ }else if(!strcmp(mode,"--missing-join-member")){
+  static kernel_thread_t foreign;
+  memset(&foreign,0,sizeof(foreign));foreign.state=THREAD_STATE_READY;
+  foreign.process=&p;foreign.process_reference_held=true;
+  foreign.process_state=THREAD_PROCESS_ATTACHED;
+  target_record->join_claimed=true;target_record->join_waiter=&foreign;
+ }else if(!strcmp(mode,"--live-wake-failure")){
+  mg_thread_created_t waiter;
+  assert(process_thread_create(&p,0x400100,0x52,&waiter.handle,
+                               &waiter.id)==MG_OK);
+  kernel_thread_t *waiter_thread=p.thread_records->execution;
+  target_record=p.thread_records->next;
+  assert(target_record&&target_record->execution);
+  target_record->join_claimed=true;
+  target_record->join_waiter=waiter_thread;
+  waiter_thread->state=THREAD_STATE_BLOCKED;
+  waiter_thread->queued=false;
+  scheduler_enqueue_failure=true;
+ }else{
+  panic("unknown negative-control mode");
+ }
+ worker_complete(target_record,0x5151U);
+ panic("expected join wake validation failure did not occur");
+}
+
+int main(int argc,char **argv)
 {
  process_t p;kernel_thread_t main_thread;mg_thread_created_t made;
+ if(argc==2){
+  mutex_init(&vmm_operation_mutex);
+  run_wake_failure_case(argv[1]);
+  return 0;
+ }
  u64 result=0;mutex_init(&vmm_operation_mutex);init(&p,&main_thread);
  assert(process_snapshot_reap_flags_locked(&p)==0);
  p.worker_reap_pending=true;p.user_region_reap_pending=true;
@@ -543,6 +610,28 @@ int main(void)
  fixture_eflags=1ULL<<9;
  assert(process_worker_reclaim_context_valid()&&fixture_eflags==(1ULL<<9));
  assert(process_current_thread_id()==1);
+ kernel_thread_t wake_case={0};
+ wake_case.state=THREAD_STATE_RUNNING;
+ assert(scheduler_wake_waiter_result(&wake_case)==SCHEDULER_WAKE_DELIVERED&&
+        wake_case.event_wake_pending);
+ scheduler_clear_event_wake(&wake_case);
+ wake_case.state=THREAD_STATE_READY;
+ assert(scheduler_wake_waiter_result(&wake_case)==SCHEDULER_WAKE_DELIVERED&&
+        wake_case.event_wake_pending);
+ scheduler_clear_event_wake(&wake_case);
+ wake_case.state=THREAD_STATE_BLOCKED;
+ wake_case.queued=false;scheduler_enqueue_failure=false;
+ assert(scheduler_wake_waiter_result(&wake_case)==SCHEDULER_WAKE_DELIVERED&&
+        wake_case.state==THREAD_STATE_READY&&wake_case.queued);
+ wake_case.state=THREAD_STATE_BLOCKED;wake_case.queued=false;
+ scheduler_enqueue_failure=true;
+ assert(scheduler_wake_waiter_result(&wake_case)==SCHEDULER_WAKE_FAILED&&
+        wake_case.state==THREAD_STATE_BLOCKED&&!wake_case.queued);
+ scheduler_enqueue_failure=false;
+ wake_case.state=THREAD_STATE_TERMINATED;
+ assert(scheduler_wake_waiter_result(&wake_case)==
+        SCHEDULER_WAKE_ALREADY_TERMINATED);
+ assert(scheduler_wake_waiter_result(NULL)==SCHEDULER_WAKE_FAILED);
  process_user_region_t missing_region={0};
  assert(process_user_region_release(&p,&missing_region)==
         PROCESS_REGION_RELEASE_INVALID);
@@ -760,10 +849,10 @@ int main(void)
  process_worker_reclaim_pending(&p);
  assert(!p.thread_records&&p.thread_count==1);
 
- /* A distinct detached worker joins another worker. Pause the completion
-  * wake after publication, interrupt the joiner, and finish/reap it while the
-  * completion path still holds the process-list reader pin. The delayed wake
-  * must finish before that pin permits the scheduler object to be reclaimed. */
+ /* A distinct detached worker joins another worker. Pause after the
+  * production scheduler has published the completion wake but before its
+  * return to the registry-locked completion callback. The joiner can run, but
+  * cannot cancel or consume the registration until wake publication ends. */
  process_handle_t target_handle;
  assert(process_thread_create(&p,0x400100,0x21,&target_handle,&made.id)==MG_OK);
  process_thread_record_t *target_record=p.thread_records;
@@ -782,30 +871,80 @@ int main(void)
  while(!block_entered)pthread_cond_wait(&event_changed,&event_lock);
  block_entered=false;
  pthread_mutex_unlock(&event_lock);
- wake_pause_thread=joining_thread;wake_pause_armed=true;
- wake_pause_entered=false;wake_pause_release=false;
+ wake_delivery_pause_armed=true;wake_delivery_paused=false;
+ wake_delivery_resume=false;registry_attempt_watch=joining_thread;
+ registry_attempt_seen=false;
  assert(pthread_create(&tb,NULL,complete_host,target_record)==0);
  pthread_mutex_lock(&event_lock);
- while(!wake_pause_entered)pthread_cond_wait(&event_changed,&event_lock);
+ while(!wake_delivery_paused)pthread_cond_wait(&event_changed,&event_lock);
  pthread_mutex_unlock(&event_lock);
- assert(p.thread_list_readers==1&&target_record->completed&&
+ assert(target_record->completed&&
         target_record->join_waiter==joining_thread);
- __atomic_store_n(&joining_thread->process_exit_requested,true,
-                  __ATOMIC_RELEASE);
- assert(scheduler_wake_waiter(joining_thread));
- assert(pthread_join(ta,NULL)==0&&detached_join.status==MG_ERR_SHUTDOWN);
- assert(!target_record->join_claimed&&!target_record->join_waiter);
+ pthread_mutex_lock(&event_lock);
+ while(!registry_attempt_seen)pthread_cond_wait(&event_changed,&event_lock);
+ pthread_mutex_unlock(&event_lock);
+ assert(pthread_mutex_trylock(&process_registry_lock)==EBUSY);
+ assert(detached_join.status==0&&target_record->join_claimed&&
+        target_record->join_waiter==joining_thread);
+ pthread_mutex_lock(&event_lock);wake_delivery_resume=true;
+ pthread_cond_broadcast(&event_changed);pthread_mutex_unlock(&event_lock);
+ assert(pthread_join(tb,NULL)==0);
+ assert(pthread_join(ta,NULL)==0&&detached_join.status==MG_OK&&
+        detached_join.result==0x7788U);
+ registry_attempt_watch=NULL;
+ assert(!target_record->join_claimed&&!target_record->join_waiter&&
+        target_record->joined&&!joining_thread->event_wake_pending);
  worker_complete(joining_record,0x2233U);
  process_worker_reclaim_pending(&p);
- assert(joining_record->listed&&joining_record->execution==joining_thread&&
-        joining_record->detached&&p.thread_list_readers==1);
- pthread_mutex_lock(&event_lock);wake_pause_release=true;
- pthread_cond_broadcast(&event_changed);pthread_mutex_unlock(&event_lock);
- assert(pthread_join(tb,NULL)==0&&p.thread_list_readers==0);
- assert(p.thread_records==target_record&&target_record->listed&&
-        !joining_record->listed&&p.thread_count==1);
- object_release(&joining_record->object);
- assert(process_thread_detach(&p,target_handle)==MG_OK);
+ assert(!p.thread_records&&p.thread_count==1);
+
+ /* A waiter that is already a terminated, still process-owned descriptor is
+  * a canceled registration. Completion retains the result and makes it
+  * available to the initial thread; it does not make the waiter runnable. */
+ assert(process_thread_create(&p,0x400100,0x31,&target_handle,&made.id)==MG_OK);
+ target_record=p.thread_records;
+ assert(process_thread_create(&p,0x400100,0x32,&joining_handle,&made.id)==MG_OK);
+ joining_record=p.thread_records;joining_thread=joining_record->execution;
+ assert(process_thread_detach(&p,joining_handle)==MG_OK);
+ u64 join_flags=spin_lock_irqsave(&process_registry_lock);
+ target_record->join_claimed=true;target_record->join_waiter=joining_thread;
+ spin_unlock_irqrestore(&process_registry_lock,join_flags);
+ worker_complete(joining_record,0x3232U);
+ assert(joining_thread->state==THREAD_STATE_TERMINATED&&
+        joining_thread->process_state==THREAD_PROCESS_HANDOFF_COMPLETE);
+ worker_complete(target_record,0x31U);
+ assert(target_record->completed&&!target_record->join_claimed&&
+        !target_record->join_waiter);
+ assert(process_thread_join(&p,target_handle,&result)==MG_OK&&result==0x31U);
+ process_worker_reclaim_pending(&p);
+ assert(!p.thread_records&&p.thread_count==1);
+
+ /* Cancellation clears the registration and event latch before the same
+  * thread starts a later timed sleep. Delayed target completion has no waiter
+  * pointer to wake, so it cannot consume or shorten that sleep. */
+ assert(process_thread_create(&p,0x400100,0x41,&made.handle,&made.id)==MG_OK);
+ r=p.thread_records;
+ join_call_t canceled_join={.p=&p,.h=made.handle,
+                             .caller=&main_thread,.status=1};
+ block_entered=false;
+ assert(pthread_create(&ta,NULL,join_host,&canceled_join)==0);
+ pthread_mutex_lock(&event_lock);
+ while(!block_entered)pthread_cond_wait(&event_changed,&event_lock);
+ block_entered=false;
+ pthread_mutex_unlock(&event_lock);
+ __atomic_store_n(&interrupt_pending,true,__ATOMIC_RELEASE);
+ assert(scheduler_wake_waiter(&main_thread));
+ assert(pthread_join(ta,NULL)==0&&
+        canceled_join.status==MG_ERR_INTERRUPTED);
+ assert(!r->join_claimed&&!r->join_waiter&&
+        !main_thread.event_wake_pending);
+ main_thread.state=THREAD_STATE_BLOCKED;main_thread.sleeping=true;
+ worker_complete(r,0x41U);
+ assert(main_thread.state==THREAD_STATE_BLOCKED&&main_thread.sleeping&&
+        !main_thread.event_wake_pending&&
+        !fixture_sleep_consumes_event(&main_thread));
+ main_thread.state=THREAD_STATE_RUNNING;main_thread.sleeping=false;
+ assert(process_thread_join(&p,made.handle,&result)==MG_OK&&result==0x41U);
  process_worker_reclaim_pending(&p);
  assert(!p.thread_records&&p.thread_count==1);
 
@@ -896,7 +1035,7 @@ int main(void)
         !p.user_regions);
  clear(&p);
  pthread_mutex_destroy(&vmm_operation_mutex.state_lock);
- puts("thread API: transactional creation, single join, detach, handoff- and lease-deferred stack/TLS reap, and exit admission passed");
+ puts("thread API: transactional creation, serialized join completion/cancellation, wake outcomes, detach, handoff- and lease-deferred stack/TLS reap, and exit admission passed");
  return 0;
 }
 '''
@@ -934,4 +1073,22 @@ with tempfile.TemporaryDirectory(prefix="mangrove-thread-api-") as directory:
                     "-o", str(binary)], check=True)
     env = os.environ.copy()
     env["ASAN_OPTIONS"] = "detect_leaks=0"
-    subprocess.run([str(binary)], check=True, env=env)
+    subprocess.run([str(binary)], check=True, env=env, cwd=directory)
+
+    def disable_core_dumps():
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+
+    for mode, expected in (
+        ("--bad-join-pair", "inconsistent worker join registration"),
+        ("--bad-join-owner", "worker joiner lost process ownership"),
+        ("--missing-join-member", "worker joiner lost process ownership"),
+        ("--live-wake-failure", "failed to wake completed worker joiner"),
+    ):
+        failure = subprocess.run([str(binary), mode], env=env, cwd=directory,
+                                 capture_output=True, text=True,
+                                 preexec_fn=disable_core_dumps)
+        if failure.returncode == 0 or expected not in failure.stderr:
+            raise AssertionError(
+                f"{mode} did not fail at {expected!r}: "
+                f"status={failure.returncode}, stderr={failure.stderr!r}")
+        print(f"negative control {mode}: rejected ({failure.returncode})")
