@@ -42,7 +42,7 @@ enum {KERNEL_STACK_USAGE_BOOTSTRAP};
 #define THREAD_CPU_NONE ((u32)-1)
 typedef struct {bool active;} kernel_stack_t;
 typedef struct {unsigned references;} kernel_object_t;
-typedef struct process {kernel_object_t object;unsigned handoffs;} process_t;
+typedef struct process {kernel_object_t object;unsigned handoffs,post_wakes;} process_t;
 typedef struct kernel_thread {
  struct kernel_thread *next; uintptr_t saved_stack_pointer;
  unsigned state,running_cpu,effective_priority,base_priority,last_selected_priority,ready_wait_ticks;
@@ -54,8 +54,7 @@ typedef struct kernel_thread {
  unsigned fpu_state;
  uintptr_t user_fs_base;
 } kernel_thread_t;
-typedef struct {kernel_thread_t *scheduler_idle_thread;
- process_t *scheduler_post_handoff_process;} cpu_local_t;
+typedef struct {kernel_thread_t *scheduler_idle_thread;} cpu_local_t;
 static cpu_local_t cpu; static kernel_thread_t bootstrap_thread, *current_thread, *idle_thread;
 typedef struct {kernel_thread_t *head;} thread_ready_queue_t;
 static thread_ready_queue_t ready_queues[3];
@@ -63,6 +62,8 @@ static struct {unsigned dispatches[3];} scheduler_stats;
 static unsigned scheduler_lock, scheduler_context_switch_in_progress;
 static unsigned sampled_kernel_stacks;
 static uintptr_t fake_fs_base;
+process_t *scheduler_context_switch_complete(uintptr_t *);
+void scheduler_context_switch_post_complete(process_t *);
 static u64 rdmsr(u32 msr){assert(msr==MSR_IA32_FS_BASE);return fake_fs_base;}
 static void wrmsr(u32 msr,u64 value)
 {assert(msr==MSR_IA32_FS_BASE);fake_fs_base=(uintptr_t)value;}
@@ -75,9 +76,16 @@ static void spin_unlock_irqrestore(unsigned *p,u64 f){(void)f;assert(*p);*p=0;}
 static void panic(const char *s){puts(s);abort();}
 static bool object_reference(kernel_object_t *object)
 {if(!object||object->references==~0U)return false;object->references++;return true;}
-static void process_scheduler_handoff_complete(kernel_thread_t *thread)
+static bool process_scheduler_context_handoff_complete(kernel_thread_t *thread)
 {assert(thread && thread->process && !scheduler_lock &&
-        !scheduler_context_switch_in_progress);thread->process->handoffs++;}
+        !scheduler_context_switch_in_progress && thread->context_switch_pending &&
+        thread->state==THREAD_STATE_TERMINATED &&
+        thread->running_cpu==THREAD_CPU_NONE);
+ thread->process->handoffs++;return true;}
+static void process_scheduler_post_handoff(process_t *process)
+{assert(process && !scheduler_lock);process->post_wakes++;}
+static void object_release(kernel_object_t *object)
+{assert(object && object->references);object->references--;}
 static cpu_local_t *scheduler_cpu_local(void){return &cpu;}
 static void fpu_state_save(unsigned *s){(void)s;}
 static void fpu_state_restore(unsigned *s){(void)s;}
@@ -105,7 +113,7 @@ int main(void){
  assert(scheduler_select_next_locked()==NULL);
  assert(outgoing.running_cpu==0 && !outgoing.queued && outgoing.context_switch_pending);
  assert(scheduler_context_switch_in_progress==1 && !incoming.saved_context_valid);
- scheduler_context_switch_complete(&outgoing.saved_stack_pointer);
+ assert(scheduler_context_switch_complete(&outgoing.saved_stack_pointer)==NULL);
  assert(fake_fs_base==incoming.user_fs_base);
  assert(!outgoing.context_switch_pending && outgoing.running_cpu==THREAD_CPU_NONE);
  assert(scheduler_context_switch_in_progress==0);
@@ -115,19 +123,39 @@ int main(void){
  outgoing.context_switch_pending=true;outgoing.saved_context_valid=true;
  scheduler_enqueue_locked(&outgoing);
  assert(scheduler_select_next_locked()==NULL);
- scheduler_context_switch_complete(&outgoing.saved_stack_pointer);
+ assert(scheduler_context_switch_complete(&outgoing.saved_stack_pointer)==NULL);
  assert(scheduler_select_next_locked()==&outgoing);
  /* Completion releases blocked/terminated stacks without scheduling them. */
  for(unsigned state=THREAD_STATE_BLOCKED;state<=THREAD_STATE_TERMINATED;state++){
   outgoing.state=state;outgoing.running_cpu=0;outgoing.context_switch_pending=true;
-  scheduler_context_switch_complete(&outgoing.saved_stack_pointer);
+  process_t *handoff=scheduler_context_switch_complete(&outgoing.saved_stack_pointer);
+  if(handoff)scheduler_context_switch_post_complete(handoff);
   assert(!outgoing.queued && outgoing.running_cpu==THREAD_CPU_NONE && !outgoing.context_switch_pending);
  }
- /* Terminating any process-owned thread stages its process for post-RFLAGS
-  * cleanup, even when it is the initial thread rather than a worker. */
- assert(cpu.scheduler_post_handoff_process==&process &&
-        process.object.references==1);
- assert(process.handoffs==1);
+ /* Process accounting runs while the descriptor barrier is held; the
+  * returned process reference is released by its stack-local post hook. */
+ assert(process.object.references==0 && process.handoffs==1 &&
+        process.post_wakes==1);
+ /* Model an interrupt after IF restoration but before the first post hook:
+  * both process references remain independently owned by their stack frames. */
+ process_t second_process={0};
+ kernel_thread_t second={.state=THREAD_STATE_TERMINATED,.running_cpu=0,
+   .context_switch_pending=true,.saved_stack_pointer=0x2500,
+   .process=&second_process};
+ outgoing.state=THREAD_STATE_TERMINATED;outgoing.running_cpu=0;
+ outgoing.context_switch_pending=true;
+ process_t *first_handoff=scheduler_context_switch_complete(
+     &outgoing.saved_stack_pointer);
+ assert(first_handoff==&process);
+ process_t *second_handoff=scheduler_context_switch_complete(
+     &second.saved_stack_pointer);
+ assert(second_handoff==&second_process && process.object.references==1 &&
+        second_process.object.references==1 && outgoing.context_switch_pending==false &&
+        second.context_switch_pending==false);
+ scheduler_context_switch_post_complete(second_handoff);
+ scheduler_context_switch_post_complete(first_handoff);
+ assert(second_process.handoffs==1 &&
+        second_process.post_wakes==1 && second_process.object.references==0);
  kernel_thread_t guarded={.state=THREAD_STATE_READY,.running_cpu=0,
    .saved_stack_pointer=0x3000,.kernel_stack={.active=true}};
  incoming.saved_stack_pointer=0x3000;current_thread=&incoming;
@@ -139,7 +167,26 @@ int main(void){
 '''
 with tempfile.TemporaryDirectory(prefix='mangrove-scheduler-') as d:
     c = Path(d) / 'test.c'
-    c.write_text(pre + ''.join(function(n) for n in ('thread_context_ready', 'scheduler_context_switch_saved', 'scheduler_context_switch_complete', 'scheduler_select_next_locked')) + post)
+    c.write_text(pre + ''.join(function(n) for n in ('thread_context_ready', 'scheduler_context_switch_saved', 'scheduler_context_switch_complete', 'scheduler_context_switch_post_complete', 'scheduler_select_next_locked')) + post)
     exe = Path(d) / 'test'
     subprocess.run(['cc', '-std=c11', '-Wall', '-Wextra', '-Werror', '-fsanitize=address,undefined', str(c), '-o', str(exe)], check=True)
     subprocess.run([str(exe)], check=True)
+
+assembly = (ROOT / 'kernel/src/context_switch.s').read_text()
+switch = assembly.split('thread_context_switch:', 1)[1].split(
+    '/* Enter a prepared thread context', 1)[0]
+complete = switch.index('call scheduler_context_switch_complete')
+restore_flags = switch.index('    popfq', complete)
+post_call = switch.index('call scheduler_context_switch_post_complete',
+                         restore_flags)
+post_frame = switch[restore_flags:post_call]
+saved_sequence = ('    pushq %rax', '    pushq %rdi', '    pushq %rsi',
+                 '    pushq %rdx', '    pushq %rcx', '    pushq %r8',
+                 '    pushq %r9', '    pushq %r10', '    pushq %r11',
+                 '    pushfq', '    subq $8, %rsp', '    movq %rax, %rdi')
+positions = [post_frame.index(instruction) for instruction in saved_sequence]
+assert positions == sorted(positions)
+assert 'scheduler_post_handoff_process' not in (
+    (ROOT / 'kernel/include/cpu.h').read_text() +
+    (ROOT / 'kernel/src/scheduler.c').read_text())
+print('scheduler handoff assembly: restored-IF window owns process reference on incoming stack')

@@ -217,6 +217,9 @@ bool scheduler_thread_is_running(const kernel_thread_t *thread);
 /* True only after self/external termination and the final stack handoff.
  * A merely blocked or preempted exit syscall is not reclaimable. */
 bool scheduler_thread_exit_complete(const kernel_thread_t *thread);
+/* The incoming-stack completion callback may account this terminated thread
+ * while its context_switch_pending reclamation barrier is still held. */
+bool scheduler_thread_handoff_callback_valid(const kernel_thread_t *thread);
 /* True only for a privately owned, prepared thread context that has not been
  * queued, run, or published to a process yet. The creator must keep it private
  * until process_attach_thread() succeeds and must enqueue it afterward. */
@@ -244,10 +247,13 @@ bool scheduler_prepare_idle_cpu(struct cpu_local *cpu,
                                 kernel_stack_t *stack);
 /* Enter the current CPU's idle context.  A successful call does not return. */
 bool scheduler_start_cpu(void);
-/* Assembly context-switch ownership hooks. The post hook runs after incoming
- * RFLAGS are restored and may reclaim resources using SMP TLB shootdowns. */
-void scheduler_context_switch_complete(uintptr_t *outgoing_rsp_slot);
-void scheduler_context_switch_post_complete(void);
+/* The first hook runs on the incoming stack with interrupts masked. It returns
+ * a retained process reference for the post hook, and keeps the outgoing
+ * scheduler record unreapable until its process callback has finished. The
+ * post hook is restricted to nonblocking notification and reference release. */
+struct process *scheduler_context_switch_complete(
+    uintptr_t *outgoing_rsp_slot);
+void scheduler_context_switch_post_complete(struct process *process);
 bool scheduler_prepare_preemption(struct cpu_registers *regs);
 u64 scheduler_preempt_from_trampoline(void);
 u64 scheduler_preempt_return_flags(void);

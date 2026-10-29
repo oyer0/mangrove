@@ -73,13 +73,14 @@ using it. Thread return values are 64-bit process-local completion results.
 Process-owned handles, mappings, IPC state, CWD, and terminal/session state
 are released only after admitted syscalls have unwound and every owned thread,
 including the initiating thread, has completed its scheduler/CR3 handoff. The
-handoff completion path performs shared-resource cleanup on a different live
-stack; it never frees the stack whose handoff it is acknowledging. Process
-state then becomes terminated. Wait, poll, session retirement, and shutdown
-finalize the retained thread records before releasing the process owner
-reference. The PID 1 BSP bootstrap record is scheduler-owned static state: its
-process reference is detached at final reap, while the permanent record and
-linker-backed stack are not freed. Interrupt and shutdown wake walks, and
+handoff callback only publishes completion while retaining the thread record;
+the dedicated process cleanup worker later releases shared resources on its
+own live stack. It never frees the stack whose handoff it is acknowledging.
+Process state then becomes terminated. Wait, poll, session retirement, and
+shutdown finalize the retained thread records before releasing the process
+owner reference. The PID 1 BSP bootstrap record is scheduler-owned static
+state: its process reference is detached at final reap, while the permanent
+record and linker-backed stack are not freed. Interrupt and shutdown wake walks, and
 external termination's scheduler-group walk, pin the thread-list reader count
 before dropping the registry lock. Final publication and reaping wait for
 those walks; reaping also closes reader admission before detaching records.
@@ -128,11 +129,18 @@ workers retain only a small completion record until join or process exit.
 Detached records are removed automatically after safe handoff and resource
 release. Process exit can reclaim the remaining mappings together with the
 address space after every thread and syscall has stopped.
-Process-wide resource cleanup runs after the incoming scheduler context
-restores its interrupt state. The earlier handoff callback runs with interrupts
-masked and must not perform user unmaps that can wait for remote TLB
-shootdowns.
-The scheduler keeps a process reference across this deferred cleanup.
+The scheduler handoff callback runs with interrupts masked. It accounts the
+stopped thread while its scheduler record is still protected by the pending
+handoff barrier; that barrier is released only after the callback's final
+thread-record access. The callback returns a retained process reference on the
+incoming thread's own stack. The post-switch hook only signals the process
+cleanup worker and releases that reference, so an interrupt or nested switch
+cannot overwrite a per-CPU cleanup slot. Process-wide resource cleanup runs
+on the dedicated ordinary kernel worker, outside the handoff callback, where
+mutex operations and remote TLB shootdowns can make progress. The worker scans
+the process registry for fully stopped exiting processes; its latched event
+wake closes the scan-to-park race. The scheduler callback and post hook never
+perform process resource teardown.
 
 The ELF loader accepts at most one validated nonempty `PT_TLS` segment; an
 all-zero `PT_TLS` emitted by the linker for an image without TLS sections means

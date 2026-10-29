@@ -3424,7 +3424,8 @@ test-sync: test-syscall-user-memory
 test-sync: test-process-memory-unmap
 test-sync: test-process-interrupt
 test-sync: test-process-thread-lifecycle test-process-thread-termination \
-		test-process-thread-api test-scheduler-process-cpu
+		test-process-thread-api test-scheduler-process-cpu \
+		test-scheduler-handoff-lifetime
 test-sync: test-user-context
 test-sync: test-user-tls
 
@@ -3439,7 +3440,8 @@ test-user-tls: test-libc-link $(PING)
 		"$(RUNTIME_API_LINK_OBJ)" "$(RUNTIME_API_LINK_ELF)" "$(PING)"
 
 .PHONY: test-process-thread-lifecycle test-process-thread-termination \
-	test-process-thread-api test-scheduler-process-cpu
+	test-process-thread-api test-scheduler-process-cpu \
+	test-scheduler-handoff-lifetime
 test-process-thread-lifecycle:
 	python3 tests/kernel/process_thread_lifecycle_test.py "$(HOST_CC)"
 
@@ -3451,3 +3453,6 @@ test-process-thread-api:
 
 test-scheduler-process-cpu:
 	python3 tests/kernel/scheduler_process_cpu_snapshot_test.py "$(HOST_CC)"
+
+test-scheduler-handoff-lifetime:
+	python3 tests/kernel/scheduler_handoff_lifetime_test.py "$(HOST_CC)"

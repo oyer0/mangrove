@@ -225,11 +225,16 @@ bool process_attach_thread(process_t *process, struct kernel_thread *thread);
  * The caller must hold a process reference and may destroy the thread only
  * after this succeeds. */
 bool process_detach_thread(process_t *process, struct kernel_thread *thread);
-/* Scheduler lifecycle hook, called only after the outgoing stack handoff. */
+/* Complete a stopped process-owned thread that cannot be selected again. */
 void process_scheduler_handoff_complete(struct kernel_thread *thread);
-/* Runs after the incoming interrupt state is restored. Process teardown may
- * unmap user memory and wait for remote TLB shootdowns. */
+/* Scheduler-only variant: the outgoing record remains protected by its
+ * context-switch barrier while this callback accounts completion. */
+bool process_scheduler_context_handoff_complete(struct kernel_thread *thread);
+/* Runs after the incoming interrupt state is restored. This hook only wakes
+ * the process cleanup worker; it must not perform blocking teardown. */
 void process_scheduler_post_handoff(process_t *process);
+/* Start the single process teardown worker after scheduler initialization. */
+bool process_start_cleanup_worker(void);
 /* Called when a process-owned kernel entry returns, before scheduler exit. */
 void process_thread_entry_completed(struct kernel_thread *thread,
                                     i32 status);

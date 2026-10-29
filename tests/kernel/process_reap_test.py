@@ -109,7 +109,8 @@ static unsigned user_region_metadata_releases;
 static jmp_buf panic_environment;
 static bool scheduler_thread_exit_complete(const kernel_thread_t *thread);
 static void process_scheduler_handoff_complete(kernel_thread_t *thread);
-static bool process_cleanup_exit_resources(process_t *process);
+static void process_cleanup_worker_wake(process_t *process)
+{assert(process);}
 /* This fixture covers process completion for its initial thread and does not
  * model worker-record readers; worker wake lifetime is exercised in the
  * process-thread API production-source concurrency fixture. */
@@ -151,8 +152,6 @@ static void object_release(kernel_object_t *object)
  if(!object->ref_count)all_processes=NULL;}
 static void process_unlink_locked(process_t *p)
 {assert(process_registry_lock && p==&child);p->parent=NULL;}
-static bool process_cleanup_exit_resources(process_t *process)
-{(void)process;return false;}
 static void process_scheduler_post_handoff(process_t *process);
 static bool scheduler_block(void)
 {assert(!process_registry_lock && !scheduler_lock);
@@ -216,14 +215,19 @@ if re.search(r'^bool scheduler_thread_exit_complete\(', scheduler, re.M):
     completion = function(scheduler, 'scheduler_thread_exit_complete')
     completion = completion.replace('bool scheduler_thread_exit_complete(',
                                      'static bool scheduler_thread_exit_complete(', 1)
+handoff_valid = function(scheduler, 'scheduler_thread_handoff_callback_valid')
+handoff_valid = handoff_valid.replace(
+    'bool scheduler_thread_handoff_callback_valid(',
+    'static bool scheduler_thread_handoff_callback_valid(', 1)
 running = function(scheduler, 'scheduler_thread_is_running')
 running = running.replace('bool scheduler_thread_is_running(',
                           'static __attribute__((unused)) bool scheduler_thread_is_running(', 1)
-code = prefix + completion + running
+code = prefix + completion + handoff_valid + running
 code += function(source, 'process_storage_authorization_clear_locked')
 for name in ('process_thread_list_complete_locked',
              'process_worker_records_release_all',
              'process_publish_terminated_locked',
+             'process_scheduler_handoff_complete_internal',
              'process_scheduler_handoff_complete',
              'process_scheduler_post_handoff',
              'process_detach_thread_owned', 'process_detach_thread',

@@ -177,6 +177,11 @@ static bool scheduler_thread_exit_complete(const kernel_thread_t *thread)
 {return thread && thread->state==THREAD_STATE_TERMINATED &&
  thread->running_cpu==THREAD_CPU_NONE && !thread->context_switch_pending &&
  !thread->preempt_return_rip && !thread->sleeping;}
+static bool scheduler_thread_handoff_callback_valid(
+ const kernel_thread_t *thread)
+{return thread && thread->state==THREAD_STATE_TERMINATED &&
+ thread->running_cpu==THREAD_CPU_NONE && thread->context_switch_pending &&
+ !thread->preempt_return_rip && !thread->sleeping;}
 static bool scheduler_terminate_thread_group(kernel_thread_t *head,
                                                usize expected_count);
 static bool process_finish_termination(process_t *process);
@@ -189,6 +194,8 @@ static bool scheduler_unblock(kernel_thread_t *thread)
 {(void)thread; return true;}
 static void process_worker_reclaim_pending(process_t *process)
 {assert(process && !process_registry_lock); worker_reap_calls++;}
+static void process_cleanup_worker_wake(process_t *process)
+{assert(process && !process_registry_lock);}
 static bool process_exit(process_t *process, i32 status)
 {(void)status; assert(process->state == PROCESS_STATE_ACTIVE &&
                       !process->active_syscalls);
@@ -208,6 +215,7 @@ scheduler_functions = "".join(function(path, name) for path, name in (
     ("kernel/src/process.c", "process_storage_authorization_clear_locked"),
     ("kernel/src/process.c", "process_publish_terminated_locked"),
     ("kernel/src/process.c", "process_finish_termination"),
+    ("kernel/src/process.c", "process_scheduler_handoff_complete_internal"),
     ("kernel/src/process.c", "process_scheduler_handoff_complete"),
     ("kernel/src/process.c", "process_attach_thread"),
     ("kernel/src/process.c", "process_publish_launch"),

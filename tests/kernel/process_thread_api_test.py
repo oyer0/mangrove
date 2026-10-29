@@ -263,6 +263,11 @@ static bool scheduler_thread_exit_complete(const kernel_thread_t *t)
 {return t&&t->state==THREAD_STATE_TERMINATED&&
  t->running_cpu==THREAD_CPU_NONE&&!t->context_switch_pending&&
  !t->sleeping&&!t->preempt_return_rip;}
+static bool scheduler_thread_handoff_callback_valid(
+ const kernel_thread_t*t)
+{return t&&t->state==THREAD_STATE_TERMINATED&&
+ t->running_cpu==THREAD_CPU_NONE&&t->context_switch_pending&&
+ !t->sleeping&&!t->preempt_return_rip;}
 static bool kernel_stack_release_context_valid(void){return true;}
 static bool vmm_user_range_executable(void *as,uintptr_t p,usize n)
 {return as&&p&&n;}
@@ -318,6 +323,7 @@ static kernel_thread_t *process_publish_terminated_locked(process_t*p)
 {(void)p;return NULL;}
 static bool process_cleanup_exit_resources(process_t*p){(void)p;return true;}
 static bool process_finish_termination(process_t*p){(void)p;return true;}
+static void process_cleanup_worker_wake(process_t*p){assert(p);}
 static bool scheduler_unblock(kernel_thread_t*t){(void)t;return true;}
 static bool scheduler_wake_waiter(kernel_thread_t*t)
 {if(!t)return false;
@@ -432,6 +438,7 @@ names = (
     ("kernel/src/process.c", "process_detach_thread"),
     ("kernel/src/process.c", "process_thread_list_read_acquire_locked"),
     ("kernel/src/process.c", "process_thread_list_read_release"),
+    ("kernel/src/process.c", "process_scheduler_handoff_complete_internal"),
     ("kernel/src/process.c", "process_scheduler_handoff_complete"),
     ("kernel/src/process.c", "process_worker_reap_needed_locked"),
     ("kernel/src/process.c", "process_worker_reap_immediate_locked"),
