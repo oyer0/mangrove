@@ -273,6 +273,17 @@ object destructor can release the address space. Refusal to release an
 ordinary thread record is an invariant failure, not permission to continue
 teardown.
 
+`process_wait()` registers its child predicate and pins the parent's thread
+list before releasing the registry lock. Child completion publishes an event
+wake: if the waiter is still running, the scheduler latches the event for its
+next `scheduler_block()`; if it is already blocked, the scheduler makes it
+ready. The waiter rechecks child and process-exit predicates after every wake,
+so unrelated event wakes cannot be mistaken for child completion. A separate
+thread-list reader pin protects the captured waiter through wake delivery,
+even if the wait syscall is interrupted and unwinds its registration first.
+The process-wide wait slot still permits only one outstanding wait
+registration at a time; another concurrent wait returns busy.
+
 ## Orderly shutdown and reboot
 
 The privileged `/bin/shutdown` and `/bin/reboot` commands request a kernel

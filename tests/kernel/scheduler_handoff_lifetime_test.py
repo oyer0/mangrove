@@ -61,6 +61,7 @@ process_functions=(
  'process_thread_list_complete_locked',
  'process_thread_list_read_acquire_locked',
  'process_thread_list_read_release',
+ 'process_waiter_wake_release',
  'process_publish_terminated_locked',
  'process_attach_thread',
  'process_detach_thread_owned',

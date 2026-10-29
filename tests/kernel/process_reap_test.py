@@ -60,6 +60,7 @@ typedef struct process process_t;
 typedef struct process_thread_record process_thread_record_t;
 typedef struct kernel_thread {
  u32 state, running_cpu; bool context_switch_pending, syscall_active, sleeping;
+ bool event_wake_pending;
  bool stack_external;
  uintptr_t preempt_return_rip;
  process_t *process;
@@ -82,6 +83,7 @@ struct process_thread_record {
 };
 struct process {
  int state; bool wait_collected, owner_reference_held, shutdown_requested;
+ bool exit_requested;
  bool launch_ready, wait_claimed, exit_cleanup_complete,
       exit_cleanup_in_progress,
       thread_reap_in_progress, exit_notification_sent, termination_pending,
@@ -115,13 +117,21 @@ static jmp_buf panic_environment;
 static bool scheduler_thread_exit_complete(const kernel_thread_t *thread);
 static void process_scheduler_handoff_complete(kernel_thread_t *thread);
 void process_handle_reference_release(kernel_object_t *object);
-/* This fixture covers process completion for its initial thread and does not
- * model worker-record readers; worker wake lifetime is exercised in the
- * process-thread API production-source concurrency fixture. */
 static bool process_thread_list_read_acquire_locked(process_t *process)
-{(void)process;return false;}
+{
+ assert(process_registry_lock);
+ if(!process||process->state==PROCESS_STATE_TERMINATED||
+    !process->threads||!process->thread_count||
+    process->thread_list_readers==UINT32_MAX)
+  return false;
+ process->thread_list_readers++;
+ return true;
+}
 static void process_thread_list_read_release(process_t *process)
-{(void)process;}
+{
+ assert(process_registry_lock==0&&process&&process->thread_list_readers);
+ process->thread_list_readers--;
+}
 /* This fixture models a safe process context and does not include the
  * deferred cleanup worker. The focused deferred-release fixture exercises
  * the production unsafe-context retry path. */
@@ -136,10 +146,8 @@ static void spin_unlock(u32 *lock){spin_unlock_irqrestore(lock,0);}
 static u64 process_cli_save(void){return 1;}
 static void process_cli_restore(u64 flags){(void)flags;}
 static kernel_thread_t *thread_current(void){return &parent_thread;}
-static bool scheduler_unblock(kernel_thread_t *thread)
-{(void)thread;return true;}
 static bool scheduler_wake_waiter(kernel_thread_t *thread)
-{(void)thread;return true;}
+{if(!thread)return false;thread->event_wake_pending=true;return true;}
 static bool process_shutdown_requested(const process_t *p)
 {return p->shutdown_requested;}
 static kernel_object_t *process_handle_lookup_any(process_t *p,
@@ -234,6 +242,7 @@ code += function(source, 'process_storage_authorization_clear_locked')
 for name in ('process_thread_list_complete_locked',
              'process_session_collection_ready_locked',
              'process_worker_records_release_all',
+             'process_waiter_wake_release',
              'process_publish_terminated_locked',
              'process_scheduler_handoff_complete_internal',
              'process_scheduler_handoff_complete',
@@ -269,6 +278,10 @@ static void reset(bool active)
  cancel_initial=expected_panic=false;
  destroyed_roots=released_memory=frees=external_terminations=0;
  block_success=sleep_success=true;request_shutdown=false;
+ parent.threads=parent.main_thread=&parent_thread;parent.thread_count=1;
+ parent_thread.process=&parent;
+ parent_thread.process_state=THREAD_PROCESS_ATTACHED;
+ parent_thread.state=THREAD_STATE_RUNNING;
 }
 int main(void)
 {

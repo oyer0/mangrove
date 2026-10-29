@@ -3336,6 +3336,10 @@ test-process-arguments:
 test-process-handles:
 	python3 tests/kernel/process_handles_test.py "$(HOST_CC)"
 
+.PHONY: test-process-wait
+test-process-wait:
+	python3 tests/kernel/process_wait_event_test.py "$(HOST_CC)"
+
 .PHONY: test-syscall-user-memory
 test-syscall-user-memory:
 	python3 tests/kernel/syscall_user_memory_test.py "$(HOST_CC)"
@@ -3419,6 +3423,7 @@ test-guest-random:
 		--ovmf-code "$(OVMF_CODE_SOURCE)" --ovmf-vars "$(OVMF_VARS_SOURCE)"
 
 test-sync: test-process-arguments
+test-sync: test-process-wait
 test-sync: test-process-handles
 test-sync: test-syscall-user-memory
 test-sync: test-process-memory-unmap

@@ -208,8 +208,6 @@ static bool thread_destroy(kernel_thread_t *thread)
  freed_threads++;return true;}
 static bool scheduler_wake_waiter(kernel_thread_t *thread)
 {(void)thread;__atomic_add_fetch(&wake_calls,1U,__ATOMIC_RELAXED);return true;}
-static bool scheduler_unblock(kernel_thread_t *thread)
-{(void)thread;__atomic_add_fetch(&unblocks,1U,__ATOMIC_RELAXED);return true;}
 static void console_cancel_waiter(kernel_thread_t *thread)
 {(void)thread;__atomic_add_fetch(&console_cancels,1U,__ATOMIC_RELAXED);}
 static void terminal_output_finish_for_process(u64 pid,
@@ -260,6 +258,7 @@ names = (
     "process_thread_list_complete_locked",
     "process_thread_list_read_acquire_locked",
     "process_thread_list_read_release",
+    "process_waiter_wake_release",
     "process_cleanup_candidate_locked",
     "process_cleanup_worker_release_handoffs_once",
     "process_cleanup_worker_run_once",
