@@ -11,7 +11,9 @@ threads layer.
 aligned integer, boolean, and pointer scalar atomics up to 64 bits are
 lock-free on Mangrove's x86-64 target. The header supplies C17 memory orders,
 load/store, exchange, compare-and-exchange, integer read-modify-write,
-`atomic_flag`, and thread/signal fences. These operations link without
+pointer `atomic_fetch_add`/`atomic_fetch_sub` with C element-scaled pointer
+arithmetic, `atomic_flag`, and thread/signal fences. Fetch operations return
+the prior value and evaluate each argument once. These operations link without
 `libatomic`. Larger or aggregate atomic objects are outside the supported
 contract; native links intentionally do not supply an atomic helper runtime.
 Atomic objects must meet their compiler-provided natural alignment.
