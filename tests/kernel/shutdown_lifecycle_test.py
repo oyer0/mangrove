@@ -94,6 +94,8 @@ static bool object_reference(kernel_object_t *object)
 { if (!object || !object->references) return false; object->references++; return true; }
 static void object_release(kernel_object_t *object)
 { assert(object && object->references > 1); object->references--; }
+static void process_handle_reference_release(kernel_object_t *object)
+{ object_release(object); }
 static void panic(const char *message)
 { (void)message; assert(!"unexpected process panic"); }
 static bool process_finish_termination(process_t *process)

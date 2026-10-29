@@ -147,9 +147,19 @@ reaping accounts for registered handoff references and is retried after the
 worker drops its temporary scan pin. A later collection retry also accepts a
 fully finalized process whose thread list is already empty; this keeps a
 temporary reference from making that process permanently undiscoverable.
-Dropping a retained process-handle reference retries collection after the
-reference is released, including when an in-flight handle operation overlapped
-the handle close. The worker's latched event wake closes the scan-to-park race.
+Dropping a retained process reference captures its stable session ID before the
+reference is released, without sampling lifecycle eligibility. In a safe
+execution context, collection is retried after the reference drop. If the
+caller holds a spinlock, has interrupts disabled, or has not consumed an
+incoming mutex handoff, it publishes a coalesced retry to the existing cleanup
+worker instead. The worker scans the process registry for terminated,
+session-owned processes and rechecks all collection predicates and exact
+reference counts before finalization. The latch is set after the dropped pin
+can no longer affect those counts; its event wake closes the scan-to-park race.
+This also covers an in-flight process-handle operation overlapping handle
+closure and references released by termination, shutdown, and syscall
+admission paths. A retry retains no process or session pointer and cannot keep
+an otherwise collectable process alive.
 The scheduler callback and post hook never perform process resource teardown
 or final object release.
 

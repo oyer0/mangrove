@@ -60,6 +60,12 @@ static bool process_shutdown_active;
  * in the assembly context-switch callback. Pending work is derived by scanning
  * all_processes; this is one waiter, not a dynamically growing work queue. */
 static kernel_thread_t *process_cleanup_worker;
+/* Coalesced request to retry collection after a process reference has been
+ * released from a context where session collection is unsafe. The worker
+ * discovers candidates from all_processes, so the flag retains no object or
+ * session pointer and cannot create a reference cycle. */
+static _Atomic bool process_session_collection_retry_pending;
+static _Atomic bool process_cleanup_worker_ready;
 
 #define PROCESS_SHUTDOWN_GRACE_MS 5000U
 #define PROCESS_SHUTDOWN_FORCE_MS 5000U
@@ -129,10 +135,13 @@ static void process_unlink_locked(process_t *process);
 static void process_unlink_all_locked(process_t *process);
 static bool process_cleanup_exit_resources(process_t *process);
 static bool process_finish_termination(process_t *process);
+static bool process_cleanup_context_valid(void);
 static kernel_thread_t *process_publish_terminated_locked(process_t *process);
 static void process_worker_records_release_all(process_t *process);
 static void process_cleanup_worker_entry(void *unused);
 static bool process_cleanup_worker_wake(process_t *hint);
+static bool process_cleanup_worker_retry_session_collections_once(void);
+static void process_cleanup_worker_request_session_collection_retry(void);
 static kernel_object_t *process_handle_lookup_reference(
     process_t *process, process_handle_t handle,
     kernel_object_type_t type, u32 required_rights);
@@ -300,6 +309,10 @@ bool process_init(void)
     all_processes = NULL;
     process_shutdown_active = false;
     process_cleanup_worker = NULL;
+    __atomic_store_n(&process_session_collection_retry_pending, false,
+                     __ATOMIC_RELAXED);
+    __atomic_store_n(&process_cleanup_worker_ready, false,
+                     __ATOMIC_RELAXED);
     return true;
 }
 
@@ -470,6 +483,51 @@ static bool process_cleanup_worker_release_handoffs_once(void)
     return true;
 }
 
+/* A single atomic latch coalesces unsafe-context collection requests. The
+ * process registry is the candidate list; scan by monotonically allocated
+ * session ID and retain only the scalar ID across the unlocked reaper call.
+ * This keeps notification bounded and avoids retaining process pointers. */
+static bool process_cleanup_worker_retry_session_collections_once(void)
+{
+    if (!__atomic_exchange_n(&process_session_collection_retry_pending, false,
+                             __ATOMIC_ACQ_REL))
+        return false;
+
+    mg_session_id_t after = PROCESS_NO_SESSION;
+    for (;;) {
+        mg_session_id_t next_session = PROCESS_NO_SESSION;
+        u64 flags = spin_lock_irqsave(&process_registry_lock);
+        for (process_t *process = all_processes; process;
+             process = process->next_all) {
+            mg_session_id_t candidate = process->session_id;
+            if (process->launch_ready && process->owner_reference_held &&
+                process->state == PROCESS_STATE_TERMINATED &&
+                candidate > after &&
+                (!next_session || candidate < next_session))
+                next_session = candidate;
+        }
+        spin_unlock_irqrestore(&process_registry_lock, flags);
+        if (next_session == PROCESS_NO_SESSION) break;
+        process_reap_session_members(next_session);
+        after = next_session;
+    }
+    return true;
+}
+
+static void process_cleanup_worker_request_session_collection_retry(void)
+{
+    bool already_pending = __atomic_exchange_n(
+        &process_session_collection_retry_pending, true, __ATOMIC_ACQ_REL);
+    if (already_pending) return;
+
+    /* During worker startup, the durable latch is enough: startup checks it
+     * after enqueue. Once ready, every publication must either wake the
+     * blocked worker or latch a wake while it is running. */
+    if (__atomic_load_n(&process_cleanup_worker_ready, __ATOMIC_ACQUIRE) &&
+        !process_cleanup_worker_wake(NULL))
+        panic("process: collection retry worker could not be notified");
+}
+
 static bool process_cleanup_worker_run_once(void)
 {
     process_t *process;
@@ -478,14 +536,18 @@ static bool process_cleanup_worker_run_once(void)
     u64 flags = spin_lock_irqsave(&process_registry_lock);
     process = process_cleanup_candidate_locked();
     spin_unlock_irqrestore(&process_registry_lock, flags);
-    if (!process) return worked;
+    if (process) {
+        session_id = process->session_id;
+        (void)process_cleanup_exit_resources(process);
+        object_release(&process->object);
+        if (session_id != PROCESS_NO_SESSION)
+            process_reap_session_members(session_id);
+        worked = true;
+    }
 
-    session_id = process->session_id;
-    (void)process_cleanup_exit_resources(process);
-    object_release(&process->object);
-    if (session_id != PROCESS_NO_SESSION)
-        process_reap_session_members(session_id);
-    return true;
+    if (process_cleanup_worker_retry_session_collections_once())
+        worked = true;
+    return worked;
 }
 
 static void process_cleanup_worker_entry(void *unused)
@@ -531,10 +593,20 @@ bool process_start_cleanup_worker(void)
     __atomic_store_n(&process_cleanup_worker, worker, __ATOMIC_RELEASE);
     spin_unlock_irqrestore(&process_registry_lock, flags);
 
-    if (scheduler_enqueue(worker)) return true;
+    if (scheduler_enqueue(worker)) {
+        __atomic_store_n(&process_cleanup_worker_ready, true,
+                         __ATOMIC_RELEASE);
+        if (__atomic_load_n(&process_session_collection_retry_pending,
+                            __ATOMIC_ACQUIRE) &&
+            !process_cleanup_worker_wake(NULL))
+            panic("process: startup collection retry wake failed");
+        return true;
+    }
 
     flags = spin_lock_irqsave(&process_registry_lock);
     __atomic_store_n(&process_cleanup_worker, NULL, __ATOMIC_RELEASE);
+    __atomic_store_n(&process_cleanup_worker_ready, false,
+                     __ATOMIC_RELEASE);
     spin_unlock_irqrestore(&process_registry_lock, flags);
     if (!scheduler_terminate_thread(worker) || !thread_destroy(worker))
         panic("process: cleanup worker startup rollback failed");
@@ -2231,15 +2303,9 @@ i64 process_memory_unmap(process_t *process, uintptr_t address)
 static bool process_cleanup_exit_resources(process_t *process)
 {
     u64 flags;
-    u64 current_flags;
-    kernel_thread_t *current;
 
     if (!process) return false;
-    current = thread_current();
-    __asm__ volatile("pushfq; popq %0" : "=r"(current_flags) :: "memory");
-    if (!current || current->waiting_mutex || spinlock_depth_current() ||
-        !(current_flags & (1ULL << 9)) ||
-        !kernel_stack_release_context_valid()) {
+    if (!process_cleanup_context_valid()) {
         /* Teardown takes mutexes and can wait for remote TLB acknowledgments.
          * IF alone is insufficient while a resumed mutex waiter still owns
          * an unconsumed handoff marker. Retry on the dedicated worker. */
@@ -2276,6 +2342,17 @@ static bool process_cleanup_exit_resources(process_t *process)
     spin_unlock_irqrestore(&process_registry_lock, flags);
     (void)process_finish_termination(process);
     return true;
+}
+
+static bool process_cleanup_context_valid(void)
+{
+    u64 current_flags;
+    kernel_thread_t *current = thread_current();
+
+    __asm__ volatile("pushfq; popq %0" : "=r"(current_flags) :: "memory");
+    return current && !current->waiting_mutex && !spinlock_depth_current() &&
+        (current_flags & (1ULL << 9)) &&
+        kernel_stack_release_context_valid();
 }
 
 static bool process_finish_termination(process_t *process)
@@ -2404,7 +2481,10 @@ void process_syscall_leave(process_t *process)
         process->state == PROCESS_STATE_EXITING;
     spin_unlock_irqrestore(&process_registry_lock, flags);
     if (queue_cleanup) process_cleanup_worker_wake(process);
-    object_release(&process->object);
+    if (queue_cleanup)
+        process_handle_reference_release(&process->object);
+    else
+        object_release(&process->object);
 }
 
 static bool process_termination_begin(process_t *process)
@@ -2820,10 +2900,10 @@ bool process_terminate_session_members(mg_session_id_t session_id)
         if (!process) break;
         if (!process_terminate_external(process, -1)) {
             result = false;
-            object_release(&process->object);
+            process_handle_reference_release(&process->object);
             break;
         }
-        object_release(&process->object);
+        process_handle_reference_release(&process->object);
     }
     return result;
 }
@@ -2886,16 +2966,24 @@ void process_handle_reference_release(kernel_object_t *object)
     if (object->type == OBJECT_TYPE_PROCESS) {
         process_t *target = object_process(object);
         u64 flags = spin_lock_irqsave(&process_registry_lock);
-        if (target->launch_ready &&
-            target->state == PROCESS_STATE_TERMINATED &&
-            target->owner_reference_held && !target->wait_claimed)
+        /* Capture stable identity while the lookup pins the object. Lifecycle
+         * eligibility may change between this observation and the pin drop. */
+        if (target->launch_ready && target->owner_reference_held &&
+            target->session_id != PROCESS_NO_SESSION)
             session_id = target->session_id;
         spin_unlock_irqrestore(&process_registry_lock, flags);
     }
 
     object_release(object);
-    if (session_id != PROCESS_NO_SESSION)
+    if (session_id == PROCESS_NO_SESSION) return;
+
+    /* Retry only after this reference is gone. If the caller is inside a
+     * spinlock, a mutex handoff, a scheduler callback, or has interrupts
+     * disabled, defer collection to the existing safe cleanup worker. */
+    if (process_cleanup_context_valid())
         process_reap_session_members(session_id);
+    else
+        process_cleanup_worker_request_session_collection_retry();
 }
 
 mg_session_id_t process_session_id(const process_t *process)
@@ -2977,7 +3065,7 @@ bool process_interrupt_foreground_session(void)
          thread = thread->process_next)
         (void)scheduler_wake_waiter(thread);
     process_thread_list_read_release(target);
-    object_release(&target->object);
+    process_handle_reference_release(&target->object);
     return true;
 }
 
@@ -3063,7 +3151,7 @@ static void process_shutdown_mark_phase(process_t *requester, bool services)
              thread = thread->process_next)
             (void)scheduler_wake_waiter(thread);
         process_thread_list_read_release(target);
-        object_release(&target->object);
+        process_handle_reference_release(&target->object);
     }
 }
 
@@ -3106,19 +3194,19 @@ static int process_shutdown_wait_phase(process_t *requester, bool services)
         }
         if (forcing) {
             (void)process_terminate_external(target, -1);
-            object_release(&target->object);
+            process_handle_reference_release(&target->object);
             if (timer_uptime_ms() >= force_deadline) {
                 process_t *remaining = process_shutdown_next_work(
                     requester, services);
                 if (remaining) {
                     kprint("[ERROR] shutdown timeout waiting for safe process exit pid=%llu name=%s\n",
                            remaining->pid, remaining->name);
-                    object_release(&remaining->object);
+                    process_handle_reference_release(&remaining->object);
                 }
                 return MG_ERR_TIMEOUT;
             }
         } else {
-            object_release(&target->object);
+            process_handle_reference_release(&target->object);
         }
         (void)scheduler_sleep(1U);
     }

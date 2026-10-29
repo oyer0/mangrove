@@ -120,6 +120,11 @@ static bool process_thread_list_read_acquire_locked(process_t *process)
 {(void)process;return false;}
 static void process_thread_list_read_release(process_t *process)
 {(void)process;}
+/* This fixture models a safe process context and does not include the
+ * deferred cleanup worker. The focused deferred-release fixture exercises
+ * the production unsafe-context retry path. */
+static bool process_cleanup_context_valid(void){return true;}
+static void process_cleanup_worker_request_session_collection_retry(void){}
 static u64 spin_lock_irqsave(u32 *lock)
 {assert(!*lock);*lock=1;return 1;}
 static void spin_unlock_irqrestore(u32 *lock,u64 flags)
@@ -319,9 +324,11 @@ int main(void)
  child.active_syscalls=1;
  assert(!process_terminate_session_members(42) && child.owner_reference_held);
  child.active_syscalls=0;
- assert(process_terminate_session_members(42) && !owner_releases &&
-        child.state==PROCESS_STATE_TERMINATED &&
-        child_thread.process_state==THREAD_PROCESS_HANDOFF_COMPLETE);
+ assert(process_terminate_session_members(42) && owner_releases==1 &&
+        child.state==PROCESS_STATE_TERMINATED && !child.thread_count &&
+        !child.owner_reference_held &&
+        child_thread.process_state==THREAD_PROCESS_UNATTACHED &&
+        !child.object.ref_count && !all_processes);
 
  /* A missed admission check must fail before retiring page tables. */
  reset(false);expected_panic=true;
