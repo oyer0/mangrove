@@ -276,7 +276,10 @@ static void process_object_destroy(kernel_object_t *object)
         process->worker_reapers || process->thread_records ||
         process->scheduler_handoff_references ||
         __atomic_load_n(&process->scheduler_handoff_releases_pending,
-                        __ATOMIC_ACQUIRE))
+                        __ATOMIC_ACQUIRE) ||
+        __atomic_load_n(&process->deferred_reference_releases_pending,
+                        __ATOMIC_ACQUIRE) ||
+        process->deferred_reference_collection_retry)
         panic("process: destruction with owned thread state");
 
     process_cwd_clear(process);
@@ -483,10 +486,75 @@ static bool process_cleanup_worker_release_handoffs_once(void)
     return true;
 }
 
-/* A single atomic latch coalesces unsafe-context collection requests. The
- * process registry is the candidate list; scan by monotonically allocated
- * session ID and retain only the scalar ID across the unlocked reaper call.
- * This keeps notification bounded and avoids retaining process pointers. */
+/* Transfer a retained process reference to the cleanup worker when dropping
+ * it in the caller could run process destruction in an unsafe context. The
+ * pending count is protected by process_registry_lock and each unit continues
+ * to own its original object reference. A worker pin protects the process
+ * while a bounded batch is detached and released outside the registry lock. */
+#define PROCESS_DEFERRED_REFERENCE_RELEASE_BATCH 16U
+static bool process_cleanup_worker_release_deferred_references_once(void)
+{
+    process_t *process = NULL;
+    u32 release_count = 0;
+    mg_session_id_t retry_session = PROCESS_NO_SESSION;
+    u64 flags = spin_lock_irqsave(&process_registry_lock);
+
+    for (process_t *candidate = all_processes; candidate;
+         candidate = candidate->next_all) {
+        u32 pending = __atomic_load_n(
+            &candidate->deferred_reference_releases_pending,
+            __ATOMIC_ACQUIRE);
+        u32 remaining;
+
+        if (!pending) continue;
+        if (!object_reference(&candidate->object)) {
+            spin_unlock_irqrestore(&process_registry_lock, flags);
+            panic("process: deferred reference lost its process");
+        }
+        release_count = pending < PROCESS_DEFERRED_REFERENCE_RELEASE_BATCH
+            ? pending : PROCESS_DEFERRED_REFERENCE_RELEASE_BATCH;
+        pending = __atomic_fetch_sub(
+            &candidate->deferred_reference_releases_pending, release_count,
+            __ATOMIC_ACQ_REL);
+        if (pending < release_count) {
+            spin_unlock_irqrestore(&process_registry_lock, flags);
+            panic("process: deferred reference count underflow");
+        }
+        remaining = pending - release_count;
+        if (__atomic_load_n(&candidate->object.ref_count,
+                            __ATOMIC_ACQUIRE) <= release_count) {
+            spin_unlock_irqrestore(&process_registry_lock, flags);
+            panic("process: deferred reference ownership lost");
+        }
+
+        /* Publishers and this worker serialize on the registry lock. Keep the
+         * retry marker until the last queued reference is claimed, so a
+         * bounded batch cannot consume the only collection retry. */
+        if (!remaining && candidate->deferred_reference_collection_retry) {
+            retry_session = candidate->session_id;
+            candidate->deferred_reference_collection_retry = false;
+        }
+        for (u32 i = 0; i < release_count; i++)
+            object_release(&candidate->object);
+        process = candidate;
+        break;
+    }
+    spin_unlock_irqrestore(&process_registry_lock, flags);
+    if (!process) return false;
+
+    /* The worker pin is now the only reference needed to safely finish this
+     * batch. Its release may destroy the process, so retain only the scalar
+     * session identity beyond this point. */
+    object_release(&process->object);
+    if (retry_session != PROCESS_NO_SESSION)
+        process_reap_session_members(retry_session);
+    return true;
+}
+
+/* A single atomic latch coalesces cleanup-worker passes needed by transferred
+ * references and session-collection retries. The process registry is the
+ * candidate list; scan by monotonically allocated session ID and retain only
+ * the scalar ID across the unlocked reaper call. */
 static bool process_cleanup_worker_retry_session_collections_once(void)
 {
     if (!__atomic_exchange_n(&process_session_collection_retry_pending, false,
@@ -532,6 +600,8 @@ static bool process_cleanup_worker_run_once(void)
 {
     process_t *process;
     bool worked = process_cleanup_worker_release_handoffs_once();
+    if (process_cleanup_worker_release_deferred_references_once())
+        worked = true;
     mg_session_id_t session_id;
     u64 flags = spin_lock_irqsave(&process_registry_lock);
     process = process_cleanup_candidate_locked();
@@ -2920,6 +2990,8 @@ void process_reap_session_members(mg_session_id_t session_id)
                 process->state == PROCESS_STATE_TERMINATED &&
                 process->owner_reference_held &&
                 process_session_collection_ready_locked(process) &&
+                /* Transferred process references remain in ref_count and
+                 * intentionally keep this exact-count gate closed. */
                 __atomic_load_n(&process->object.ref_count, __ATOMIC_ACQUIRE) ==
                     (u64)process->thread_count + 1U +
                         process->scheduler_handoff_references &&
@@ -2953,37 +3025,59 @@ void process_reap_session_members(mg_session_id_t session_id)
     }
 }
 
-/* Drop a retained process-object handle reference and retry session
- * collection only after that reference is gone. Keeping the copied session
- * ID lets the retry safely collect the process itself. This also covers an
- * in-flight handle operation that overlaps the close which removed its
- * table-owned reference. */
+/* Release a retained process-object handle reference without permitting a
+ * potentially final drop in an unsafe caller context. A copied session ID
+ * lets safe release or the worker retry collection after the reference is
+ * gone. This also covers in-flight handle operations overlapping close. */
 void process_handle_reference_release(kernel_object_t *object)
 {
     mg_session_id_t session_id = PROCESS_NO_SESSION;
 
     if (!object) return;
-    if (object->type == OBJECT_TYPE_PROCESS) {
-        process_t *target = object_process(object);
-        u64 flags = spin_lock_irqsave(&process_registry_lock);
-        /* Capture stable identity while the lookup pins the object. Lifecycle
-         * eligibility may change between this observation and the pin drop. */
-        if (target->launch_ready && target->owner_reference_held &&
-            target->session_id != PROCESS_NO_SESSION)
-            session_id = target->session_id;
-        spin_unlock_irqrestore(&process_registry_lock, flags);
+    if (object->type != OBJECT_TYPE_PROCESS) {
+        object_release(object);
+        return;
     }
 
-    object_release(object);
-    if (session_id == PROCESS_NO_SESSION) return;
+    process_t *target = object_process(object);
+    bool safe_to_release = process_cleanup_context_valid();
+    u64 flags = spin_lock_irqsave(&process_registry_lock);
+    /* Capture stable identity while the caller's retained reference pins the
+     * object. Collection eligibility may change before either safe release. */
+    if (target->launch_ready && target->owner_reference_held &&
+        target->session_id != PROCESS_NO_SESSION)
+        session_id = target->session_id;
 
-    /* Retry only after this reference is gone. If the caller is inside a
-     * spinlock, a mutex handoff, a scheduler callback, or has interrupts
-     * disabled, defer collection to the existing safe cleanup worker. */
-    if (process_cleanup_context_valid())
-        process_reap_session_members(session_id);
-    else
+    if (!safe_to_release) {
+        u32 pending = __atomic_load_n(
+            &target->deferred_reference_releases_pending, __ATOMIC_RELAXED);
+        if (pending == ~(u32)0) {
+            spin_unlock_irqrestore(&process_registry_lock, flags);
+            panic("process: deferred reference count overflow");
+        }
+        if (__atomic_load_n(&target->object.ref_count, __ATOMIC_ACQUIRE) <=
+            pending) {
+            spin_unlock_irqrestore(&process_registry_lock, flags);
+            panic("process: deferred reference has no retained owner");
+        }
+        __atomic_store_n(&target->deferred_reference_releases_pending,
+                         pending + 1U, __ATOMIC_RELEASE);
+        if (session_id != PROCESS_NO_SESSION)
+            target->deferred_reference_collection_retry = true;
+        spin_unlock_irqrestore(&process_registry_lock, flags);
+
+        /* The actual retained object reference remains live in the pending
+         * count. This durable worker-pass latch also covers publication before
+         * worker readiness and closes the worker scan-to-park race. */
         process_cleanup_worker_request_session_collection_retry();
+        return;
+    }
+    spin_unlock_irqrestore(&process_registry_lock, flags);
+
+    /* In safe contexts, preserve ordinary reference-release semantics. */
+    object_release(object);
+    if (session_id != PROCESS_NO_SESSION)
+        process_reap_session_members(session_id);
 }
 
 mg_session_id_t process_session_id(const process_t *process)

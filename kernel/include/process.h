@@ -115,6 +115,13 @@ struct process {
     /* Atomic subset published for the cleanup worker to release. Each such
      * reference keeps this process discoverable in all_processes. */
     _Atomic u32 scheduler_handoff_releases_pending;
+    /* Retained process references transferred by callers that cannot safely
+     * run a possibly final destructor. Each pending unit owns one object
+     * reference until the cleanup worker claims and releases it. */
+    _Atomic u32 deferred_reference_releases_pending;
+    /* Registry-locked collection retry associated with the deferred refs.
+     * Kept until the final pending reference is released. */
+    bool deferred_reference_collection_retry;
     process_thread_record_t *thread_records;
     u32 worker_reapers;
     /* Atomic fast-path hint. The intrusive list remains registry-locked;
@@ -408,9 +415,10 @@ kernel_object_t *process_handle_lookup(process_t *process,
  * trigger or defer a session-collection retry; other object types may use
  * object_release(). lookup_any permits querying a terminated process. */
 bool process_handle_close(process_t *process, process_handle_t handle);
-/* Release a retained object obtained from a process handle. Collection is
- * retried after the pin is dropped, synchronously only in a safe cleanup
- * context and otherwise through the process cleanup worker. */
+/* Release a retained object obtained from a process handle. Safe callers drop
+ * it normally and retry collection afterward. If that drop could invoke a
+ * process destructor from an unsafe context, ownership of the same reference
+ * transfers to the cleanup worker before this function returns. */
 void process_handle_reference_release(kernel_object_t *object);
 void process_handle_close_all(process_t *process);
 const char *process_state_name(process_state_t state);

@@ -239,6 +239,10 @@ static bool process_cleanup_context_valid(void)
        kernel_stack_release_context_valid();}
 static bool process_cleanup_worker_retry_session_collections_once(void)
 {return false;}
+/* This fixture checks thread exit publication, not the independent deferred
+ * process-reference queue exercised by scheduler_deferred_release_test.py. */
+static bool process_cleanup_worker_release_deferred_references_once(void)
+{return false;}
 static void process_handle_reference_release(kernel_object_t *object)
 {object_release(object);}
 static bool process_cleanup_worker_run_once(void);

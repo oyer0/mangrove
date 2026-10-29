@@ -92,6 +92,8 @@ struct process {
  u32 thread_count, live_thread_count, thread_list_readers;
  u32 scheduler_handoff_references;
  _Atomic u32 scheduler_handoff_releases_pending;
+ _Atomic u32 deferred_reference_releases_pending;
+ bool deferred_reference_collection_retry;
  u32 worker_reapers;
  process_thread_record_t *thread_records;
  bool worker_reap_pending;
