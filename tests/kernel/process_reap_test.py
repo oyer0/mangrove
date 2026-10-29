@@ -49,6 +49,7 @@ typedef u64 mg_session_id_t;
 enum {PROCESS_STATE_ACTIVE, PROCESS_STATE_EXITING, PROCESS_STATE_TERMINATED};
 enum {THREAD_STATE_RUNNING, THREAD_STATE_READY, THREAD_STATE_BLOCKED,
       THREAD_STATE_TERMINATED};
+typedef int thread_state_t;
 enum {THREAD_PROCESS_UNATTACHED, THREAD_PROCESS_ATTACHED,
       THREAD_PROCESS_EXIT_REQUESTED, THREAD_PROCESS_HANDOFF_COMPLETE};
 enum {MG_OK=0, MG_ERR_BAD_ARGUMENT=-4, MG_ERR_INVALID_HANDLE=-8,
@@ -159,14 +160,16 @@ static process_t *object_process(kernel_object_t *object)
 static bool object_reference(kernel_object_t *object)
 {assert(process_registry_lock);object->ref_count++;return true;}
 static void object_release(kernel_object_t *object)
-{assert(!process_registry_lock && object==&child.object);
+{assert(!process_registry_lock && object);
  /* No collector may release ownership before the child is really done. */
- if(!child.owner_reference_held || object->ref_count==1)
+ if(object==&child.object &&
+    (!child.owner_reference_held || object->ref_count==1))
    assert(child.thread_count==0 ||
           scheduler_thread_exit_complete(child.main_thread));
  assert(object->ref_count);object->ref_count--;
- if(!child.owner_reference_held && !owner_releases)owner_releases++;
- if(!object->ref_count)all_processes=NULL;}
+ if(object==&child.object && !child.owner_reference_held && !owner_releases)
+   owner_releases++;
+ if(object==&child.object && !object->ref_count)all_processes=NULL;}
 static void process_unlink_locked(process_t *p)
 {assert(process_registry_lock && p==&child);p->parent=NULL;}
 static bool scheduler_block(void)
@@ -237,7 +240,8 @@ handoff_valid = handoff_valid.replace(
 running = function(scheduler, 'scheduler_thread_is_running')
 running = running.replace('bool scheduler_thread_is_running(',
                           'static __attribute__((unused)) bool scheduler_thread_is_running(', 1)
-code = prefix + completion + handoff_valid + running
+state_snapshot = function(scheduler, 'scheduler_thread_state_snapshot')
+code = prefix + completion + handoff_valid + running + state_snapshot
 code += function(source, 'process_storage_authorization_clear_locked')
 for name in ('process_thread_list_complete_locked',
              'process_session_collection_ready_locked',
@@ -265,6 +269,8 @@ static void reset(bool active)
  child.owner_reference_held=true;child.exit_status=23;
  child.object=(kernel_object_t){.ref_count=2,.process=&child,
                                  .type=OBJECT_TYPE_PROCESS};
+ parent.object=(kernel_object_t){.ref_count=2,.process=&parent,
+                                  .type=OBJECT_TYPE_PROCESS};
  child_thread=(kernel_thread_t){.state=THREAD_STATE_READY,
    .running_cpu=THREAD_CPU_NONE,.syscall_active=true,.process=&child,
    .process_state=active?THREAD_PROCESS_ATTACHED:

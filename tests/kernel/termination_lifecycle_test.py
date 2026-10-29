@@ -53,6 +53,7 @@ typedef int32_t i32;
 typedef u32 process_handle_t;
 enum {THREAD_STATE_RUNNING, THREAD_STATE_READY, THREAD_STATE_BLOCKED,
       THREAD_STATE_TERMINATED};
+typedef int thread_state_t;
 enum {PROCESS_STATE_ACTIVE, PROCESS_STATE_EXITING, PROCESS_STATE_TERMINATED};
 enum {THREAD_PROCESS_UNATTACHED, THREAD_PROCESS_ATTACHED,
       THREAD_PROCESS_EXIT_REQUESTED, THREAD_PROCESS_HANDOFF_COMPLETE};
@@ -214,6 +215,7 @@ scheduler_functions = "".join(function(path, name) for path, name in (
     ("kernel/src/process.c", "process_thread_list_complete_locked"),
     ("kernel/src/process.c", "process_thread_list_read_acquire_locked"),
     ("kernel/src/process.c", "process_thread_list_read_release"),
+    ("kernel/src/scheduler.c", "scheduler_thread_state_snapshot"),
     ("kernel/src/process.c", "process_waiter_wake_release"),
     ("kernel/src/process.c", "process_storage_authorization_clear_locked"),
     ("kernel/src/process.c", "process_publish_terminated_locked"),

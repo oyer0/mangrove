@@ -72,7 +72,8 @@ process_functions=(
  'process_scheduler_context_handoff_complete',
  'process_scheduler_post_handoff',
  'process_finalize_exit')
-functions=''.join(fn('kernel/src/process.c',name) for name in process_functions)
+functions=fn('kernel/src/scheduler.c','scheduler_thread_state_snapshot')
+functions+=''.join(fn('kernel/src/process.c',name) for name in process_functions)
 functions+=''.join(fn('kernel/src/process.c',name) for name in ('process_termination_begin','process_termination_cancel','process_terminate_external'))
 functions+=fn('kernel/src/scheduler.c','scheduler_terminate_thread_group')
 functions+=fn('kernel/src/scheduler.c','scheduler_context_switch_complete')

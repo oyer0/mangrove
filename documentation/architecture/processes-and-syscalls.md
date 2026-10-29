@@ -278,11 +278,23 @@ list before releasing the registry lock. Child completion publishes an event
 wake: if the waiter is still running, the scheduler latches the event for its
 next `scheduler_block()`; if it is already blocked, the scheduler makes it
 ready. The waiter rechecks child and process-exit predicates after every wake,
-so unrelated event wakes cannot be mistaken for child completion. A separate
-thread-list reader pin protects the captured waiter through wake delivery,
-even if the wait syscall is interrupted and unwinds its registration first.
+so unrelated event wakes cannot be mistaken for child completion. Before
+clearing the registration, child completion retains both a parent process
+reference and a thread-list reader pin: the reader protects the scheduler
+record, while the object reference remains held through reader-release
+follow-up and is released through the safe/deferred process-reference path. A
+delayed notification may find that the waiter has already terminated after
+consuming the child result. That is accepted only when the terminal scheduler
+record is still attached to the pinned parent; a live waiter that cannot be
+woken or a record that is no longer parent-owned remains an invariant failure.
 The process-wide wait slot still permits only one outstanding wait
-registration at a time; another concurrent wait returns busy.
+registration at a time; another concurrent wait returns busy. The wait keeps
+local interrupts masked across waiter registration and its check-to-block
+handoff. After success it restores the caller's interrupt state while dropping
+the reader pin, then reacquires the registry with IRQ-save semantics before
+claiming the child result. Every lock release restores the flags saved for
+that acquisition; the process wait path does not rely on plain spinlocks to
+mask interrupts.
 
 ## Orderly shutdown and reboot
 
