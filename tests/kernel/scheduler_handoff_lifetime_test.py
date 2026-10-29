@@ -29,7 +29,8 @@ for n in ast.parse((R/'tests/kernel/process_thread_lifecycle_test.py').read_text
   except (ValueError,TypeError):pass
 p=d['prefix'].replace('u32 state, running_cpu;', 'uintptr_t saved_stack_pointer,user_fs_base; bool queued; u32 syscall_nesting; u32 state, running_cpu;')
 p=p.replace('freed_threads++;return true;', 'freed_threads++;free(thread);return true;')
-p=p.replace('static kernel_thread_t cleanup_worker_thread={.state=THREAD_STATE_RUNNING,\n                                               .running_cpu=0};\nstatic void process_cleanup_worker_wake(process_t *process)\n{assert(process);cleanup_wake_calls++;}\nstatic bool process_cleanup_worker_run_once(void);\nstatic bool run_cleanup_worker_once(process_t *process)\n{kernel_thread_t *previous=local_thread;all_processes=process;\n local_thread=&cleanup_worker_thread;fixture_interrupts_enabled=true;\n bool worked=process_cleanup_worker_run_once();local_thread=previous;\n all_processes=NULL;return worked;}\n','static void process_cleanup_worker_wake(process_t *process)\n{(void)process;}\n')
+p=p.replace('static kernel_thread_t *process_cleanup_worker=&cleanup_worker_thread;\nstatic bool process_cleanup_worker_wake(process_t *process)\n{assert(process);cleanup_wake_calls++;return true;}\nstatic void process_reap_session_members(mg_session_id_t session_id)\n{assert(session_id==PROCESS_NO_SESSION);}', 'static kernel_thread_t *process_cleanup_worker=(kernel_thread_t *)1;\nstatic bool process_cleanup_worker_wake(process_t *process)\n{assert(process);cleanup_wake_calls++;return true;}\nstatic void process_reap_session_members(mg_session_id_t session_id)\n{assert(session_id==PROCESS_NO_SESSION);}')
+p=re.sub(r'static bool process_cleanup_worker_run_once\(void\);\nstatic bool run_cleanup_worker_once\(process_t \*process\)\n\{.*?\}\n','',p,flags=re.S)
 p=p.replace('static void spin_unlock_irqrestore(spinlock_t *lock,u64 flags)', 'static void remote_collect(void);\nstatic bool remote_armed;\nstatic void spin_unlock_irqrestore(spinlock_t *lock,u64 flags)')
 p=p.replace('{(void)flags;assert(pthread_mutex_unlock(lock)==0);}', '{(void)flags;assert(pthread_mutex_unlock(lock)==0); if(lock==&scheduler_lock&&remote_armed){remote_armed=false;remote_collect();}}')
 p+='\nstatic bool process_cleanup_exit_resources(process_t *process)\n{(void)process;return false;}\n'
@@ -109,10 +110,18 @@ int main(void) {
   * the callback has returned can cleanup/termination/final reap destroy the
   * outgoing descriptor. */
  scheduler_context_switch_post_complete(handoff);
+ assert(process.scheduler_handoff_references==1 &&
+        __atomic_load_n(&process.scheduler_handoff_releases_pending,
+                        __ATOMIC_ACQUIRE)==1 &&
+        process.object.ref_count==3);
  process.exit_cleanup_complete=true;
  assert(process_finish_termination(&process));
  assert(process_finalize_exit(&process));
- assert(freed_threads==1 && process.thread_count==0);
+ assert(freed_threads==1 && process.thread_count==0 &&
+        process.object.ref_count==2 &&
+        process.scheduler_handoff_references==1 &&
+        __atomic_load_n(&process.scheduler_handoff_releases_pending,
+                        __ATOMIC_ACQUIRE)==1);
  puts("scheduler handoff lifetime: external collector race deferred safely PASS");
  return 0;
 }

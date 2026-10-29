@@ -3425,7 +3425,7 @@ test-sync: test-process-memory-unmap
 test-sync: test-process-interrupt
 test-sync: test-process-thread-lifecycle test-process-thread-termination \
 		test-process-thread-api test-scheduler-process-cpu \
-		test-scheduler-handoff-lifetime
+		test-scheduler-handoff-lifetime test-scheduler-deferred-release
 test-sync: test-user-context
 test-sync: test-user-tls
 
@@ -3441,7 +3441,7 @@ test-user-tls: test-libc-link $(PING)
 
 .PHONY: test-process-thread-lifecycle test-process-thread-termination \
 	test-process-thread-api test-scheduler-process-cpu \
-	test-scheduler-handoff-lifetime
+	test-scheduler-handoff-lifetime test-scheduler-deferred-release
 test-process-thread-lifecycle:
 	python3 tests/kernel/process_thread_lifecycle_test.py "$(HOST_CC)"
 
@@ -3456,3 +3456,6 @@ test-scheduler-process-cpu:
 
 test-scheduler-handoff-lifetime:
 	python3 tests/kernel/scheduler_handoff_lifetime_test.py "$(HOST_CC)"
+
+test-scheduler-deferred-release:
+	python3 tests/kernel/scheduler_deferred_release_test.py "$(HOST_CC)"

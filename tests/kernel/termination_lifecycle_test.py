@@ -77,6 +77,8 @@ typedef struct process_thread_record {
 struct process {int state; kernel_thread_t *main_thread, *threads;
  u32 thread_count, live_thread_count, active_syscalls;
  u32 thread_list_readers;
+ u32 scheduler_handoff_references;
+ _Atomic u32 scheduler_handoff_releases_pending;
  u32 storage_authorized_operation; u64 storage_authorized_thread_id;
  bool storage_management_session, storage_management_authorizing;
  process_thread_record_t *thread_records;

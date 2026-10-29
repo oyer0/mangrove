@@ -132,7 +132,7 @@ static bool process_finish_termination(process_t *process);
 static kernel_thread_t *process_publish_terminated_locked(process_t *process);
 static void process_worker_records_release_all(process_t *process);
 static void process_cleanup_worker_entry(void *unused);
-static void process_cleanup_worker_wake(process_t *hint);
+static bool process_cleanup_worker_wake(process_t *hint);
 static kernel_object_t *process_handle_lookup_reference(
     process_t *process, process_handle_t handle,
     kernel_object_type_t type, u32 required_rights);
@@ -264,7 +264,10 @@ static void process_object_destroy(kernel_object_t *object)
     if (process->active_syscalls || process->live_thread_count ||
         process->thread_list_readers ||
         process->thread_count || process->threads || process->main_thread ||
-        process->worker_reapers || process->thread_records)
+        process->worker_reapers || process->thread_records ||
+        process->scheduler_handoff_references ||
+        __atomic_load_n(&process->scheduler_handoff_releases_pending,
+                        __ATOMIC_ACQUIRE))
         panic("process: destruction with owned thread state");
 
     process_cwd_clear(process);
@@ -384,16 +387,86 @@ static process_t *process_cleanup_candidate_locked(void)
     return NULL;
 }
 
-static bool process_cleanup_worker_run_once(void)
+#define PROCESS_HANDOFF_RELEASE_BATCH 16U
+
+/* Scheduler callbacks transfer their retained process reference to this
+ * worker instead of dropping it on an incoming stack with a pending mutex
+ * handoff. A bounded batch keeps each pass finite if several CPUs publish at
+ * once. The reference registry is the work list: each pending reference keeps
+ * its process linked until this worker releases it. */
+static bool process_cleanup_worker_release_handoffs_once(void)
 {
-    process_t *process;
+    process_t *process = NULL;
+    u32 release_count = 0;
+    mg_session_id_t session_id = PROCESS_NO_SESSION;
     u64 flags = spin_lock_irqsave(&process_registry_lock);
-    process = process_cleanup_candidate_locked();
+
+    for (process_t *candidate = all_processes; candidate;
+         candidate = candidate->next_all) {
+        u32 pending = __atomic_load_n(
+            &candidate->scheduler_handoff_releases_pending,
+            __ATOMIC_ACQUIRE);
+        if (!pending) continue;
+        if (!object_reference(&candidate->object)) {
+            spin_unlock_irqrestore(&process_registry_lock, flags);
+            panic("process: pending scheduler reference lost its owner");
+        }
+        release_count = pending < PROCESS_HANDOFF_RELEASE_BATCH
+            ? pending : PROCESS_HANDOFF_RELEASE_BATCH;
+        pending = __atomic_fetch_sub(
+            &candidate->scheduler_handoff_releases_pending, release_count,
+            __ATOMIC_ACQ_REL);
+        if (pending < release_count) {
+            spin_unlock_irqrestore(&process_registry_lock, flags);
+            panic("process: scheduler release publication underflow");
+        }
+        if (candidate->scheduler_handoff_references < release_count ||
+            __atomic_load_n(&candidate->object.ref_count,
+                            __ATOMIC_ACQUIRE) <= release_count) {
+            spin_unlock_irqrestore(&process_registry_lock, flags);
+            panic("process: scheduler handoff ownership accounting lost");
+        }
+        candidate->scheduler_handoff_references -= release_count;
+        /* object_reference() above leaves a worker pin in place. Releasing
+         * only the claimed tokens cannot destroy the process here; doing the
+         * atomic drops under the registry lock keeps session-reap reference
+         * accounting coherent at every lock boundary. */
+        for (u32 i = 0; i < release_count; i++)
+            object_release(&candidate->object);
+        process = candidate;
+        session_id = candidate->session_id;
+        break;
+    }
     spin_unlock_irqrestore(&process_registry_lock, flags);
     if (!process) return false;
 
+    /* This may now be the final reference. Process destruction is permitted
+     * here: this is the ordinary cleanup worker, not a switch callback. */
+    object_release(&process->object);
+
+    /* A concurrent session reap can decline while this worker holds its
+     * temporary scan reference. Retry after dropping that pin so the deferred
+     * release cannot strand an otherwise collectable process. */
+    if (session_id != PROCESS_NO_SESSION)
+        process_reap_session_members(session_id);
+    return true;
+}
+
+static bool process_cleanup_worker_run_once(void)
+{
+    process_t *process;
+    bool worked = process_cleanup_worker_release_handoffs_once();
+    mg_session_id_t session_id;
+    u64 flags = spin_lock_irqsave(&process_registry_lock);
+    process = process_cleanup_candidate_locked();
+    spin_unlock_irqrestore(&process_registry_lock, flags);
+    if (!process) return worked;
+
+    session_id = process->session_id;
     (void)process_cleanup_exit_resources(process);
     object_release(&process->object);
+    if (session_id != PROCESS_NO_SESSION)
+        process_reap_session_members(session_id);
     return true;
 }
 
@@ -412,13 +485,15 @@ static void process_cleanup_worker_entry(void *unused)
     }
 }
 
-static void process_cleanup_worker_wake(process_t *hint)
+static bool process_cleanup_worker_wake(process_t *hint)
 {
     (void)hint; /* Work is discovered from the authoritative process registry. */
     kernel_thread_t *worker = __atomic_load_n(&process_cleanup_worker,
                                                __ATOMIC_ACQUIRE);
-    if (worker && !scheduler_wake_waiter(worker))
+    if (!worker) return false;
+    if (!scheduler_wake_waiter(worker))
         panic("process: cleanup worker could not be notified");
+    return true;
 }
 
 bool process_start_cleanup_worker(void)
@@ -2434,6 +2509,22 @@ static bool process_scheduler_handoff_complete_internal(
             : !scheduler_thread_exit_complete(thread)))
         return false;
     flags = spin_lock_irqsave(&process_registry_lock);
+    if (context_callback &&
+        (thread->process != process || !thread->process_reference_held)) {
+        spin_unlock_irqrestore(&process_registry_lock, flags);
+        return false;
+    }
+    if (context_callback) {
+        if (process->scheduler_handoff_references == ~(u32)0) {
+            spin_unlock_irqrestore(&process_registry_lock, flags);
+            panic("process: scheduler handoff reference overflow");
+        }
+        /* scheduler_context_switch_complete() retained one object reference
+         * before this callback. Register its lifetime before the scheduler
+         * clears context_switch_pending, so session/process collectors can
+         * account for it even if the callback has not published it yet. */
+        process->scheduler_handoff_references++;
+    }
     if (thread->process == process &&
         thread->process_state != THREAD_PROCESS_HANDOFF_COMPLETE) {
         thread->process_state = THREAD_PROCESS_HANDOFF_COMPLETE;
@@ -2490,10 +2581,18 @@ bool process_scheduler_context_handoff_complete(struct kernel_thread *thread)
 
 void process_scheduler_post_handoff(process_t *process)
 {
-    /* Only signal here: the suspended incoming continuation may not yet have
-     * consumed a mutex ownership handoff. The cleanup worker runs blocking
-     * process/VMM teardown on its own ordinary kernel stack. */
-    if (process) process_cleanup_worker_wake(process);
+    u32 pending;
+
+    if (!process) return;
+    /* Transfer the retained reference to the existing cleanup worker. This
+     * bounded atomic publication avoids taking the process registry lock
+     * while the incoming mutex continuation may still own a handoff marker. */
+    pending = __atomic_fetch_add(
+        &process->scheduler_handoff_releases_pending, 1U, __ATOMIC_RELEASE);
+    if (pending == ~(u32)0)
+        panic("process: scheduler handoff release count overflow");
+    if (!process_cleanup_worker_wake(process))
+        panic("process: scheduler handoff before cleanup worker startup");
 }
 
 static void process_unlink_locked(process_t *process)
@@ -2724,7 +2823,8 @@ void process_reap_session_members(mg_session_id_t session_id)
                 process->owner_reference_held &&
                 process_thread_list_complete_locked(process) &&
                 __atomic_load_n(&process->object.ref_count, __ATOMIC_ACQUIRE) ==
-                    process->thread_count + 1U &&
+                    (u64)process->thread_count + 1U +
+                        process->scheduler_handoff_references &&
                 object_reference(&process->object))
                 break;
         }
@@ -2740,7 +2840,7 @@ void process_reap_session_members(mg_session_id_t session_id)
             process->state == PROCESS_STATE_TERMINATED &&
             process->thread_count == 0 &&
             __atomic_load_n(&process->object.ref_count, __ATOMIC_ACQUIRE) ==
-                2U;
+                2U + process->scheduler_handoff_references;
         if (reap) {
             process_unlink_locked(process);
             process->owner_reference_held = false;

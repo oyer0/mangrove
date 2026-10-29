@@ -142,6 +142,8 @@ struct process {
     bool thread_reap_in_progress,worker_reap_pending;
     bool user_region_reap_pending;
     u32 active_syscalls,thread_count,live_thread_count,thread_list_readers;
+    u32 scheduler_handoff_references;
+    _Atomic u32 scheduler_handoff_releases_pending;
     u32 worker_reapers;
     kernel_thread_t *main_thread,*threads;
     process_thread_record_t *thread_records;

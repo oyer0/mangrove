@@ -89,6 +89,8 @@ struct process {
  process_t *parent, *waiting_child, *next_all, *first_child, *next_sibling;
  kernel_thread_t *main_thread, *threads, *waiting_thread;
  u32 thread_count, live_thread_count, thread_list_readers;
+ u32 scheduler_handoff_references;
+ _Atomic u32 scheduler_handoff_releases_pending;
  u32 worker_reapers;
  process_thread_record_t *thread_records;
  bool worker_reap_pending;
@@ -109,8 +111,6 @@ static unsigned user_region_metadata_releases;
 static jmp_buf panic_environment;
 static bool scheduler_thread_exit_complete(const kernel_thread_t *thread);
 static void process_scheduler_handoff_complete(kernel_thread_t *thread);
-static void process_cleanup_worker_wake(process_t *process)
-{assert(process);}
 /* This fixture covers process completion for its initial thread and does not
  * model worker-record readers; worker wake lifetime is exercised in the
  * process-thread API production-source concurrency fixture. */
@@ -152,7 +152,6 @@ static void object_release(kernel_object_t *object)
  if(!object->ref_count)all_processes=NULL;}
 static void process_unlink_locked(process_t *p)
 {assert(process_registry_lock && p==&child);p->parent=NULL;}
-static void process_scheduler_post_handoff(process_t *process);
 static bool scheduler_block(void)
 {assert(!process_registry_lock && !scheduler_lock);
  block_calls++;if(!block_success)return false;
@@ -164,7 +163,6 @@ static bool scheduler_block(void)
  child_thread.preempt_return_rip=0;
  child_thread.process_state=THREAD_PROCESS_EXIT_REQUESTED;
  process_scheduler_handoff_complete(&child_thread);
- process_scheduler_post_handoff(&child);
  /* Completion is published only after resource cleanup and stack handoff. */
  parent.waiting_child=NULL;parent.waiting_thread=NULL;
  return true;}
@@ -184,7 +182,7 @@ static bool process_terminate_external(process_t *p,i32 status)
  child_thread.state=THREAD_STATE_TERMINATED;child_thread.running_cpu=THREAD_CPU_NONE;
  child_thread.context_switch_pending=false;child_thread.process_state=THREAD_PROCESS_EXIT_REQUESTED;
  process_scheduler_handoff_complete(&child_thread);
- process_scheduler_post_handoff(&child);return true;}
+ return true;}
 static void process_cwd_clear(process_t *p){assert(p==&child);}
 static void process_unlink_all(process_t *p){assert(p==&child);all_processes=NULL;}
 static bool thread_destroy(kernel_thread_t *t)
@@ -229,7 +227,6 @@ for name in ('process_thread_list_complete_locked',
              'process_publish_terminated_locked',
              'process_scheduler_handoff_complete_internal',
              'process_scheduler_handoff_complete',
-             'process_scheduler_post_handoff',
              'process_detach_thread_owned', 'process_detach_thread',
              'process_finalize_exit',
              'process_wait', 'process_poll', 'process_reap_session_members',
