@@ -2,17 +2,20 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Portable C stress core and real POSIX adapter, independent Python oracle."""
 from pathlib import Path
-import os,subprocess,sys,tempfile,json
+import os,subprocess,sys,json
 sys.dont_write_bytecode=True
 from pathlib import Path as _TestPath
 import sys as _test_sys
 _test_sys.path.insert(0, str(_TestPath(__file__).resolve().parents[2] / "shared"))
 from fsstress_oracle import decode,model,validate_log,encode,payload
 ROOT=Path(__file__).resolve().parents[3]
+sys.path.insert(0,str(ROOT/'tests/shared'))
+import artifact_lifecycle as artifacts
 cc=sys.argv[1] if len(sys.argv)>1 else 'gcc'
 base=[cc,'-std=c17','-O1','-Wall','-Wextra','-Werror','-Wno-misleading-indentation','-fsanitize=address,undefined','-fno-sanitize-recover=all']
 source=ROOT/'userspace/fsstress'
-folder=Path(tempfile.mkdtemp(prefix='mangrove-fsstress-'))
+workspace=artifacts.ArtifactWorkspace(name='fsstress-host')
+folder=workspace.path
 env={**os.environ,'ASAN_OPTIONS':'detect_leaks=0'}
 def run(args,expected=0):
     r=subprocess.run([str(folder/'fsstress'),*map(str,args)],capture_output=True,text=True,env=env,timeout=30)
@@ -21,6 +24,7 @@ def run(args,expected=0):
     assert not r.stderr,r.stderr
     return r.stdout
 try:
+    workspace.require_free_space(128*1024*1024,'fsstress host regression')
     subprocess.run(base+[str(source/'model.c'),str(ROOT/'tests/filesystems/stress/fsstress_unit.c'),'-o',str(folder/'unit')],check=True)
     subprocess.run([str(folder/'unit')],check=True,env=env)
     subprocess.run(base+[str(source/f) for f in ('model.c','engine.c','main.c','posix.c')]+['-o',str(folder/'fsstress')],check=True)
@@ -71,6 +75,10 @@ try:
         else:assert 'kind=result' in r.stdout and 'first=6' in r.stdout
     print('fsstress controlled transport: allocation/space, pre-write I/O, confirmed short write, uncertain partial write and online read failure distinguished')
     print('fsstress POSIX: seeds 0,1,0x5eed7,UINT64_MAX; independent bytes/namespace, replay, model/status/content/incomplete evidence controls PASS')
-except BaseException:
-    print('Failure artifacts:',folder,file=sys.stderr);raise
-else:print('Artifacts:',folder)
+except BaseException as error:
+    result=workspace.finish({'suite':'fsstress','status':'INCOMPLETE' if isinstance(error,KeyboardInterrupt) else 'FAIL',
+                             'error':f'{type(error).__name__}: {error}'},verified=False)
+    print('Failure evidence:',result.get('failure_evidence',folder),file=sys.stderr);raise
+else:
+    workspace.finish({'suite':'fsstress','status':'PASS'},verified=True)
+    print('fsstress regressions PASS; temporary artifacts removed')

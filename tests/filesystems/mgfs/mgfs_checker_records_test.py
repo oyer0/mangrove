@@ -7,22 +7,26 @@ The checker is independently compiled with ASan/UBSan as well as the driver.
 """
 import os
 from pathlib import Path
-import shutil
 import struct
 import subprocess
 import sys
-import tempfile
 
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / 'tests/filesystems/mfqs'))
+sys.path.insert(0, str(ROOT / 'tests/shared'))
+import artifact_lifecycle as artifacts
 from runner import build, FORMAT_ARGS
 from images import create
 from mgfs_images import seal, U64
 
 CC = sys.argv[1] if len(sys.argv) > 1 else 'cc'
 ENV = {**os.environ, 'ASAN_OPTIONS': 'detect_leaks=0'}
-folder = Path(tempfile.mkdtemp(prefix='mangrove-mgfs-checker-records-'))
+workspace = artifacts.ArtifactWorkspace(name='mgfs-checker-records')
+folder = workspace.path
+image = folder / 'media.img'
 try:
+    workspace.require_free_space(256 * 1024 * 1024,
+                                 'MGFS checker-record regression')
     adapter, tools = build(folder, CC)
     flags = [CC, '-std=gnu11', '-O1', '-g', '-Wall', '-Wextra', '-Werror',
              '-fsanitize=address,undefined', '-fno-sanitize-recover=all']
@@ -36,7 +40,6 @@ try:
         str(ROOT / 'tests/filesystems/mfqs/host.c'),
         str(ROOT / 'kernel/src/vfs.c'), str(ROOT / 'libc/src/utf8.c'),
         '-o', str(binary)], check=True)
-    image = folder / 'media.img'
     create(image, 'mgfs', 'empty', tools, FORMAT_ARGS)
     empty = image.read_bytes()
     cases = 0
@@ -209,8 +212,17 @@ try:
     print(f'MGFS checker Records: {cases} checks passed; production capacity, '
           'unchanged full-table failures, slot reuse, 64-bit IDs, ownership, '
           'enumeration and corruption controls; ASan/UBSan; LSan disabled')
-except BaseException:
-    print('Failure artifacts preserved:', folder, file=sys.stderr)
+except BaseException as error:
+    if image.is_file():
+        workspace.set_failure_media(image)
+    status = 'INCOMPLETE' if isinstance(error, KeyboardInterrupt) else 'FAIL'
+    evidence = workspace.finish({'suite': 'mgfs-checker-records',
+                                 'status': status,
+                                 'error': f'{type(error).__name__}: {error}'},
+                                verified=False)
+    print('Failure evidence:', evidence.get('failure_evidence', folder),
+          file=sys.stderr)
     raise
 else:
-    shutil.rmtree(folder)
+    workspace.finish({'suite': 'mgfs-checker-records', 'status': 'PASS'},
+                     verified=True)

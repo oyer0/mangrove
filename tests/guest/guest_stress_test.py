@@ -261,8 +261,6 @@ def main():
     p.add_argument('--extra-controls',action='store_true',help='MGFS real model/status/failing-prefix/incomplete controls and write/flush uncertainty');p.add_argument('--controls',action='store_true');p.add_argument('--accel',choices=('tcg','kvm'),default=guest.default_accel());p.add_argument('--qemu',default='qemu-system-x86_64');p.add_argument('--timeout',type=int,default=600)
     p.add_argument('--ovmf-code',type=Path,default=Path('/usr/share/OVMF/OVMF_CODE_4M.fd'));p.add_argument('--ovmf-vars',type=Path,default=Path('/usr/share/OVMF/OVMF_VARS_4M.fd'))
     a=p.parse_args()
-    error=guest.accel_error(a.accel,a.qemu)
-    if error: p.error(error)
     a.build_dir=a.build_dir.resolve();a.host=a.host.resolve()
     for path in (a.output,a.ovmf_code,a.ovmf_vars):
         if path is None:continue
@@ -271,6 +269,11 @@ def main():
     if (a.output is not None and a.output.exists()) or not 64<=a.operations<=256 or not 60<=a.timeout<=600:p.error('new output and bounded guest configuration required')
     seeds=a.seed or ['0000000000000000',secrets.token_hex(8)]
     if len(seeds)>4 or any(not re.fullmatch('[0-9a-f]{16}',s) for s in seeds):p.error('1..4 explicit hexadecimal seeds required')
+    # Reject malformed invocations before probing host virtualization. This
+    # keeps argument-validation regressions independent of KVM availability;
+    # valid guest runs still require their explicitly selected accelerator.
+    error=guest.accel_error(a.accel,a.qemu)
+    if error: p.error(error)
     workspace=artifacts.ArtifactWorkspace(a.output,name='guest-stress',retain=a.retain_artifacts)
     a.output=workspace.path
     report=dict(status='FAIL',profiles=[],seeds=seeds,operations=a.operations,accel=a.accel);started=time.monotonic();cpu=time.process_time()

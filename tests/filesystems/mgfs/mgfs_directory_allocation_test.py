@@ -6,21 +6,25 @@ Offline fixture encoder and independent mgfsck; no namespace/mutation mocks.
 import os
 from pathlib import Path
 import resource
-import shutil
 import subprocess
 import sys
-import tempfile
 
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / 'tests/filesystems/mfqs'))
+sys.path.insert(0, str(ROOT / 'tests/shared'))
+import artifact_lifecycle as artifacts
 from runner import build, FORMAT_ARGS
 from images import create
 from mgfs_images import preallocate
 
 CC = sys.argv[1] if len(sys.argv) > 1 else 'gcc'
 ENV = {**os.environ, 'ASAN_OPTIONS': 'detect_leaks=0'}
-folder = Path(tempfile.mkdtemp(prefix='mangrove-mgfs-directory-allocation-'))
+workspace = artifacts.ArtifactWorkspace(name='mgfs-directory-allocation')
+folder = workspace.path
+image = folder / 'media.img'
 try:
+    workspace.require_free_space(256 * 1024 * 1024,
+                                 'MGFS directory-allocation regression')
     adapter, tools = build(folder, CC)
     binary = folder / 'test'
     subprocess.run([CC, '-std=gnu11', '-O1', '-Wall', '-Wextra', '-Werror', '-Wno-unused-function',
@@ -29,7 +33,6 @@ try:
         '-I'+str(ROOT/'kernel/src/storage'),str(ROOT/'tests/filesystems/mgfs/mgfs_directory_allocation_test.c'),
         str(ROOT/'tests/filesystems/mfqs/host.c'),str(ROOT/'kernel/src/vfs.c'),
         str(ROOT/'libc/src/utf8.c'),'-o',str(binary)],check=True)
-    image = folder / 'media.img'
     create(image, 'mgfs', 'empty', tools, FORMAT_ARGS)
 
     def adapter_run(commands):
@@ -127,8 +130,17 @@ try:
     usage = resource.getrusage(resource.RUSAGE_CHILDREN)
     print(f'Fault outcomes={outcomes}; peak_requested={max_heap}; max_recovery={max_recovery}; ordinary32={int(result['ordinary'])*32}; safe_fixed32={int(result['safe'])*32}')
     print(f'MGFS directory allocation: {cases} production-path cases; CPU={usage.ru_utime+usage.ru_stime-start_cpu:.3f}s; ASan/UBSan; independent mgfsck before/after; poisoned unused entries remain invisible')
-except BaseException:
-    print('Failure artifacts preserved:',folder, file=sys.stderr)
+except BaseException as error:
+    if image.is_file():
+        workspace.set_failure_media(image)
+    status = 'INCOMPLETE' if isinstance(error, KeyboardInterrupt) else 'FAIL'
+    evidence = workspace.finish({'suite': 'mgfs-directory-allocation',
+                                 'status': status,
+                                 'error': f'{type(error).__name__}: {error}'},
+                                verified=False)
+    print('Failure evidence:', evidence.get('failure_evidence', folder),
+          file=sys.stderr)
     raise
 else:
-    shutil.rmtree(folder)
+    workspace.finish({'suite': 'mgfs-directory-allocation', 'status': 'PASS'},
+                     verified=True)

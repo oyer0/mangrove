@@ -1584,6 +1584,7 @@ test-slab-benchmark:
 	python3 tests/memory/slab_benchmark.py "$(HOST_CC)"
 
 test-mfqs:
+	python3 tests/filesystems/mfqs/artifact_lifecycle_test.py
 	python3 tests/filesystems/mfqs/mfqs_test.py "$(HOST_CC)"
 
 .PHONY: test-heap-profile
