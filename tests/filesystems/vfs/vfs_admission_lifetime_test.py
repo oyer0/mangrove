@@ -88,6 +88,11 @@ struct process {
 #define HANDLE_INDEX_MASK 0xffffU
 bool object_reference(kernel_object_t *object);
 void object_release(kernel_object_t *object);
+/* These handle-lifetime cases use files; process collection is tested by the
+ * dedicated process reaper fixture. */
+void process_handle_reference_release(kernel_object_t *object) {
+    object_release(object);
+}
 static void process_handle_revision_advance(process_t *process) {
     process->handle_revision++;
     if (!process->handle_revision) process->handle_revision = 1U;

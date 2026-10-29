@@ -1566,7 +1566,7 @@ static void syscall_dispatch_inner(syscall_frame_t *frame)
             if (!(frame->rax == SYSCALL_READ
                     ? syscall_user_buffer_writable(buffer, length)
                     : syscall_user_buffer_valid(buffer, length))) {
-                object_release(object);
+                process_handle_reference_release(object);
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
             }
@@ -1577,7 +1577,7 @@ static void syscall_dispatch_inner(syscall_frame_t *frame)
                     : object_write(object, buffer, length);
             file_write = frame->rax != SYSCALL_READ &&
                          object->type == OBJECT_TYPE_FILE;
-            object_release(object);
+            process_handle_reference_release(object);
             frame->rax = (u64)syscall_object_io_result(file_write, result);
             return;
         }
@@ -1592,7 +1592,7 @@ static void syscall_dispatch_inner(syscall_frame_t *frame)
             }
             bool allowed = object->type != OBJECT_TYPE_THREAD ||
                 process_thread_handle_close_allowed(object);
-            object_release(object);
+            process_handle_reference_release(object);
             frame->rax = allowed && process_handle_close(process, handle)
                 ? (u64)MG_OK : (u64)(allowed ? MG_ERR_INVALID_HANDLE :
                                                MG_ERR_BUSY);

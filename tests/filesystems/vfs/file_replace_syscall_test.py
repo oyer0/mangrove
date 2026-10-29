@@ -200,6 +200,10 @@ static int object_file_snapshot_stream(kernel_object_t *object,usize capacity,
     vfs_snapshot_sink_t sink,vfs_snapshot_finish_t finish,void *context);
 bool object_reference(kernel_object_t *object);
 void object_release(kernel_object_t *object);
+/* This fixture exercises file handles, not process-session collection. */
+void process_handle_reference_release(kernel_object_t *object) {
+    object_release(object);
+}
 '''
 
 parts = "".join(function(path, name) for path, name in (

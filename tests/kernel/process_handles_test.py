@@ -127,6 +127,8 @@ static bool object_reference(kernel_object_t *object)
 { if (!object) return false; u32 count=__atomic_load_n(&object->ref_count,__ATOMIC_ACQUIRE); while(count&&count!=UINT32_MAX){if(__atomic_compare_exchange_n(&object->ref_count,&count,count+1U,false,__ATOMIC_ACQUIRE,__ATOMIC_RELAXED))return true;}return false; }
 static void object_release(kernel_object_t *object)
 { assert(object);u32 count=__atomic_fetch_sub(&object->ref_count,1U,__ATOMIC_ACQ_REL);assert(count); }
+static void process_handle_reference_release(kernel_object_t *object)
+{ object_release(object); }
 static bool process_thread_handle_close_allowed(kernel_object_t *object)
 { (void)object; return false; }
 '''

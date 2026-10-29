@@ -163,6 +163,8 @@ static kernel_object_t *process_handle_lookup_any(process_t *parent,
 static process_t *object_process(kernel_object_t *object) {return object->process;}
 static void object_release(kernel_object_t *object)
 {assert(object&&object->references);object->references--;lookup_releases++;}
+static void process_handle_reference_release(kernel_object_t *object)
+{object_release(object);}
 static bool object_reference(kernel_object_t *object)
 {assert(object);object->references++;return true;}
 static bool scheduler_thread_process_attachable(const kernel_thread_t *thread)
