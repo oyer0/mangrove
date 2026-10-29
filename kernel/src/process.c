@@ -136,7 +136,10 @@ static void process_unlink_all_locked(process_t *process);
 static bool process_cleanup_exit_resources(process_t *process);
 static bool process_finish_termination(process_t *process);
 static bool process_cleanup_context_valid(void);
-static kernel_thread_t *process_publish_terminated_locked(process_t *process);
+static kernel_thread_t *process_publish_terminated_locked(
+    process_t *process, process_t **out_waiter_process);
+static void process_waiter_wake_release(process_t *process,
+                                        kernel_thread_t *waiter);
 static void process_worker_records_release_all(process_t *process);
 static void process_cleanup_worker_entry(void *unused);
 static bool process_cleanup_worker_wake(process_t *hint);
@@ -766,6 +769,30 @@ static void process_thread_list_read_release(process_t *process)
     if (finish_exit) (void)process_finish_termination(process);
 }
 
+/* The process-list reader pin keeps a captured waiter's scheduler record
+ * alive across the unlocked wake. Event wakes latch if the waiter has not yet
+ * entered scheduler_block(); process_wait() owns and releases its separate
+ * registration pin when it resumes or is interrupted. */
+static void process_waiter_wake_release(process_t *process,
+                                        kernel_thread_t *waiter)
+{
+    bool woke;
+    bool active;
+    u64 flags;
+
+    if (!process || !waiter)
+        panic("process: invalid retained wait notification");
+    woke = scheduler_wake_waiter(waiter);
+    if (!woke) {
+        flags = spin_lock_irqsave(&process_registry_lock);
+        active = process->state == PROCESS_STATE_ACTIVE;
+        spin_unlock_irqrestore(&process_registry_lock, flags);
+        if (active)
+            panic("process: active process waiter could not be woken");
+    }
+    process_thread_list_read_release(process);
+}
+
 /* Caller holds process_registry_lock.  Revoking this state at the first
  * process-exit transition prevents an admitted sibling syscall from using a
  * grant after process-wide teardown has begun. */
@@ -790,9 +817,13 @@ static void process_storage_authorization_revoke_thread_locked(
     }
 }
 
-static kernel_thread_t *process_publish_terminated_locked(process_t *process)
+static kernel_thread_t *process_publish_terminated_locked(
+    process_t *process, process_t **out_waiter_process)
 {
     kernel_thread_t *waiter = NULL;
+    process_t *waiter_process = NULL;
+
+    if (out_waiter_process) *out_waiter_process = NULL;
     if (!process || process->state != PROCESS_STATE_EXITING ||
         process->thread_list_readers ||
         !process->exit_cleanup_complete ||
@@ -806,7 +837,16 @@ static kernel_thread_t *process_publish_terminated_locked(process_t *process)
     if (process->parent && process->parent->state == PROCESS_STATE_ACTIVE &&
         process->parent->waiting_child == process &&
         process->parent->waiting_thread) {
+        waiter_process = process->parent;
+        /* The wait registration itself pins the parent's list until its
+         * syscall unwinds. Take a second, delivery-owned pin before clearing
+         * the registration: an unrelated event may let that syscall resume
+         * before this completion path reaches scheduler_wake_waiter(). */
+        if (!out_waiter_process ||
+            !process_thread_list_read_acquire_locked(waiter_process))
+            panic("process: unable to retain child waiter");
         waiter = process->parent->waiting_thread;
+        *out_waiter_process = waiter_process;
         process->parent->waiting_child = NULL;
         process->parent->waiting_thread = NULL;
     }
@@ -2060,6 +2100,7 @@ void process_worker_reclaim_pending(process_t *process)
         bool drop_list_reference = false;
         bool cleanup_ready = false;
         kernel_thread_t *terminated_waiter = NULL;
+        process_t *terminated_waiter_process = NULL;
         process_region_release_result_t stack_release_result =
             PROCESS_REGION_RELEASED;
         process_region_release_result_t tls_release_result =
@@ -2168,12 +2209,13 @@ void process_worker_reclaim_pending(process_t *process)
                 !process->exit_cleanup_complete &&
                 !process->exit_cleanup_in_progress &&
                 process_thread_list_complete_locked(process);
-            terminated_waiter = process_publish_terminated_locked(process);
+            terminated_waiter = process_publish_terminated_locked(
+                process, &terminated_waiter_process);
             spin_unlock_irqrestore(&process_registry_lock, flags);
 
-            if (terminated_waiter &&
-                !scheduler_unblock(terminated_waiter))
-                panic("process: worker reap failed to wake process waiter");
+            if (terminated_waiter)
+                process_waiter_wake_release(terminated_waiter_process,
+                                            terminated_waiter);
             if (cleanup_ready) (void)process_cleanup_exit_resources(process);
             if (drop_list_reference) object_release(&record->object);
             object_release(&record->object); /* claimed reaper pin */
@@ -2428,16 +2470,17 @@ static bool process_cleanup_context_valid(void)
 static bool process_finish_termination(process_t *process)
 {
     kernel_thread_t *waiter = NULL;
+    process_t *waiter_process = NULL;
     bool terminated;
     u64 flags;
 
     if (!process) return false;
     flags = spin_lock_irqsave(&process_registry_lock);
-    waiter = process_publish_terminated_locked(process);
+    waiter = process_publish_terminated_locked(process, &waiter_process);
     terminated = process->state == PROCESS_STATE_TERMINATED;
     spin_unlock_irqrestore(&process_registry_lock, flags);
 
-    if (waiter) (void)scheduler_unblock(waiter);
+    if (waiter) process_waiter_wake_release(waiter_process, waiter);
     return terminated;
 }
 
@@ -2668,6 +2711,7 @@ static bool process_scheduler_handoff_complete_internal(
     process_t *process;
     kernel_thread_t *waiter = NULL;
     kernel_thread_t *join_waiter = NULL;
+    process_t *waiter_process = NULL;
     bool join_waiter_pinned = false;
     u64 flags;
 
@@ -2724,7 +2768,7 @@ static bool process_scheduler_handoff_complete_internal(
             }
         }
     }
-    waiter = process_publish_terminated_locked(process);
+    waiter = process_publish_terminated_locked(process, &waiter_process);
     spin_unlock_irqrestore(&process_registry_lock, flags);
 
     if (join_waiter) {
@@ -2733,7 +2777,7 @@ static bool process_scheduler_handoff_complete_internal(
         if (join_waiter_pinned)
             process_thread_list_read_release(process);
     }
-    if (waiter) (void)scheduler_unblock(waiter);
+    if (waiter) process_waiter_wake_release(waiter_process, waiter);
     return true;
 }
 
@@ -4373,6 +4417,8 @@ int process_wait(process_t *parent, process_handle_t handle,
     process_t *child;
     kernel_thread_t *thread;
     u64 flags;
+    bool waiter_reader_pinned = false;
+    bool interrupted;
 
     if (!parent || parent->state != PROCESS_STATE_ACTIVE || !out_status) {
         return MG_ERR_BAD_ARGUMENT;
@@ -4382,6 +4428,13 @@ int process_wait(process_t *parent, process_handle_t handle,
     child = object_process(object);
     u64 wait_flags = process_cli_save();
     spin_lock(&process_registry_lock);
+    if (parent->state != PROCESS_STATE_ACTIVE || parent->exit_requested ||
+        parent->termination_pending || parent->shutdown_requested) {
+        spin_unlock(&process_registry_lock);
+        process_cli_restore(wait_flags);
+        process_handle_reference_release(object);
+        return MG_ERR_SHUTDOWN;
+    }
     if (child == parent || child->parent != parent || child->wait_collected) {
         spin_unlock(&process_registry_lock);
         process_cli_restore(wait_flags);
@@ -4390,17 +4443,59 @@ int process_wait(process_t *parent, process_handle_t handle,
     }
     if (child->state != PROCESS_STATE_TERMINATED) {
         thread = thread_current();
-        if (parent->waiting_child || !thread || child->wait_claimed) {
+        if (parent->waiting_child || !thread ||
+            thread->process != parent ||
+            thread->process_state != THREAD_PROCESS_ATTACHED ||
+            child->wait_claimed) {
             spin_unlock(&process_registry_lock);
             process_cli_restore(wait_flags);
             process_handle_reference_release(object);
             return MG_ERR_BUSY;
         }
+        if (!process_thread_list_read_acquire_locked(parent)) {
+            spin_unlock(&process_registry_lock);
+            process_cli_restore(wait_flags);
+            process_handle_reference_release(object);
+            return MG_ERR_BUSY;
+        }
+        waiter_reader_pinned = true;
         parent->waiting_child = child;
         parent->waiting_thread = thread;
-        spin_unlock(&process_registry_lock);
-        if (!scheduler_block()) {
+
+        /* Keep the registration and reader pin until the child predicate is
+         * true or this process is interrupted. Completion uses the scheduler
+         * event latch, so it is safe whether it runs before scheduler_block()
+         * parks this thread or after the thread is already BLOCKED. Unrelated
+         * event wakes simply recheck the predicate and wait again. */
+        for (;;) {
+            spin_unlock(&process_registry_lock);
+            bool woke = scheduler_block();
             spin_lock(&process_registry_lock);
+
+            interrupted = parent->state != PROCESS_STATE_ACTIVE ||
+                parent->exit_requested || parent->termination_pending ||
+                parent->shutdown_requested;
+            if (interrupted || child->state == PROCESS_STATE_TERMINATED)
+                break;
+            if (!woke) {
+                if (parent->waiting_thread == thread &&
+                    parent->waiting_child == child) {
+                    parent->waiting_child = NULL;
+                    parent->waiting_thread = NULL;
+                }
+                spin_unlock(&process_registry_lock);
+                process_cli_restore(wait_flags);
+                if (waiter_reader_pinned) {
+                    process_thread_list_read_release(parent);
+                    waiter_reader_pinned = false;
+                }
+                process_handle_reference_release(object);
+                return interrupted ? MG_ERR_SHUTDOWN : MG_ERR_BUSY;
+            }
+            /* A wake for another event is not a child-completion predicate.
+             * Keep the registration intact and block again. */
+        }
+        if (interrupted) {
             if (parent->waiting_thread == thread &&
                 parent->waiting_child == child) {
                 parent->waiting_child = NULL;
@@ -4408,19 +4503,27 @@ int process_wait(process_t *parent, process_handle_t handle,
             }
             spin_unlock(&process_registry_lock);
             process_cli_restore(wait_flags);
+            if (waiter_reader_pinned) {
+                process_thread_list_read_release(parent);
+                waiter_reader_pinned = false;
+            }
             process_handle_reference_release(object);
-            return process_shutdown_requested(parent) ? MG_ERR_SHUTDOWN :
-                MG_ERR_BUSY;
+            return MG_ERR_SHUTDOWN;
         }
-        spin_lock(&process_registry_lock);
         if (parent->waiting_thread == thread &&
             parent->waiting_child == child) {
             parent->waiting_child = NULL;
             parent->waiting_thread = NULL;
         }
+        spin_unlock(&process_registry_lock);
+        process_cli_restore(wait_flags);
+        if (waiter_reader_pinned) {
+            process_thread_list_read_release(parent);
+            waiter_reader_pinned = false;
+        }
+        spin_lock(&process_registry_lock);
         if (child->state != PROCESS_STATE_TERMINATED) {
             spin_unlock(&process_registry_lock);
-            process_cli_restore(wait_flags);
             process_handle_reference_release(object);
             return process_shutdown_requested(parent) ? MG_ERR_SHUTDOWN :
                 MG_ERR_BUSY;

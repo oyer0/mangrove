@@ -194,8 +194,6 @@ static void process_cleanup_exit_resources(process_t *process);
 static void console_cancel_waiter(kernel_thread_t *thread) {(void)thread;}
 static bool scheduler_wake_waiter(kernel_thread_t *thread)
 {(void)thread; return true;}
-static bool scheduler_unblock(kernel_thread_t *thread)
-{(void)thread; return true;}
 static void process_worker_reclaim_pending(process_t *process)
 {assert(process && !process_registry_lock); worker_reap_calls++;}
 static void process_cleanup_worker_wake(process_t *process)
@@ -216,6 +214,7 @@ scheduler_functions = "".join(function(path, name) for path, name in (
     ("kernel/src/process.c", "process_thread_list_complete_locked"),
     ("kernel/src/process.c", "process_thread_list_read_acquire_locked"),
     ("kernel/src/process.c", "process_thread_list_read_release"),
+    ("kernel/src/process.c", "process_waiter_wake_release"),
     ("kernel/src/process.c", "process_storage_authorization_clear_locked"),
     ("kernel/src/process.c", "process_publish_terminated_locked"),
     ("kernel/src/process.c", "process_finish_termination"),
