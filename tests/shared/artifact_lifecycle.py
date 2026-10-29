@@ -17,7 +17,9 @@ import threading
 ROOT = Path(__file__).resolve().parents[2]
 MARKER = ".mangrove-test-workspace.json"
 IMAGE_SUFFIXES = {".img", ".qcow", ".qcow2", ".raw", ".ppm"}
-SMALL_EVIDENCE_SUFFIXES = {".json", ".log", ".txt", ".tsv"}
+SMALL_EVIDENCE_SUFFIXES = {
+    ".json", ".log", ".txt", ".tsv", ".trace", ".stdout", ".stderr",
+}
 MAX_DIAGNOSTIC_FILE = 8 * 1024 * 1024
 MAX_DIAGNOSTIC_TOTAL = 32 * 1024 * 1024
 MAX_FAILURE_MEDIA = 2

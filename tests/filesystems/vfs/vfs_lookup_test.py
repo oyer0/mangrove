@@ -3,10 +3,8 @@
 """Checked namespace failures and a historical busy-CWD bypass, full production units."""
 import os
 from pathlib import Path
-import shutil
 import subprocess
 import sys
-import tempfile
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[3]
 sys.path[:0] = [str(ROOT / 'tests'), str(ROOT / 'tests/filesystems/mfqs')]
@@ -15,12 +13,17 @@ from pathlib import Path as _TestPath
 import sys as _test_sys
 _test_sys.path.insert(0, str(_TestPath(__file__).resolve().parents[2] / "shared"))
 from host_build import dead_strip_flags
+import artifact_lifecycle as artifacts
 
 
 def main():
-    work = Path(tempfile.mkdtemp(prefix='mangrove-lookup-'))
+    workspace = artifacts.ArtifactWorkspace(name='vfs-lookup')
+    work = workspace.path
     compiler = sys.argv[1] if len(sys.argv) > 1 else 'gcc'
+    image = work / 'not-created.img'
     try:
+        workspace.require_free_space(512 * 1024 * 1024,
+                                     'VFS lookup regression images')
         baseline = work / 'historical-vfs.c'
         baseline.write_bytes(subprocess.check_output(['git', 'show',
             '707a060a2332b7c343639ba721da39fd647fc27e:kernel/src/vfs.c'], cwd=ROOT))
@@ -55,12 +58,24 @@ def main():
                 print(result.stdout.strip(), flush=True)
                 check(image, backend, tools)
     except Unavailable as error:
-        print('INCOMPLETE ' + str(error)); return 2
-    except BaseException:
-        print('Lookup failure evidence retained:', work, file=sys.stderr); raise
+        result = workspace.finish({'suite': 'vfs-lookup', 'status': 'INCOMPLETE',
+                                   'error': str(error)}, verified=False)
+        print('INCOMPLETE; evidence: ' + str(
+            result.get('failure_evidence') or work))
+        return 2
+    except BaseException as error:
+        if image.is_file():
+            workspace.set_failure_media(image)
+        status = 'INCOMPLETE' if isinstance(error, KeyboardInterrupt) else 'FAIL'
+        result = workspace.finish({'suite': 'vfs-lookup', 'status': status,
+                                   'error': f'{type(error).__name__}: {error}'},
+                                  verified=False)
+        print('Lookup failure evidence: ' + str(
+            result.get('failure_evidence') or work), file=sys.stderr)
+        raise
     else:
         print('Independent images, ASan/UBSan and historical controls PASS; controlled block/heap/scheduler.')
-        shutil.rmtree(work)
+        workspace.finish({'suite': 'vfs-lookup', 'status': 'PASS'}, verified=True)
     return 0
 
 

@@ -12,11 +12,12 @@ import resource
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "filesystems/mfqs"))
+sys.path.insert(0, str(ROOT / "shared"))
+import artifact_lifecycle as artifacts
 from model import Model, fixed_trace
 from generator import generated_trace
 from witnesses import evidence
@@ -279,9 +280,12 @@ def qualify(directory, adapter, tools, compiler, trace, negative=None, driver_so
     try:
         start = time.perf_counter()
         cpu = resource.getrusage(resource.RUSAGE_CHILDREN)
+        adapter_env = os.environ.copy()
+        adapter_env.setdefault("ASAN_OPTIONS", "detect_leaks=0")
         with (directory / "observations.tsv").open("w") as stdout, (directory / "adapter.stderr").open("w") as stderr:
             result = subprocess.run([str(adapter), str(image)], input=wire, text=True,
-                                    stdout=stdout, stderr=stderr, timeout=120)
+                                    stdout=stdout, stderr=stderr, timeout=120,
+                                    env=adapter_env)
         after = resource.getrusage(resource.RUSAGE_CHILDREN)
         report["timing"] = dict(adapter_wall_seconds=time.perf_counter() - start,
             adapter_cpu_seconds=after.ru_utime + after.ru_stime - cpu.ru_utime - cpu.ru_stime)
@@ -352,7 +356,7 @@ def qualify(directory, adapter, tools, compiler, trace, negative=None, driver_so
     return report
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cc", default="gcc")
     parser.add_argument("--backend", choices=("mgfs", "fat32", "exfat"), default="mgfs")
@@ -362,13 +366,15 @@ def main():
     parser.add_argument("--negative-control", choices=("byte", "length", "namespace", "offset", "count", "status", "pins", "middle", "tail"))
     parser.add_argument("--campaign", choices=("quick", "extended"))
     parser.add_argument("--seed", type=lambda value: int(value, 0), default=0)
-    args = parser.parse_args()
-    directory = args.artifacts or Path(tempfile.mkdtemp(prefix="mangrove-mfqs-"))
-    if args.artifacts:
-        if directory.exists():
-            parser.error("--artifacts must name a new directory (existing data is preserved)")
-        directory.mkdir(parents=True)
+    args = parser.parse_args(argv)
     try:
+        workspace = artifacts.ArtifactWorkspace(args.artifacts, name="mfqs-run")
+    except FileExistsError:
+        parser.error("--artifacts must name a new directory (existing data is preserved)")
+    directory = workspace.path
+    try:
+        workspace.require_free_space(256 * 1024 * 1024,
+                                     "MFQS single-run artifacts")
         backend, layout = args.backend, args.layout
         expected_initial = None
         campaign, seed = args.campaign, args.seed
@@ -400,18 +406,50 @@ def main():
         (directory / "incomplete.json").write_text(json.dumps(dict(
             version=VERSION, status="INCOMPLETE", error=str(error),
             environment=dict(platform=platform.platform(), compiler=args.cc)), indent=2) + "\n")
-        print(f"INCOMPLETE: harness/environment failure: {error}; artifacts: {directory}")
+        outcome = dict(version=VERSION, status="INCOMPLETE", error=str(error),
+                       environment=dict(platform=platform.platform(), compiler=args.cc))
+        report = workspace.finish(outcome, verified=False)
+        location = (report.get("failure_evidence") or report.get("retained_output") or
+                    str(directory))
+        print(f"INCOMPLETE: harness/environment failure: {error}; evidence: {location}")
         return 2
-    print(f"{report['status']}: {report['profile']}/{layout} ({len(trace)} commands); "
+    except KeyboardInterrupt:
+        outcome = dict(version=VERSION, status="INCOMPLETE", error="interrupted",
+                       environment=dict(platform=platform.platform(), compiler=args.cc))
+        (directory / "incomplete.json").write_text(json.dumps(outcome, indent=2) + "\n")
+        result = workspace.finish(outcome, verified=False)
+        location = result.get("failure_evidence") or result.get("retained_output") or str(directory)
+        print(f"INCOMPLETE: interrupted; evidence: {location}")
+        return 130
+    except BaseException as error:
+        # Keep unexpected programming failures visible while still publishing
+        # bounded diagnostics and removing the owned scratch workspace.
+        outcome = dict(version=VERSION, status="FAIL",
+                       error=f"{type(error).__name__}: {error}",
+                       environment=dict(platform=platform.platform(), compiler=args.cc))
+        image = directory / "media.img"
+        if image.is_file():
+            workspace.set_failure_media(image)
+        try:
+            workspace.finish(outcome, verified=False)
+        finally:
+            print(f"MFQS runner failed; owned evidence: " +
+                  str(outcome.get("failure_evidence", directory)), file=sys.stderr)
+        raise
+
+    status = report.get("status", "INCOMPLETE")
+    image = directory / "media.img"
+    if status == "FAIL" and image.is_file():
+        workspace.set_failure_media(image)
+    result = workspace.finish(report, verified=status in {"PASS", "EXPECTED_FAILURE"})
+    print(f"{status}: {report['profile']}/{layout} ({len(trace)} commands); "
           "broader qualification INCOMPLETE")
-    if report["status"] != "PASS" or args.artifacts:
-        print(f"Artifacts: {directory}")
+    if status != "PASS" or args.artifacts:
+        print(f"Artifacts: {result.get('retained_output') or result.get('failure_evidence') or directory}")
         if report.get("failure"):
             print(json.dumps(report["failure"], sort_keys=True))
         if report.get("coverage", {}).get("missing"):
             print("Missing qualification witnesses: " + ", ".join(report["coverage"]["missing"]))
-    else:
-        shutil.rmtree(directory)
     return 0 if report["status"] == "PASS" else 2 if report["status"] == "INCOMPLETE" else 1
 
 

@@ -59,11 +59,17 @@ class ArtifactLifecycleTests(unittest.TestCase):
         workspace = self.workspace("failed")
         (workspace.path / "disk.img").write_bytes(b"large media")
         (workspace.path / "serial.log").write_text("guest failed at phase verify\n")
+        (workspace.path / "commands.trace").write_text("bounded command trace\n")
+        (workspace.path / "adapter.stderr").write_text("diagnostic from adapter\n")
         (workspace.path / "screen.ppm").write_bytes(b"bounded framebuffer evidence")
         report = workspace.finish({"status": "FAIL", "error": "checker mismatch"})
         evidence = self.root / report["failure_evidence"]
         self.assertEqual((evidence / "serial.log").read_text(),
                          "guest failed at phase verify\n")
+        self.assertEqual((evidence / "commands.trace").read_text(),
+                         "bounded command trace\n")
+        self.assertEqual((evidence / "adapter.stderr").read_text(),
+                         "diagnostic from adapter\n")
         saved_report = json.loads((evidence / "report.json").read_text())
         self.assertEqual(saved_report["error"], "checker mismatch")
         self.assertFalse((evidence / "disk.img").exists())

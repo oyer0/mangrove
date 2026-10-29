@@ -3,14 +3,14 @@
 """Production MFQS foundation plus genuinely failing model negative controls."""
 import json
 from pathlib import Path
-import shutil
 import subprocess
 import sys
-import tempfile
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "filesystems/mfqs"))
+sys.path.insert(0, str(ROOT / "shared"))
+import artifact_lifecycle as artifacts
 from model import fixed_trace
 from generator import Random, VECTORS, generated_trace
 from runner import build, compare, encode, qualify, validate_trace, response
@@ -157,8 +157,12 @@ def witness_known_answers():
 
 def main():
     compiler = sys.argv[1] if len(sys.argv) > 1 else "gcc"
-    directory = Path(tempfile.mkdtemp(prefix="mangrove-mfqs-regression-"))
+    workspace = artifacts.ArtifactWorkspace(name="mfqs-regression")
+    directory = workspace.path
+    incomplete = False
     try:
+        workspace.require_free_space(1024 * 1024 * 1024,
+                                     "MFQS aggregate regression")
         witness_known_answers()
         rng = Random(0)
         assert tuple(rng.next() for _ in VECTORS) == VECTORS
@@ -241,9 +245,14 @@ def main():
                      data=b"a\0b\0".hex())]
         duplicate = "MFQS1\t1\t0\t0\t0\t2\t0\t" + b"a\0a\0".hex() + "\n"
         assert compare(membership_trace, want, duplicate)["kind"] == "model-mismatch"
+        unknown_output = directory / "unsupported-layout-cli"
         unknown = subprocess.run([sys.executable, str(ROOT / "filesystems/mfqs/runner.py"),
-                                  "--backend", "mgfs", "--layout", "slack"], capture_output=True, text=True)
+                                  "--backend", "mgfs", "--layout", "slack",
+                                  "--artifacts", str(unknown_output)],
+                                 capture_output=True, text=True)
         assert unknown.returncode == 2 and "INCOMPLETE" in unknown.stdout
+        unknown_report = json.loads((unknown_output / "incomplete.json").read_text())
+        assert unknown_report["status"] == "INCOMPLETE"
         # Discovery/reporting unit check only, not a mocked filesystem test.
         with patch("images.shutil.which", return_value=None):
             for backend in ("fat32", "exfat"):
@@ -286,7 +295,6 @@ def main():
         print("PASS negative-control checks: incorrect byte and length each report FAIL; "
               "historical production shrink-on-overwrite reports FAIL (4096 -> 1)")
         print("MGFS measured resources: " + json.dumps(report["metrics"], sort_keys=True))
-        incomplete = False
         for backend, layouts in (("fat32", ("empty", "slack")),
                                  ("exfat", ("empty", "slack", "chained-slack", "short-valid"))):
             folder = directory / backend
@@ -355,12 +363,40 @@ def main():
         print("INCOMPLETE broader qualification: Unicode/import matrices, directory moves, "
               "open-handle namespace mutations, large-file/fault/concurrency/guest profiles")
         if incomplete:
-            print(f"INCOMPLETE backend evidence retained: {directory}")
+            outcome = dict(suite="MFQS", status="INCOMPLETE",
+                           error="one or more optional filesystem backends unavailable",
+                           compiler=compiler)
+            retained = workspace.finish(outcome, verified=False)
+            print("INCOMPLETE backend evidence retained: " +
+                  str(retained.get("failure_evidence") or directory))
             return 2
-    except BaseException:
-        print(f"MFQS verification failed; complete artifacts preserved: {directory}", file=sys.stderr)
+    except BaseException as error:
+        # Preserve concise reports and the image(s) named by a failed case;
+        # the complete collection of successful scratch images is disposable.
+        failed_media = []
+        reports = sorted(directory.rglob("report.json"),
+                         key=lambda path: path.stat().st_mtime_ns, reverse=True)
+        for path in reports:
+            try:
+                data = json.loads(path.read_text())
+            except (OSError, ValueError):
+                continue
+            if data.get("status") in {"FAIL", "INCOMPLETE"}:
+                media = path.parent / "media.img"
+                if media.is_file() and not media.is_symlink():
+                    failed_media.append(media)
+                    if len(failed_media) == artifacts.MAX_FAILURE_MEDIA:
+                        break
+        if failed_media:
+            workspace.set_failure_media(*failed_media)
+        status = "INCOMPLETE" if isinstance(error, KeyboardInterrupt) else "FAIL"
+        outcome = dict(suite="MFQS", status=status,
+                       error=f"{type(error).__name__}: {error}", compiler=compiler)
+        retained = workspace.finish(outcome, verified=False)
+        print("MFQS verification failed; bounded evidence: " +
+              str(retained.get("failure_evidence") or directory), file=sys.stderr)
         raise
-    shutil.rmtree(directory)
+    workspace.finish(dict(suite="MFQS", status="PASS", compiler=compiler), verified=True)
     return 0
 
 
