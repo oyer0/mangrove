@@ -66,6 +66,8 @@ static bool object_reference(kernel_object_t *object)
 { assert(process_registry_lock); object->references++; return true; }
 static void object_release(kernel_object_t *object)
 { assert(!process_registry_lock && object->references > 1U); object->references--; }
+static void process_handle_reference_release(kernel_object_t *object)
+{ object_release(object); }
 static void panic(const char *message)
 { (void)message; assert(!"unexpected process panic"); }
 static bool process_finish_termination(process_t *process)

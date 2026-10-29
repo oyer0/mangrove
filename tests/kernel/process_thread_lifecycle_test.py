@@ -233,6 +233,14 @@ static bool process_cleanup_worker_wake(process_t *process)
 {assert(process);cleanup_wake_calls++;return true;}
 static void process_reap_session_members(mg_session_id_t session_id)
 {assert(session_id==PROCESS_NO_SESSION);}
+static bool process_cleanup_context_valid(void)
+{return local_thread && !local_thread->waiting_mutex &&
+       fixture_interrupts_enabled && !spinlock_depth_current() &&
+       kernel_stack_release_context_valid();}
+static bool process_cleanup_worker_retry_session_collections_once(void)
+{return false;}
+static void process_handle_reference_release(kernel_object_t *object)
+{object_release(object);}
 static bool process_cleanup_worker_run_once(void);
 static bool run_cleanup_worker_once(process_t *process)
 {kernel_thread_t *previous=local_thread;all_processes=process;

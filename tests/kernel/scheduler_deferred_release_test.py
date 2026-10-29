@@ -39,6 +39,14 @@ def fixture_prefix():
     else:
         raise ValueError('process_reap_test.py prefix')
 
+    prefix = prefix.replace(
+        '/* This fixture models a safe process context and does not include the\n'
+        ' * deferred cleanup worker. The focused deferred-release fixture exercises\n'
+        ' * the production unsafe-context retry path. */\n'
+        'static bool process_cleanup_context_valid(void){return true;}\n'
+        'static void process_cleanup_worker_request_session_collection_retry(void){}\n',
+        '')
+
     prefix = prefix.replace('#include <setjmp.h>',
                             '#include <setjmp.h>\n#include <pthread.h>\n'
                             '#include <stdatomic.h>\n#include <sched.h>')
@@ -48,6 +56,7 @@ def fixture_prefix():
     prefix = prefix.replace(
         'static process_t parent, child, *all_processes;',
         'static process_t parent, child, *all_processes;\n'
+        'static process_handle_slot_t pid_handle_slot;\n'
         'static _Thread_local bool in_scheduler_callback, incoming_mutex_pending;\n'
         'static _Thread_local bool fixture_interrupts_enabled, in_cleanup_worker;\n'
         'static _Atomic unsigned wake_count, publishers_done;\n'
@@ -58,18 +67,74 @@ def fixture_prefix():
         'static kernel_thread_t cleanup_worker_sentinel;\n'
         'static kernel_thread_t *process_cleanup_worker=\n'
         '    &cleanup_worker_sentinel;\n'
+        'static _Atomic bool process_session_collection_retry_pending;\n'
+        'static _Atomic bool process_cleanup_worker_ready=true;\n'
+        'static _Atomic unsigned collection_retry_wake_count;\n'
+        'static u32 session_fixture_lock;\n'
+        'static bool helper_snapshot_paused, termination_published;\n'
+        'static bool retry_scan_paused, retry_published;\n'
+        'static bool pause_pid_lookup, pid_lookup_pinned, pid_close_done;\n'
+        'static pthread_mutex_t pid_gate_lock=PTHREAD_MUTEX_INITIALIZER;\n'
+        'static pthread_cond_t pid_gate_changed=PTHREAD_COND_INITIALIZER;\n'
+        'static u32 process_destructions;\n'
+        'static _Thread_local unsigned fixture_lock_depth;\n'
+        'static void object_release(kernel_object_t *);\n'
+        'static bool process_finish_termination(process_t *);\n'
         'static void process_object_destroy(kernel_object_t *);\n'
+        'static void process_cleanup_worker_entry(void *unused)'
+        '{(void)unused;}\n'
+        'static kernel_thread_t *thread_create_suspended(const char *name, '
+        'void (*entry)(void *), void *arg)\n'
+        '{(void)name;(void)entry;(void)arg;return &cleanup_worker_sentinel;}\n'
+        'static bool scheduler_enqueue(kernel_thread_t *thread)'
+        '{return thread==&cleanup_worker_sentinel;}\n'
+        'static bool scheduler_terminate_thread(kernel_thread_t *thread)'
+        '{return thread==&cleanup_worker_sentinel;}\n'
+        'static bool process_thread_handle_close_allowed(kernel_object_t *o)'
+        '{(void)o;return true;}\n'
         'static void process_reap_session_members(mg_session_id_t);')
+    prefix = prefix.replace('i32 exit_status; u64 session_id; u32 active_syscalls;',
+                            'i32 exit_status; u64 pid; u64 session_id; '
+                            'u32 active_syscalls;')
+    prefix = prefix.replace('typedef u64 process_handle_t;',
+                            'typedef u64 process_handle_t;\n'
+                            'typedef size_t usize;\n'
+                            'typedef uint16_t u16;\n'
+                            'typedef int kernel_object_type_t;\n'
+                            '#define HANDLE_INDEX_MASK 0xffffU')
+    prefix = prefix.replace(
+        'enum {PROCESS_STATE_ACTIVE, PROCESS_STATE_EXITING, PROCESS_STATE_TERMINATED};',
+        'enum {PROCESS_STATE_ACTIVE, PROCESS_STATE_EXITING, PROCESS_STATE_TERMINATED};\n'
+        'enum {OBJECT_TYPE_INVALID, OBJECT_TYPE_THREAD=2, '
+        'OBJECT_RIGHT_READ=1, '
+        'OBJECT_RIGHT_WRITE=2};')
+    prefix = prefix.replace('bool context_switch_pending, syscall_active, sleeping;',
+                            'bool context_switch_pending, syscall_active, sleeping;\n'
+                            ' bool waiting_mutex;')
     prefix = prefix.replace(
         'typedef struct {unsigned ref_count; process_t *process; int type;}\n'
         ' kernel_object_t;',
         'typedef struct kernel_object {unsigned ref_count; process_t *process; '
         'int type; void (*destroy)(struct kernel_object *); } kernel_object_t;')
     prefix = prefix.replace(
+        'typedef struct kernel_object {unsigned ref_count; process_t *process; '
+        'int type; void (*destroy)(struct kernel_object *); } kernel_object_t;',
+        'typedef struct kernel_object {unsigned ref_count; process_t *process; '
+        'int type; void (*destroy)(struct kernel_object *); } kernel_object_t;\n'
+        'typedef struct {kernel_object_t *object; u32 rights; u16 generation; '
+        'bool active, reserved;} process_handle_slot_t;')
+    prefix = prefix.replace(
+        'kernel_object_t object;\n void *address_space, *handle_table;',
+        'kernel_object_t object;\n void *address_space, *handle_table; '
+        'usize handle_capacity, next_handle_slot; u32 handle_lock; '
+        'pthread_mutex_t handle_growth_mutex; u64 handle_revision;')
+    prefix = prefix.replace(
         'static u32 process_registry_lock, scheduler_lock;',
         'static u32 process_registry_lock, scheduler_lock;\n'
         'static pthread_mutex_t registry_mutex=PTHREAD_MUTEX_INITIALIZER;\n'
         'static pthread_mutex_t scheduler_mutex=PTHREAD_MUTEX_INITIALIZER;\n'
+        'static pthread_mutex_t session_mutex=PTHREAD_MUTEX_INITIALIZER;\n'
+        'static pthread_mutex_t handle_mutex=PTHREAD_MUTEX_INITIALIZER;\n'
         'static pthread_mutex_t collection_gate=PTHREAD_MUTEX_INITIALIZER;\n'
         'static pthread_cond_t collection_changed=PTHREAD_COND_INITIALIZER;\n'
         'static _Thread_local unsigned collection_role;\n'
@@ -81,12 +146,17 @@ def fixture_prefix():
         '{(void)flags;assert(*lock);*lock=0;}',
         'static pthread_mutex_t *fixture_mutex(u32 *lock)\n'
         '{return lock==&process_registry_lock?&registry_mutex:\n'
-        '        &scheduler_mutex;}\n'
+        ' lock==&session_fixture_lock?&session_mutex:\n'
+        ' lock==&parent.handle_lock?&handle_mutex:&scheduler_mutex;}\n'
         'static u64 spin_lock_irqsave(u32 *lock)\n'
-        '{assert(!pthread_mutex_lock(fixture_mutex(lock)));assert(!*lock);'
-        '*lock=1;return 1;}\n'
+        '{u64 saved=fixture_interrupts_enabled?1U:0U;'
+        'assert(!pthread_mutex_lock(fixture_mutex(lock)));assert(!*lock);'
+        '*lock=1;fixture_interrupts_enabled=false;fixture_lock_depth++;'
+        'return saved;}\n'
         'static void spin_unlock_irqrestore(u32 *lock,u64 flags)\n'
         '{(void)flags;assert(*lock);*lock=0;'
+        'assert(fixture_lock_depth);fixture_lock_depth--;'
+        'fixture_interrupts_enabled=flags!=0;'
         'assert(!pthread_mutex_unlock(fixture_mutex(lock)));\n'
         'if(lock!=&process_registry_lock)return;\n'
         'assert(!pthread_mutex_lock(&collection_gate));\n'
@@ -101,21 +171,77 @@ def fixture_prefix():
         'pthread_cond_broadcast(&collection_changed);\n'
         ' while(!collector_done)'
         'pthread_cond_wait(&collection_changed,&collection_gate);\n'
+        '}else if(collection_role==3 && !helper_snapshot_paused){'
+        'assert(child.state==PROCESS_STATE_EXITING && '
+        'child.object.ref_count==3);helper_snapshot_paused=true;'
+        'pthread_cond_broadcast(&collection_changed);'
+        'while(!termination_published)'
+        'pthread_cond_wait(&collection_changed,&collection_gate);'
+        '}else if(collection_role==7 && !retry_scan_paused){'
+        'retry_scan_paused=true;pthread_cond_broadcast(&collection_changed);'
+        'while(!retry_published)'
+        'pthread_cond_wait(&collection_changed,&collection_gate);'
         '}\n'
         'assert(!pthread_mutex_unlock(&collection_gate));}')
+    prefix += ('static bool mutex_lock(pthread_mutex_t *mutex)\n'
+               '{return pthread_mutex_lock(mutex)==0;}\n'
+               'static bool mutex_unlock(pthread_mutex_t *mutex)\n'
+               '{return pthread_mutex_unlock(mutex)==0;}\n')
+    prefix = prefix.replace(
+        'static void spin_lock(u32 *lock){(void)spin_lock_irqsave(lock);}\n'
+        'static void spin_unlock(u32 *lock){spin_unlock_irqrestore(lock,0);}',
+        'static void spin_lock(u32 *lock)\n'
+        '{assert(!pthread_mutex_lock(fixture_mutex(lock)));assert(!*lock);'
+        '*lock=1;fixture_lock_depth++;}\n'
+        'static void spin_unlock(u32 *lock)\n'
+        '{assert(*lock);*lock=0;assert(fixture_lock_depth);'
+        'fixture_lock_depth--;'
+        'assert(!pthread_mutex_unlock(fixture_mutex(lock)));}')
     # Use the real atomic object reference implementation below.
     prefix = prefix.replace(c_function(prefix, 'object_reference'), '')
     prefix = prefix.replace(c_function(prefix, 'object_release'), '')
     prefix = prefix.replace(
+        c_function(prefix, 'process_handle_lookup_any'),
+        'static bool object_reference(kernel_object_t *object);\n'
+        'static kernel_object_t *process_handle_lookup_any(process_t *p,\n'
+        ' process_handle_t h,int type,u32 rights)\n'
+        '{(void)rights;assert(p==&parent && (h==7U || h==0x10001U) && '
+        'type==OBJECT_TYPE_PROCESS);\n'
+        ' assert(object_reference(&child.object));\n'
+        ' if(pause_pid_lookup && collection_role==6){'
+        'pthread_mutex_lock(&pid_gate_lock);pid_lookup_pinned=true;'
+        'pthread_cond_broadcast(&pid_gate_changed);'
+        'while(!pid_close_done)'
+        'pthread_cond_wait(&pid_gate_changed,&pid_gate_lock);'
+        'pthread_mutex_unlock(&pid_gate_lock);}\n'
+        ' return &child.object;}\n')
+    prefix = prefix.replace(
+        'static bool kernel_stack_release_context_valid(void){return true;}',
+        'static u32 spinlock_depth_current(void){return fixture_lock_depth;}\n'
+        'static bool kernel_stack_release_context_valid(void)\n'
+        '{return !spinlock_depth_current() && fixture_interrupts_enabled;}')
+    prefix = prefix.replace(
         'static void process_cwd_clear(process_t *p){assert(p==&child);}',
         'static void process_cwd_clear(process_t *p){assert(p==&child); '
-        'assert(in_cleanup_worker && fixture_interrupts_enabled && '
+        'assert(fixture_interrupts_enabled && '
         '!incoming_mutex_pending && !in_scheduler_callback);}')
+    prefix = prefix.replace('static void kfree(void *p){(void)p;frees++;}',
+                            'static void kfree(void *p){if(p==&child)'
+                            'process_destructions++;frees++;}')
+    prefix = prefix.replace(
+        'static void process_unlink_locked(process_t *p)\n'
+        '{assert(process_registry_lock && p==&child);p->parent=NULL;}',
+        'static void process_unlink_locked(process_t *p)\n'
+        '{assert(process_registry_lock && p==&child);\n'
+        ' if(p->parent){process_t **c=&p->parent->first_child;'
+        'while(*c && *c!=p)c=&(*c)->next_sibling;'
+        'if(*c==p)*c=p->next_sibling;}\n'
+        ' p->parent=NULL;p->next_sibling=NULL;}')
     prefix = prefix.replace(
         'static void vmm_destroy_address_space(void *root)\n'
         '{assert(root==child.address_space);destroyed_roots++;}',
         'static void vmm_destroy_address_space(void *root)\n'
-        '{assert(root==child.address_space); assert(in_cleanup_worker && '
+        '{assert(root==child.address_space); assert('
         'fixture_interrupts_enabled && !incoming_mutex_pending && '
         '!in_scheduler_callback); destroyed_roots++;}')
     return prefix
@@ -125,6 +251,14 @@ prefix = fixture_prefix()
 prefix += r'''
 static bool process_cleanup_worker_wake(process_t *process)
 {
+    if (!process) {
+        assert(!process);
+        assert(atomic_load_explicit(&process_session_collection_retry_pending,
+                                    memory_order_acquire));
+        atomic_fetch_add_explicit(&collection_retry_wake_count,1U,
+                                  memory_order_relaxed);
+        return true;
+    }
     if (!process || !publisher_context || !in_scheduler_callback ||
         fixture_interrupts_enabled || !incoming_mutex_pending)
         fprintf(stderr,"wake context process=%p publisher=%d callback=%d IF=%d mutex=%d\n",
@@ -159,13 +293,30 @@ static bool scheduler_thread_exit_complete(const kernel_thread_t *thread)
  !thread->sleeping && !thread->preempt_return_rip;}
 '''
 functions += c_function(object_source, 'object_reference')
-functions += c_function(object_source, 'object_release')
+actual_release = c_function(object_source, 'object_release').replace(
+    'void object_release(', 'static void process_object_release_actual(', 1)
+functions += actual_release + r'''
+static bool pause_before_reference_drop;
+static void object_release(kernel_object_t *object)
+{
+    if (pause_before_reference_drop && object==&child.object) {
+        pause_before_reference_drop=false;
+        assert(process_finish_termination(&child));
+        process_reap_session_members(42);
+        assert(child.state==PROCESS_STATE_TERMINATED &&
+               child.thread_count==1 && child.object.ref_count==3 &&
+               child.owner_reference_held && !destroyed_roots);
+    }
+    process_object_release_actual(object);
+}
+'''
 for name in (
         'process_storage_authorization_clear_locked',
         'process_thread_list_complete_locked',
         'process_session_collection_ready_locked',
         'process_worker_records_release_all',
         'process_publish_terminated_locked',
+        'process_finish_termination',
         'process_scheduler_handoff_complete_internal',
         'process_scheduler_handoff_complete',
         'process_scheduler_context_handoff_complete',
@@ -175,7 +326,17 @@ for name in (
         'process_finalize_exit',
         'process_wait',
         'process_reap_session_members',
+        'process_cleanup_context_valid',
+        'process_cleanup_worker_request_session_collection_retry',
+        'process_cleanup_worker_retry_session_collections_once',
+        'process_start_cleanup_worker',
         'process_handle_reference_release',
+        'handle_slots',
+        'process_handle_revision_advance',
+        'decode_handle',
+        'process_handle_lookup_reference',
+        'process_handle_close',
+        'process_handle_pid',
         'process_object_destroy',
         'process_cleanup_worker_release_handoffs_once'):
     functions += c_function(process_source, name)
@@ -213,6 +374,8 @@ static void reset(bool active)
         .process_reference_held=true};
     all_processes=&child;
     process_registry_lock=scheduler_lock=sleep_calls=owner_releases=step=0;
+    session_fixture_lock=0;
+    fixture_lock_depth=0;
     block_calls=exit_notifications=thread_reaps=0;
     destroyed_roots=released_memory=frees=external_terminations=0;
     user_region_metadata_releases=0;
@@ -223,6 +386,17 @@ static void reset(bool active)
     in_cleanup_worker=in_scheduler_callback=incoming_mutex_pending=false;
     atomic_store_explicit(&wake_count,0U,memory_order_relaxed);
     atomic_store_explicit(&publishers_done,0U,memory_order_relaxed);
+    atomic_store_explicit(&process_session_collection_retry_pending,false,
+                          memory_order_relaxed);
+    atomic_store_explicit(&process_cleanup_worker_ready,true,
+                          memory_order_relaxed);
+    atomic_store_explicit(&collection_retry_wake_count,0U,
+                          memory_order_relaxed);
+    process_destructions=0;
+    pause_before_reference_drop=false;
+    pause_pid_lookup=pid_lookup_pinned=pid_close_done=false;
+    helper_snapshot_paused=termination_published=false;
+    retry_scan_paused=retry_published=false;
     collection_role=0;
     collector_selected=worker_pin_paused=collector_done=false;
 }
@@ -569,6 +743,267 @@ static void delayed_handle_close_and_operation_case(void)
     leave_worker_context();
 }
 
+static void *release_stale_snapshot_reference(void *unused)
+{
+    (void)unused;
+    collection_role=3;
+    fixture_interrupts_enabled=true;
+    process_handle_reference_release(&child.object);
+    return NULL;
+}
+
+static void *publish_termination_during_release(void *unused)
+{
+    (void)unused;
+    collection_role=4;
+    enter_worker_context();
+    pthread_mutex_lock(&collection_gate);
+    while(!helper_snapshot_paused)
+        pthread_cond_wait(&collection_changed,&collection_gate);
+    pthread_mutex_unlock(&collection_gate);
+
+    /* This is the real termination publisher and collector. The helper's
+     * reference is still live, so exact-count admission must defer. */
+    assert(process_finish_termination(&child));
+    process_reap_session_members(42);
+    assert(child.state==PROCESS_STATE_TERMINATED && child.thread_count==1 &&
+           child.object.ref_count==3 && child.owner_reference_held &&
+           !destroyed_roots);
+    pthread_mutex_lock(&collection_gate);
+    termination_published=true;
+    pthread_cond_broadcast(&collection_changed);
+    pthread_mutex_unlock(&collection_gate);
+    leave_worker_context();
+    return NULL;
+}
+
+static void termination_between_snapshot_and_drop_case(void)
+{
+    pthread_t releaser,terminator;
+    reset(false);
+    child.state=PROCESS_STATE_EXITING;
+    child.exit_notification_sent=false;
+    child.object.ref_count=3; /* owner, attached thread, retained lookup */
+    child.object.destroy=process_object_destroy;
+    child.address_space=&child;
+    child.parent=&parent;parent.first_child=&child;
+    child.main_thread=&child_thread;child.threads=&child_thread;
+    child.thread_count=1;child.live_thread_count=0;
+    child_thread.process=&child;
+    child_thread.process_state=THREAD_PROCESS_HANDOFF_COMPLETE;
+    child_thread.process_reference_held=true;
+    child_thread.stack_external=true;
+    assert(!pthread_create(&releaser,NULL,
+                           release_stale_snapshot_reference,NULL));
+    assert(!pthread_create(&terminator,NULL,
+                           publish_termination_during_release,NULL));
+    assert(!pthread_join(releaser,NULL));
+    assert(!pthread_join(terminator,NULL));
+    assert(child.state==PROCESS_STATE_TERMINATED && !child.thread_count &&
+           !child.owner_reference_held && child.object.ref_count==0 &&
+           all_processes==NULL && !parent.first_child &&
+           destroyed_roots==1 && released_memory==1 &&
+           user_region_metadata_releases==1 && process_destructions==1);
+}
+
+static void *pid_lookup_under_session_lock(void *unused)
+{
+    (void)unused;
+    collection_role=6;
+    fixture_interrupts_enabled=true;
+    u64 flags=spin_lock_irqsave(&session_fixture_lock);
+    assert(process_handle_pid(&parent,0x10001U)==123U);
+    spin_unlock_irqrestore(&session_fixture_lock,flags);
+    return NULL;
+}
+
+static void prepare_finalized_session_process(void)
+{
+    reset(false);
+    child.object.destroy=process_object_destroy;
+    child.address_space=&child;
+    child.parent=&parent;parent.first_child=&child;
+    child.pid=123U;
+    assert(process_finalize_exit(&child));
+    assert(child.state==PROCESS_STATE_TERMINATED && !child.thread_count &&
+           child.object.ref_count==1 && child.exit_notification_sent);
+}
+
+static void locked_pid_release_deferred_case(void)
+{
+    pthread_t lookup;
+    prepare_finalized_session_process();
+    assert(!pthread_mutex_init(&parent.handle_growth_mutex,NULL));
+    pid_handle_slot=(process_handle_slot_t){.object=&child.object,
+        .generation=1U,.active=true};
+    parent.handle_table=&pid_handle_slot;
+    parent.handle_capacity=1U;
+    parent.handle_revision=1U;
+    assert(object_reference(&child.object)); /* open handle-table slot */
+    process_reap_session_members(42);
+    assert(child.owner_reference_held && child.object.ref_count==2 &&
+           !destroyed_roots);
+
+    pause_pid_lookup=true;
+    assert(!pthread_create(&lookup,NULL,pid_lookup_under_session_lock,NULL));
+    pthread_mutex_lock(&pid_gate_lock);
+    while(!pid_lookup_pinned)
+        pthread_cond_wait(&pid_gate_changed,&pid_gate_lock);
+    pthread_mutex_unlock(&pid_gate_lock);
+
+    /* CPU B uses the production close path while CPU A still has the PID
+     * lookup pin and holds session_lock. The close lookup's safe retry must
+     * decline because the PID pin still owns the process. */
+    fixture_interrupts_enabled=true;
+    assert(process_handle_close(&parent,0x10001U));
+    assert(!pid_handle_slot.active && !pid_handle_slot.object);
+    assert(child.owner_reference_held && child.object.ref_count==2 &&
+           !destroyed_roots);
+    pthread_mutex_lock(&pid_gate_lock);
+    pid_close_done=true;
+    pthread_cond_broadcast(&pid_gate_changed);
+    pthread_mutex_unlock(&pid_gate_lock);
+    assert(!pthread_join(lookup,NULL));
+
+    assert(child.owner_reference_held && child.object.ref_count==1 &&
+           !destroyed_roots &&
+           atomic_load_explicit(&process_session_collection_retry_pending,
+                                memory_order_acquire) &&
+           atomic_load_explicit(&collection_retry_wake_count,
+                                memory_order_relaxed)==1U);
+
+    /* Duplicate notifications coalesce without another wake or retained pin. */
+    for(unsigned i=0;i<8;i++)
+        process_cleanup_worker_request_session_collection_retry();
+    assert(atomic_load_explicit(&collection_retry_wake_count,
+                                memory_order_relaxed)==1U);
+    enter_worker_context();
+    assert(process_cleanup_worker_retry_session_collections_once());
+    assert(!process_cleanup_worker_retry_session_collections_once());
+    assert(!child.owner_reference_held && child.object.ref_count==0 &&
+           all_processes==NULL && !parent.first_child &&
+           destroyed_roots==1 && released_memory==1 &&
+           user_region_metadata_releases==1 && process_destructions==1 &&
+           !atomic_load_explicit(&process_session_collection_retry_pending,
+                                 memory_order_acquire));
+    leave_worker_context();
+    assert(!pthread_mutex_destroy(&parent.handle_growth_mutex));
+}
+
+typedef struct { pthread_barrier_t *start; } collection_releaser_t;
+static void *release_unsafe_collection_pin(void *argument)
+{
+    collection_releaser_t *item=argument;
+    int result=pthread_barrier_wait(item->start);
+    assert(result==0 || result==PTHREAD_BARRIER_SERIAL_THREAD);
+    fixture_interrupts_enabled=false;
+    process_handle_reference_release(&child.object);
+    fixture_interrupts_enabled=true;
+    return NULL;
+}
+
+static void concurrent_pin_releases_coalesce_case(void)
+{
+    enum {RELEASES=12};
+    pthread_t threads[RELEASES];
+    collection_releaser_t item;
+    pthread_barrier_t start;
+    prepare_finalized_session_process();
+    for(unsigned i=0;i<RELEASES;i++)
+        assert(object_reference(&child.object));
+    assert(child.object.ref_count==RELEASES+1U);
+    assert(!pthread_barrier_init(&start,NULL,RELEASES+1U));
+    item.start=&start;
+    for(unsigned i=0;i<RELEASES;i++)
+        assert(!pthread_create(&threads[i],NULL,
+                               release_unsafe_collection_pin,&item));
+    int result=pthread_barrier_wait(&start);
+    assert(result==0 || result==PTHREAD_BARRIER_SERIAL_THREAD);
+    for(unsigned i=0;i<RELEASES;i++)
+        assert(!pthread_join(threads[i],NULL));
+    pthread_barrier_destroy(&start);
+    assert(child.owner_reference_held && child.object.ref_count==1 &&
+           !destroyed_roots &&
+           atomic_load_explicit(&process_session_collection_retry_pending,
+                                memory_order_acquire) &&
+           atomic_load_explicit(&collection_retry_wake_count,
+                                memory_order_relaxed)==1U);
+    enter_worker_context();
+    assert(process_cleanup_worker_retry_session_collections_once());
+    assert(!child.owner_reference_held && !child.object.ref_count &&
+           !all_processes && !parent.first_child && destroyed_roots==1 &&
+           process_destructions==1);
+    leave_worker_context();
+}
+
+static void *retry_scan_during_publication(void *unused)
+{
+    (void)unused;
+    collection_role=7;
+    enter_worker_context();
+    assert(process_cleanup_worker_retry_session_collections_once());
+    leave_worker_context();
+    return NULL;
+}
+
+static void retry_publication_during_scan_case(void)
+{
+    pthread_t scanner;
+    prepare_finalized_session_process();
+    assert(__atomic_exchange_n(&process_session_collection_retry_pending,true,
+                               __ATOMIC_RELEASE)==false);
+    assert(!pthread_create(&scanner,NULL,retry_scan_during_publication,NULL));
+    pthread_mutex_lock(&collection_gate);
+    while(!retry_scan_paused)
+        pthread_cond_wait(&collection_changed,&collection_gate);
+    pthread_mutex_unlock(&collection_gate);
+
+    process_cleanup_worker_request_session_collection_retry();
+    pthread_mutex_lock(&collection_gate);
+    retry_published=true;
+    pthread_cond_broadcast(&collection_changed);
+    pthread_mutex_unlock(&collection_gate);
+    assert(!pthread_join(scanner,NULL));
+    assert(!child.owner_reference_held && child.object.ref_count==0 &&
+           process_destructions==1 &&
+           atomic_load_explicit(&process_session_collection_retry_pending,
+                                memory_order_acquire));
+    enter_worker_context();
+    assert(process_cleanup_worker_retry_session_collections_once());
+    assert(!atomic_load_explicit(&process_session_collection_retry_pending,
+                                 memory_order_acquire) &&
+           process_destructions==1);
+    leave_worker_context();
+}
+
+static void retry_latched_before_worker_start_case(void)
+{
+    prepare_finalized_session_process();
+    __atomic_store_n(&process_cleanup_worker,NULL,__ATOMIC_RELEASE);
+    __atomic_store_n(&process_cleanup_worker_ready,false,__ATOMIC_RELEASE);
+    process_cleanup_worker_request_session_collection_retry();
+    assert(atomic_load_explicit(&process_session_collection_retry_pending,
+                                memory_order_acquire) &&
+           atomic_load_explicit(&collection_retry_wake_count,
+                                memory_order_relaxed)==0U &&
+           child.owner_reference_held);
+
+    /* The production startup path publishes the worker as ready, then checks
+     * the durable latch and wakes it if a request arrived before startup. */
+    assert(process_start_cleanup_worker());
+    assert(atomic_load_explicit(&process_cleanup_worker_ready,
+                                memory_order_acquire) &&
+           atomic_load_explicit(&collection_retry_wake_count,
+                                memory_order_relaxed)==1U &&
+           atomic_load_explicit(&process_session_collection_retry_pending,
+                                memory_order_acquire));
+    enter_worker_context();
+    assert(process_cleanup_worker_retry_session_collections_once());
+    assert(!child.owner_reference_held && !child.object.ref_count &&
+           !all_processes && process_destructions==1);
+    leave_worker_context();
+}
+
 int main(void)
 {
     exact_last_reference_case();
@@ -578,9 +1013,15 @@ int main(void)
     delayed_handle_close_and_operation_case();
     publication_before_wake_case();
     concurrent_publishers_case();
+    termination_between_snapshot_and_drop_case();
+    locked_pid_release_deferred_case();
+    concurrent_pin_releases_coalesce_case();
+    retry_publication_during_scan_case();
+    retry_latched_before_worker_start_case();
     puts("deferred scheduler references: final release context, session reap, "
-         "zero-thread retry, concurrent collection, publish-before-wake, "
-         "bounded batches, and concurrent publishers PASS");
+         "zero-thread retry, stale-state and locked-caller retry, "
+         "coalesced concurrent releases, scan-time publication, "
+         "publish-before-wake, bounded batches, and concurrent publishers PASS");
     return 0;
 }
 '''

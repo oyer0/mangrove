@@ -404,13 +404,13 @@ kernel_object_t *process_handle_lookup(process_t *process,
                                        u32 required_rights);
 /* Both successful lookup forms return a retained object reference that
  * remains valid across concurrent close. A returned process object must be
- * released with process_handle_reference_release() so a final handle
- * reference can retry session collection; other object types may use
+ * released with process_handle_reference_release() so its dropped pin can
+ * trigger or defer a session-collection retry; other object types may use
  * object_release(). lookup_any permits querying a terminated process. */
 bool process_handle_close(process_t *process, process_handle_t handle);
-/* Release a retained object obtained from a process handle. Process objects
- * may become session-collectable when the final in-flight handle reference
- * is dropped. */
+/* Release a retained object obtained from a process handle. Collection is
+ * retried after the pin is dropped, synchronously only in a safe cleanup
+ * context and otherwise through the process cleanup worker. */
 void process_handle_reference_release(kernel_object_t *object);
 void process_handle_close_all(process_t *process);
 const char *process_state_name(process_state_t state);
