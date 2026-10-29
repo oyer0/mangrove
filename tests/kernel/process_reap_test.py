@@ -49,6 +49,8 @@ typedef u64 mg_session_id_t;
 enum {PROCESS_STATE_ACTIVE, PROCESS_STATE_EXITING, PROCESS_STATE_TERMINATED};
 enum {THREAD_STATE_RUNNING, THREAD_STATE_READY, THREAD_STATE_BLOCKED,
       THREAD_STATE_TERMINATED};
+typedef enum {SCHEDULER_WAKE_FAILED=0, SCHEDULER_WAKE_DELIVERED,
+               SCHEDULER_WAKE_ALREADY_TERMINATED} scheduler_wake_result_t;
 typedef int thread_state_t;
 enum {THREAD_PROCESS_UNATTACHED, THREAD_PROCESS_ATTACHED,
       THREAD_PROCESS_EXIT_REQUESTED, THREAD_PROCESS_HANDOFF_COMPLETE};
@@ -80,7 +82,7 @@ struct process_thread_record {
  kernel_thread_t *execution, *join_waiter;
  process_thread_record_t *next;
  void *stack_region, *tls_region;
- bool completed, kernel_stack_released, listed, reclaiming;
+ bool completed, kernel_stack_released, join_claimed, listed, reclaiming;
 };
 struct process {
  int state; bool wait_collected, owner_reference_held, shutdown_requested;
@@ -149,6 +151,13 @@ static void process_cli_restore(u64 flags){(void)flags;}
 static kernel_thread_t *thread_current(void){return &parent_thread;}
 static bool scheduler_wake_waiter(kernel_thread_t *thread)
 {if(!thread)return false;thread->event_wake_pending=true;return true;}
+static scheduler_wake_result_t scheduler_wake_waiter_result(
+    kernel_thread_t *thread)
+{if(!thread)return SCHEDULER_WAKE_FAILED;
+ if(thread->state==THREAD_STATE_TERMINATED)
+  return SCHEDULER_WAKE_ALREADY_TERMINATED;
+ return scheduler_wake_waiter(thread)?SCHEDULER_WAKE_DELIVERED:
+        SCHEDULER_WAKE_FAILED;}
 static bool process_shutdown_requested(const process_t *p)
 {return p->shutdown_requested;}
 static kernel_object_t *process_handle_lookup_any(process_t *p,
@@ -244,6 +253,7 @@ state_snapshot = function(scheduler, 'scheduler_thread_state_snapshot')
 code = prefix + completion + handoff_valid + running + state_snapshot
 code += function(source, 'process_storage_authorization_clear_locked')
 for name in ('process_thread_list_complete_locked',
+             'process_thread_member_locked',
              'process_session_collection_ready_locked',
              'process_worker_records_release_all',
              'process_waiter_wake_release',

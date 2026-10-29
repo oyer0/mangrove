@@ -75,6 +75,8 @@ typedef u64 mg_session_id_t;
 typedef pthread_mutex_t spinlock_t;
 enum {THREAD_STATE_RUNNING, THREAD_STATE_READY, THREAD_STATE_BLOCKED,
       THREAD_STATE_TERMINATED};
+typedef enum {SCHEDULER_WAKE_FAILED=0, SCHEDULER_WAKE_DELIVERED,
+               SCHEDULER_WAKE_ALREADY_TERMINATED} scheduler_wake_result_t;
 enum {PROCESS_STATE_ACTIVE, PROCESS_STATE_EXITING, PROCESS_STATE_TERMINATED};
 enum {THREAD_PROCESS_UNATTACHED, THREAD_PROCESS_ATTACHED,
       THREAD_PROCESS_EXIT_REQUESTED, THREAD_PROCESS_HANDOFF_COMPLETE};
@@ -209,6 +211,13 @@ static bool thread_destroy(kernel_thread_t *thread)
  freed_threads++;return true;}
 static bool scheduler_wake_waiter(kernel_thread_t *thread)
 {(void)thread;__atomic_add_fetch(&wake_calls,1U,__ATOMIC_RELAXED);return true;}
+static scheduler_wake_result_t scheduler_wake_waiter_result(
+    kernel_thread_t *thread)
+{if(!thread)return SCHEDULER_WAKE_FAILED;
+ if(thread->state==THREAD_STATE_TERMINATED)
+  return SCHEDULER_WAKE_ALREADY_TERMINATED;
+ return scheduler_wake_waiter(thread)?SCHEDULER_WAKE_DELIVERED:
+        SCHEDULER_WAKE_FAILED;}
 static void console_cancel_waiter(kernel_thread_t *thread)
 {(void)thread;__atomic_add_fetch(&console_cancels,1U,__ATOMIC_RELAXED);}
 static void terminal_output_finish_for_process(u64 pid,
@@ -257,6 +266,7 @@ names = (
     "process_storage_authorization_revoke_thread_locked",
     "process_thread_register_locked",
     "process_thread_list_complete_locked",
+    "process_thread_member_locked",
     "process_thread_list_read_acquire_locked",
     "process_thread_list_read_release",
     "process_waiter_wake_release",

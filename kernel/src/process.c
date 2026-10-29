@@ -390,6 +390,29 @@ static bool process_thread_list_complete_locked(process_t *process)
     return count == process->thread_count && main_seen;
 }
 
+/* Caller holds process_registry_lock. Validate a scheduler descriptor's
+ * process-list ownership without exporting a raw pointer past the lock. Bound
+ * the walk by the published count so a corrupt cycle cannot hang completion
+ * delivery in scheduler context. */
+static bool process_thread_member_locked(process_t *process,
+                                        kernel_thread_t *target)
+{
+    u32 count = 0;
+    bool found = false;
+
+    if (!process || !target || !process->thread_count || !process->threads)
+        return false;
+    for (kernel_thread_t *thread = process->threads; thread;
+         thread = thread->process_next) {
+        if (count >= process->thread_count || thread->process != process ||
+            !thread->process_reference_held)
+            return false;
+        if (thread == target) found = true;
+        count++;
+    }
+    return count == process->thread_count && found;
+}
+
 /* Session collection may race a temporary object pin after the process's
  * final thread list has already been detached. That state is still a valid
  * collection candidate once the finalizer has published its completion. */
@@ -2744,7 +2767,6 @@ static bool process_scheduler_handoff_complete_internal(
     kernel_thread_t *waiter = NULL;
     kernel_thread_t *join_waiter = NULL;
     process_t *waiter_process = NULL;
-    bool join_waiter_pinned = false;
     u64 flags;
 
     if (!thread || !(process = thread->process) ||
@@ -2784,18 +2806,44 @@ static bool process_scheduler_handoff_complete_internal(
                 record->kernel_stack_released = false;
                 __atomic_store_n(&process->worker_reap_pending, true,
                                  __ATOMIC_RELEASE);
-                /* The waiter is a scheduler-thread pointer, not owned by
-                 * the completion record. Keep process thread-list readers
-                 * pinned through wake delivery so a detached waiter cannot
-                 * be removed and freed in the unlocked interval. Retain the
-                 * claim pointer until the join call consumes or abandons it,
-                 * so its failure path can release the claim after a racing
-                 * completion. If process termination has already closed
-                 * reader admission, its process-wide wake handles the waiter. */
-                if (record->join_waiter &&
-                    process_thread_list_read_acquire_locked(process)) {
+                /* Registration cancellation and event publication share the
+                 * registry lock. Never export this scheduler pointer: a late
+                 * wake after join cancellation could interrupt a later sleep,
+                 * and a retained list reader would keep memory alive without
+                 * making a terminated thread wakeable. */
+                if (record->join_claimed != (record->join_waiter != NULL))
+                    panic("process: inconsistent worker join registration");
+                if (record->join_claimed) {
+                    scheduler_wake_result_t wake_result;
+
                     join_waiter = record->join_waiter;
-                    join_waiter_pinned = true;
+                    if (!record->listed || record->process != process ||
+                        record->execution != thread || join_waiter == thread ||
+                        join_waiter->process != process ||
+                        !join_waiter->process_reference_held ||
+                        (join_waiter->process_state != THREAD_PROCESS_ATTACHED &&
+                         join_waiter->process_state !=
+                             THREAD_PROCESS_EXIT_REQUESTED &&
+                         join_waiter->process_state !=
+                             THREAD_PROCESS_HANDOFF_COMPLETE) ||
+                        !process_thread_member_locked(process, join_waiter))
+                        panic("process: worker joiner lost process ownership");
+
+                    /* Lock order is process_registry_lock -> scheduler_lock.
+                     * The scheduler operation only latches or queues a wake;
+                     * it cannot sleep, switch, reap, or release references. */
+                    wake_result = scheduler_wake_waiter_result(join_waiter);
+                    if (wake_result == SCHEDULER_WAKE_ALREADY_TERMINATED) {
+                        /* Keep the completion result and join right durable;
+                         * a later caller may claim the completed record. */
+                        if (!record->join_claimed ||
+                            record->join_waiter != join_waiter)
+                            panic("process: worker join claim changed");
+                        record->join_claimed = false;
+                        record->join_waiter = NULL;
+                    } else if (wake_result != SCHEDULER_WAKE_DELIVERED) {
+                        panic("process: failed to wake completed worker joiner");
+                    }
                 }
             }
         }
@@ -2803,12 +2851,6 @@ static bool process_scheduler_handoff_complete_internal(
     waiter = process_publish_terminated_locked(process, &waiter_process);
     spin_unlock_irqrestore(&process_registry_lock, flags);
 
-    if (join_waiter) {
-        if (!scheduler_wake_waiter(join_waiter))
-            panic("process: failed to wake completed worker joiner");
-        if (join_waiter_pinned)
-            process_thread_list_read_release(process);
-    }
     if (waiter) process_waiter_wake_release(waiter_process, waiter);
     return true;
 }
