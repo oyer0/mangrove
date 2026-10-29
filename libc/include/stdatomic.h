@@ -120,12 +120,82 @@ typedef struct {
 
 #define atomic_fetch_add(object, operand) \
     atomic_fetch_add_explicit((object), (operand), memory_order_seq_cst)
-#define atomic_fetch_add_explicit(object, operand, order) \
-    __atomic_fetch_add((object), (operand), (int)(order))
+
+/* GCC's generic __atomic_fetch_add treats a pointer operand as a byte count,
+ * while C17 specifies pointer arithmetic in units of the pointed-to type.
+ * Use a compare/exchange loop for pointers and retain GCC's scalar RMW for
+ * integer atomics (including its defined narrow-integer behavior).  The
+ * statement expressions capture each caller argument once. */
+static inline int __mangrove_atomic_failure_order(memory_order order)
+{
+    switch (order) {
+    case memory_order_consume: return __ATOMIC_CONSUME;
+    case memory_order_acquire: return __ATOMIC_ACQUIRE;
+    case memory_order_release: return __ATOMIC_RELAXED;
+    case memory_order_acq_rel: return __ATOMIC_ACQUIRE;
+    case memory_order_seq_cst: return __ATOMIC_SEQ_CST;
+    case memory_order_relaxed:
+    default: return __ATOMIC_RELAXED;
+    }
+}
+
+#define __MANGROVE_ATOMIC_POINTER_FETCH_ADD(object, operand, order) ({ \
+    __auto_type __mg_atomic_object = (object); \
+    __auto_type __mg_atomic_operand = (operand); \
+    memory_order __mg_atomic_order = (order); \
+    __auto_type __mg_atomic_old = \
+        __atomic_load_n(__mg_atomic_object, __ATOMIC_RELAXED); \
+    __typeof__(__mg_atomic_old) __mg_atomic_desired; \
+    do { \
+        __mg_atomic_desired = __mg_atomic_old + __mg_atomic_operand; \
+    } while (!__atomic_compare_exchange_n( \
+        __mg_atomic_object, &__mg_atomic_old, __mg_atomic_desired, false, \
+        (int)__mg_atomic_order, \
+        __mangrove_atomic_failure_order(__mg_atomic_order))); \
+    __mg_atomic_old; \
+})
+
+#define atomic_fetch_add_explicit(object, operand, order) ({ \
+    __auto_type __mg_atomic_object = (object); \
+    __auto_type __mg_atomic_operand = (operand); \
+    memory_order __mg_atomic_order = (order); \
+    __builtin_choose_expr( \
+        __builtin_classify_type(*__mg_atomic_object) == 5, \
+        __MANGROVE_ATOMIC_POINTER_FETCH_ADD( \
+            __mg_atomic_object, __mg_atomic_operand, __mg_atomic_order), \
+        __atomic_fetch_add(__mg_atomic_object, __mg_atomic_operand, \
+                           (int)__mg_atomic_order)); \
+})
 #define atomic_fetch_sub(object, operand) \
     atomic_fetch_sub_explicit((object), (operand), memory_order_seq_cst)
-#define atomic_fetch_sub_explicit(object, operand, order) \
-    __atomic_fetch_sub((object), (operand), (int)(order))
+
+#define __MANGROVE_ATOMIC_POINTER_FETCH_SUB(object, operand, order) ({ \
+    __auto_type __mg_atomic_object = (object); \
+    __auto_type __mg_atomic_operand = (operand); \
+    memory_order __mg_atomic_order = (order); \
+    __auto_type __mg_atomic_old = \
+        __atomic_load_n(__mg_atomic_object, __ATOMIC_RELAXED); \
+    __typeof__(__mg_atomic_old) __mg_atomic_desired; \
+    do { \
+        __mg_atomic_desired = __mg_atomic_old - __mg_atomic_operand; \
+    } while (!__atomic_compare_exchange_n( \
+        __mg_atomic_object, &__mg_atomic_old, __mg_atomic_desired, false, \
+        (int)__mg_atomic_order, \
+        __mangrove_atomic_failure_order(__mg_atomic_order))); \
+    __mg_atomic_old; \
+})
+
+#define atomic_fetch_sub_explicit(object, operand, order) ({ \
+    __auto_type __mg_atomic_object = (object); \
+    __auto_type __mg_atomic_operand = (operand); \
+    memory_order __mg_atomic_order = (order); \
+    __builtin_choose_expr( \
+        __builtin_classify_type(*__mg_atomic_object) == 5, \
+        __MANGROVE_ATOMIC_POINTER_FETCH_SUB( \
+            __mg_atomic_object, __mg_atomic_operand, __mg_atomic_order), \
+        __atomic_fetch_sub(__mg_atomic_object, __mg_atomic_operand, \
+                           (int)__mg_atomic_order)); \
+})
 #define atomic_fetch_or(object, operand) \
     atomic_fetch_or_explicit((object), (operand), memory_order_seq_cst)
 #define atomic_fetch_or_explicit(object, operand, order) \
