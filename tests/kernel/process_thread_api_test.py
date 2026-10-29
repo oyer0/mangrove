@@ -254,6 +254,8 @@ static bool object_reference(kernel_object_t *o)
 static void object_release(kernel_object_t *o)
 {u32 n;if(!o)return;n=__atomic_sub_fetch(&o->ref_count,1,__ATOMIC_ACQ_REL);
  assert(n!=UINT32_MAX);if(!n&&o->destroy)o->destroy(o);}
+static void process_handle_reference_release(kernel_object_t *o)
+{object_release(o);}
 static bool scheduler_thread_process_attachable(const kernel_thread_t *t)
 {return t&&t->state==THREAD_STATE_READY&&t->running_cpu==THREAD_CPU_NONE&&
  !t->context_switch_pending&&!t->syscall_active&&!t->sleeping&&

@@ -71,7 +71,8 @@ typedef struct kernel_thread {
  bool process_exit_status_valid;
  process_thread_record_t *worker_record;
 } kernel_thread_t;
-typedef struct {unsigned ref_count; process_t *process;} kernel_object_t;
+typedef struct {unsigned ref_count; process_t *process; int type;}
+ kernel_object_t;
 struct process_thread_record {
  kernel_object_t object; process_t *process;
  kernel_thread_t *execution, *join_waiter;
@@ -111,6 +112,7 @@ static unsigned user_region_metadata_releases;
 static jmp_buf panic_environment;
 static bool scheduler_thread_exit_complete(const kernel_thread_t *thread);
 static void process_scheduler_handoff_complete(kernel_thread_t *thread);
+void process_handle_reference_release(kernel_object_t *object);
 /* This fixture covers process completion for its initial thread and does not
  * model worker-record readers; worker wake lifetime is exercised in the
  * process-thread API production-source concurrency fixture. */
@@ -223,6 +225,7 @@ running = running.replace('bool scheduler_thread_is_running(',
 code = prefix + completion + handoff_valid + running
 code += function(source, 'process_storage_authorization_clear_locked')
 for name in ('process_thread_list_complete_locked',
+             'process_session_collection_ready_locked',
              'process_worker_records_release_all',
              'process_publish_terminated_locked',
              'process_scheduler_handoff_complete_internal',
@@ -230,6 +233,7 @@ for name in ('process_thread_list_complete_locked',
              'process_detach_thread_owned', 'process_detach_thread',
              'process_finalize_exit',
              'process_wait', 'process_poll', 'process_reap_session_members',
+             'process_handle_reference_release',
              'process_terminate_session_members', 'process_object_destroy'):
     code += function(source, name)
 code += r'''
@@ -243,7 +247,8 @@ static void reset(bool active)
  child.exit_cleanup_complete=!active;child.session_id=42;
  child.launch_ready=true;
  child.owner_reference_held=true;child.exit_status=23;
- child.object=(kernel_object_t){.ref_count=2,.process=&child};
+ child.object=(kernel_object_t){.ref_count=2,.process=&child,
+                                 .type=OBJECT_TYPE_PROCESS};
  child_thread=(kernel_thread_t){.state=THREAD_STATE_READY,
    .running_cpu=THREAD_CPU_NONE,.syscall_active=true,.process=&child,
    .process_state=active?THREAD_PROCESS_ATTACHED:
@@ -272,7 +277,8 @@ int main(void)
  int completed_wait=process_wait(&parent,7,&status);
  assert(completed_wait==MG_OK && !block_calls);
 
- reset(true);status=-1;
+ reset(true);child.object.ref_count++; /* parent handle-table reference */
+ status=-1;
  assert(process_poll(&parent,7,&status)==MG_ERR_WOULD_BLOCK && status==-1);
  child_thread.state=THREAD_STATE_BLOCKED;
  assert(process_poll(&parent,7,&status)==MG_ERR_WOULD_BLOCK);
@@ -330,6 +336,35 @@ int main(void)
  process_object_destroy(&child.object);
  assert(destroyed_roots==1 && released_memory==1 && frees==2 &&
         user_region_metadata_releases==1);
+
+ /* A worker pin may make the first session-collection final-count check
+  * defer after final thread removal. The completed empty list must remain a
+  * valid candidate on the retry after the pin is released. */
+ reset(false);child.address_space=&child;
+ assert(process_finalize_exit(&child));
+ assert(child.thread_count==0 && child.exit_notification_sent &&
+        process_session_collection_ready_locked(&child));
+ child.object.ref_count++; /* cleanup worker scan pin */
+ process_reap_session_members(42);
+ assert(child.owner_reference_held && child.object.ref_count==2 &&
+        !owner_releases);
+ object_release(&child.object);
+ process_reap_session_members(42);
+ assert(!child.owner_reference_held && child.object.ref_count==0 &&
+        owner_releases==1 && !all_processes);
+
+ /* An open process handle remains an external owner. Closing its slot and
+  * then dropping the retained lookup reference automatically retries the
+  * completed session collection. */
+ reset(false);child.address_space=&child;
+ child.object.ref_count=4; /* owner, thread, handle slot, in-flight lookup */
+ process_reap_session_members(42);
+ assert(child.thread_count==1 && child.owner_reference_held &&
+        !owner_releases);
+ object_release(&child.object); /* close removes the table-owned reference */
+ process_handle_reference_release(&child.object);
+ assert(child.thread_count==0 && !child.owner_reference_held &&
+        child.object.ref_count==0 && owner_releases==1 && !all_processes);
  puts("process reaping: wake-before-exit, suspended cleanup, remote handoff, poll, session collection, and shutdown cancellation passed");
 }
 '''

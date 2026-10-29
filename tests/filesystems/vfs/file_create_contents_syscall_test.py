@@ -158,6 +158,11 @@ kernel_object_t *process_handle_lookup(process_t *,
     process_handle_t, kernel_object_type_t, u32);
 bool object_reference(kernel_object_t *);
 void object_release(kernel_object_t *);
+/* The extracted handle-table fixture uses ordinary file objects; process
+ * handle close's lifecycle retry is outside this fixture's scope. */
+void process_handle_reference_release(kernel_object_t *object) {
+    object_release(object);
+}
 static i64 file_read(kernel_object_t *object,void *b,u64 n) {
     (void)object;(void)b;(void)n;return 0;
 }

@@ -144,9 +144,14 @@ mutex operations, or remote TLB shootdowns. The registry scan plus the retained
 references is the deferred-work list, so concurrent callbacks cannot
 overwrite one another and no separate queue allocation is needed. Session
 reaping accounts for registered handoff references and is retried after the
-worker drops its temporary scan pin. The worker's latched event wake closes
-the scan-to-park race. The scheduler callback and post hook never perform
-process resource teardown or final object release.
+worker drops its temporary scan pin. A later collection retry also accepts a
+fully finalized process whose thread list is already empty; this keeps a
+temporary reference from making that process permanently undiscoverable.
+Dropping a retained process-handle reference retries collection after the
+reference is released, including when an in-flight handle operation overlapped
+the handle close. The worker's latched event wake closes the scan-to-park race.
+The scheduler callback and post hook never perform process resource teardown
+or final object release.
 
 The ELF loader accepts at most one validated nonempty `PT_TLS` segment; an
 all-zero `PT_TLS` emitted by the linker for an image without TLS sections means

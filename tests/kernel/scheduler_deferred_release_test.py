@@ -61,9 +61,48 @@ def fixture_prefix():
         'static void process_object_destroy(kernel_object_t *);\n'
         'static void process_reap_session_members(mg_session_id_t);')
     prefix = prefix.replace(
-        'typedef struct {unsigned ref_count; process_t *process;} kernel_object_t;',
+        'typedef struct {unsigned ref_count; process_t *process; int type;}\n'
+        ' kernel_object_t;',
         'typedef struct kernel_object {unsigned ref_count; process_t *process; '
-        'void (*destroy)(struct kernel_object *); } kernel_object_t;')
+        'int type; void (*destroy)(struct kernel_object *); } kernel_object_t;')
+    prefix = prefix.replace(
+        'static u32 process_registry_lock, scheduler_lock;',
+        'static u32 process_registry_lock, scheduler_lock;\n'
+        'static pthread_mutex_t registry_mutex=PTHREAD_MUTEX_INITIALIZER;\n'
+        'static pthread_mutex_t scheduler_mutex=PTHREAD_MUTEX_INITIALIZER;\n'
+        'static pthread_mutex_t collection_gate=PTHREAD_MUTEX_INITIALIZER;\n'
+        'static pthread_cond_t collection_changed=PTHREAD_COND_INITIALIZER;\n'
+        'static _Thread_local unsigned collection_role;\n'
+        'static bool collector_selected, worker_pin_paused, collector_done;')
+    prefix = prefix.replace(
+        'static u64 spin_lock_irqsave(u32 *lock)\n'
+        '{assert(!*lock);*lock=1;return 1;}\n'
+        'static void spin_unlock_irqrestore(u32 *lock,u64 flags)\n'
+        '{(void)flags;assert(*lock);*lock=0;}',
+        'static pthread_mutex_t *fixture_mutex(u32 *lock)\n'
+        '{return lock==&process_registry_lock?&registry_mutex:\n'
+        '        &scheduler_mutex;}\n'
+        'static u64 spin_lock_irqsave(u32 *lock)\n'
+        '{assert(!pthread_mutex_lock(fixture_mutex(lock)));assert(!*lock);'
+        '*lock=1;return 1;}\n'
+        'static void spin_unlock_irqrestore(u32 *lock,u64 flags)\n'
+        '{(void)flags;assert(*lock);*lock=0;'
+        'assert(!pthread_mutex_unlock(fixture_mutex(lock)));\n'
+        'if(lock!=&process_registry_lock)return;\n'
+        'assert(!pthread_mutex_lock(&collection_gate));\n'
+        'if(collection_role==1 && !collector_selected){\n'
+        ' assert(child.object.ref_count==4);collector_selected=true;'
+        'pthread_cond_broadcast(&collection_changed);\n'
+        ' while(!worker_pin_paused)'
+        'pthread_cond_wait(&collection_changed,&collection_gate);\n'
+        '}else if(collection_role==2 && !worker_pin_paused){\n'
+        ' assert(child.scheduler_handoff_references==0 && '
+        'child.object.ref_count==4);worker_pin_paused=true;'
+        'pthread_cond_broadcast(&collection_changed);\n'
+        ' while(!collector_done)'
+        'pthread_cond_wait(&collection_changed,&collection_gate);\n'
+        '}\n'
+        'assert(!pthread_mutex_unlock(&collection_gate));}')
     # Use the real atomic object reference implementation below.
     prefix = prefix.replace(c_function(prefix, 'object_reference'), '')
     prefix = prefix.replace(c_function(prefix, 'object_release'), '')
@@ -124,6 +163,7 @@ functions += c_function(object_source, 'object_release')
 for name in (
         'process_storage_authorization_clear_locked',
         'process_thread_list_complete_locked',
+        'process_session_collection_ready_locked',
         'process_worker_records_release_all',
         'process_publish_terminated_locked',
         'process_scheduler_handoff_complete_internal',
@@ -135,6 +175,7 @@ for name in (
         'process_finalize_exit',
         'process_wait',
         'process_reap_session_members',
+        'process_handle_reference_release',
         'process_object_destroy',
         'process_cleanup_worker_release_handoffs_once'):
     functions += c_function(process_source, name)
@@ -160,7 +201,8 @@ static void reset(bool active)
     child.launch_ready=true;
     child.owner_reference_held=true;
     child.exit_status=23;
-    child.object=(kernel_object_t){.ref_count=2,.process=&child};
+    child.object=(kernel_object_t){.ref_count=2,.process=&child,
+        .type=OBJECT_TYPE_PROCESS};
     child_thread=(kernel_thread_t){
         .state=active?THREAD_STATE_READY:THREAD_STATE_TERMINATED,
         .running_cpu=THREAD_CPU_NONE,
@@ -181,6 +223,8 @@ static void reset(bool active)
     in_cleanup_worker=in_scheduler_callback=incoming_mutex_pending=false;
     atomic_store_explicit(&wake_count,0U,memory_order_relaxed);
     atomic_store_explicit(&publishers_done,0U,memory_order_relaxed);
+    collection_role=0;
+    collector_selected=worker_pin_paused=collector_done=false;
 }
 
 static void prepare_handoff(process_t *process,kernel_thread_t *thread)
@@ -408,14 +452,135 @@ static void concurrent_publishers_case(void)
     assert(destroyed_roots==1);
 }
 
+static void *collect_session_paused(void *unused)
+{
+    (void)unused;
+    collection_role=1;
+    fixture_interrupts_enabled=true;
+    process_reap_session_members(42);
+    assert(child.thread_count==0 && child.owner_reference_held &&
+           child.object.ref_count==2 && destroyed_roots==0);
+    assert(!pthread_mutex_lock(&collection_gate));
+    collector_done=true;
+    pthread_cond_broadcast(&collection_changed);
+    assert(!pthread_mutex_unlock(&collection_gate));
+    return NULL;
+}
+
+static void *release_handoff_during_collection(void *unused)
+{
+    (void)unused;
+    collection_role=2;
+    enter_worker_context();
+    assert(process_cleanup_worker_release_handoffs_once());
+    leave_worker_context();
+    return NULL;
+}
+
+static void worker_pin_overlapping_session_collection_case(void)
+{
+    pthread_t collector, worker;
+    reset(false);
+    child.object.destroy=process_object_destroy;
+    child.object.process=&child;
+    child.address_space=&child;
+    prepare_handoff(&child,&child_thread);
+    enter_callback_context();
+    scheduler_context_switch_post_complete(&child);
+    leave_callback_context();
+
+    assert(!pthread_create(&collector,NULL,collect_session_paused,NULL));
+    assert(!pthread_mutex_lock(&collection_gate));
+    while(!collector_selected)
+        pthread_cond_wait(&collection_changed,&collection_gate);
+    assert(!pthread_mutex_unlock(&collection_gate));
+    assert(!pthread_create(&worker,NULL,release_handoff_during_collection,NULL));
+    assert(!pthread_join(collector,NULL));
+    assert(!pthread_join(worker,NULL));
+    collection_role=0;
+
+    assert(child.thread_count==0 && !child.owner_reference_held &&
+           child.object.ref_count==0 && !child.scheduler_handoff_references &&
+           !atomic_load_explicit(&child.scheduler_handoff_releases_pending,
+                                 memory_order_acquire) &&
+           destroyed_roots==1 && released_memory==1 &&
+           user_region_metadata_releases==1 && all_processes==NULL);
+}
+
+static pthread_barrier_t competing_collectors_start;
+static void *collect_finalized_session(void *unused)
+{
+    (void)unused;
+    enter_worker_context();
+    int result=pthread_barrier_wait(&competing_collectors_start);
+    assert(result==0 || result==PTHREAD_BARRIER_SERIAL_THREAD);
+    process_reap_session_members(42);
+    leave_worker_context();
+    return NULL;
+}
+
+static void concurrent_session_collectors_case(void)
+{
+    pthread_t collectors[2];
+    reset(false);
+    child.object.destroy=process_object_destroy;
+    child.object.process=&child;
+    child.address_space=&child;
+    assert(process_finalize_exit(&child));
+    assert(child.thread_count==0 && child.object.ref_count==1);
+    assert(pthread_barrier_init(&competing_collectors_start,NULL,3)==0);
+    for(unsigned i=0;i<2;i++)
+        assert(!pthread_create(&collectors[i],NULL,
+                              collect_finalized_session,NULL));
+    int result=pthread_barrier_wait(&competing_collectors_start);
+    assert(result==0 || result==PTHREAD_BARRIER_SERIAL_THREAD);
+    assert(!pthread_join(collectors[0],NULL));
+    assert(!pthread_join(collectors[1],NULL));
+    pthread_barrier_destroy(&competing_collectors_start);
+    assert(!child.owner_reference_held && child.object.ref_count==0 &&
+           owner_releases==0 && destroyed_roots==1 &&
+           user_region_metadata_releases==1 && all_processes==NULL);
+}
+
+static void delayed_handle_close_and_operation_case(void)
+{
+    reset(false);
+    enter_worker_context(); /* Session collection is a safe teardown context. */
+    child.object.destroy=process_object_destroy;
+    child.object.process=&child;
+    child.address_space=&child;
+    /* Owner, final thread, table slot, close lookup, and an operation lookup. */
+    child.object.ref_count=5;
+    process_reap_session_members(42);
+    assert(child.thread_count==1 && child.owner_reference_held &&
+           !destroyed_roots);
+
+    object_release(&child.object); /* close removes the table slot */
+    process_handle_reference_release(&child.object); /* close lookup */
+    assert(child.thread_count==1 && child.owner_reference_held &&
+           child.object.ref_count==3 && !destroyed_roots);
+
+    /* An operation that retained the handle before close is the last external
+     * pin. Dropping it retries collection only after the pin is gone. */
+    process_handle_reference_release(&child.object);
+    assert(child.thread_count==0 && !child.owner_reference_held &&
+           child.object.ref_count==0 && destroyed_roots==1 &&
+           user_region_metadata_releases==1 && all_processes==NULL);
+    leave_worker_context();
+}
+
 int main(void)
 {
     exact_last_reference_case();
     session_collection_case();
+    worker_pin_overlapping_session_collection_case();
+    concurrent_session_collectors_case();
+    delayed_handle_close_and_operation_case();
     publication_before_wake_case();
     concurrent_publishers_case();
     puts("deferred scheduler references: final release context, session reap, "
-         "publish-before-wake, bounded batches, and concurrent publishers PASS");
+         "zero-thread retry, concurrent collection, publish-before-wake, "
+         "bounded batches, and concurrent publishers PASS");
     return 0;
 }
 '''

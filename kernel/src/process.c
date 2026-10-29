@@ -371,6 +371,24 @@ static bool process_thread_list_complete_locked(process_t *process)
     return count == process->thread_count && main_seen;
 }
 
+/* Session collection may race a temporary object pin after the process's
+ * final thread list has already been detached. That state is still a valid
+ * collection candidate once the finalizer has published its completion. */
+static bool process_session_collection_ready_locked(process_t *process)
+{
+    if (!process) return false;
+    if (process->thread_count)
+        return process_thread_list_complete_locked(process);
+
+    return process->state == PROCESS_STATE_TERMINATED &&
+        process->exit_cleanup_complete && process->exit_notification_sent &&
+        !process->exit_cleanup_in_progress && !process->active_syscalls &&
+        !process->live_thread_count && !process->threads &&
+        !process->main_thread && !process->thread_records &&
+        !process->thread_list_readers && !process->thread_reap_in_progress &&
+        !process->worker_reapers && !process->wait_claimed;
+}
+
 static process_t *process_cleanup_candidate_locked(void)
 {
     for (process_t *process = all_processes; process;
@@ -2821,7 +2839,7 @@ void process_reap_session_members(mg_session_id_t session_id)
                 process->session_id == session_id &&
                 process->state == PROCESS_STATE_TERMINATED &&
                 process->owner_reference_held &&
-                process_thread_list_complete_locked(process) &&
+                process_session_collection_ready_locked(process) &&
                 __atomic_load_n(&process->object.ref_count, __ATOMIC_ACQUIRE) ==
                     (u64)process->thread_count + 1U +
                         process->scheduler_handoff_references &&
@@ -2853,6 +2871,31 @@ void process_reap_session_members(mg_session_id_t session_id)
         object_release(&process->object); /* process owner reference */
         object_release(&process->object);
     }
+}
+
+/* Drop a retained process-object handle reference and retry session
+ * collection only after that reference is gone. Keeping the copied session
+ * ID lets the retry safely collect the process itself. This also covers an
+ * in-flight handle operation that overlaps the close which removed its
+ * table-owned reference. */
+void process_handle_reference_release(kernel_object_t *object)
+{
+    mg_session_id_t session_id = PROCESS_NO_SESSION;
+
+    if (!object) return;
+    if (object->type == OBJECT_TYPE_PROCESS) {
+        process_t *target = object_process(object);
+        u64 flags = spin_lock_irqsave(&process_registry_lock);
+        if (target->launch_ready &&
+            target->state == PROCESS_STATE_TERMINATED &&
+            target->owner_reference_held && !target->wait_claimed)
+            session_id = target->session_id;
+        spin_unlock_irqrestore(&process_registry_lock, flags);
+    }
+
+    object_release(object);
+    if (session_id != PROCESS_NO_SESSION)
+        process_reap_session_members(session_id);
 }
 
 mg_session_id_t process_session_id(const process_t *process)
@@ -4074,7 +4117,7 @@ u64 process_handle_pid(process_t *process, process_handle_t handle)
     if (!object) return 0;
     child = object_process(object);
     u64 pid = child->pid;
-    object_release(object);
+    process_handle_reference_release(object);
     return pid;
 }
 
@@ -4091,29 +4134,29 @@ int process_poll(process_t *parent, process_handle_t handle, i32 *out_status)
     u64 flags = spin_lock_irqsave(&process_registry_lock);
     if (child == parent || child->parent != parent || child->wait_collected) {
         spin_unlock_irqrestore(&process_registry_lock, flags);
-        object_release(object);
+        process_handle_reference_release(object);
         return MG_ERR_NOT_CHILD;
     }
     if (child->state != PROCESS_STATE_TERMINATED) {
         spin_unlock_irqrestore(&process_registry_lock, flags);
-        object_release(object);
+        process_handle_reference_release(object);
         return MG_ERR_WOULD_BLOCK;
     }
     spin_unlock_irqrestore(&process_registry_lock, flags);
     if (!process_finalize_exit(child)) {
-        object_release(object);
+        process_handle_reference_release(object);
         return MG_ERR_WOULD_BLOCK;
     }
     flags = spin_lock_irqsave(&process_registry_lock);
     if (child->parent != parent || child->wait_collected ||
         child->state != PROCESS_STATE_TERMINATED) {
         spin_unlock_irqrestore(&process_registry_lock, flags);
-        object_release(object);
+        process_handle_reference_release(object);
         return MG_ERR_NOT_CHILD;
     }
     *out_status = child->exit_status;
     spin_unlock_irqrestore(&process_registry_lock, flags);
-    object_release(object);
+    process_handle_reference_release(object);
     return MG_OK;
 }
 
@@ -4132,12 +4175,12 @@ int process_terminate_child(process_t *parent, process_handle_t handle,
     if (child == parent || child->parent != parent ||
         child->state != PROCESS_STATE_ACTIVE) {
         spin_unlock_irqrestore(&process_registry_lock, flags);
-        object_release(object);
+        process_handle_reference_release(object);
         return MG_ERR_NOT_CHILD;
     }
     spin_unlock_irqrestore(&process_registry_lock, flags);
     bool terminated = process_terminate_external(child, status);
-    object_release(object);
+    process_handle_reference_release(object);
     return terminated ? MG_OK : MG_ERR_BUSY;
 }
 
@@ -4160,7 +4203,7 @@ int process_wait(process_t *parent, process_handle_t handle,
     if (child == parent || child->parent != parent || child->wait_collected) {
         spin_unlock(&process_registry_lock);
         process_cli_restore(wait_flags);
-        object_release(object);
+        process_handle_reference_release(object);
         return MG_ERR_INVALID_HANDLE;
     }
     if (child->state != PROCESS_STATE_TERMINATED) {
@@ -4168,7 +4211,7 @@ int process_wait(process_t *parent, process_handle_t handle,
         if (parent->waiting_child || !thread || child->wait_claimed) {
             spin_unlock(&process_registry_lock);
             process_cli_restore(wait_flags);
-            object_release(object);
+            process_handle_reference_release(object);
             return MG_ERR_BUSY;
         }
         parent->waiting_child = child;
@@ -4183,7 +4226,7 @@ int process_wait(process_t *parent, process_handle_t handle,
             }
             spin_unlock(&process_registry_lock);
             process_cli_restore(wait_flags);
-            object_release(object);
+            process_handle_reference_release(object);
             return process_shutdown_requested(parent) ? MG_ERR_SHUTDOWN :
                 MG_ERR_BUSY;
         }
@@ -4196,7 +4239,7 @@ int process_wait(process_t *parent, process_handle_t handle,
         if (child->state != PROCESS_STATE_TERMINATED) {
             spin_unlock(&process_registry_lock);
             process_cli_restore(wait_flags);
-            object_release(object);
+            process_handle_reference_release(object);
             return process_shutdown_requested(parent) ? MG_ERR_SHUTDOWN :
                 MG_ERR_BUSY;
         }
@@ -4204,7 +4247,7 @@ int process_wait(process_t *parent, process_handle_t handle,
     if (child->wait_claimed) {
         spin_unlock(&process_registry_lock);
         process_cli_restore(wait_flags);
-        object_release(object);
+        process_handle_reference_release(object);
         return MG_ERR_BUSY;
     }
     child->wait_claimed = true;
@@ -4215,7 +4258,7 @@ int process_wait(process_t *parent, process_handle_t handle,
         flags = spin_lock_irqsave(&process_registry_lock);
         child->wait_claimed = false;
         spin_unlock_irqrestore(&process_registry_lock, flags);
-        object_release(object);
+        process_handle_reference_release(object);
         return MG_ERR_BUSY;
     }
 
@@ -4224,7 +4267,7 @@ int process_wait(process_t *parent, process_handle_t handle,
         child->state != PROCESS_STATE_TERMINATED || !child->wait_claimed) {
         child->wait_claimed = false;
         spin_unlock_irqrestore(&process_registry_lock, flags);
-        object_release(object);
+        process_handle_reference_release(object);
         return MG_ERR_INVALID_HANDLE;
     }
     *out_status = child->exit_status;
@@ -4234,7 +4277,7 @@ int process_wait(process_t *parent, process_handle_t handle,
     child->owner_reference_held = false;
     spin_unlock(&process_registry_lock);
     object_release(&child->object); /* drop the process's owner reference */
-    object_release(object);
+    process_handle_reference_release(object);
     return MG_OK;
 }
 
@@ -4618,20 +4661,27 @@ bool process_handle_close(process_t *process, process_handle_t handle)
     if (!object) return false;
     bool allowed = object->type != OBJECT_TYPE_THREAD ||
         process_thread_handle_close_allowed(object);
-    object_release(object);
-    if (!allowed) return false;
+    if (!allowed) {
+        process_handle_reference_release(object);
+        return false;
+    }
 
-    if (!mutex_lock(&process->handle_growth_mutex)) return false;
+    if (!mutex_lock(&process->handle_growth_mutex)) {
+        process_handle_reference_release(object);
+        return false;
+    }
     flags = spin_lock_irqsave(&process->handle_lock);
     if (!process->handle_table || index >= process->handle_capacity) {
         spin_unlock_irqrestore(&process->handle_lock, flags);
         mutex_unlock(&process->handle_growth_mutex);
+        process_handle_reference_release(object);
         return false;
     }
     process_handle_slot_t *slots = handle_slots(process);
     if (!slots[index].active || slots[index].generation != generation) {
         spin_unlock_irqrestore(&process->handle_lock, flags);
         mutex_unlock(&process->handle_growth_mutex);
+        process_handle_reference_release(object);
         return false;
     }
     object = slots[index].object;
@@ -4643,6 +4693,7 @@ bool process_handle_close(process_t *process, process_handle_t handle)
     spin_unlock_irqrestore(&process->handle_lock, flags);
     mutex_unlock(&process->handle_growth_mutex);
     object_release(object);
+    process_handle_reference_release(object);
     return true;
 }
 
