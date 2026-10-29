@@ -374,14 +374,12 @@ void scheduler_context_switch_complete(uintptr_t *outgoing_rsp_slot)
     if (current_thread)
         wrmsr(MSR_IA32_FS_BASE, current_thread->user_fs_base);
     if (terminated && outgoing->process) {
-        if (outgoing->worker_record) {
-            cpu_local_t *cpu = scheduler_cpu_local();
-            process_t *process = outgoing->process;
-            if (!cpu || cpu->scheduler_post_handoff_process ||
-                !object_reference(&process->object))
-                panic("scheduler: failed to retain worker handoff owner");
-            cpu->scheduler_post_handoff_process = process;
-        }
+        cpu_local_t *cpu = scheduler_cpu_local();
+        process_t *process = outgoing->process;
+        if (!cpu || cpu->scheduler_post_handoff_process ||
+            !object_reference(&process->object))
+            panic("scheduler: failed to retain process handoff owner");
+        cpu->scheduler_post_handoff_process = process;
         process_scheduler_handoff_complete(outgoing);
     }
 }
@@ -396,15 +394,16 @@ void scheduler_context_switch_post_complete(void)
     process = __atomic_exchange_n(&cpu->scheduler_post_handoff_process, NULL,
                                   __ATOMIC_ACQ_REL);
     if (!process) return;
-    /* A restored syscall or IRQ continuation can have IF clear. Worker
-     * reclamation may require cross-CPU TLB acknowledgements, so briefly
-     * enable interrupts only after the incoming register/stack context is
-     * complete. The process reference on this stack protects the deferred
-     * work if a nested interrupt schedules this thread again. */
+    /* A restored syscall or IRQ continuation can have IF clear. Final
+     * process cleanup may require cross-CPU TLB acknowledgements, so run it
+     * only after the incoming register/stack context is complete. Worker
+     * region reaping is left to the syscall epilogue, where no scheduler
+     * handoff marker or user-memory lease is outstanding. The process
+     * reference protects cleanup if a nested interrupt schedules again. */
     __asm__ volatile("pushfq; popq %0" : "=r"(saved_flags) :: "memory");
     if (!(saved_flags & (1ULL << 9)))
         __asm__ volatile("sti" ::: "memory");
-    process_worker_reclaim_pending(process);
+    process_scheduler_post_handoff(process);
     object_release(&process->object);
     if (!(saved_flags & (1ULL << 9)))
         __asm__ volatile("cli" ::: "memory");

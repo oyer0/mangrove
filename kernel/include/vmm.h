@@ -41,6 +41,18 @@ typedef struct vmm_user_range_lease {
     bool active;
 } vmm_user_range_lease_t;
 
+/* Revocation is separate from unmapping so leases acquired before revocation
+ * can drain safely. RETRY means the operation mutex could not be acquired
+ * without blocking in the current context, including an unconsumed mutex
+ * handoff; no mapping or revocation state was changed, and the caller must
+ * retain ownership and retry later. INVALID covers a malformed range/address
+ * space, missing mapping, or invalid caller state. */
+typedef enum {
+    VMM_USER_RANGE_REVOKE_INVALID = 0,
+    VMM_USER_RANGE_REVOKE_RETRY,
+    VMM_USER_RANGE_REVOKED,
+} vmm_user_range_revoke_result_t;
+
 /* Exclusive lease on an unmapped subrange of either the dedicated kernel VMM
  * arena or an explicitly leased heap-tail range. Reserving space allocates
  * neither page tables nor physical frames. The generation rejects stale
@@ -144,8 +156,8 @@ bool vmm_user_range_lease(page_table_t *pml4, const void *address,
 void vmm_user_range_release(vmm_user_range_lease_t *lease);
 /* Prevent new syscall leases on a mapped owned range. Existing leases remain
  * valid and must drain before vmm_unmap_user_range() can reclaim its frames. */
-bool vmm_user_range_revoke(page_table_t *pml4, void *virtual_addr,
-                           usize page_count);
+vmm_user_range_revoke_result_t vmm_user_range_revoke(
+    page_table_t *pml4, void *virtual_addr, usize page_count);
 phys_addr_t vmm_virtual_to_physical(void *virtual_addr);
 
 /* Stage-4 ownership checks.  These are intentionally independent from

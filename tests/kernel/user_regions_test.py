@@ -58,6 +58,9 @@ typedef enum { PROCESS_USER_REGION_INITIAL_STACK=1,
 typedef enum { PROCESS_REGION_RELEASE_INVALID=0,
     PROCESS_REGION_RELEASE_DEFERRED, PROCESS_REGION_RELEASED
 } process_region_release_result_t;
+typedef enum { VMM_USER_RANGE_REVOKE_INVALID=0,
+    VMM_USER_RANGE_REVOKE_RETRY, VMM_USER_RANGE_REVOKED
+} vmm_user_range_revoke_result_t;
 #define VMM_PAGE_SIZE 4096U
 #define VMM_USER_ANON_BASE 0x0000400000000000ULL
 #define VMM_USER_ANON_LIMIT 0x00007fff00000000ULL
@@ -79,7 +82,8 @@ typedef struct process_memory_mapping {
 typedef struct process_user_region {
     uintptr_t reservation_base; usize reservation_pages;
     uintptr_t mapping_base; usize mapping_pages;
-    process_user_region_kind_t kind; bool worker_owned, release_pending;
+    process_user_region_kind_t kind; bool worker_owned, release_pending,
+        revoked;
     struct process_user_region *next;
 } process_user_region_t;
 typedef struct process {
@@ -105,7 +109,7 @@ static bool vmm_direct_map_valid(phys_addr_t f){return f!=0;}
 static void *phys_to_virt(phys_addr_t f){return (void*)f;}
 static bool vmm_user_range_unmapped(void*as,uintptr_t start,usize length){assert(as&&start%VMM_PAGE_SIZE==0&&length%VMM_PAGE_SIZE==0);for(uintptr_t a=start;a<start+length;a+=VMM_PAGE_SIZE)for(unsigned i=0;i<mapping_count;i++)if(mappings[i].address==a)return false;return true;}
 static bool vmm_map_user_page(void*as,void*va,phys_addr_t frame,u64 flags){assert(as&&frame&&(flags&PTE_USER));map_calls++;if(fail_map&&map_calls==fail_map_after)return false;assert(mapping_count<512);uintptr_t a=(uintptr_t)va;for(unsigned i=0;i<mapping_count;i++)assert(mappings[i].address!=a);mappings[mapping_count++]=(mapping_t){.address=a,.frame=frame};if(lease_on_first_map){lease_on_first_map=false;mappings[mapping_count-1U].leases=1;lease_active=true;}return true;}
-static bool vmm_user_range_revoke(void*as,void*va,usize pages){assert(as);uintptr_t start=(uintptr_t)va;for(usize p=0;p<pages;p++){uintptr_t a=start+p*VMM_PAGE_SIZE;unsigned i;for(i=0;i<mapping_count;i++)if(mappings[i].address==a)break;if(i==mapping_count)return false;}for(usize p=0;p<pages;p++){uintptr_t a=start+p*VMM_PAGE_SIZE;for(unsigned i=0;i<mapping_count;i++)if(mappings[i].address==a)mappings[i].revoking=true;}return true;}
+static vmm_user_range_revoke_result_t vmm_user_range_revoke(void*as,void*va,usize pages){assert(as);uintptr_t start=(uintptr_t)va;for(usize p=0;p<pages;p++){uintptr_t a=start+p*VMM_PAGE_SIZE;unsigned i;for(i=0;i<mapping_count;i++)if(mappings[i].address==a)break;if(i==mapping_count)return VMM_USER_RANGE_REVOKE_INVALID;}for(usize p=0;p<pages;p++){uintptr_t a=start+p*VMM_PAGE_SIZE;for(unsigned i=0;i<mapping_count;i++)if(mappings[i].address==a)mappings[i].revoking=true;}return VMM_USER_RANGE_REVOKED;}
 static bool vmm_unmap_user_range(void*as,void*va,usize pages){assert(as);uintptr_t start=(uintptr_t)va;for(usize p=0;p<pages;p++){uintptr_t a=start+p*VMM_PAGE_SIZE;unsigned i;for(i=0;i<mapping_count;i++)if(mappings[i].address==a)break;if(i==mapping_count||mappings[i].leases)return false;}for(usize p=0;p<pages;p++){uintptr_t a=start+p*VMM_PAGE_SIZE;for(unsigned i=0;i<mapping_count;i++)if(mappings[i].address==a){phys_addr_t f=mappings[i].frame;mappings[i]=mappings[--mapping_count];pmm_free_frame(f);break;}}return true;}
 static void test_lease_release(void){assert(lease_active);for(unsigned i=0;i<mapping_count;i++)if(mappings[i].leases){mappings[i].leases--;lease_active=false;return;}assert(false);}
 static uint8_t *mapped_bytes(uintptr_t address){uintptr_t page=address&~(uintptr_t)(VMM_PAGE_SIZE-1U);for(unsigned i=0;i<mapping_count;i++)if(mappings[i].address==page)return (uint8_t*)mappings[i].frame+(address-page);return NULL;}

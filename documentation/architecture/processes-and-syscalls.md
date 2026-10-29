@@ -89,7 +89,12 @@ the process executing on distinct CPUs; this is an observation, not a CPU
 reservation. Snapshot flags also report transient worker-reap pending,
 user-region-reap pending, and active worker-reaper state. These copied flags
 are diagnostic observations, not lifecycle controls; region-reap pending means
-revoked user mappings remain reserved while existing syscall leases drain.
+worker-region revocation or unmapping remains deferred while ownership is
+retained. Revocation can defer without changing VMM state when a safe reaper
+context cannot acquire the VMM operation mutex. The completed syscall
+continuation retries pending cleanup at its epilogue, after any incoming mutex
+handoff is consumed and its own user-memory leases have been released; no
+further worker exit is required to trigger the retry.
 
 Per-thread Ring 3 entry records hold independent registers, instruction and
 stack pointers, FS base, FPU state, guarded user-stack mapping, and TLS
@@ -109,14 +114,25 @@ last kernel operation releases its pin. Before a worker region is released, the
 kernel revokes admission for new syscall leases on its pages. Existing leases
 remain valid until their normal release; the region reservation and frame
 ownership remain process-owned until unmapping and its cross-CPU TLB handoff
-complete. Failed, still-private worker setup uses the same revocation and
+complete. A reaper reached before the incoming thread consumes a mutex
+handoff returns without acquiring region/VMM locks or changing ownership.
+VMM revocation reports a retryable result when its operation lock cannot be
+acquired without blocking, without changing mapping state. The syscall
+epilogue retries after the continuation has consumed its handoff and its
+user-memory leases have been released; no further worker exit is required.
+A missing mapping remains an ownership error and retains fail-stop handling.
+Failed, still-private worker setup uses the same revocation and
 deferred-reclamation path because sibling threads share the address space and
-may already hold leases on provisionally mapped pages. A syscall epilogue
-retries deferred region cleanup after its lease has been released. Joinable
+may already hold leases on provisionally mapped pages. Joinable
 workers retain only a small completion record until join or process exit.
 Detached records are removed automatically after safe handoff and resource
 release. Process exit can reclaim the remaining mappings together with the
 address space after every thread and syscall has stopped.
+Process-wide resource cleanup runs after the incoming scheduler context
+restores its interrupt state. The earlier handoff callback runs with interrupts
+masked and must not perform user unmaps that can wait for remote TLB
+shootdowns.
+The scheduler keeps a process reference across this deferred cleanup.
 
 The ELF loader accepts at most one validated nonempty `PT_TLS` segment; an
 all-zero `PT_TLS` emitted by the linker for an image without TLS sections means

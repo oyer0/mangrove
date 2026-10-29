@@ -1410,17 +1410,23 @@ static process_user_region_t *process_user_region_create(
     if (mapped != mapping_pages) {
         bool deferred = false;
         if (mapped) {
-            if (!vmm_user_range_revoke(process->address_space,
-                    (void *)mapping_base, mapped))
+            vmm_user_range_revoke_result_t revoke_result =
+                vmm_user_range_revoke(process->address_space,
+                    (void *)mapping_base, mapped);
+            if (revoke_result == VMM_USER_RANGE_REVOKE_INVALID)
                 panic("process: partial user-region revoke failed");
-            if (!vmm_unmap_user_range(process->address_space,
+            if (revoke_result == VMM_USER_RANGE_REVOKE_RETRY ||
+                !vmm_unmap_user_range(process->address_space,
                     (void *)mapping_base, mapped)) {
                 /* A sibling may already hold a syscall lease on a page
-                 * exposed by the shared address space. Keep both its frame
-                 * ownership and the reservation in the process list until
-                 * that lease drains. */
+                 * exposed by the shared address space, or the serialized VMM
+                 * operation lock may be temporarily unavailable. Keep the
+                 * frame ownership and reservation until revocation and unmap
+                 * can both complete. */
                 region->mapping_pages = mapped;
                 region->release_pending = true;
+                region->revoked =
+                    revoke_result == VMM_USER_RANGE_REVOKED;
                 process_user_region_insert_locked(process, region);
                 __atomic_store_n(&process->user_region_reap_pending, true,
                                  __ATOMIC_RELEASE);
@@ -1521,14 +1527,24 @@ static process_region_release_result_t process_user_region_release(
         mutex_unlock(&process->memory_lock);
         return PROCESS_REGION_RELEASE_INVALID;
     }
-    if (!region->release_pending) {
-        if (!vmm_user_range_revoke(process->address_space,
-                (void *)region->mapping_base, region->mapping_pages)) {
+    if (!region->revoked) {
+        vmm_user_range_revoke_result_t revoke_result =
+            vmm_user_range_revoke(process->address_space,
+                (void *)region->mapping_base, region->mapping_pages);
+        if (revoke_result == VMM_USER_RANGE_REVOKE_RETRY) {
+            region->release_pending = true;
+            __atomic_store_n(&process->user_region_reap_pending, true,
+                             __ATOMIC_RELEASE);
+            mutex_unlock(&process->memory_lock);
+            return PROCESS_REGION_RELEASE_DEFERRED;
+        }
+        if (revoke_result != VMM_USER_RANGE_REVOKED) {
             mutex_unlock(&process->memory_lock);
             return PROCESS_REGION_RELEASE_INVALID;
         }
-        region->release_pending = true;
+        region->revoked = true;
     }
+    region->release_pending = true;
     if (!vmm_unmap_user_range(process->address_space,
             (void *)region->mapping_base, region->mapping_pages)) {
         __atomic_store_n(&process->user_region_reap_pending, true,
@@ -1598,6 +1614,19 @@ static void process_user_regions_reap_pending(process_t *process)
             cursor = &region->next;
             continue;
         }
+        if (!region->revoked) {
+            vmm_user_range_revoke_result_t revoke_result =
+                vmm_user_range_revoke(process->address_space,
+                    (void *)region->mapping_base, region->mapping_pages);
+            if (revoke_result == VMM_USER_RANGE_REVOKE_INVALID)
+                panic("process: deferred user-region mapping ownership lost");
+            if (revoke_result == VMM_USER_RANGE_REVOKE_RETRY) {
+                pending = true;
+                cursor = &region->next;
+                continue;
+            }
+            region->revoked = true;
+        }
         if (!vmm_unmap_user_range(process->address_space,
                 (void *)region->mapping_base, region->mapping_pages)) {
             pending = true;
@@ -1663,9 +1692,10 @@ static bool process_worker_reap_immediate_locked(process_t *process)
  * have remote active-CPU targets during a CPU transition. */
 static bool process_worker_reclaim_context_valid(void)
 {
+    kernel_thread_t *current = thread_current();
     u64 flags = process_cli_save();
     process_cli_restore(flags);
-    return (flags & (1ULL << 9)) != 0 &&
+    return current && !current->waiting_mutex && (flags & (1ULL << 9)) != 0 &&
            kernel_stack_release_context_valid();
 }
 
@@ -1738,9 +1768,10 @@ void process_worker_reclaim_pending(process_t *process)
             if (stack_region)
                 stack_release_result = process_user_region_release(
                     process, stack_region);
-            if (tls_release_result == PROCESS_REGION_RELEASE_INVALID ||
-                stack_release_result == PROCESS_REGION_RELEASE_INVALID)
-                panic("process: worker region ownership lost during reap");
+            if (tls_release_result == PROCESS_REGION_RELEASE_INVALID)
+                panic("process: worker TLS region ownership lost during reap");
+            if (stack_release_result == PROCESS_REGION_RELEASE_INVALID)
+                panic("process: worker stack region ownership lost during reap");
             tls_released = tls_release_result == PROCESS_REGION_RELEASED;
             stack_released = stack_release_result ==
                 PROCESS_REGION_RELEASED;
@@ -2286,7 +2317,6 @@ void process_scheduler_handoff_complete(struct kernel_thread *raw_thread)
     kernel_thread_t *waiter = NULL;
     kernel_thread_t *join_waiter = NULL;
     bool join_waiter_pinned = false;
-    bool cleanup_ready = false;
     u64 flags;
 
     if (!thread || !(process = thread->process) ||
@@ -2324,13 +2354,6 @@ void process_scheduler_handoff_complete(struct kernel_thread *raw_thread)
             }
         }
     }
-    /* An unpublished process is still owned by process_abort(), which rolls
-     * back its launch resources after stopping the prepared initial thread. */
-    cleanup_ready = process->launch_ready &&
-        process->state == PROCESS_STATE_EXITING &&
-        !process->exit_cleanup_complete &&
-        !process->exit_cleanup_in_progress &&
-        process_thread_list_complete_locked(process);
     waiter = process_publish_terminated_locked(process);
     spin_unlock_irqrestore(&process_registry_lock, flags);
 
@@ -2340,8 +2363,15 @@ void process_scheduler_handoff_complete(struct kernel_thread *raw_thread)
         if (join_waiter_pinned)
             process_thread_list_read_release(process);
     }
-    if (cleanup_ready) (void)process_cleanup_exit_resources(process);
     if (waiter) (void)scheduler_unblock(waiter);
+}
+
+void process_scheduler_post_handoff(process_t *process)
+{
+    /* scheduler_context_switch_complete() runs before the incoming saved
+     * RFLAGS are restored. Process exit cleanup can unmap user pages and wait
+     * for remote TLB acknowledgements, so run it only from the later hook. */
+    if (process) (void)process_cleanup_exit_resources(process);
 }
 
 static void process_unlink_locked(process_t *process)

@@ -44,7 +44,7 @@ typedef int64_t i64;
 typedef size_t usize;
 typedef uintptr_t phys_addr_t;
 typedef pthread_mutex_t spinlock_t;
-typedef pthread_mutex_t mutex_t;
+typedef struct kernel_mutex mutex_t;
 typedef u32 process_handle_t;
 typedef i64 mg_result_t;
 typedef u64 mg_thread_result_t;
@@ -54,6 +54,10 @@ typedef struct kernel_thread kernel_thread_t;
 typedef struct kernel_object kernel_object_t;
 typedef struct process_user_region process_user_region_t;
 typedef struct process_thread_record process_thread_record_t;
+struct kernel_mutex {
+    spinlock_t state_lock;
+    kernel_thread_t *owner, *wait_head, *wait_tail;
+};
 typedef enum { PROCESS_STATE_ACTIVE, PROCESS_STATE_EXITING,
                PROCESS_STATE_TERMINATED } process_state_t;
 typedef enum { THREAD_PROCESS_UNATTACHED, THREAD_PROCESS_ATTACHED,
@@ -76,6 +80,9 @@ enum { PROCESS_USER_REGION_INITIAL_STACK=1,
 typedef enum { PROCESS_REGION_RELEASE_INVALID,
                PROCESS_REGION_RELEASE_DEFERRED,
                PROCESS_REGION_RELEASED } process_region_release_result_t;
+typedef enum { VMM_USER_RANGE_REVOKE_INVALID,
+               VMM_USER_RANGE_REVOKE_RETRY,
+               VMM_USER_RANGE_REVOKED } vmm_user_range_revoke_result_t;
 enum { THREAD_CPU_NONE = UINT32_MAX };
 struct kernel_object {
     u32 ref_count;
@@ -86,7 +93,7 @@ struct process_user_region {
     uintptr_t reservation_base, mapping_base;
     usize reservation_pages, mapping_pages;
     u32 kind, leases;
-    bool worker_owned;
+    bool worker_owned, revoked;
     bool release_pending;
     process_user_region_t *next;
 };
@@ -111,6 +118,9 @@ struct kernel_thread {
     uintptr_t user_fs_base;
     process_thread_record_t *worker_record;
     bool event_wake_pending;
+    mutex_t *waiting_mutex;
+    kernel_thread_t *mutex_wait_next;
+    bool mutex_wake_pending;
 };
 struct process_thread_record {
     kernel_object_t object;
@@ -165,10 +175,17 @@ static bool fail_thread_create,fail_prepare,fail_reserve,fail_enqueue;
 static u32 lease_on_revoke_kind;
 static bool pause_prepare,prepare_entered,allow_prepare;
 static bool interrupt_pending;
+static bool refuse_scheduler_block;
 static process_user_region_t *leased_region;
+static mutex_t vmm_operation_mutex;
+static kernel_thread_t *vmm_operation_owner;
+static bool vmm_operation_contended;
 static u64 next_thread_id=100;
 static _Thread_local u64 fixture_eflags=1ULL<<9;
 static process_t *test_process;
+void mutex_init(mutex_t *);
+bool mutex_lock(mutex_t *);
+bool mutex_unlock(mutex_t *);
 static process_region_release_result_t process_user_region_release(
     process_t*,process_user_region_t*);
 static bool process_user_region_set_worker_owned(process_t*,
@@ -212,8 +229,12 @@ static void spin_unlock_irqrestore(spinlock_t *lock,u64 flags)
    }
   }
  }
-static bool mutex_lock(mutex_t *lock){return pthread_mutex_lock(lock)==0;}
-static void mutex_unlock(mutex_t *lock){assert(pthread_mutex_unlock(lock)==0);}
+static void spinlock_init(spinlock_t *lock)
+{assert(pthread_mutex_init(lock,NULL)==0);}
+static void spin_lock(spinlock_t *lock)
+{assert(pthread_mutex_lock(lock)==0);}
+static void spin_unlock(spinlock_t *lock)
+{assert(pthread_mutex_unlock(lock)==0);}
 static void *kmalloc(usize size)
 { allocation_count++; if(fail_allocation_at==allocation_count)return NULL;
   return malloc(size); }
@@ -308,11 +329,20 @@ static bool scheduler_wake_waiter(kernel_thread_t*t)
  pthread_mutex_lock(&event_lock);
  __atomic_store_n(&t->event_wake_pending,true,__ATOMIC_RELEASE);
  pthread_cond_broadcast(&event_changed);pthread_mutex_unlock(&event_lock);return true;}
+static bool scheduler_mutex_wake(kernel_thread_t*t)
+{if(!t)return false;
+ __atomic_store_n(&t->mutex_wake_pending,true,__ATOMIC_RELEASE);
+ if(t->state==THREAD_STATE_BLOCKED)t->state=THREAD_STATE_READY;
+ pthread_mutex_lock(&event_lock);pthread_cond_broadcast(&event_changed);
+ pthread_mutex_unlock(&event_lock);return true;}
 static bool scheduler_block(void)
-{kernel_thread_t*t=local_thread;pthread_mutex_lock(&event_lock);
+{kernel_thread_t*t=local_thread;if(refuse_scheduler_block)return false;
+ pthread_mutex_lock(&event_lock);
  block_entered=true;pthread_cond_broadcast(&event_changed);
- while(!__atomic_exchange_n(&t->event_wake_pending,false,__ATOMIC_ACQ_REL))
+ while(!__atomic_load_n(&t->event_wake_pending,__ATOMIC_ACQUIRE)&&
+       !__atomic_load_n(&t->mutex_wake_pending,__ATOMIC_ACQUIRE))
  pthread_cond_wait(&event_changed,&event_lock);
+ (void)__atomic_exchange_n(&t->event_wake_pending,false,__ATOMIC_ACQ_REL);
  pthread_mutex_unlock(&event_lock);return true;}
 static void scheduler_clear_event_wake(kernel_thread_t*t)
 {if(t)__atomic_store_n(&t->event_wake_pending,false,__ATOMIC_RELEASE);}
@@ -342,14 +372,33 @@ static bool thread_release_terminated_stack(kernel_thread_t*t)
  return true;}
 static bool vmm_unmap_user_range(void*as,void*base,usize pages)
 {(void)as;(void)pages;
- if(leased_region&&leased_region->mapping_base==(uintptr_t)base)return false;
- region_releases++;return true;}
-static bool vmm_user_range_revoke(void*as,void*base,usize pages)
-{(void)as;(void)pages;for(process_user_region_t*r=test_process->user_regions;r;
+ if(vmm_operation_contended && vmm_operation_owner!=local_thread)
+  vmm_operation_mutex.owner=vmm_operation_owner;
+ else vmm_operation_mutex.owner=NULL;
+ if(!mutex_lock(&vmm_operation_mutex))return false;
+ if(leased_region&&leased_region->mapping_base==(uintptr_t)base){
+  mutex_unlock(&vmm_operation_mutex);return false;}
+ region_releases++;mutex_unlock(&vmm_operation_mutex);return true;}
+static vmm_user_range_revoke_result_t vmm_user_range_revoke(
+    void*as,void*base,usize pages)
+{(void)as;(void)pages;
+ if(vmm_operation_contended && vmm_operation_owner!=local_thread)
+  vmm_operation_mutex.owner=vmm_operation_owner;
+ else vmm_operation_mutex.owner=NULL;
+ /* Use production mutex_lock(): during scheduler post-switch, handoff_mutex
+  * is already owned by local_thread but its waiting marker has not yet been
+  * consumed. A direct VMM revoke refuses the contended operation mutex; the
+  * scheduler reaper itself defers before acquiring any mutex. */
+ if(!mutex_lock(&vmm_operation_mutex))
+  return VMM_USER_RANGE_REVOKE_RETRY;
+ for(process_user_region_t*r=test_process->user_regions;r;
  r=r->next)if(r->mapping_base==(uintptr_t)base){
   if(lease_on_revoke_kind&&r->kind==lease_on_revoke_kind){
    leased_region=r;lease_on_revoke_kind=0;}
-  return true;}return false;}
+  mutex_unlock(&vmm_operation_mutex);
+  return VMM_USER_RANGE_REVOKED;}
+ mutex_unlock(&vmm_operation_mutex);
+ return VMM_USER_RANGE_REVOKE_INVALID;}
 static bool process_user_context_discard_worker(process_t*p,kernel_thread_t*t)
 {
  if(!process_user_region_set_worker_owned(p,t->user_context.stack_region,
@@ -405,8 +454,8 @@ static void init(process_t*p,kernel_thread_t*main_thread)
  p->address_space=p;p->tls_present=true;p->handle_capacity=8;
  p->handle_table=calloc(p->handle_capacity,sizeof(process_handle_slot_t));
  assert(p->handle_table);p->handle_lock=(pthread_mutex_t)PTHREAD_MUTEX_INITIALIZER;
- p->handle_growth_mutex=(pthread_mutex_t)PTHREAD_MUTEX_INITIALIZER;
- p->memory_lock=(pthread_mutex_t)PTHREAD_MUTEX_INITIALIZER;
+ mutex_init(&p->handle_growth_mutex);
+ mutex_init(&p->memory_lock);
  p->main_thread=main_thread;p->threads=main_thread;p->thread_count=1;
  p->live_thread_count=1;main_thread->id=1;main_thread->state=THREAD_STATE_RUNNING;
  main_thread->running_cpu=0;main_thread->process=p;
@@ -419,8 +468,10 @@ static void worker_complete(process_thread_record_t*r,u64 value)
  process_scheduler_handoff_complete(t);}
 static void clear(process_t*p)
 {assert(!p->threads||p->threads==p->main_thread);
- free(p->handle_table);pthread_mutex_destroy(&p->handle_growth_mutex);
- pthread_mutex_destroy(&p->memory_lock);pthread_mutex_destroy(&p->handle_lock);}
+ free(p->handle_table);
+ pthread_mutex_destroy(&p->handle_growth_mutex.state_lock);
+ pthread_mutex_destroy(&p->memory_lock.state_lock);
+ pthread_mutex_destroy(&p->handle_lock);}
 typedef struct {process_t*p;process_handle_t h;mg_thread_result_t result;
                 kernel_thread_t *caller;mg_result_t status;} join_call_t;
 typedef struct {process_t*p;process_handle_t h;mg_result_t status;}
@@ -431,13 +482,15 @@ static void *join_host(void*raw)
 {join_call_t*c=raw;local_thread=c->caller?c->caller:test_process->main_thread;
  c->status=process_thread_join(c->p,c->h,&c->result);return NULL;}
 static void *create_host(void *raw)
-{create_call_t*c=raw;
+{create_call_t*c=raw;local_thread=test_process->main_thread;
  c->status=process_thread_create(c->p,0x400100,13,&c->made.handle,
                                  &c->made.id);return NULL;}
 static void *reap_host(void *raw)
-{process_worker_reclaim_pending((process_t*)raw);return NULL;}
+{local_thread=test_process->main_thread;
+ process_worker_reclaim_pending((process_t*)raw);return NULL;}
 static void *complete_host(void *raw)
-{worker_complete((process_thread_record_t*)raw,0x7788U);return NULL;}
+{local_thread=test_process->main_thread;
+ worker_complete((process_thread_record_t*)raw,0x7788U);return NULL;}
 static void *detach_host(void *raw)
 {detach_call_t*c=raw;local_thread=test_process->main_thread;
  c->status=process_thread_detach(c->p,c->h);
@@ -465,7 +518,7 @@ static void test_after_created_handle_is_visible(void)
 int main(void)
 {
  process_t p;kernel_thread_t main_thread;mg_thread_created_t made;
- u64 result=0;init(&p,&main_thread);
+ u64 result=0;mutex_init(&vmm_operation_mutex);init(&p,&main_thread);
  assert(process_snapshot_reap_flags_locked(&p)==0);
  p.worker_reap_pending=true;p.user_region_reap_pending=true;
  p.worker_reapers=1;
@@ -477,6 +530,84 @@ int main(void)
  fixture_eflags=1ULL<<9;
  assert(process_worker_reclaim_context_valid()&&fixture_eflags==(1ULL<<9));
  assert(process_current_thread_id()==1);
+ process_user_region_t missing_region={0};
+ assert(process_user_region_release(&p,&missing_region)==
+        PROCESS_REGION_RELEASE_INVALID);
+
+ /* Reproduce scheduler post-switch ordering with production mutex code. The
+  * unlock below assigns handoff_mutex to main_thread and publishes its wake,
+  * while waiting_mutex remains set until main_thread resumes mutex_lock().
+  * A VMM revoke during this window must report RETRY without taking or
+  * changing the different, contended operation mutex. The worker reaper must
+  * likewise leave stack/TLS ownership untouched. */
+ assert(process_thread_create(&p,0x400100,0x550,&made.handle,&made.id)==MG_OK);
+ process_thread_record_t *handoff_record=p.thread_records;
+ process_user_region_t *handoff_stack=handoff_record->stack_region;
+ process_user_region_t *handoff_tls=handoff_record->tls_region;
+ assert(process_thread_detach(&p,made.handle)==MG_OK);
+ worker_complete(handoff_record,0x551);
+ mutex_t handoff_mutex;kernel_thread_t prior_owner={0},vmm_owner={0};
+ mutex_init(&handoff_mutex);
+ handoff_mutex.owner=&prior_owner;
+ handoff_mutex.wait_head=handoff_mutex.wait_tail=&main_thread;
+ main_thread.state=THREAD_STATE_BLOCKED;
+ main_thread.waiting_mutex=&handoff_mutex;
+ main_thread.mutex_wait_next=NULL;
+ local_thread=&prior_owner;
+ assert(mutex_unlock(&handoff_mutex));
+ assert(handoff_mutex.owner==&main_thread&&
+        main_thread.waiting_mutex==&handoff_mutex&&
+        main_thread.mutex_wake_pending);
+ main_thread.state=THREAD_STATE_RUNNING;
+ local_thread=&main_thread;
+ vmm_operation_owner=&vmm_owner;vmm_operation_contended=true;
+ assert(vmm_user_range_revoke(p.address_space,
+            (void *)handoff_tls->mapping_base,handoff_tls->mapping_pages)==
+        VMM_USER_RANGE_REVOKE_RETRY);
+ u32 handoff_releases_before=region_releases;
+ u32 handoff_refs=handoff_record->object.ref_count;
+ for(unsigned attempt=0;attempt<2;attempt++) {
+  process_worker_reclaim_pending(&p);
+  assert(handoff_record->stack_region==handoff_stack&&
+         handoff_record->tls_region==handoff_tls&&
+         !handoff_stack->revoked&&!handoff_tls->revoked&&
+         !handoff_stack->release_pending&&!handoff_tls->release_pending&&
+         !handoff_record->reclaiming&&!p.worker_reapers&&
+         handoff_record->object.ref_count==handoff_refs&&
+         p.worker_reap_pending&&!p.user_region_reap_pending&&
+         region_releases==handoff_releases_before);
+ }
+ /* The incoming continuation consumes the handoff marker. At the ordinary
+  * safe retry point, make the contended VMM lock refuse parking once. The
+  * release path must defer without losing region or thread ownership. */
+ assert(mutex_lock(&handoff_mutex)&&!main_thread.waiting_mutex&&
+        !main_thread.mutex_wake_pending);
+ assert(mutex_unlock(&handoff_mutex));
+ local_thread=&main_thread;
+ refuse_scheduler_block=true;
+ process_worker_reclaim_pending(&p);
+ refuse_scheduler_block=false;
+ assert(handoff_record->stack_region==handoff_stack&&
+        handoff_record->tls_region==handoff_tls&&
+        !handoff_stack->revoked&&!handoff_tls->revoked&&
+        handoff_stack->release_pending&&handoff_tls->release_pending&&
+        !handoff_record->reclaiming&&!p.worker_reapers&&
+        handoff_record->object.ref_count==handoff_refs&&
+        p.worker_reap_pending&&p.user_region_reap_pending&&
+        region_releases==handoff_releases_before);
+ /* The VMM owner releases the operation lock. The ordinary syscall retry
+  * drains the retained stack/TLS regions without another worker exit. */
+ local_thread=&vmm_owner;
+ assert(mutex_unlock(&vmm_operation_mutex));
+ vmm_operation_owner=NULL;vmm_operation_contended=false;
+ local_thread=&main_thread;
+ process_worker_reclaim_pending(&p);
+ assert(!p.thread_records&&p.thread_count==1&&p.live_thread_count==1&&
+        !p.worker_reap_pending&&!p.user_region_reap_pending&&
+        region_releases==handoff_releases_before+2U&&
+        stack_releases>0);
+ pthread_mutex_destroy(&handoff_mutex.state_lock);
+
  fail_thread_create=true;
  assert(process_thread_create(&p,0x400100,7,&made.handle,&made.id)==MG_ERR_NO_MEMORY);
  fail_thread_create=false;
@@ -751,7 +882,8 @@ int main(void)
  assert(p.thread_count==1&&p.live_thread_count==1&&!p.thread_records&&
         !p.user_regions);
  clear(&p);
- puts("thread API: transactional creation, single join, detach, lease-deferred stack/TLS reap, and exit admission passed");
+ pthread_mutex_destroy(&vmm_operation_mutex.state_lock);
+ puts("thread API: transactional creation, single join, detach, handoff- and lease-deferred stack/TLS reap, and exit admission passed");
  return 0;
 }
 '''
@@ -769,7 +901,17 @@ for source_path, name in names:
             raise AssertionError("thread-create publication hook point changed")
         source = source.replace(old, new, 1)
     functions.append(source)
-code = prefix + "\n".join(functions) + suffix
+mutex_source = (ROOT / "kernel/src/mutex.c").read_text()
+mutex_source = re.sub(r"^#include .*\n", "", mutex_source, flags=re.M)
+mutex_source = re.sub(
+    r"static u64 mutex_irq_save\(void\).*?\n}",
+    "static u64 mutex_irq_save(void) {return 0;}", mutex_source,
+    count=1, flags=re.S)
+mutex_source = re.sub(
+    r"static void mutex_irq_restore\(u64 flags\).*?\n}",
+    "static void mutex_irq_restore(u64 flags) {(void)flags;}", mutex_source,
+    count=1, flags=re.S)
+code = prefix + mutex_source + "\n".join(functions) + suffix
 with tempfile.TemporaryDirectory(prefix="mangrove-thread-api-") as directory:
     path = Path(directory) / "process_thread_api.c"
     binary = Path(directory) / "process_thread_api"
