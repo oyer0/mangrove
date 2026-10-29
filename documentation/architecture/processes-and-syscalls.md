@@ -152,14 +152,19 @@ reference is released, without sampling lifecycle eligibility. In a safe
 execution context, collection is retried after the reference drop. If the
 caller holds a spinlock, has interrupts disabled, or has not consumed an
 incoming mutex handoff, it publishes a coalesced retry to the existing cleanup
-worker instead. The worker scans the process registry for terminated,
-session-owned processes and rechecks all collection predicates and exact
-reference counts before finalization. The latch is set after the dropped pin
-can no longer affect those counts; its event wake closes the scan-to-park race.
-This also covers an in-flight process-handle operation overlapping handle
-closure and references released by termination, shutdown, and syscall
-admission paths. A retry retains no process or session pointer and cannot keep
-an otherwise collectable process alive.
+worker instead of dropping that reference. The process registry stores a
+bounded pending-reference count on the still-pinned process object; each count
+continues to own the original reference until the worker claims it. The worker
+takes a temporary pin, releases at most 16 transferred references per pass,
+then drops its temporary pin outside the registry lock in a safe context. A
+registry-protected retry marker remains until the last deferred reference for
+that process is released. The worker then retries session collection using a
+copied session ID. The shared work latch is set after publication and its event
+wake closes the worker scan-to-park race, including requests made before worker
+readiness. This covers process-handle operations overlapping handle closure,
+including references released under session or input-device spinlocks. A
+transferred reference keeps the object discoverable until the worker consumes
+it; no separately allocated queue or unowned process pointer is retained.
 The scheduler callback and post hook never perform process resource teardown
 or final object release.
 

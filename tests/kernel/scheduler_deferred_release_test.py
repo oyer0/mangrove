@@ -52,7 +52,8 @@ def fixture_prefix():
                             '#include <stdatomic.h>\n#include <sched.h>')
     prefix = prefix.replace('#define PROCESS_NO_SESSION 0',
                             '#define PROCESS_NO_SESSION 0\n'
-                            '#define PROCESS_HANDOFF_RELEASE_BATCH 16U')
+                            '#define PROCESS_HANDOFF_RELEASE_BATCH 16U\n'
+                            '#define PROCESS_DEFERRED_REFERENCE_RELEASE_BATCH 16U')
     prefix = prefix.replace(
         'static process_t parent, child, *all_processes;',
         'static process_t parent, child, *all_processes;\n'
@@ -77,6 +78,7 @@ def fixture_prefix():
         'static pthread_mutex_t pid_gate_lock=PTHREAD_MUTEX_INITIALIZER;\n'
         'static pthread_cond_t pid_gate_changed=PTHREAD_COND_INITIALIZER;\n'
         'static u32 process_destructions;\n'
+        'static u32 unsafe_destructor_entries;\n'
         'static _Thread_local unsigned fixture_lock_depth;\n'
         'static void object_release(kernel_object_t *);\n'
         'static bool process_finish_termination(process_t *);\n'
@@ -223,7 +225,10 @@ def fixture_prefix():
     prefix = prefix.replace(
         'static void process_cwd_clear(process_t *p){assert(p==&child);}',
         'static void process_cwd_clear(process_t *p){assert(p==&child); '
-        'assert(fixture_interrupts_enabled && '
+        'if(!fixture_interrupts_enabled || fixture_lock_depth || '
+        'incoming_mutex_pending || in_scheduler_callback)'
+        'unsafe_destructor_entries++; '
+        'assert(fixture_interrupts_enabled && !fixture_lock_depth && '
         '!incoming_mutex_pending && !in_scheduler_callback);}')
     prefix = prefix.replace('static void kfree(void *p){(void)p;frees++;}',
                             'static void kfree(void *p){if(p==&child)'
@@ -338,7 +343,8 @@ for name in (
         'process_handle_close',
         'process_handle_pid',
         'process_object_destroy',
-        'process_cleanup_worker_release_handoffs_once'):
+        'process_cleanup_worker_release_handoffs_once',
+        'process_cleanup_worker_release_deferred_references_once'):
     functions += c_function(process_source, name)
 functions += c_function(scheduler_source,
                          'scheduler_context_switch_post_complete')
@@ -393,6 +399,7 @@ static void reset(bool active)
     atomic_store_explicit(&collection_retry_wake_count,0U,
                           memory_order_relaxed);
     process_destructions=0;
+    unsafe_destructor_entries=0;
     pause_before_reference_drop=false;
     pause_pid_lookup=pid_lookup_pinned=pid_close_done=false;
     helper_snapshot_paused=termination_published=false;
@@ -474,13 +481,15 @@ static void exact_last_reference_case(void)
      * token on CPU A is now the process's only remaining reference. */
     assert(process_wait(&parent,7,&status)==MG_OK && status==23);
     assert(child.thread_count==0 && !child.owner_reference_held &&
-           child.object.ref_count==2 && child.scheduler_handoff_references==1);
+           child.object.ref_count==3 && child.scheduler_handoff_references==1 &&
+           atomic_load_explicit(&child.deferred_reference_releases_pending,
+                                memory_order_acquire)==1U);
     object_release(&child.object);
-    assert(child.object.ref_count==1 && destroyed_roots==0);
+    assert(child.object.ref_count==2 && destroyed_roots==0);
 
     enter_callback_context();
     scheduler_context_switch_post_complete(&child);
-    assert(child.object.ref_count==1 && destroyed_roots==0 &&
+    assert(child.object.ref_count==2 && destroyed_roots==0 &&
            child.scheduler_handoff_references==1 &&
            atomic_load_explicit(&child.scheduler_handoff_releases_pending,
                                 memory_order_acquire)==1);
@@ -488,10 +497,14 @@ static void exact_last_reference_case(void)
 
     enter_worker_context();
     assert(process_cleanup_worker_release_handoffs_once());
+    assert(child.object.ref_count==1 && destroyed_roots==0);
+    assert(process_cleanup_worker_release_deferred_references_once());
     leave_worker_context();
     assert(child.object.ref_count==0 && child.scheduler_handoff_references==0 &&
            atomic_load_explicit(&child.scheduler_handoff_releases_pending,
                                 memory_order_acquire)==0 &&
+           !atomic_load_explicit(&child.deferred_reference_releases_pending,
+                                 memory_order_acquire) &&
            destroyed_roots==1 && released_memory==1 &&
            user_region_metadata_releases==1);
 }
@@ -865,8 +878,10 @@ static void locked_pid_release_deferred_case(void)
     pthread_mutex_unlock(&pid_gate_lock);
     assert(!pthread_join(lookup,NULL));
 
-    assert(child.owner_reference_held && child.object.ref_count==1 &&
+    assert(child.owner_reference_held && child.object.ref_count==2 &&
            !destroyed_roots &&
+           atomic_load_explicit(&child.deferred_reference_releases_pending,
+                                memory_order_acquire)==1U &&
            atomic_load_explicit(&process_session_collection_retry_pending,
                                 memory_order_acquire) &&
            atomic_load_explicit(&collection_retry_wake_count,
@@ -878,6 +893,7 @@ static void locked_pid_release_deferred_case(void)
     assert(atomic_load_explicit(&collection_retry_wake_count,
                                 memory_order_relaxed)==1U);
     enter_worker_context();
+    assert(process_cleanup_worker_release_deferred_references_once());
     assert(process_cleanup_worker_retry_session_collections_once());
     assert(!process_cleanup_worker_retry_session_collections_once());
     assert(!child.owner_reference_held && child.object.ref_count==0 &&
@@ -886,6 +902,71 @@ static void locked_pid_release_deferred_case(void)
            user_region_metadata_releases==1 && process_destructions==1 &&
            !atomic_load_explicit(&process_session_collection_retry_pending,
                                  memory_order_acquire));
+    leave_worker_context();
+    assert(!pthread_mutex_destroy(&parent.handle_growth_mutex));
+}
+
+static void wait_and_close_before_locked_pid_release_case(void)
+{
+    pthread_t lookup;
+    i32 status=-1;
+    prepare_finalized_session_process();
+    assert(!pthread_mutex_init(&parent.handle_growth_mutex,NULL));
+    pid_handle_slot=(process_handle_slot_t){.object=&child.object,
+        .generation=1U,.active=true};
+    parent.handle_table=&pid_handle_slot;
+    parent.handle_capacity=1U;
+    parent.handle_revision=1U;
+    assert(object_reference(&child.object)); /* open handle-table slot */
+
+    pause_pid_lookup=true;
+    assert(!pthread_create(&lookup,NULL,pid_lookup_under_session_lock,NULL));
+    pthread_mutex_lock(&pid_gate_lock);
+    while(!pid_lookup_pinned)
+        pthread_cond_wait(&pid_gate_changed,&pid_gate_lock);
+    pthread_mutex_unlock(&pid_gate_lock);
+
+    /* The PID query has retained its lookup while holding session_lock. A
+     * successful wait consumes the process owner; closing the table handle
+     * leaves only the still-paused PID lookup reference. */
+    fixture_interrupts_enabled=true;
+    assert(process_wait(&parent,0x10001U,&status)==MG_OK && status==23);
+    assert(!child.owner_reference_held && child.wait_collected &&
+           child.object.ref_count==3 && !destroyed_roots);
+    /* Model the wait and handle-close operations on CPU B, independently of
+     * CPU A's interrupt-disabled PID lookup. */
+    fixture_interrupts_enabled=true;
+    assert(process_handle_close(&parent,0x10001U));
+    assert(!pid_handle_slot.active && !pid_handle_slot.object &&
+           child.object.ref_count==2 && !destroyed_roots);
+
+    pthread_mutex_lock(&pid_gate_lock);
+    pid_close_done=true;
+    pthread_cond_broadcast(&pid_gate_changed);
+    pthread_mutex_unlock(&pid_gate_lock);
+    assert(!pthread_join(lookup,NULL));
+
+    /* process_wait's own reference and the PID reference were both
+     * transferred rather than dropped in interrupt-disabled/locked contexts.
+     * Their exact ownership remains represented until the safe worker drains. */
+    assert(!child.owner_reference_held && child.object.ref_count==2 &&
+           atomic_load_explicit(&child.deferred_reference_releases_pending,
+                                memory_order_acquire)==2U &&
+           !destroyed_roots && !unsafe_destructor_entries &&
+           atomic_load_explicit(&process_session_collection_retry_pending,
+                                memory_order_acquire));
+    assert(atomic_load_explicit(&collection_retry_wake_count,
+                                memory_order_relaxed)==1U);
+
+    enter_worker_context();
+    assert(process_cleanup_worker_release_deferred_references_once());
+    assert(!child.object.ref_count &&
+           !atomic_load_explicit(&child.deferred_reference_releases_pending,
+                                 memory_order_acquire) &&
+           !child.deferred_reference_collection_retry &&
+           destroyed_roots==1 && process_destructions==1 &&
+           !unsafe_destructor_entries && all_processes==NULL);
+    assert(!process_cleanup_worker_release_deferred_references_once());
     leave_worker_context();
     assert(!pthread_mutex_destroy(&parent.handle_growth_mutex));
 }
@@ -922,17 +1003,97 @@ static void concurrent_pin_releases_coalesce_case(void)
     for(unsigned i=0;i<RELEASES;i++)
         assert(!pthread_join(threads[i],NULL));
     pthread_barrier_destroy(&start);
-    assert(child.owner_reference_held && child.object.ref_count==1 &&
+    assert(child.owner_reference_held &&
+           child.object.ref_count==RELEASES+1U &&
+           atomic_load_explicit(&child.deferred_reference_releases_pending,
+                                memory_order_acquire)==RELEASES &&
            !destroyed_roots &&
            atomic_load_explicit(&process_session_collection_retry_pending,
                                 memory_order_acquire) &&
            atomic_load_explicit(&collection_retry_wake_count,
                                 memory_order_relaxed)==1U);
     enter_worker_context();
+    assert(process_cleanup_worker_release_deferred_references_once());
     assert(process_cleanup_worker_retry_session_collections_once());
     assert(!child.owner_reference_held && !child.object.ref_count &&
            !all_processes && !parent.first_child && destroyed_roots==1 &&
            process_destructions==1);
+    leave_worker_context();
+}
+
+static void concurrent_deferred_reference_publishers_case(void)
+{
+    enum {RELEASES=41U};
+    pthread_t threads[RELEASES];
+    collection_releaser_t item;
+    pthread_barrier_t start;
+    prepare_finalized_session_process();
+    child.session_id=PROCESS_NO_SESSION;
+    for(unsigned i=0;i<RELEASES;i++)
+        assert(object_reference(&child.object));
+    assert(child.object.ref_count==RELEASES+1U);
+    assert(!pthread_barrier_init(&start,NULL,RELEASES+1U));
+    item.start=&start;
+    for(unsigned i=0;i<RELEASES;i++)
+        assert(!pthread_create(&threads[i],NULL,
+                               release_unsafe_collection_pin,&item));
+    int result=pthread_barrier_wait(&start);
+    assert(result==0 || result==PTHREAD_BARRIER_SERIAL_THREAD);
+    for(unsigned i=0;i<RELEASES;i++)
+        assert(!pthread_join(threads[i],NULL));
+    pthread_barrier_destroy(&start);
+    assert(child.object.ref_count==RELEASES+1U &&
+           atomic_load_explicit(&child.deferred_reference_releases_pending,
+                                memory_order_acquire)==RELEASES &&
+           !destroyed_roots && !unsafe_destructor_entries &&
+           atomic_load_explicit(&collection_retry_wake_count,
+                                memory_order_relaxed)==1U);
+
+    enter_worker_context();
+    unsigned passes=0;
+    while(process_cleanup_worker_release_deferred_references_once())
+        passes++;
+    assert(passes==3U && child.object.ref_count==1U &&
+           child.owner_reference_held &&
+           !atomic_load_explicit(&child.deferred_reference_releases_pending,
+                                 memory_order_acquire) &&
+           !child.deferred_reference_collection_retry && !destroyed_roots);
+    object_release(&child.object); /* final owner release in safe context */
+    assert(!child.object.ref_count && destroyed_roots==1U &&
+           process_destructions==1U && !unsafe_destructor_entries);
+    leave_worker_context();
+}
+
+static void deferred_reference_before_worker_ready_case(void)
+{
+    prepare_finalized_session_process();
+    assert(object_reference(&child.object));
+    __atomic_store_n(&process_cleanup_worker,NULL,__ATOMIC_RELEASE);
+    __atomic_store_n(&process_cleanup_worker_ready,false,__ATOMIC_RELEASE);
+    fixture_interrupts_enabled=false;
+    process_handle_reference_release(&child.object);
+    fixture_interrupts_enabled=true;
+    assert(child.object.ref_count==2U &&
+           atomic_load_explicit(&child.deferred_reference_releases_pending,
+                                memory_order_acquire)==1U &&
+           !destroyed_roots &&
+           atomic_load_explicit(&process_session_collection_retry_pending,
+                                memory_order_acquire) &&
+           atomic_load_explicit(&collection_retry_wake_count,
+                                memory_order_relaxed)==0U);
+
+    assert(process_start_cleanup_worker());
+    assert(atomic_load_explicit(&process_cleanup_worker_ready,
+                                memory_order_acquire) &&
+           atomic_load_explicit(&collection_retry_wake_count,
+                                memory_order_relaxed)==1U);
+    enter_worker_context();
+    assert(process_cleanup_worker_release_deferred_references_once());
+    assert(!child.owner_reference_held && !child.object.ref_count &&
+           !child.deferred_reference_collection_retry &&
+           !child.deferred_reference_releases_pending &&
+           destroyed_roots==1U && process_destructions==1U &&
+           !unsafe_destructor_entries);
     leave_worker_context();
 }
 
@@ -942,6 +1103,9 @@ static void *retry_scan_during_publication(void *unused)
     collection_role=7;
     enter_worker_context();
     assert(process_cleanup_worker_retry_session_collections_once());
+    /* A ref transferred during the scan is durable work for the next pass,
+     * even though the current collection scan already consumed its latch. */
+    assert(process_cleanup_worker_release_deferred_references_once());
     leave_worker_context();
     return NULL;
 }
@@ -958,14 +1122,17 @@ static void retry_publication_during_scan_case(void)
         pthread_cond_wait(&collection_changed,&collection_gate);
     pthread_mutex_unlock(&collection_gate);
 
-    process_cleanup_worker_request_session_collection_retry();
+    assert(object_reference(&child.object));
+    fixture_interrupts_enabled=false;
+    process_handle_reference_release(&child.object);
+    fixture_interrupts_enabled=true;
     pthread_mutex_lock(&collection_gate);
     retry_published=true;
     pthread_cond_broadcast(&collection_changed);
     pthread_mutex_unlock(&collection_gate);
     assert(!pthread_join(scanner,NULL));
     assert(!child.owner_reference_held && child.object.ref_count==0 &&
-           process_destructions==1 &&
+           process_destructions==1 && !unsafe_destructor_entries &&
            atomic_load_explicit(&process_session_collection_retry_pending,
                                 memory_order_acquire));
     enter_worker_context();
@@ -1015,12 +1182,17 @@ int main(void)
     concurrent_publishers_case();
     termination_between_snapshot_and_drop_case();
     locked_pid_release_deferred_case();
+    wait_and_close_before_locked_pid_release_case();
     concurrent_pin_releases_coalesce_case();
+    concurrent_deferred_reference_publishers_case();
+    deferred_reference_before_worker_ready_case();
     retry_publication_during_scan_case();
     retry_latched_before_worker_start_case();
     puts("deferred scheduler references: final release context, session reap, "
          "zero-thread retry, stale-state and locked-caller retry, "
-         "coalesced concurrent releases, scan-time publication, "
+         "coalesced concurrent releases, retained unsafe releases, "
+         "bounded concurrent reference batches, pre-ready publication, "
+         "scan-time publication, "
          "publish-before-wake, bounded batches, and concurrent publishers PASS");
     return 0;
 }
