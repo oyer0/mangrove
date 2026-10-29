@@ -100,6 +100,8 @@ static bool process_finish_termination(process_t *process)
 { (void)process; return false; }
 static void process_worker_reclaim_pending(process_t *process)
 { (void)process; assert(!process_registry_lock); }
+static void process_cleanup_worker_wake(process_t *process)
+{ assert(process && !process_registry_lock); }
 static bool scheduler_wake_waiter(kernel_thread_t *thread)
 { assert(thread); wake_calls++; thread->pending_wake=true; return true; }
 static bool process_terminate_external(process_t *process, i32 status)

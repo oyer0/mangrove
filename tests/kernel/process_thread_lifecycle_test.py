@@ -84,6 +84,7 @@ typedef struct process_thread_record process_thread_record_t;
 struct kernel_thread {
     u32 state, running_cpu;
     bool context_switch_pending, syscall_active, sleeping, stack_external;
+    void *waiting_mutex;
     uintptr_t preempt_return_rip;
     u64 id;
     process_t *process;
@@ -124,7 +125,7 @@ struct process {
     bool thread_reap_in_progress, exit_notification_sent, wait_claimed;
     bool owner_reference_held;
     i32 exit_status;
-    process_t *parent, *waiting_child;
+    process_t *parent, *waiting_child, *next_all;
     kernel_thread_t *waiting_thread;
     kernel_object_t object;
     terminal_output_state_t terminal_output;
@@ -135,12 +136,16 @@ static _Thread_local kernel_thread_t *local_thread;
 static bool allow_object_reference=true;
 static bool stack_release_context=true;
 static bool syscall_lease_live;
+static process_t *all_processes;
 static unsigned wake_calls, console_cancels, cleanup_calls, freed_threads;
+static unsigned cleanup_wake_calls;
 static unsigned terminal_finishes, alternate_leaves, handle_closes, cwd_clears;
 static unsigned exit_notifications, unblocks;
 static bool fixture_interrupts_enabled=true;
 static bool process_finish_termination(process_t *process);
 static void process_worker_reclaim_pending(process_t *process);
+static bool process_cleanup_exit_resources(process_t *process);
+static void process_cleanup_worker_wake(process_t *process);
 static bool scheduler_terminate_thread(kernel_thread_t *thread);
 void process_worker_exit(struct kernel_thread *thread, u64 result);
 static void process_worker_reclaim_pending(process_t *process)
@@ -178,6 +183,14 @@ static bool scheduler_thread_exit_complete(const kernel_thread_t *thread)
    thread->running_cpu==UINT32_MAX && !thread->context_switch_pending &&
    !thread->sleeping && !thread->preempt_return_rip;
  spin_unlock_irqrestore(&scheduler_lock,f);return ok;}
+static bool scheduler_thread_handoff_callback_valid(
+ const kernel_thread_t *thread)
+{bool ok;u64 f=spin_lock_irqsave(&scheduler_lock);
+ ok=thread->state==THREAD_STATE_TERMINATED &&
+   thread->running_cpu==UINT32_MAX && thread->context_switch_pending &&
+   !thread->sleeping && !thread->preempt_return_rip;
+ spin_unlock_irqrestore(&scheduler_lock,f);return ok;}
+static u32 spinlock_depth_current(void){return 0;}
 static bool kernel_stack_release_context_valid(void)
 {return stack_release_context;}
 static void panic(const char *message)
@@ -208,6 +221,16 @@ static void process_cwd_clear(process_t *process)
 {(void)process;cwd_clears++;}
 static void session_process_exited(process_t *process)
 {(void)process;__atomic_add_fetch(&exit_notifications,1U,__ATOMIC_RELAXED);}
+static kernel_thread_t cleanup_worker_thread={.state=THREAD_STATE_RUNNING,
+                                               .running_cpu=0};
+static void process_cleanup_worker_wake(process_t *process)
+{assert(process);cleanup_wake_calls++;}
+static bool process_cleanup_worker_run_once(void);
+static bool run_cleanup_worker_once(process_t *process)
+{kernel_thread_t *previous=local_thread;all_processes=process;
+ local_thread=&cleanup_worker_thread;fixture_interrupts_enabled=true;
+ bool worked=process_cleanup_worker_run_once();local_thread=previous;
+ all_processes=NULL;return worked;}
 '''
 
 names = (
@@ -217,6 +240,8 @@ names = (
     "process_thread_list_complete_locked",
     "process_thread_list_read_acquire_locked",
     "process_thread_list_read_release",
+    "process_cleanup_candidate_locked",
+    "process_cleanup_worker_run_once",
     "process_publish_terminated_locked",
     "process_attach_thread",
     "process_detach_thread_owned",
@@ -229,7 +254,9 @@ names = (
     "process_thread_exit_requested",
     "process_thread_entry_completed",
     "process_worker_exit",
+    "process_scheduler_handoff_complete_internal",
     "process_scheduler_handoff_complete",
+    "process_scheduler_context_handoff_complete",
     "process_scheduler_post_handoff",
     "process_abort",
     "process_finalize_exit",
@@ -269,6 +296,7 @@ static void reset_process(process_t *process,kernel_thread_t *initial,
     initial->state=worker->state=THREAD_STATE_READY;
     initial->running_cpu=worker->running_cpu=UINT32_MAX;
     local_thread=NULL;allow_object_reference=true;stack_release_context=true;
+    all_processes=NULL;cleanup_wake_calls=0;
     wake_calls=console_cancels=cleanup_calls=freed_threads=0;
     terminal_finishes=alternate_leaves=handle_closes=cwd_clears=0;
     exit_notifications=unblocks=0;
@@ -378,6 +406,11 @@ int main(void)
            !process.exit_cleanup_complete);
     fixture_interrupts_enabled=true;
     process_scheduler_post_handoff(&process);
+    assert(cleanup_calls==0 && cleanup_wake_calls>=1);
+    initial.waiting_mutex=(void *)1;
+    assert(!process_cleanup_exit_resources(&process) && cleanup_calls==0);
+    initial.waiting_mutex=NULL;
+    assert(run_cleanup_worker_once(&process));
     assert(process.state==PROCESS_STATE_EXITING && cleanup_calls==1 &&
            process.exit_cleanup_complete &&
            process.live_thread_count==0 && process.thread_count==2 &&
@@ -433,6 +466,7 @@ int main(void)
     thread_stopped(&initial);
     process_scheduler_handoff_complete(&initial);
     process_scheduler_post_handoff(&process);
+    assert(run_cleanup_worker_once(&process));
     assert(process.state==PROCESS_STATE_TERMINATED && cleanup_calls==1 &&
            process_finalize_exit(&process) && process.thread_count==0 &&
            exit_notifications==1);
@@ -466,6 +500,7 @@ int main(void)
     thread_stopped(&initial);
     process_scheduler_handoff_complete(&initial);
     process_scheduler_post_handoff(&process);
+    assert(run_cleanup_worker_once(&process));
     assert(process.state==PROCESS_STATE_TERMINATED && cleanup_calls==1 &&
            process_finalize_exit(&process));
 
@@ -488,6 +523,7 @@ int main(void)
     thread_stopped(&initial);
     process_scheduler_handoff_complete(&initial);
     process_scheduler_post_handoff(&process);
+    assert(run_cleanup_worker_once(&process));
     assert(process.state==PROCESS_STATE_TERMINATED &&
            process_finalize_exit(&process));
     assert(process.thread_count==0 && process.main_thread==NULL &&
@@ -537,6 +573,7 @@ int main(void)
     thread_stopped(&initial);
     process_scheduler_handoff_complete(&initial);
     process_scheduler_post_handoff(&process);
+    assert(run_cleanup_worker_once(&process));
     assert(process.state==PROCESS_STATE_TERMINATED &&
            process.live_thread_count==0 && cleanup_calls==1);
     assert(process_finalize_exit(&process) && process.thread_count==0 &&
@@ -563,6 +600,7 @@ int main(void)
     thread_stopped(&initial);
     process_scheduler_handoff_complete(&initial);
     process_scheduler_post_handoff(&process);
+    assert(run_cleanup_worker_once(&process));
     assert(cleanup_calls==1 && process.state==PROCESS_STATE_TERMINATED);
     assert(process_finalize_exit(&process) && process.thread_count==0);
 

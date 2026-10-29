@@ -56,6 +56,10 @@ static u64 next_pid;
 static process_t *all_processes;
 static spinlock_t process_registry_lock;
 static bool process_shutdown_active;
+/* Process-wide resource teardown runs on this ordinary kernel thread, never
+ * in the assembly context-switch callback. Pending work is derived by scanning
+ * all_processes; this is one waiter, not a dynamically growing work queue. */
+static kernel_thread_t *process_cleanup_worker;
 
 #define PROCESS_SHUTDOWN_GRACE_MS 5000U
 #define PROCESS_SHUTDOWN_FORCE_MS 5000U
@@ -127,6 +131,8 @@ static bool process_cleanup_exit_resources(process_t *process);
 static bool process_finish_termination(process_t *process);
 static kernel_thread_t *process_publish_terminated_locked(process_t *process);
 static void process_worker_records_release_all(process_t *process);
+static void process_cleanup_worker_entry(void *unused);
+static void process_cleanup_worker_wake(process_t *hint);
 static kernel_object_t *process_handle_lookup_reference(
     process_t *process, process_handle_t handle,
     kernel_object_type_t type, u32 required_rights);
@@ -290,6 +296,7 @@ bool process_init(void)
     next_pid = 1;
     all_processes = NULL;
     process_shutdown_active = false;
+    process_cleanup_worker = NULL;
     return true;
 }
 
@@ -361,6 +368,86 @@ static bool process_thread_list_complete_locked(process_t *process)
     return count == process->thread_count && main_seen;
 }
 
+static process_t *process_cleanup_candidate_locked(void)
+{
+    for (process_t *process = all_processes; process;
+         process = process->next_all) {
+        if (!process->launch_ready ||
+            process->state != PROCESS_STATE_EXITING ||
+            process->exit_cleanup_complete ||
+            process->exit_cleanup_in_progress ||
+            !process_thread_list_complete_locked(process))
+            continue;
+        if (object_reference(&process->object))
+            return process;
+    }
+    return NULL;
+}
+
+static bool process_cleanup_worker_run_once(void)
+{
+    process_t *process;
+    u64 flags = spin_lock_irqsave(&process_registry_lock);
+    process = process_cleanup_candidate_locked();
+    spin_unlock_irqrestore(&process_registry_lock, flags);
+    if (!process) return false;
+
+    (void)process_cleanup_exit_resources(process);
+    object_release(&process->object);
+    return true;
+}
+
+static void process_cleanup_worker_entry(void *unused)
+{
+    (void)unused;
+    for (;;) {
+        kernel_thread_t *self = thread_current();
+        scheduler_clear_event_wake(self);
+        if (process_cleanup_worker_run_once())
+            continue;
+        /* scheduler_wake_waiter latches an event when this thread is still
+         * RUNNING, so a state change between the registry scan and this park
+         * cannot be lost. */
+        (void)scheduler_block();
+    }
+}
+
+static void process_cleanup_worker_wake(process_t *hint)
+{
+    (void)hint; /* Work is discovered from the authoritative process registry. */
+    kernel_thread_t *worker = __atomic_load_n(&process_cleanup_worker,
+                                               __ATOMIC_ACQUIRE);
+    if (worker && !scheduler_wake_waiter(worker))
+        panic("process: cleanup worker could not be notified");
+}
+
+bool process_start_cleanup_worker(void)
+{
+    kernel_thread_t *worker = thread_create_suspended(
+        "process-cleanup", process_cleanup_worker_entry, NULL);
+    u64 flags;
+
+    if (!worker) return false;
+    flags = spin_lock_irqsave(&process_registry_lock);
+    if (__atomic_load_n(&process_cleanup_worker, __ATOMIC_ACQUIRE)) {
+        spin_unlock_irqrestore(&process_registry_lock, flags);
+        if (!scheduler_terminate_thread(worker) || !thread_destroy(worker))
+            panic("process: duplicate cleanup worker rollback failed");
+        return false;
+    }
+    __atomic_store_n(&process_cleanup_worker, worker, __ATOMIC_RELEASE);
+    spin_unlock_irqrestore(&process_registry_lock, flags);
+
+    if (scheduler_enqueue(worker)) return true;
+
+    flags = spin_lock_irqsave(&process_registry_lock);
+    __atomic_store_n(&process_cleanup_worker, NULL, __ATOMIC_RELEASE);
+    spin_unlock_irqrestore(&process_registry_lock, flags);
+    if (!scheduler_terminate_thread(worker) || !thread_destroy(worker))
+        panic("process: cleanup worker startup rollback failed");
+    return false;
+}
+
 static void process_thread_record_destroy(kernel_object_t *object)
 {
     process_thread_record_t *record;
@@ -421,6 +508,7 @@ static bool process_thread_list_read_acquire_locked(process_t *process)
 static void process_thread_list_read_release(process_t *process)
 {
     u64 flags;
+    bool queue_cleanup;
 
     if (!process) return;
     flags = spin_lock_irqsave(&process_registry_lock);
@@ -432,11 +520,14 @@ static void process_thread_list_read_release(process_t *process)
     bool finish_exit = !process->thread_list_readers &&
         process->state == PROCESS_STATE_EXITING &&
         process->exit_cleanup_complete;
+    queue_cleanup = process->state == PROCESS_STATE_EXITING &&
+        !process->exit_cleanup_complete;
     bool reap_workers = !process->thread_list_readers &&
         process->state == PROCESS_STATE_ACTIVE &&
         __atomic_load_n(&process->worker_reap_pending, __ATOMIC_ACQUIRE);
     spin_unlock_irqrestore(&process_registry_lock, flags);
     if (reap_workers) process_worker_reclaim_pending(process);
+    if (queue_cleanup) process_cleanup_worker_wake(process);
     if (finish_exit) (void)process_finish_termination(process);
 }
 
@@ -2047,8 +2138,21 @@ i64 process_memory_unmap(process_t *process, uintptr_t address)
 static bool process_cleanup_exit_resources(process_t *process)
 {
     u64 flags;
+    u64 current_flags;
+    kernel_thread_t *current;
 
     if (!process) return false;
+    current = thread_current();
+    __asm__ volatile("pushfq; popq %0" : "=r"(current_flags) :: "memory");
+    if (!current || current->waiting_mutex || spinlock_depth_current() ||
+        !(current_flags & (1ULL << 9)) ||
+        !kernel_stack_release_context_valid()) {
+        /* Teardown takes mutexes and can wait for remote TLB acknowledgments.
+         * IF alone is insufficient while a resumed mutex waiter still owns
+         * an unconsumed handoff marker. Retry on the dedicated worker. */
+        process_cleanup_worker_wake(process);
+        return false;
+    }
     flags = spin_lock_irqsave(&process_registry_lock);
     if (!process->launch_ready ||
         process->state != PROCESS_STATE_EXITING || process->active_syscalls ||
@@ -2196,13 +2300,17 @@ bool process_syscall_enter(process_t *process)
 void process_syscall_leave(process_t *process)
 {
     u64 flags;
+    bool queue_cleanup;
 
     if (!process) return;
     flags = spin_lock_irqsave(&process_registry_lock);
     if (!process->active_syscalls)
         panic("process: syscall admission underflow");
     process->active_syscalls--;
+    queue_cleanup = process->active_syscalls == 0U &&
+        process->state == PROCESS_STATE_EXITING;
     spin_unlock_irqrestore(&process_registry_lock, flags);
+    if (queue_cleanup) process_cleanup_worker_wake(process);
     object_release(&process->object);
 }
 
@@ -2310,7 +2418,8 @@ void process_worker_exit(struct kernel_thread *raw_thread, u64 result)
     spin_unlock_irqrestore(&process_registry_lock, flags);
 }
 
-void process_scheduler_handoff_complete(struct kernel_thread *raw_thread)
+static bool process_scheduler_handoff_complete_internal(
+    struct kernel_thread *raw_thread, bool context_callback)
 {
     kernel_thread_t *thread = raw_thread;
     process_t *process;
@@ -2320,8 +2429,10 @@ void process_scheduler_handoff_complete(struct kernel_thread *raw_thread)
     u64 flags;
 
     if (!thread || !(process = thread->process) ||
-        !scheduler_thread_exit_complete(thread))
-        return;
+        (context_callback
+            ? !scheduler_thread_handoff_callback_valid(thread)
+            : !scheduler_thread_exit_complete(thread)))
+        return false;
     flags = spin_lock_irqsave(&process_registry_lock);
     if (thread->process == process &&
         thread->process_state != THREAD_PROCESS_HANDOFF_COMPLETE) {
@@ -2364,14 +2475,25 @@ void process_scheduler_handoff_complete(struct kernel_thread *raw_thread)
             process_thread_list_read_release(process);
     }
     if (waiter) (void)scheduler_unblock(waiter);
+    return true;
+}
+
+void process_scheduler_handoff_complete(struct kernel_thread *thread)
+{
+    (void)process_scheduler_handoff_complete_internal(thread, false);
+}
+
+bool process_scheduler_context_handoff_complete(struct kernel_thread *thread)
+{
+    return process_scheduler_handoff_complete_internal(thread, true);
 }
 
 void process_scheduler_post_handoff(process_t *process)
 {
-    /* scheduler_context_switch_complete() runs before the incoming saved
-     * RFLAGS are restored. Process exit cleanup can unmap user pages and wait
-     * for remote TLB acknowledgements, so run it only from the later hook. */
-    if (process) (void)process_cleanup_exit_resources(process);
+    /* Only signal here: the suspended incoming continuation may not yet have
+     * consumed a mutex ownership handoff. The cleanup worker runs blocking
+     * process/VMM teardown on its own ordinary kernel stack. */
+    if (process) process_cleanup_worker_wake(process);
 }
 
 static void process_unlink_locked(process_t *process)

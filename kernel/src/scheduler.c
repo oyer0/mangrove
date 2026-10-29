@@ -342,10 +342,11 @@ void scheduler_context_restore_current(void)
  * runs, but that helper still returns through the outgoing stack.  Keep the
  * thread pinned until assembly has switched to the incoming stack, then clear
  * this final reclamation barrier from the target stack. */
-void scheduler_context_switch_complete(uintptr_t *outgoing_rsp_slot)
+process_t *scheduler_context_switch_complete(uintptr_t *outgoing_rsp_slot)
 {
     kernel_thread_t *outgoing = NULL;
     bool terminated = false;
+    process_t *handoff_process = NULL;
     u64 flags;
 
     if (outgoing_rsp_slot) {
@@ -355,8 +356,19 @@ void scheduler_context_switch_complete(uintptr_t *outgoing_rsp_slot)
     flags = spin_lock_irqsave(&scheduler_lock);
     if (outgoing) {
         outgoing->running_cpu = THREAD_CPU_NONE;
-        outgoing->context_switch_pending = false;
         terminated = outgoing->state == THREAD_STATE_TERMINATED;
+        /* Keep the descriptor barrier set while process completion still
+         * consumes fields from this record. External collectors use the same
+         * scheduler predicate before detaching or destroying it. */
+        if (terminated && outgoing->process) {
+            handoff_process = outgoing->process;
+            if (!object_reference(&handoff_process->object)) {
+                spin_unlock_irqrestore(&scheduler_lock, flags);
+                panic("scheduler: failed to retain process handoff owner");
+            }
+        } else {
+            outgoing->context_switch_pending = false;
+        }
         if (outgoing->state == THREAD_STATE_READY && !outgoing->queued &&
             outgoing != &bootstrap_thread &&
             outgoing != scheduler_cpu_local()->scheduler_idle_thread &&
@@ -373,40 +385,36 @@ void scheduler_context_switch_complete(uintptr_t *outgoing_rsp_slot)
      * here, before the saved syscall/interrupt frame can return to Ring 3. */
     if (current_thread)
         wrmsr(MSR_IA32_FS_BASE, current_thread->user_fs_base);
-    if (terminated && outgoing->process) {
-        cpu_local_t *cpu = scheduler_cpu_local();
-        process_t *process = outgoing->process;
-        if (!cpu || cpu->scheduler_post_handoff_process ||
-            !object_reference(&process->object))
-            panic("scheduler: failed to retain process handoff owner");
-        cpu->scheduler_post_handoff_process = process;
-        process_scheduler_handoff_complete(outgoing);
+    if (handoff_process) {
+        if (!process_scheduler_context_handoff_complete(outgoing))
+            panic("scheduler: process handoff callback rejected owner");
+        /* This is the final access to outgoing. Until this publication the
+         * process collector sees context_switch_pending and cannot detach
+         * the scheduler record. */
+        flags = spin_lock_irqsave(&scheduler_lock);
+        if (outgoing->state != THREAD_STATE_TERMINATED ||
+            outgoing->running_cpu != THREAD_CPU_NONE ||
+            !outgoing->context_switch_pending) {
+            spin_unlock_irqrestore(&scheduler_lock, flags);
+            panic("scheduler: outgoing handoff ownership changed");
+        }
+        outgoing->context_switch_pending = false;
+        spin_unlock_irqrestore(&scheduler_lock, flags);
     }
+    return handoff_process;
 }
 
-void scheduler_context_switch_post_complete(void)
+void scheduler_context_switch_post_complete(process_t *process)
 {
-    cpu_local_t *cpu = scheduler_cpu_local();
-    process_t *process;
-    u64 saved_flags;
-
-    if (!cpu) return;
-    process = __atomic_exchange_n(&cpu->scheduler_post_handoff_process, NULL,
-                                  __ATOMIC_ACQ_REL);
     if (!process) return;
-    /* A restored syscall or IRQ continuation can have IF clear. Final
-     * process cleanup may require cross-CPU TLB acknowledgements, so run it
-     * only after the incoming register/stack context is complete. Worker
-     * region reaping is left to the syscall epilogue, where no scheduler
-     * handoff marker or user-memory lease is outstanding. The process
-     * reference protects cleanup if a nested interrupt schedules again. */
-    __asm__ volatile("pushfq; popq %0" : "=r"(saved_flags) :: "memory");
-    if (!(saved_flags & (1ULL << 9)))
-        __asm__ volatile("sti" ::: "memory");
+    /* This runs before the suspended mutex_lock continuation consumes its
+     * handoff marker. It is deliberately limited to an event wake; the
+     * process cleanup worker performs mutex and VMM operations on its own
+     * ordinary kernel stack. A process pointer is carried by this stack
+     * frame, so nested/preempted context switches cannot collide in a CPU
+     * singleton slot. */
     process_scheduler_post_handoff(process);
     object_release(&process->object);
-    if (!(saved_flags & (1ULL << 9)))
-        __asm__ volatile("cli" ::: "memory");
 }
 
 static void scheduler_validate_saved_context(const kernel_thread_t *thread)
@@ -1793,6 +1801,21 @@ bool scheduler_thread_exit_complete(const kernel_thread_t *thread)
         !thread->preempt_return_rip;
     spin_unlock_irqrestore(&scheduler_lock, flags);
     return complete;
+}
+
+bool scheduler_thread_handoff_callback_valid(const kernel_thread_t *thread)
+{
+    bool valid;
+    u64 flags;
+
+    if (!thread) return false;
+    flags = spin_lock_irqsave(&scheduler_lock);
+    valid = thread->state == THREAD_STATE_TERMINATED &&
+        thread->running_cpu == THREAD_CPU_NONE &&
+        thread->context_switch_pending && !thread->sleeping &&
+        !thread->preempt_return_rip;
+    spin_unlock_irqrestore(&scheduler_lock, flags);
+    return valid;
 }
 
 bool scheduler_thread_process_attachable(const kernel_thread_t *thread)

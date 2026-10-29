@@ -113,6 +113,10 @@ static init_result_t init_scheduler(const char **reason)
         *reason = "bootstrap thread initialization failed";
         return INIT_RESULT_FAILED;
     }
+    if (!process_start_cleanup_worker()) {
+        *reason = "process cleanup worker startup failed";
+        return INIT_RESULT_FAILED;
+    }
 #ifdef PITH_DEBUG_BOOT_TESTS
     kernel_debug_scheduler_tests();
 #endif

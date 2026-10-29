@@ -74,7 +74,6 @@ struct process {
 };
 typedef struct cpu_local {
     kernel_thread_t *scheduler_idle_thread;
-    process_t *scheduler_post_handoff_process;
 } cpu_local_t;
 
 static kernel_thread_t *current_thread;
@@ -102,8 +101,8 @@ static void wrmsr(u32 msr, u64 value)
 { assert(msr == 0xc0000100U); fake_fs_base = (uintptr_t)value; }
 static bool scheduler_enqueue_locked(kernel_thread_t *thread)
 { thread->queued = true; return true; }
-static void process_scheduler_handoff_complete(kernel_thread_t *thread)
-{ (void)thread; }
+static bool process_scheduler_context_handoff_complete(kernel_thread_t *thread)
+{ (void)thread; return true; }
 static bool object_reference(kernel_object_t *object)
 { return object != NULL; }
 static kernel_thread_t *thread_current(void) { return current_thread; }

@@ -76,6 +76,11 @@ thread_context_switch:
     pushq %r11
     pushfq
     subq $8, %rsp
+    /* scheduler_context_switch_complete returns a retained process pointer in
+     * RAX. Keep the incoming RAX/RDI values on this thread's own stack while
+     * passing it to the nonblocking notification hook. Nested switches save
+     * this stack frame independently; no per-CPU singleton can be overwritten. */
+    movq %rax, %rdi
     call scheduler_context_switch_post_complete
     addq $8, %rsp
     popfq

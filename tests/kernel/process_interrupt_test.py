@@ -58,6 +58,7 @@ struct process {
 };
 static int process_registry_lock;
 static process_t *all_processes;
+static unsigned cleanup_wakes;
 static u64 spin_lock_irqsave(int *lock) { assert(!*lock); *lock = 1; return 1; }
 static void spin_unlock_irqrestore(int *lock, u64 flags)
 { (void)flags; assert(*lock); *lock = 0; }
@@ -71,6 +72,8 @@ static bool process_finish_termination(process_t *process)
 { (void)process; return false; }
 static void process_worker_reclaim_pending(process_t *process)
 { (void)process; assert(!process_registry_lock); }
+static void process_cleanup_worker_wake(process_t *process)
+{ assert(process && !process_registry_lock); cleanup_wakes++; }
 static bool scheduler_wake_waiter(kernel_thread_t *thread)
 { assert(thread); thread->wakes++; return true; }
 '''
