@@ -123,12 +123,13 @@ struct process {
      * Kept until the final pending reference is released. */
     bool deferred_reference_collection_retry;
     process_thread_record_t *thread_records;
+    /* Exclusive cleanup-worker operation, acquired before provisional-region
+     * work and held through all completion-record follow-up. */
     u32 worker_reapers;
-    /* Atomic fast-path hint. The intrusive list remains registry-locked;
-     * syscall epilogues only enter the potentially linear reaper while some
-     * completed worker still owns execution resources or a consumed record. */
+    /* Durable obligation; only real progress notifications schedule another
+     * safe-worker attempt. The intrusive list remains registry-locked. */
     bool worker_reap_pending;
-    /* Protected by memory_lock and sampled atomically by syscall epilogues.
+    /* Protected by memory_lock and sampled atomically by the cleanup worker.
      * Provisional stack/TLS regions can outlive failed setup while a sibling
      * still holds a kernel user-memory lease. */
     _Atomic bool user_region_reap_pending;

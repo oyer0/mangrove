@@ -409,7 +409,7 @@ int main(void)
 '''
 with tempfile.TemporaryDirectory(prefix='mangrove-process-reap-') as directory:
     path = Path(directory) / 'reap.c'
-    path.write_text(code)
+    path.write_text('#include "' + str(ROOT / "tests/kernel/process_cleanup_fixture.h") + '"\n' + code)
     binary = path.with_suffix('')
     subprocess.run([args.cc, '-std=c11', '-Wall', '-Wextra', '-Werror',
                     '-fsanitize=address,undefined', str(path), '-o', str(binary)],

@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include <vmm.h>
+#include <process_cleanup.h>
 #include <x86_cache.h>
 #include <pci.h>
 #include <cpu.h>
@@ -3063,6 +3064,7 @@ bool vmm_user_range_lease(page_table_t *pml4, const void *address,
 void vmm_user_range_release(vmm_user_range_lease_t *lease)
 {
     vmm_address_space_metadata_t *metadata;
+    bool reap_progress = false;
     if (!lease || !lease->active) return;
     u64 flags = spin_lock_irqsave(&vmm_metadata_lock);
     metadata = vmm_metadata_find(lease->address_space);
@@ -3075,6 +3077,8 @@ void vmm_user_range_release(vmm_user_range_lease_t *lease)
         if (!leaf || !leaf->user_pin_count)
             panic("vmm: user-range lease lost its mapping");
         leaf->user_pin_count--;
+        if (!leaf->user_pin_count && leaf->user_revoking)
+            reap_progress = true;
     }
     metadata->active_user_leases -= lease->page_count;
     lease->active = false;
@@ -3082,6 +3086,7 @@ void vmm_user_range_release(vmm_user_range_lease_t *lease)
     lease->first_page = 0;
     lease->page_count = 0;
     spin_unlock_irqrestore(&vmm_metadata_lock, flags);
+    if (reap_progress) process_cleanup_request(PROCESS_CLEANUP_WORKER_REAP);
 }
 
 vmm_user_range_revoke_result_t vmm_user_range_revoke(

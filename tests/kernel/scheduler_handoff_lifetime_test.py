@@ -132,7 +132,7 @@ int main(void) {
 code=p+functions+helper+main
 with tempfile.TemporaryDirectory(prefix='mangrove-handoff-lifetime-') as folder:
  folder=Path(folder);source=folder/'handoff_lifetime.c';binary=folder/'handoff_lifetime'
- source.write_text(code)
+ source.write_text('#include "' + str(R / "tests/kernel/process_cleanup_fixture.h") + '"\n' + code)
  env={**os.environ,'ASAN_OPTIONS':'detect_leaks=0'}
  subprocess.run([CC,'-std=gnu17','-g','-O1','-Wall','-Wextra',
      '-Wno-unused-function','-Wno-unused-variable','-Werror',

@@ -55,7 +55,9 @@ process-wide termination. Exit closes creation and syscall admission, wakes
 blocked siblings, and marks CPU-bound Ring 3 siblings for retirement at the
 next user-origin timer preemption. Returning syscalls release their user-memory
 leases and process admission before the syscall boundary retires the calling
-thread. Shared process state is not torn down while any owned thread remains
+thread. Assembly retains an outer scheduler syscall marker through the entire
+C epilogue, so a blocked native continuation remains protected from external
+termination even after its process admission count is released. Shared process state is not torn down while any owned thread remains
 live.
 
 `mg_thread_create()` returns a generation-tagged typed handle for join/detach
@@ -101,10 +103,12 @@ user-region-reap pending, and active worker-reaper state. These copied flags
 are diagnostic observations, not lifecycle controls; region-reap pending means
 worker-region revocation or unmapping remains deferred while ownership is
 retained. Revocation can defer without changing VMM state when a safe reaper
-context cannot acquire the VMM operation mutex. The completed syscall
-continuation retries pending cleanup at its epilogue, after any incoming mutex
-handoff is consumed and its own user-memory leases have been released; no
-further worker exit is required to trigger the retry.
+context cannot acquire the VMM operation mutex. The existing process cleanup worker owns heavy worker and provisional-region
+reaping independently of future syscalls in the owning process. Completion,
+join/detach, last-reader and last revoking-page lease transitions publish
+coalesced work. Finite PID snapshots visit each candidate once; unchanged
+lease/reader deferrals park until their next real dependency transition.
+
 
 Per-thread Ring 3 entry records hold independent registers, instruction and
 stack pointers, FS base, FPU state, guarded user-stack mapping, and TLS
@@ -124,12 +128,13 @@ last kernel operation releases its pin. Before a worker region is released, the
 kernel revokes admission for new syscall leases on its pages. Existing leases
 remain valid until their normal release; the region reservation and frame
 ownership remain process-owned until unmapping and its cross-CPU TLB handoff
-complete. A reaper reached before the incoming thread consumes a mutex
-handoff returns without acquiring region/VMM locks or changing ownership.
-VMM revocation reports a retryable result when its operation lock cannot be
-acquired without blocking, without changing mapping state. The syscall
-epilogue retries after the continuation has consumed its handoff and its
-user-memory leases have been released; no further worker exit is required.
+complete. The reaper claims a process cleanup operation before entering any provisional
+region or completion-record path and releases it only after all follow-up.
+Process cleanup and external termination admission wait for this operation.
+The worker uses its own safe stack with interrupts enabled; scheduler callbacks
+and syscall epilogues only publish work. VMM revocation preserves the retryable
+refusal result without changing mapping state, and missing owned mappings
+remain corruption.
 A missing mapping remains an ownership error and retains fail-stop handling.
 Failed, still-private worker setup uses the same revocation and
 deferred-reclamation path because sibling threads share the address space and
