@@ -100,7 +100,8 @@ def fixture_prefix():
         '{return thread==&cleanup_worker_sentinel;}\n'
         'static bool process_thread_handle_close_allowed(kernel_object_t *o)'
         '{(void)o;return true;}\n'
-        'static void process_reap_session_members(mg_session_id_t);')
+        'static void process_reap_session_members(mg_session_id_t);\n'
+        'static void process_collect_completed(mg_session_id_t,bool);')
     prefix = prefix.replace('i32 exit_status; u64 session_id; u32 active_syscalls;',
                             'i32 exit_status; u64 pid; u64 session_id; '
                             'u32 active_syscalls;')
@@ -340,7 +341,7 @@ for name in (
         'process_detach_thread',
         'process_finalize_exit',
         'process_wait',
-        'process_reap_session_members',
+        'process_collect_completed', 'process_reap_session_members',
         'process_cleanup_context_valid',
         'process_cleanup_worker_request_session_collection_retry',
         'process_cleanup_worker_retry_session_collections_once',
@@ -353,7 +354,7 @@ for name in (
         'process_handle_close',
         'process_handle_pid',
         'process_object_destroy',
-        'process_cleanup_worker_release_handoffs_once',
+        'process_cleanup_reference_candidate_locked', 'process_cleanup_worker_release_handoffs_once',
         'process_cleanup_worker_release_deferred_references_once'):
     functions += c_function(process_source, name)
 functions += c_function(scheduler_source,
@@ -1182,8 +1183,62 @@ static void retry_latched_before_worker_start_case(void)
     leave_worker_context();
 }
 
+static void fair_reference_batches_case(void)
+{
+    reset(true);
+    enter_worker_context();
+    process_t records[20];memset(records,0,sizeof(records));
+    for(unsigned i=0;i<20;i++) {
+        records[i].pid=i+1;
+        records[i].next_all=i?&records[i-1]:NULL;
+        records[i].object=(kernel_object_t){.ref_count=2,.process=&records[i],
+            .type=OBJECT_TYPE_PROCESS};
+        records[i].state=PROCESS_STATE_ACTIVE;
+        records[i].deferred_reference_releases_pending=1;
+    }
+    all_processes=&records[19];
+    records[19].object.ref_count=65;
+    records[19].deferred_reference_releases_pending=64;
+    process_reference_release_after=process_reference_release_limit=0;
+    for(unsigned i=0;i<20;i++)
+        assert(process_cleanup_worker_release_deferred_references_once());
+    for(unsigned i=0;i<19;i++)
+        assert(!records[i].deferred_reference_releases_pending &&
+               records[i].object.ref_count==1);
+    assert(records[19].deferred_reference_releases_pending==48);
+    for(unsigned i=0;i<20;i++) {
+        records[i].scheduler_handoff_references=1;
+        records[i].scheduler_handoff_releases_pending=1;
+        records[i].object.ref_count++;
+    }
+    records[19].object.ref_count+=63;
+    records[19].scheduler_handoff_references=64;
+    records[19].scheduler_handoff_releases_pending=64;
+    process_handoff_release_after=process_handoff_release_limit=0;
+    for(unsigned i=0;i<20;i++)
+        assert(process_cleanup_worker_release_handoffs_once());
+    for(unsigned i=0;i<19;i++)
+        assert(!records[i].scheduler_handoff_releases_pending &&
+               records[i].object.ref_count==1);
+    assert(records[19].scheduler_handoff_releases_pending==48);
+    process_t late={0};late.pid=21;late.next_all=all_processes;
+    late.object=(kernel_object_t){.ref_count=2,.process=&late,
+        .type=OBJECT_TYPE_PROCESS};
+    late.scheduler_handoff_references=late.scheduler_handoff_releases_pending=1;
+    all_processes=&late;
+    records[0].object.ref_count++;
+    records[0].scheduler_handoff_references=records[0].scheduler_handoff_releases_pending=1;
+    process_handoff_release_after=process_handoff_release_limit=20;
+    assert(process_cleanup_worker_release_handoffs_once());
+    assert(!records[0].scheduler_handoff_releases_pending &&
+           late.scheduler_handoff_releases_pending==1);
+    all_processes=NULL;
+    leave_worker_context();
+}
+
 int main(void)
 {
+    fair_reference_batches_case();
     exact_last_reference_case();
     session_collection_case();
     worker_pin_overlapping_session_collection_case();
@@ -1214,7 +1269,7 @@ with tempfile.TemporaryDirectory(prefix='mangrove-deferred-ref-') as directory:
     directory = Path(directory)
     source = directory / 'deferred_release.c'
     binary = directory / 'deferred_release'
-    source.write_text('#include "' + str(ROOT / "tests/kernel/process_cleanup_fixture.h") + '"\n' + code)
+    source.write_text('#define PROCESS_FIXTURE_REAL_COLLECTION_LATCH\n#include "' + str(ROOT / "tests/kernel/process_cleanup_fixture.h") + '"\n' + code)
     env = dict(os.environ)
     env['ASAN_OPTIONS'] = env.get('ASAN_OPTIONS', 'detect_leaks=0')
     subprocess.run([

@@ -263,7 +263,7 @@ for name in ('process_thread_list_complete_locked',
              'process_scheduler_handoff_complete',
              'process_detach_thread_owned', 'process_detach_thread',
              'process_finalize_exit',
-             'process_wait', 'process_poll', 'process_reap_session_members',
+             'process_wait', 'process_poll', 'process_collect_completed', 'process_reap_session_members',
              'process_handle_reference_release',
              'process_terminate_session_members', 'process_object_destroy'):
     code += function(source, name)

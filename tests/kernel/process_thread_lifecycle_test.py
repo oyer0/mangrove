@@ -120,6 +120,7 @@ struct process {
     u32 thread_count, live_thread_count;
     u32 scheduler_handoff_references;
     _Atomic u32 scheduler_handoff_releases_pending;
+    _Atomic u32 deferred_reference_releases_pending;
     mg_session_id_t session_id;
     u32 worker_reapers;
     bool worker_reap_pending;
@@ -158,7 +159,6 @@ void process_worker_exit(struct kernel_thread *thread, u64 result);
 static void process_worker_records_release_all(process_t *process)
 {assert(process && !process->thread_records && !process->worker_reapers);}
 static void process_unlink_locked(process_t *process);
-static void process_unlink_all_locked(process_t *process);
 static u64 spin_lock_irqsave(spinlock_t *lock)
 {assert(pthread_mutex_lock(lock)==0);return 0;}
 static void spin_unlock_irqrestore(spinlock_t *lock,u64 flags)
@@ -267,7 +267,7 @@ names = (
     "process_thread_list_read_release",
     "process_waiter_wake_locked",
     "process_cleanup_candidate_locked",
-    "process_cleanup_worker_release_handoffs_once",
+    "process_cleanup_reference_candidate_locked", "process_cleanup_worker_release_handoffs_once",
     "process_cleanup_worker_run_once",
     "process_publish_terminated_locked",
     "process_attach_thread",
@@ -309,8 +309,6 @@ static bool scheduler_terminate_thread(kernel_thread_t *thread)
  thread_stopped(thread);return true;}
 static void process_unlink_locked(process_t *process)
 {process->parent=NULL;}
-static void process_unlink_all_locked(process_t *process)
-{(void)process;}
 static void reset_process(process_t *process,kernel_thread_t *initial,
                           kernel_thread_t *worker)
 {
@@ -581,6 +579,23 @@ int main(void)
            cleanup_calls==1 && terminal_finishes==1 &&
            alternate_leaves==1 && handle_closes==1 && cwd_clears==1 &&
            exit_notifications==0);
+
+    /* Aborted unpublished objects remain discoverable until an already
+     * transferred scheduler reference has been consumed by the worker. */
+    reset_process(&process,&initial,&worker);
+    process.launch_ready=false;
+    assert(process_attach_thread(&process,&initial));
+    all_processes=&process;
+    assert(object_reference(&process.object));
+    process.scheduler_handoff_references=1;
+    process.scheduler_handoff_releases_pending=1;
+    process_abort(&process);
+    assert(all_processes==&process && process.object.ref_count==1 &&
+           !process.owner_reference_held && process.thread_count==0);
+    assert(process_cleanup_worker_release_handoffs_once());
+    assert(!process.object.ref_count && !process.scheduler_handoff_references &&
+           !process.scheduler_handoff_releases_pending);
+    all_processes=NULL; /* Object destruction itself is covered by reap tests. */
 
     /* Competing exit requests are serialized: the first status is retained,
      * both threads observe the process-wide request, and only one cleanup

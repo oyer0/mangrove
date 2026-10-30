@@ -72,7 +72,7 @@ static void panic(const char *message)
 { (void)message; assert(!"unexpected process panic"); }
 static bool process_finish_termination(process_t *process)
 { (void)process; return false; }
-static void process_worker_reclaim_pending(process_t *process)
+static __attribute__((unused)) void process_worker_reclaim_pending(process_t *process)
 { (void)process; assert(!process_registry_lock); }
 static void process_cleanup_worker_wake(process_t *process)
 { assert(process && !process_registry_lock); cleanup_wakes++; }
@@ -158,7 +158,7 @@ int main(void)
 with tempfile.TemporaryDirectory(prefix='mangrove-process-interrupt-') as temp:
     cfile = Path(temp) / 'process_interrupt.c'
     binary = Path(temp) / 'process_interrupt'
-    cfile.write_text(prelude + body + postlude)
+    cfile.write_text('#include "' + str(ROOT / "tests/kernel/process_cleanup_fixture.h") + '"\n' + prelude + body + postlude)
     compiler = sys.argv[1] if len(sys.argv) > 1 else 'cc'
     subprocess.run([compiler, '-std=c11', '-Wall', '-Wextra', '-Werror',
                     '-fsanitize=address,undefined', str(cfile), '-o', str(binary)],

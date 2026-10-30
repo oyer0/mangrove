@@ -1838,12 +1838,16 @@ test-dev-tools: test-qmp-client test-artifact-lifecycle
 test-spinlock-context:
 	python3 tests/kernel/spinlock_context_test.py "$(HOST_CC)"
 
+.PHONY: test-process-orphan-collection
+test-process-orphan-collection:
+	python3 tests/kernel/process_orphan_collection_test.py "$(HOST_CC)"
+
 .PHONY: test-process-autonomous-reap test-syscall-marker
 test-process-autonomous-reap:
 	python3 tests/kernel/process_autonomous_reap_test.py "$(HOST_CC)"
 test-syscall-marker:
 	python3 tests/kernel/syscall_marker_test.py "$(HOST_CC)"
-test-sync: test-process-autonomous-reap test-syscall-marker
+test-sync: test-process-orphan-collection test-process-autonomous-reap test-syscall-marker
 
 .PHONY: test-ipc-waiters
 test-ipc-waiters:

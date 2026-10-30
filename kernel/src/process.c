@@ -73,6 +73,8 @@ static _Atomic u64 process_worker_reap_generation;
 static u64 process_worker_reap_after, process_worker_reap_limit;
 static u64 process_worker_reap_seen_generation;
 static bool process_worker_reap_sweep_active;
+static u64 process_handoff_release_after, process_reference_release_after;
+static u64 process_handoff_release_limit, process_reference_release_limit;
 
 
 #define PROCESS_SHUTDOWN_GRACE_MS 5000U
@@ -151,6 +153,7 @@ static void process_worker_records_release_all(process_t *process);
 static void process_cleanup_worker_entry(void *unused);
 static bool process_cleanup_worker_wake(process_t *hint);
 static bool process_cleanup_worker_retry_session_collections_once(void);
+static void process_collect_completed(mg_session_id_t session_id, bool abandoned);
 static void process_cleanup_worker_request_session_collection_retry(void);
 static kernel_object_t *process_handle_lookup_reference(
     process_t *process, process_handle_t handle,
@@ -308,6 +311,7 @@ static void process_object_destroy(kernel_object_t *object)
         process->first_child = NULL;
         spin_unlock_irqrestore(&process_registry_lock, flags);
     }
+    process_cleanup_request(PROCESS_CLEANUP_COLLECTION);
     process_memory_release_all(process);
     vmm_destroy_address_space(process->address_space);
     process_user_region_metadata_release(process);
@@ -325,6 +329,8 @@ bool process_init(void)
     process_worker_reap_generation = 0;
     process_worker_reap_after = process_worker_reap_limit = 0;
     process_worker_reap_sweep_active = false;
+    process_handoff_release_after = process_reference_release_after = 0;
+    process_handoff_release_limit = process_reference_release_limit = 0;
     process_cleanup_worker = NULL;
     __atomic_store_n(&process_session_collection_retry_pending, false,
                      __ATOMIC_RELAXED);
@@ -430,6 +436,10 @@ static bool process_thread_member_locked(process_t *process,
 static bool process_session_collection_ready_locked(process_t *process)
 {
     if (!process) return false;
+    if (process->wait_claimed || process->wait_collected ||
+        process->active_syscalls || process->worker_reapers ||
+        process->exit_cleanup_in_progress || !process->exit_cleanup_complete)
+        return false;
     if (process->thread_count)
         return process_thread_list_complete_locked(process);
 
@@ -458,6 +468,30 @@ static process_t *process_cleanup_candidate_locked(void)
     return NULL;
 }
 
+static process_t *process_cleanup_reference_candidate_locked(u64 *after,
+                                                        u64 *limit, bool handoff)
+{
+    process_t *best = NULL;
+    for (u32 pass = 0; pass < 2U && !best; pass++) {
+        if (pass || !*limit) {
+            *limit = 0;
+            for (process_t *p = all_processes; p; p = p->next_all)
+                if (p->pid > *limit) *limit = p->pid;
+        }
+        for (process_t *p = all_processes; p; p = p->next_all) {
+            u32 pending = handoff
+                ? __atomic_load_n(&p->scheduler_handoff_releases_pending,
+                                   __ATOMIC_ACQUIRE)
+                : __atomic_load_n(&p->deferred_reference_releases_pending,
+                                   __ATOMIC_ACQUIRE);
+            if (pending && p->pid <= *limit && (pass || p->pid > *after) &&
+                (!best || p->pid < best->pid)) best = p;
+        }
+    }
+    if (best) *after = best->pid;
+    return best;
+}
+
 #define PROCESS_HANDOFF_RELEASE_BATCH 16U
 
 /* Scheduler callbacks transfer their retained process reference to this
@@ -472,12 +506,12 @@ static bool process_cleanup_worker_release_handoffs_once(void)
     mg_session_id_t session_id = PROCESS_NO_SESSION;
     u64 flags = spin_lock_irqsave(&process_registry_lock);
 
-    for (process_t *candidate = all_processes; candidate;
-         candidate = candidate->next_all) {
+    process_t *candidate = process_cleanup_reference_candidate_locked(
+        &process_handoff_release_after, &process_handoff_release_limit, true);
+    if (candidate) {
         u32 pending = __atomic_load_n(
             &candidate->scheduler_handoff_releases_pending,
             __ATOMIC_ACQUIRE);
-        if (!pending) continue;
         if (!object_reference(&candidate->object)) {
             spin_unlock_irqrestore(&process_registry_lock, flags);
             panic("process: pending scheduler reference lost its owner");
@@ -506,7 +540,6 @@ static bool process_cleanup_worker_release_handoffs_once(void)
             object_release(&candidate->object);
         process = candidate;
         session_id = candidate->session_id;
-        break;
     }
     spin_unlock_irqrestore(&process_registry_lock, flags);
     if (!process) return false;
@@ -520,6 +553,7 @@ static bool process_cleanup_worker_release_handoffs_once(void)
      * release cannot strand an otherwise collectable process. */
     if (session_id != PROCESS_NO_SESSION)
         process_reap_session_members(session_id);
+    process_cleanup_request(PROCESS_CLEANUP_COLLECTION);
     return true;
 }
 
@@ -536,14 +570,14 @@ static bool process_cleanup_worker_release_deferred_references_once(void)
     mg_session_id_t retry_session = PROCESS_NO_SESSION;
     u64 flags = spin_lock_irqsave(&process_registry_lock);
 
-    for (process_t *candidate = all_processes; candidate;
-         candidate = candidate->next_all) {
+    process_t *candidate = process_cleanup_reference_candidate_locked(
+        &process_reference_release_after, &process_reference_release_limit, false);
+    if (candidate) {
         u32 pending = __atomic_load_n(
             &candidate->deferred_reference_releases_pending,
             __ATOMIC_ACQUIRE);
         u32 remaining;
 
-        if (!pending) continue;
         if (!object_reference(&candidate->object)) {
             spin_unlock_irqrestore(&process_registry_lock, flags);
             panic("process: deferred reference lost its process");
@@ -574,7 +608,6 @@ static bool process_cleanup_worker_release_deferred_references_once(void)
         for (u32 i = 0; i < release_count; i++)
             object_release(&candidate->object);
         process = candidate;
-        break;
     }
     spin_unlock_irqrestore(&process_registry_lock, flags);
     if (!process) return false;
@@ -585,6 +618,7 @@ static bool process_cleanup_worker_release_deferred_references_once(void)
     object_release(&process->object);
     if (retry_session != PROCESS_NO_SESSION)
         process_reap_session_members(retry_session);
+    process_cleanup_request(PROCESS_CLEANUP_COLLECTION);
     return true;
 }
 
@@ -616,6 +650,7 @@ static bool process_cleanup_worker_retry_session_collections_once(void)
         process_reap_session_members(next_session);
         after = next_session;
     }
+    process_collect_completed(PROCESS_NO_SESSION, true);
     return true;
 }
 
@@ -729,6 +764,9 @@ static bool process_cleanup_worker_run_once(void)
         worked = true;
     }
 
+    if (work & PROCESS_CLEANUP_COLLECTION)
+        __atomic_store_n(&process_session_collection_retry_pending, true,
+                         __ATOMIC_RELEASE);
     if (process_cleanup_worker_retry_session_collections_once())
         worked = true;
     /* A finite sweep can publish its own continuation without an external
@@ -951,6 +989,7 @@ static bool process_publish_terminated_locked(process_t *process)
         parent->waiting_child = NULL;
         parent->waiting_thread = NULL;
     }
+    process_cleanup_request(PROCESS_CLEANUP_COLLECTION);
     return true;
 }
 
@@ -2595,6 +2634,7 @@ bool process_exit(process_t *process, i32 status)
     }
     if (process->state == PROCESS_STATE_ACTIVE) {
         process->state = PROCESS_STATE_EXITING;
+        process_cleanup_request(PROCESS_CLEANUP_COLLECTION);
         process->termination_pending = true;
         process_storage_authorization_clear_locked(process);
         /* A self-exit may win against an external termination reservation.
@@ -3001,7 +3041,8 @@ static void process_abort(process_t *process)
     process->state = PROCESS_STATE_TERMINATED;
     process->termination_pending = false;
     process_unlink_locked(process);
-    process_unlink_all_locked(process);
+    /* The registry remains the owner index for transferred references.
+     * Only the final destructor removes this unpublished terminal object. */
     spin_unlock_irqrestore(&process_registry_lock, flags);
     terminal_output_finish_for_process(process->pid,
                                        &process->terminal_output);
@@ -3011,8 +3052,13 @@ static void process_abort(process_t *process)
     process_cwd_clear(process);
     if (!process_detach_thread(process, thread) || !thread_destroy(thread))
         panic("process: launch rollback could not release initial thread");
+    flags = spin_lock_irqsave(&process_registry_lock);
+    process->exit_cleanup_complete = true;
+    process->exit_notification_sent = true;
     process->owner_reference_held = false;
+    spin_unlock_irqrestore(&process_registry_lock, flags);
     object_release(&process->object);
+    process_cleanup_request(PROCESS_CLEANUP_COLLECTION);
 }
 
 bool process_terminate_external(process_t *process, i32 status)
@@ -3086,6 +3132,7 @@ bool process_terminate_external(process_t *process, i32 status)
     }
     if (process->state == PROCESS_STATE_ACTIVE) {
         process->state = PROCESS_STATE_EXITING;
+        process_cleanup_request(PROCESS_CLEANUP_COLLECTION);
         process_storage_authorization_clear_locked(process);
         __atomic_store_n(&process->exit_requested, true, __ATOMIC_RELEASE);
         process->exit_status = status;
@@ -3144,7 +3191,7 @@ bool process_terminate_session_members(mg_session_id_t session_id)
     return result;
 }
 
-void process_reap_session_members(mg_session_id_t session_id)
+static void process_collect_completed(mg_session_id_t session_id, bool abandoned)
 {
     for (;;) {
         process_t *process = NULL;
@@ -3152,7 +3199,9 @@ void process_reap_session_members(mg_session_id_t session_id)
 
         for (process = all_processes; process; process = process->next_all) {
             if (process->launch_ready &&
-                process->session_id == session_id &&
+                (abandoned ? (!process->parent ||
+                    process->parent->state != PROCESS_STATE_ACTIVE)
+                    : process->session_id == session_id) &&
                 process->state == PROCESS_STATE_TERMINATED &&
                 process->owner_reference_held &&
                 process_session_collection_ready_locked(process) &&
@@ -3173,6 +3222,7 @@ void process_reap_session_members(mg_session_id_t session_id)
         }
         flags = spin_lock_irqsave(&process_registry_lock);
         bool reap = process->owner_reference_held &&
+            !process->wait_claimed && !process->wait_collected &&
             process->state == PROCESS_STATE_TERMINATED &&
             process->thread_count == 0 &&
             __atomic_load_n(&process->object.ref_count, __ATOMIC_ACQUIRE) ==
@@ -3189,6 +3239,12 @@ void process_reap_session_members(mg_session_id_t session_id)
         object_release(&process->object); /* process owner reference */
         object_release(&process->object);
     }
+}
+
+void process_reap_session_members(mg_session_id_t session_id)
+{
+    if (session_id != PROCESS_NO_SESSION)
+        process_collect_completed(session_id, false);
 }
 
 /* Release a retained process-object handle reference without permitting a
@@ -3228,8 +3284,7 @@ void process_handle_reference_release(kernel_object_t *object)
         }
         __atomic_store_n(&target->deferred_reference_releases_pending,
                          pending + 1U, __ATOMIC_RELEASE);
-        if (session_id != PROCESS_NO_SESSION)
-            target->deferred_reference_collection_retry = true;
+        target->deferred_reference_collection_retry = true;
         spin_unlock_irqrestore(&process_registry_lock, flags);
 
         /* The actual retained object reference remains live in the pending
@@ -3244,6 +3299,7 @@ void process_handle_reference_release(kernel_object_t *object)
     object_release(object);
     if (session_id != PROCESS_NO_SESSION)
         process_reap_session_members(session_id);
+    process_cleanup_request(PROCESS_CLEANUP_COLLECTION);
 }
 
 mg_session_id_t process_session_id(const process_t *process)
@@ -3351,7 +3407,8 @@ static bool process_matches_shutdown_phase(const process_t *process,
     /* A process that was already under construction when shutdown started is
      * a quiescence dependency even before its service/session metadata is
      * published. The caller waits for publication, then classifies it. */
-    if (!process->launch_ready) return true;
+    if (!process->launch_ready)
+        return process->state != PROCESS_STATE_TERMINATED;
     if (!services) return !process->system_service;
     /* PID 1 and the session coordinators remain alive through the final
      * transition. Sprout restarts leaf services if sync/timeout aborts; the

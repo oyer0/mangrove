@@ -95,6 +95,19 @@ record and linker-backed stack are not freed. Interrupt and shutdown wake walks,
 external termination's scheduler-group walk, pin the thread-list reader count
 before dropping the registry lock. Final publication and reaping wait for
 those walks; reaping also closes reader admission before detaching records.
+When a parent irreversibly begins exit, it abandons future unclaimed child
+waits. A terminated child with no parent or a parent that is no longer ACTIVE
+can be collected by the cleanup worker, including outside a session. An
+admitted wait claim, live handle, temporary reference, syscall, list reader,
+cleanup claim or incomplete scheduler handoff still prevents collection.
+Collection retries accept completed zero-thread objects and consume the base
+owner once. Parent exit/unlink, termination and final reference release publish
+collection work; an open handle is a dependency, not a reason to busy retry.
+Aborted unpublished launches stay in the process registry until final object
+destruction so transferred references remain discoverable, but no longer count
+as unfinished shutdown construction. Reference-drain cursors give each pending
+PID a turn, with at most 16 references released per batch.
+
 Process inspection aggregates attached thread states. Its CPU field uses
 `MG_PROCESS_CPU_MULTIPLE` only when a scheduler-locked point-in-time sample sees
 the process executing on distinct CPUs; this is an observation, not a CPU

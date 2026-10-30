@@ -451,7 +451,7 @@ code = prefix + object_functions + process_functions + scheduler_functions + suf
 with HostFixture("launch-publication") as fixture:
     source = fixture.path / "launch_publication.c"
     binary = fixture.path / "launch_publication"
-    source.write_text(code)
+    source.write_text('#include "' + str(ROOT / "tests/kernel/process_cleanup_fixture.h") + '"\n' + code)
     fixture.run([CC, "-std=gnu17", "-O1", "-g", "-Wall", "-Wextra",
                  "-Werror", "-fsanitize=address,undefined", "-pthread",
                  str(source), "-o", str(binary)])

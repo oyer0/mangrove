@@ -18,7 +18,7 @@ tree.body = [node for node in tree.body if not isinstance(node, ast.With)]
 namespace = {'__file__': str(p), '__name__': 'fixture_definitions'}
 exec(compile(tree, str(p), 'exec'), namespace)
 code = namespace['code'].split('int main(')[0]
-code = code.replace('struct process {', 'struct process {\n u64 pid, session_id; bool external_termination_in_progress; process_t *next_all;')
+code = code.replace('struct process {', 'struct process {\n u64 pid, session_id; unsigned deferred_reference_releases_pending; bool external_termination_in_progress; process_t *next_all;')
 code = 'static unsigned record_destructions;\n#include "' + str(ROOT / 'kernel/include/process_cleanup.h') + '"\n' + code
 code = code.replace('for(process_user_region_t*r=test_process->user_regions;r;', 'for(process_user_region_t*r=((process_t*)as)->user_regions;r;')
 code = code.replace('    kfree(record);', '    record_destructions++; kfree(record);')
@@ -28,6 +28,7 @@ static bool process_cleanup_worker_ready;
 static unsigned process_cleanup_work_pending;
 static u64 process_worker_reap_generation;
 static u64 process_worker_reap_after, process_worker_reap_limit;
+static u64 process_handoff_release_after, process_handoff_release_limit;
 static u64 process_worker_reap_seen_generation;
 static bool process_worker_reap_sweep_active;
 static unsigned worker_wakes;
@@ -35,12 +36,13 @@ static bool process_cleanup_worker_wake(process_t*p){(void)p;worker_wakes++;retu
 '''
 code += 'typedef u64 mg_session_id_t;\n#define PROCESS_NO_SESSION 0U\n#define PROCESS_HANDOFF_RELEASE_BATCH 16U\nstatic void process_reap_session_members(u64 id){assert(id==0);}\n'
 for name in ('process_termination_begin', 'process_cleanup_request', 'process_cleanup_worker_reap_once',
-             'process_scheduler_post_handoff',
+             'process_scheduler_post_handoff', 'process_cleanup_reference_candidate_locked',
              'process_cleanup_worker_release_handoffs_once'):
     code += namespace['function']('kernel/src/process.c', name) + '\n'
 code += r'''
 static bool process_cleanup_worker_release_deferred_references_once(void){return false;}
-static bool process_cleanup_worker_retry_session_collections_once(void){return false;}
+static bool process_session_collection_retry_pending;
+static bool process_cleanup_worker_retry_session_collections_once(void){process_session_collection_retry_pending=false;return false;}
 static process_t*process_cleanup_candidate_locked(void){return NULL;}
 '''
 code += namespace['function']('kernel/src/process.c', 'process_cleanup_worker_run_once') + '\n'
