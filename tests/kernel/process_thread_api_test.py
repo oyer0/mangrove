@@ -446,7 +446,6 @@ static bool process_user_context_discard_worker(process_t*p,kernel_thread_t*t)
 names = (
     ("kernel/src/process.c", "process_handle_revision_advance"),
     ("kernel/src/process.c", "process_thread_register_locked"),
-    ("kernel/src/process.c", "process_thread_list_complete_locked"),
     ("kernel/src/process.c", "process_thread_member_locked"),
     ("kernel/src/process.c", "process_thread_record_destroy"),
     ("kernel/src/process.c", "process_snapshot_reap_flags_locked"),
@@ -1068,7 +1067,7 @@ with HostFixture("thread-api") as fixture:
     directory = fixture.path
     path = Path(directory) / "process_thread_api.c"
     binary = Path(directory) / "process_thread_api"
-    path.write_text(code)
+    path.write_text('#include "' + str(ROOT / "tests/kernel/process_cleanup_fixture.h") + '"\n' + code)
     fixture.run([CC, "-std=gnu17", "-Wall", "-Wextra", "-Werror",
                     "-fsanitize=address,undefined", "-pthread", str(path),
                     "-o", str(binary)], check=True)

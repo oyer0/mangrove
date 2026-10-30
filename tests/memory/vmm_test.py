@@ -76,7 +76,7 @@ def run(name, source):
     with tempfile.TemporaryDirectory(prefix='mangrove-launch-') as directory:
         path = Path(directory) / (name + '.c')
         binary = path.with_suffix('')
-        path.write_text(COMMON + source)
+        path.write_text('#include "' + str(ROOT / "tests/kernel/process_cleanup_fixture.h") + '"\n' + COMMON + source)
         subprocess.run([CC, '-std=c11', '-Wall', '-Wextra', '-Werror', '-pthread',
                         '-fsanitize=address,undefined', str(path), '-o', str(binary)], check=True)
         subprocess.run([str(binary)], check=True)
@@ -229,6 +229,7 @@ int main(void){
  assert(!vmm_unmap_user_range(meta.root,(void*)0x800000,2));
  sync_result=pthread_barrier_wait(&race.release);assert(sync_result==0||sync_result==PTHREAD_BARRIER_SERIAL_THREAD);
  assert(pthread_join(lease_thread,NULL)==0&&meta.active_user_leases==0);
+ assert(process_cleanup_fixture_work & PROCESS_CLEANUP_WORKER_REAP);
  assert(pthread_barrier_destroy(&race.held)==0&&pthread_barrier_destroy(&race.release)==0);
  assert(vmm_unmap_user_range(meta.root,(void*)0x800000,2));
  assert(table_frees==range_frame_frees+2U);

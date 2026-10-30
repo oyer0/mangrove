@@ -45,14 +45,12 @@ def function_from(path, name):
 dispatch = function_from("kernel/src/syscall.c", "syscall_dispatch")
 lease_release = dispatch.index("syscall_user_lease_release_all(&context)")
 syscall_leave = dispatch.index("process_syscall_leave(process)", lease_release)
-worker_reap_retry = dispatch.index("process_worker_reclaim_pending(process)",
-                                   syscall_leave)
 thread_exit_check = dispatch.index(
     "if (tracked && process_thread_exit_requested(thread))", syscall_leave)
-assert lease_release < syscall_leave < worker_reap_retry < thread_exit_check
-assert "worker_reap_pending" in dispatch[syscall_leave:worker_reap_retry]
-assert "user_region_reap_pending" in dispatch[
-    syscall_leave:worker_reap_retry]
+assert lease_release < syscall_leave < thread_exit_check
+assert "process_worker_reclaim_pending" not in dispatch
+entry = (ROOT / "kernel/src/syscall_entry.s").read_text()
+assert entry.index("call scheduler_syscall_enter") < entry.index("call syscall_dispatch") < entry.index("call scheduler_syscall_leave")
 
 
 prefix = r'''
@@ -152,13 +150,11 @@ static unsigned terminal_finishes, alternate_leaves, handle_closes, cwd_clears;
 static unsigned exit_notifications, unblocks;
 static bool fixture_interrupts_enabled=true;
 static bool process_finish_termination(process_t *process);
-static void process_worker_reclaim_pending(process_t *process);
 static bool process_cleanup_exit_resources(process_t *process);
 static bool process_cleanup_worker_wake(process_t *process);
 static bool scheduler_terminate_thread(kernel_thread_t *thread);
 void process_worker_exit(struct kernel_thread *thread, u64 result);
-static void process_worker_reclaim_pending(process_t *process)
-{assert(process);}
+
 static void process_worker_records_release_all(process_t *process)
 {assert(process && !process->thread_records && !process->worker_reapers);}
 static void process_unlink_locked(process_t *process);
@@ -656,7 +652,7 @@ code = prefix + scheduler_state_snapshot + \
 with tempfile.TemporaryDirectory(prefix="mangrove-process-thread-") as directory:
     path = Path(directory) / "process_thread_lifecycle.c"
     binary = Path(directory) / "process_thread_lifecycle"
-    path.write_text(code)
+    path.write_text('#include "' + str(ROOT / "tests/kernel/process_cleanup_fixture.h") + '"\n' + code)
     subprocess.run([CC, "-std=gnu17", "-Wall", "-Wextra", "-Werror",
                     "-fsanitize=address,undefined", "-pthread", str(path),
                     "-o", str(binary)], check=True)

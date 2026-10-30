@@ -586,7 +586,7 @@ from host_fixture import HostFixture
 with HostFixture("process-wait") as fixture:
     path = fixture.path / "wait.c"
     binary = fixture.path / "wait"
-    path.write_text(code)
+    path.write_text('#include "' + str(ROOT / "tests/kernel/process_cleanup_fixture.h") + '"\n' + code)
     fixture.run([CC, "-std=gnu17", "-Wall", "-Wextra", "-Werror",
                  "-Wno-unused-function", "-pthread", "-fsanitize=address,undefined",
                  str(path), "-o", str(binary)])

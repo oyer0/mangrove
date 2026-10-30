@@ -34,7 +34,7 @@ def run(source, name):
     with tempfile.TemporaryDirectory(prefix="mangrove-termination-") as tmp:
         path = Path(tmp) / f"{name}.c"
         binary = Path(tmp) / name
-        path.write_text(source)
+        path.write_text('#include "' + str(ROOT / "tests/kernel/process_cleanup_fixture.h") + '"\n' + source)
         subprocess.run([CC, "-std=c11", "-Wall", "-Wextra", "-Werror",
                         "-fsanitize=address,undefined", str(path), "-o",
                         str(binary)], check=True)
@@ -192,7 +192,6 @@ static bool scheduler_thread_handoff_callback_valid(
 static bool scheduler_terminate_thread_group(kernel_thread_t *head,
                                                usize expected_count);
 static bool process_finish_termination(process_t *process);
-static void process_worker_reclaim_pending(process_t *process);
 static void process_cleanup_exit_resources(process_t *process);
 static void console_cancel_waiter(kernel_thread_t *thread) {(void)thread;}
 static bool scheduler_wake_waiter(kernel_thread_t *thread)
@@ -204,8 +203,7 @@ static scheduler_wake_result_t scheduler_wake_waiter_result(
   return SCHEDULER_WAKE_ALREADY_TERMINATED;
  return scheduler_wake_waiter(thread)?SCHEDULER_WAKE_DELIVERED:
         SCHEDULER_WAKE_FAILED;}
-static void process_worker_reclaim_pending(process_t *process)
-{assert(process && !process_registry_lock); worker_reap_calls++;}
+
 static bool process_cleanup_worker_wake(process_t *process)
 {assert(process && !process_registry_lock); return true;}
 static bool process_exit(process_t *process, i32 status)
@@ -295,7 +293,8 @@ int main(void) {
    .thread_list_readers=1,.worker_reap_pending=true};
  kernel_thread_t reap_thread={0};reap_process.threads=&reap_thread;
  process_thread_list_read_release(&reap_process);
- assert(!reap_process.thread_list_readers && worker_reap_calls==1);
+ assert(!reap_process.thread_list_readers && worker_reap_calls==0 &&
+        (process_cleanup_fixture_work & PROCESS_CLEANUP_WORKER_REAP));
 
  process_t caller={.state=PROCESS_STATE_ACTIVE};
  process_t target = {.state=PROCESS_STATE_ACTIVE,.parent=&caller,

@@ -77,11 +77,11 @@ static bool own_process_is_running_on_multiple_cpus(void)
     return false;
 }
 
-static bool own_process_memory_bytes(u64 *out_bytes, u32 *out_flags)
+static bool process_memory_bytes_for(u64 pid, u64 *out_bytes,
+                                     u32 *out_flags, u32 *out_state)
 {
     if (!out_bytes) return false;
     mg_process_info_t entries[MG_PROCESS_SNAPSHOT_PAGE_MAX];
-    u64 pid = process_current_pid();
     u32 offset = 0, count = 0, total = 0;
     do {
         mg_process_snapshot_request_t request = {
@@ -96,6 +96,7 @@ static bool own_process_memory_bytes(u64 *out_bytes, u32 *out_flags)
             if (entries[i].pid == pid) {
                 *out_bytes = entries[i].memory_bytes;
                 if (out_flags) *out_flags = entries[i].flags;
+                if (out_state) *out_state = entries[i].state;
                 return true;
             }
         }
@@ -104,9 +105,13 @@ static bool own_process_memory_bytes(u64 *out_bytes, u32 *out_flags)
     return false;
 }
 
-/* A process snapshot reports address-space size before its syscall epilogue.
- * That epilogue may finish a worker reap, so use consecutive observations
- * rather than treating one possibly stale sample as a stable baseline. */
+static bool own_process_memory_bytes(u64 *bytes, u32 *flags)
+{
+    return process_memory_bytes_for(process_current_pid(), bytes, flags, NULL);
+}
+
+/* A process snapshot can race autonomous cleanup. Use consecutive startup
+ * observations when establishing the initial mapping baseline. */
 static bool own_process_memory_stable(u64 deadline, u64 *out_bytes)
 {
     u64 previous = 0;
@@ -134,8 +139,8 @@ static bool own_process_memory_stable(u64 deadline, u64 *out_bytes)
 /* Reaping is asynchronous with respect to the worker's user-level return and
  * join completion. A pair of identical non-baseline snapshots is not proof
  * that stack/TLS mappings were reclaimed; wait for the exact pre-worker
- * mapping baseline instead. Snapshot syscalls also provide opportunities for
- * the kernel's deferred reaper to run after releasing their own user leases. */
+ * mapping baseline instead. The separate autonomous-target case verifies
+ * cleanup without target-process snapshot/yield syscalls. */
 static bool own_process_memory_wait_for(u64 expected, u64 deadline,
                                         u64 *out_last, u32 *out_flags,
                                         u32 *out_samples)
@@ -433,10 +438,115 @@ static int verify_syscall_entry_stack(void)
     return 0;
 }
 
+/* The observer and target synchronize through disposable guest files before
+ * releasing the worker. After release the target performs only Ring 3 CPU
+ * work and then the non-returning exit syscall: observer snapshots cannot
+ * accidentally supply the target's missing reaper trigger. */
+static atomic_uint autonomous_go;
+static mg_thread_result_t autonomous_worker(void *unused)
+{
+    (void)unused;
+    while (!atomic_load_explicit(&autonomous_go, memory_order_acquire))
+        __asm__ volatile("pause");
+    return 0;
+}
+
+static int autonomous_target(const char *base)
+{
+    char ready[160], go[160];
+    snprintf(ready, sizeof(ready), "%s.ready", base);
+    snprintf(go, sizeof(go), "%s.go", base);
+    u64 baseline;
+    if (!own_process_memory_bytes(&baseline, NULL)) return 71;
+    mg_thread_created_t made;
+    if (mg_thread_create(&made, autonomous_worker, NULL) != MG_OK ||
+        mg_thread_detach(made.handle) != MG_OK) return 72;
+    mg_handle_t file;
+    if (file_create_contents(ready, &baseline, sizeof(baseline), &file) < 0 ||
+        handle_close(file) != MG_OK) return 73;
+    u64 deadline = uptime_ms() + 8000U;
+    for (;;) {
+        mg_result_t opened = file_open(go, MG_OPEN_READ);
+        if (opened > 0) {
+            if (handle_close((mg_handle_t)opened) != MG_OK) return 74;
+            break;
+        }
+        if (uptime_ms() >= deadline) return 75;
+        (void)process_yield();
+    }
+    atomic_store_explicit(&autonomous_go, 1U, memory_order_release);
+    /* Finite CPU workload, not a timer or cleanup polling mechanism. Early
+     * target exit before the observer witnesses cleanup is a test failure. */
+    volatile u64 work = 1;
+    for (u64 i = 0; i < 500000000ULL; i++)
+        work = (work + i) ^ (work >> 7);
+    process_exit(0);
+}
+
+static int verify_autonomous_reap(void)
+{
+    char base[128], ready[160], go[160];
+    snprintf(base, sizeof(base), "/temp/thread-autonomous-%llu",
+             (unsigned long long)process_current_pid());
+    snprintf(ready, sizeof(ready), "%s.ready", base);
+    snprintf(go, sizeof(go), "%s.go", base);
+    const char *command[] = {"/bin/threadtest", "autonomous-target", base};
+    mg_result_t spawned = process_spawn_argv(command, 3U);
+    if (spawned <= 0) return 76;
+    mg_handle_t child = (mg_handle_t)spawned;
+    u64 pid = process_handle_pid(child), baseline = 0;
+    u64 deadline = uptime_ms() + 8000U;
+    while (uptime_ms() < deadline && !baseline) {
+        mg_result_t opened = file_open(ready, MG_OPEN_READ);
+        if (opened > 0) {
+            mg_result_t read = object_read((mg_handle_t)opened,
+                                           &baseline, sizeof(baseline));
+            (void)handle_close((mg_handle_t)opened);
+            if (read != (mg_result_t)sizeof(baseline)) baseline = 0;
+        }
+        (void)process_yield();
+    }
+    if (!baseline) return 77;
+    u64 bytes = 0; u32 flags = 0, state = 0;
+    if (!process_memory_bytes_for(pid, &bytes, &flags, &state) ||
+        bytes <= baseline) return 78;
+    mg_handle_t file;
+    if (file_create_contents(go, "1", 1U, &file) < 0 ||
+        handle_close(file) != MG_OK) return 79;
+    bool reclaimed = false;
+    deadline = uptime_ms() + 8000U;
+    while (uptime_ms() < deadline) {
+        if (!process_memory_bytes_for(pid, &bytes, &flags, &state) ||
+            state == MG_PROCESS_INSPECTION_EXITED) break;
+        if (bytes == baseline && !(flags & MG_PROCESS_FLAG_REAP_STATE_MASK)) {
+            reclaimed = true;
+            break;
+        }
+        (void)process_yield();
+    }
+    i32 status = -1;
+    mg_result_t waited = process_wait(child, &status);
+    mg_result_t closed = handle_close(child);
+    (void)path_remove(ready); (void)path_remove(go);
+    if (!reclaimed || waited != MG_OK || closed != MG_OK || status != 0) {
+        printf("THREADS1 autonomous diagnostic pid=%llu baseline=%llu bytes=%llu flags=%x state=%u wait=%lld close=%lld status=%d\n",
+               (unsigned long long)pid, (unsigned long long)baseline,
+               (unsigned long long)bytes, flags, state,
+               (long long)waited, (long long)closed, status);
+        return 80;
+    }
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
+    if (argc == 3 && !strcmp(argv[1], "autonomous-target"))
+        return autonomous_target(argv[2]);
     if (argc == 2) return child_mode(argv[1]);
     REQUIRE(argc == 1, "arguments");
+    int autonomous_result = verify_autonomous_reap();
+    if (autonomous_result) printf("THREADS1 autonomous case=%d\n", autonomous_result);
+    REQUIRE(autonomous_result == 0, "autonomous CPU-inactive reap");
     REQUIRE(verify_syscall_entry_stack() == 0,
             "trusted syscall stack, user-memory isolation, and flags");
     worker_arg_t arguments[WORKERS] = {{.index = 0U}, {.index = 1U}};
@@ -618,7 +728,7 @@ int main(int argc, char **argv)
     int length = snprintf(transcript, sizeof(transcript),
         "THREADS1 PASS cpus=2 workers=%u iterations=%u atomic=%u mutex=%u "
         "tls=isolated return=join explicit-exit=pass detached=%u "
-        "termination=spin,wait,fault\n",
+        "termination=spin,wait,fault autonomous=cpu-inactive\n",
         WORKERS, ITERATIONS, WORKERS * ITERATIONS,
         WORKERS * ITERATIONS, REPEAT_WORKERS);
     REQUIRE(length > 0 && (usize)length < sizeof(transcript), "format log");

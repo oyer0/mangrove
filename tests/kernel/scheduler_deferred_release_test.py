@@ -1214,7 +1214,7 @@ with tempfile.TemporaryDirectory(prefix='mangrove-deferred-ref-') as directory:
     directory = Path(directory)
     source = directory / 'deferred_release.c'
     binary = directory / 'deferred_release'
-    source.write_text(code)
+    source.write_text('#include "' + str(ROOT / "tests/kernel/process_cleanup_fixture.h") + '"\n' + code)
     env = dict(os.environ)
     env['ASAN_OPTIONS'] = env.get('ASAN_OPTIONS', 'detect_leaks=0')
     subprocess.run([

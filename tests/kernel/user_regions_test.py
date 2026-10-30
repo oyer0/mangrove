@@ -257,7 +257,7 @@ with tempfile.TemporaryDirectory(prefix="mangrove-user-regions-") as folder:
     folder = Path(folder)
     source = folder / "user_regions_test.c"
     binary = folder / "user_regions_test"
-    source.write_text(fixture)
+    source.write_text('#include "' + str(ROOT / "tests/kernel/process_cleanup_fixture.h") + '"\n' + fixture)
     subprocess.run([CC, "-std=gnu17", "-O1", "-g", "-Wall", "-Wextra",
         "-Werror", "-fsanitize=address,undefined", "-pthread", str(source),
         "-o", str(binary)], check=True)

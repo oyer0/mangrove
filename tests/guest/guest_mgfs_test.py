@@ -1116,7 +1116,7 @@ def inspect_threads(folder, disk, build, run):
     (folder / 'threads-guest.log').write_text(transcript)
     expected = ('THREADS1 PASS cpus=2 workers=2 iterations=2000 atomic=4000 '
                 'mutex=4000 tls=isolated return=join explicit-exit=pass '
-                'detached=24 termination=spin,wait,fault\n')
+                'detached=24 termination=spin,wait,fault autonomous=cpu-inactive\n')
     if transcript != expected:
         raise ValueError('native thread lifecycle evidence is incomplete: ' +
                          repr(transcript))

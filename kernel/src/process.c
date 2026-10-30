@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include <process.h>
+#include <process_cleanup.h>
 #include <scheduler.h>
 #include <heap.h>
 #include <string.h>
@@ -66,6 +67,13 @@ static kernel_thread_t *process_cleanup_worker;
  * session pointer and cannot create a reference cycle. */
 static _Atomic bool process_session_collection_retry_pending;
 static _Atomic bool process_cleanup_worker_ready;
+static _Atomic u32 process_cleanup_work_pending;
+static _Atomic u64 process_worker_reap_generation;
+/* Only the cleanup worker owns these scalar sweep cursors. */
+static u64 process_worker_reap_after, process_worker_reap_limit;
+static u64 process_worker_reap_seen_generation;
+static bool process_worker_reap_sweep_active;
+
 
 #define PROCESS_SHUTDOWN_GRACE_MS 5000U
 #define PROCESS_SHUTDOWN_FORCE_MS 5000U
@@ -313,6 +321,10 @@ bool process_init(void)
     next_pid = 1;
     all_processes = NULL;
     process_shutdown_active = false;
+    process_cleanup_work_pending = 0;
+    process_worker_reap_generation = 0;
+    process_worker_reap_after = process_worker_reap_limit = 0;
+    process_worker_reap_sweep_active = false;
     process_cleanup_worker = NULL;
     __atomic_store_n(&process_session_collection_retry_pending, false,
                      __ATOMIC_RELAXED);
@@ -610,21 +622,98 @@ static bool process_cleanup_worker_retry_session_collections_once(void)
 static void process_cleanup_worker_request_session_collection_retry(void)
 {
     bool already_pending = __atomic_exchange_n(
-        &process_session_collection_retry_pending, true, __ATOMIC_ACQ_REL);
+        &process_session_collection_retry_pending, true, __ATOMIC_SEQ_CST);
     if (already_pending) return;
 
     /* During worker startup, the durable latch is enough: startup checks it
      * after enqueue. Once ready, every publication must either wake the
      * blocked worker or latch a wake while it is running. */
-    if (__atomic_load_n(&process_cleanup_worker_ready, __ATOMIC_ACQUIRE) &&
+    if (__atomic_load_n(&process_cleanup_worker_ready, __ATOMIC_SEQ_CST) &&
         !process_cleanup_worker_wake(NULL))
         panic("process: collection retry worker could not be notified");
+}
+
+void process_cleanup_request(unsigned int work)
+{
+    if (work & PROCESS_CLEANUP_WORKER_REAP) {
+        if (__atomic_fetch_add(&process_worker_reap_generation, 1U,
+                               __ATOMIC_RELEASE) == ~(u64)0)
+            panic("process: cleanup generation overflow");
+    }
+    /* Startup publishes ready then inspects work; producers publish work
+     * then inspect ready. A single SC order prevents both sides observing
+     * the old value and leaving pre-start work unnotified. */
+    __atomic_fetch_or(&process_cleanup_work_pending, work, __ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&process_cleanup_worker_ready, __ATOMIC_SEQ_CST))
+        (void)process_cleanup_worker_wake(NULL);
+}
+
+/* A finite PID sweep tries each current process once. Deferred leases/readers
+ * do not requeue themselves; a real dependency transition publishes work.
+ * New progress during a sweep starts one subsequent sweep, not a busy poll. */
+static bool process_cleanup_worker_reap_once(void)
+{
+    bool worked = false;
+    if (!process_worker_reap_sweep_active) {
+        process_worker_reap_seen_generation = __atomic_load_n(
+            &process_worker_reap_generation, __ATOMIC_ACQUIRE);
+        u64 flags = spin_lock_irqsave(&process_registry_lock);
+        process_worker_reap_limit = 0;
+        for (process_t *p = all_processes; p; p = p->next_all)
+            if (p->pid > process_worker_reap_limit)
+                process_worker_reap_limit = p->pid;
+        spin_unlock_irqrestore(&process_registry_lock, flags);
+        process_worker_reap_after = 0;
+        process_worker_reap_sweep_active = true;
+    }
+    for (u32 count = 0; count < 16U; count++) {
+        process_t *candidate = NULL;
+        u64 flags = spin_lock_irqsave(&process_registry_lock);
+        for (process_t *p = all_processes; p; p = p->next_all) {
+            if (p->pid <= process_worker_reap_after ||
+                p->pid > process_worker_reap_limit ||
+                (candidate && p->pid >= candidate->pid) ||
+                p->state != PROCESS_STATE_ACTIVE || p->termination_pending ||
+                p->worker_reapers ||
+                (!__atomic_load_n(&p->worker_reap_pending, __ATOMIC_ACQUIRE) &&
+                 !__atomic_load_n(&p->user_region_reap_pending, __ATOMIC_ACQUIRE)))
+                continue;
+            candidate = p;
+        }
+        if (candidate && !object_reference(&candidate->object))
+            panic("process: cleanup sweep lost process owner");
+        if (candidate) process_worker_reap_after = candidate->pid;
+        spin_unlock_irqrestore(&process_registry_lock, flags);
+        if (!candidate) {
+            process_worker_reap_sweep_active = false;
+            if (__atomic_load_n(&process_worker_reap_generation,
+                                 __ATOMIC_ACQUIRE) !=
+                    process_worker_reap_seen_generation)
+                __atomic_fetch_or(&process_cleanup_work_pending,
+                    PROCESS_CLEANUP_WORKER_REAP, __ATOMIC_RELEASE);
+            return worked;
+        }
+        process_worker_reclaim_pending(candidate);
+        object_release(&candidate->object);
+        worked = true;
+    }
+    /* Continue only to visit the remaining finite snapshot, not to retry a
+     * process already attempted in this generation. */
+    __atomic_fetch_or(&process_cleanup_work_pending,
+                     PROCESS_CLEANUP_WORKER_REAP, __ATOMIC_RELEASE);
+    return worked;
 }
 
 static bool process_cleanup_worker_run_once(void)
 {
     process_t *process;
+    u32 work = __atomic_exchange_n(&process_cleanup_work_pending, 0U,
+                                    __ATOMIC_ACQ_REL);
     bool worked = process_cleanup_worker_release_handoffs_once();
+    if ((work & PROCESS_CLEANUP_WORKER_REAP) ||
+        process_worker_reap_sweep_active) {
+        if (process_cleanup_worker_reap_once()) worked = true;
+    }
     if (process_cleanup_worker_release_deferred_references_once())
         worked = true;
     mg_session_id_t session_id;
@@ -642,7 +731,10 @@ static bool process_cleanup_worker_run_once(void)
 
     if (process_cleanup_worker_retry_session_collections_once())
         worked = true;
-    return worked;
+    /* A finite sweep can publish its own continuation without an external
+     * scheduler wake. Consume that work before considering a park. */
+    return worked || __atomic_load_n(&process_cleanup_work_pending,
+                                     __ATOMIC_ACQUIRE) != 0U;
 }
 
 static void process_cleanup_worker_entry(void *unused)
@@ -690,9 +782,10 @@ bool process_start_cleanup_worker(void)
 
     if (scheduler_enqueue(worker)) {
         __atomic_store_n(&process_cleanup_worker_ready, true,
-                         __ATOMIC_RELEASE);
-        if (__atomic_load_n(&process_session_collection_retry_pending,
-                            __ATOMIC_ACQUIRE) &&
+                         __ATOMIC_SEQ_CST);
+        if ((__atomic_load_n(&process_session_collection_retry_pending,
+                            __ATOMIC_SEQ_CST) ||
+             __atomic_load_n(&process_cleanup_work_pending, __ATOMIC_SEQ_CST)) &&
             !process_cleanup_worker_wake(NULL))
             panic("process: startup collection retry wake failed");
         return true;
@@ -786,7 +879,7 @@ static void process_thread_list_read_release(process_t *process)
         process->state == PROCESS_STATE_ACTIVE &&
         __atomic_load_n(&process->worker_reap_pending, __ATOMIC_ACQUIRE);
     spin_unlock_irqrestore(&process_registry_lock, flags);
-    if (reap_workers) process_worker_reclaim_pending(process);
+    if (reap_workers) process_cleanup_request(PROCESS_CLEANUP_WORKER_REAP);
     if (queue_cleanup) process_cleanup_worker_wake(process);
     if (finish_exit) (void)process_finish_termination(process);
 }
@@ -1811,6 +1904,7 @@ static process_user_region_t *process_user_region_create(
         mutex_unlock(&process->memory_lock);
         kfree(frames);
         if (!deferred) kfree(region);
+        else process_cleanup_request(PROCESS_CLEANUP_WORKER_REAP);
         return NULL;
     }
     process_user_region_insert_locked(process, region);
@@ -2083,10 +2177,18 @@ void process_worker_reclaim_pending(process_t *process)
         (!__atomic_load_n(&process->worker_reap_pending, __ATOMIC_ACQUIRE) &&
          !__atomic_load_n(&process->user_region_reap_pending,
                           __ATOMIC_ACQUIRE)) ||
-        !process_worker_reclaim_context_valid() ||
-        !object_reference(&process->object))
+        !process_worker_reclaim_context_valid())
         return;
 
+    flags = spin_lock_irqsave(&process_registry_lock);
+    if (process->state != PROCESS_STATE_ACTIVE || process->termination_pending ||
+        process->worker_reapers ||
+        process->thread_reap_in_progress || !object_reference(&process->object)) {
+        spin_unlock_irqrestore(&process_registry_lock, flags);
+        return;
+    }
+    process->worker_reapers = 1U;
+    spin_unlock_irqrestore(&process_registry_lock, flags);
     process_user_regions_reap_pending(process);
 
     for (;;) {
@@ -2106,7 +2208,6 @@ void process_worker_reclaim_pending(process_t *process)
         bool tls_released = true;
         bool execution_stack_released = true;
         bool drop_list_reference = false;
-        bool cleanup_ready = false;
         process_region_release_result_t stack_release_result =
             PROCESS_REGION_RELEASED;
         process_region_release_result_t tls_release_result =
@@ -2120,10 +2221,8 @@ void process_worker_reclaim_pending(process_t *process)
             !process->termination_pending &&
             !process->thread_reap_in_progress &&
             record->listed && record->completed && !record->reclaiming &&
-            process->worker_reapers != ~(u32)0 &&
             object_reference(&record->object)) {
             record->reclaiming = true;
-            process->worker_reapers++;
             execution = record->execution;
             stack_region = record->stack_region;
             tls_region = record->tls_region;
@@ -2205,20 +2304,9 @@ void process_worker_reclaim_pending(process_t *process)
                 }
             }
             record->reclaiming = false;
-            if (!process->worker_reapers) {
-                spin_unlock_irqrestore(&process_registry_lock, flags);
-                panic("process: worker reaper count underflow");
-            }
-            process->worker_reapers--;
-            cleanup_ready = process->launch_ready &&
-                process->state == PROCESS_STATE_EXITING &&
-                !process->exit_cleanup_complete &&
-                !process->exit_cleanup_in_progress &&
-                process_thread_list_complete_locked(process);
             (void)process_publish_terminated_locked(process);
             spin_unlock_irqrestore(&process_registry_lock, flags);
 
-            if (cleanup_ready) (void)process_cleanup_exit_resources(process);
             if (drop_list_reference) object_release(&record->object);
             object_release(&record->object); /* claimed reaper pin */
             object_release(&record->object); /* traversal/reaper pin */
@@ -2239,6 +2327,13 @@ void process_worker_reclaim_pending(process_t *process)
       spin_unlock_irqrestore(&process_registry_lock, flags);
       if (!retry_immediate) break;
     }
+    flags = spin_lock_irqsave(&process_registry_lock);
+    if (process->worker_reapers != 1U)
+        panic("process: cleanup operation ownership lost");
+    process->worker_reapers = 0U;
+    bool finish_exit = process->state == PROCESS_STATE_EXITING;
+    spin_unlock_irqrestore(&process_registry_lock, flags);
+    if (finish_exit) (void)process_cleanup_exit_resources(process);
     object_release(&process->object);
 }
 
@@ -2617,6 +2712,7 @@ static bool process_termination_begin(process_t *process)
     flags = spin_lock_irqsave(&process_registry_lock);
     if (process->state == PROCESS_STATE_ACTIVE && process->thread_count &&
         process->launch_ready && !process->active_syscalls &&
+        !process->worker_reapers &&
         !process->termination_pending &&
         !process->external_termination_in_progress) {
         process->termination_pending = true;
@@ -2827,6 +2923,7 @@ void process_scheduler_post_handoff(process_t *process)
         &process->scheduler_handoff_releases_pending, 1U, __ATOMIC_RELEASE);
     if (pending == ~(u32)0)
         panic("process: scheduler handoff release count overflow");
+    process_cleanup_request(PROCESS_CLEANUP_WORKER_REAP | PROCESS_CLEANUP_EXIT);
     if (!process_cleanup_worker_wake(process))
         panic("process: scheduler handoff before cleanup worker startup");
 }
@@ -2957,7 +3054,8 @@ bool process_terminate_external(process_t *process, i32 status)
     } else {
         flags = spin_lock_irqsave(&process_registry_lock);
         if (process->state == PROCESS_STATE_EXITING &&
-            !process->active_syscalls && process->thread_count &&
+            !process->active_syscalls && !process->worker_reapers &&
+            process->thread_count &&
             !process->external_termination_in_progress &&
             process_thread_list_read_acquire_locked(process)) {
             process->external_termination_in_progress = true;
@@ -3693,6 +3791,7 @@ bool process_user_context_prepare_worker(process_t *process,
             if (process_user_region_release(process, stack_region) ==
                 PROCESS_REGION_RELEASE_INVALID)
                 panic("process: worker-stack rollback failed");
+            process_cleanup_request(PROCESS_CLEANUP_WORKER_REAP);
             return false;
         }
     }
@@ -3709,6 +3808,7 @@ bool process_user_context_prepare_worker(process_t *process,
         if (process_user_region_release(process, stack_region) ==
                 PROCESS_REGION_RELEASE_INVALID)
             panic("process: worker-stack termination rollback failed");
+        process_cleanup_request(PROCESS_CLEANUP_WORKER_REAP);
         return false;
     }
 
@@ -3757,6 +3857,7 @@ bool process_user_context_discard_worker(process_t *process,
     thread->user_fs_base = 0;
     thread->entry = NULL;
     thread->entry_argument = NULL;
+    process_cleanup_request(PROCESS_CLEANUP_WORKER_REAP);
     return true;
 }
 
@@ -4923,6 +5024,7 @@ int process_thread_join(process_t *process, process_handle_t handle,
     process_cli_restore(wait_flags);
 
     if (failure == MG_OK && !claimed) {
+        process_cleanup_request(PROCESS_CLEANUP_WORKER_REAP);
         *out_result = result;
         /* joined is committed before the slot is consumed. A concurrent
          * explicit close may win the slot race; it cannot undo the join. */
@@ -4965,6 +5067,7 @@ int process_thread_detach(process_t *process, process_handle_t handle)
          * that releases join entitlement. A competing close may consume the
          * already-detached handle first. */
         (void)process_handle_close(process, handle);
+        process_cleanup_request(PROCESS_CLEANUP_WORKER_REAP);
     }
     object_release(object);
     return result;
