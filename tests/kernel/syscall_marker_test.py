@@ -11,7 +11,7 @@ from host_fixture import HostFixture
 CC = sys.argv[1] if len(sys.argv)>1 else 'gcc'
 p=ROOT/'tests/kernel/termination_lifecycle_test.py'
 t=ast.parse(p.read_text())
-t.body=[n for n in t.body if not (isinstance(n,ast.Expr) and isinstance(n.value,ast.Call) and isinstance(n.value.func,ast.Name) and n.value.func.id=='run')]
+t.body=[n for n in t.body if not isinstance(n,ast.With) and not (isinstance(n,ast.Expr) and isinstance(n.value,ast.Call) and isinstance(n.value.func,ast.Name) and n.value.func.id=='run')]
 ns={'__file__':str(p),'__name__':'definitions_only'}
 exec(compile(t,str(p),'exec'),ns)
 fn=ns['function']

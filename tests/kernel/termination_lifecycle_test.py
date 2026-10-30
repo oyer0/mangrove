@@ -7,11 +7,11 @@ do not emulate a live kernel stack, filesystem I/O, or guest SMP execution.
 """
 from pathlib import Path
 import re
-import subprocess
 import sys
-import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "tests/shared"))
+from host_fixture import HostFixture
 CC = sys.argv[1] if len(sys.argv) > 1 else "cc"
 
 
@@ -31,14 +31,15 @@ def function(path, name):
 
 
 def run(source, name):
-    with tempfile.TemporaryDirectory(prefix="mangrove-termination-") as tmp:
+    with HostFixture("termination-lifecycle") as workspace:
+        tmp = workspace.path
         path = Path(tmp) / f"{name}.c"
         binary = Path(tmp) / name
         path.write_text('#include "' + str(ROOT / "tests/kernel/process_cleanup_fixture.h") + '"\n' + source)
-        subprocess.run([CC, "-std=c11", "-Wall", "-Wextra", "-Werror",
+        workspace.run([CC, "-std=c11", "-Wall", "-Wextra", "-Werror",
                         "-fsanitize=address,undefined", str(path), "-o",
                         str(binary)], check=True)
-        subprocess.run([str(binary)], check=True)
+        workspace.run([str(binary)], check=True)
 
 
 scheduler_prefix = r'''
@@ -457,5 +458,6 @@ int main(void) {
 # Session state/retirement is covered by the complete production state machine,
 # not the old synchronous allocator/retirement model.
 run(scheduler_prefix + scheduler_functions + scheduler_suffix, "scheduler")
-subprocess.run([sys.executable, str(ROOT / "tests/kernel/session_lifecycle_test.py"),
-                CC], check=True, timeout=90)
+with HostFixture("termination-session") as workspace:
+    workspace.run([sys.executable, str(ROOT / "tests/kernel/session_lifecycle_test.py"),
+                    CC], check=True, timeout=90)

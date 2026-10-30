@@ -4,11 +4,11 @@
 from pathlib import Path
 import os
 import re
-import subprocess
 import sys
-import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "tests/shared"))
+from host_fixture import HostFixture
 CC = sys.argv[1] if len(sys.argv) > 1 else "cc"
 
 
@@ -45,22 +45,23 @@ fixture = fixture.replace("/* WORKER_RETURN */",
                           extract("kernel/src/syscall.c",
                                   "syscall_finish_worker_return"))
 
-with tempfile.TemporaryDirectory(prefix="mangrove-user-context-") as folder:
+with HostFixture("user-context") as workspace:
+    folder = workspace.path
     folder = Path(folder)
     cfile = folder / "user_context_test.c"
     binary = folder / "user_context_test"
     cfile.write_text('#include "' + str(ROOT / "tests/kernel/process_cleanup_fixture.h") + '"\n' + fixture)
-    subprocess.run([CC, "-std=gnu17", "-O1", "-g", "-Wall", "-Wextra",
+    workspace.run([CC, "-std=gnu17", "-O1", "-g", "-Wall", "-Wextra",
         "-Werror", "-fsanitize=address,undefined", "-pthread",
         str(cfile), "-o", str(binary)], check=True)
-    subprocess.run([str(binary)], check=True,
+    workspace.run([str(binary)], check=True,
                    env={**os.environ, "ASAN_OPTIONS": "detect_leaks=0"})
 
     obj = folder / "ring3.o"
-    subprocess.run([CC, "-m64", "-c", str(ROOT / "kernel/src/ring3.s"),
+    workspace.run([CC, "-m64", "-c", str(ROOT / "kernel/src/ring3.s"),
                     "-o", str(obj)], check=True)
-    disassembly = subprocess.run(["objdump", "-d", str(obj)], check=True,
-        capture_output=True, text=True).stdout.lower()
+    disassembly = workspace.run(["objdump", "-d", str(obj)], check=True,
+        ).stdout.lower()
     assert "iretq" in disassembly
     assert "wrmsr" in disassembly and "c0000100" in disassembly
     assert "xor    %r15d,%r15d" in disassembly

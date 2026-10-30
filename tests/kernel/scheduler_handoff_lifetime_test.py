@@ -2,8 +2,11 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Production scheduler/process handoff ownership under an external collector."""
 from pathlib import Path
+import sys
 import ast,re,os,subprocess,sys,tempfile
 R=Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(R / "tests/shared"))
+from host_fixture import HostFixture
 CC=sys.argv[1] if len(sys.argv)>1 else 'gcc'
 def fn(path,name):
  s=(R/path).read_text()
@@ -131,12 +134,13 @@ int main(void) {
 }
 '''
 code=p+functions+helper+main
-with tempfile.TemporaryDirectory(prefix='mangrove-handoff-lifetime-') as folder:
+with HostFixture("scheduler-handoff-lifetime") as workspace:
+ folder = workspace.path
  folder=Path(folder);source=folder/'handoff_lifetime.c';binary=folder/'handoff_lifetime'
  source.write_text('#include "' + str(R / "tests/kernel/process_cleanup_fixture.h") + '"\n' + code)
  env={**os.environ,'ASAN_OPTIONS':'detect_leaks=0'}
- subprocess.run([CC,'-std=gnu17','-g','-O1','-Wall','-Wextra',
+ workspace.run([CC,'-std=gnu17','-g','-O1','-Wall','-Wextra',
      '-Wno-unused-function','-Wno-unused-variable','-Werror',
      '-fsanitize=address,undefined','-pthread',str(source),'-o',str(binary)],
      check=True,env=env)
- subprocess.run([str(binary)],check=True,env=env,timeout=10)
+ workspace.run([str(binary)],check=True,env=env,timeout=10)
