@@ -1408,7 +1408,7 @@ test-libc: test-unicode test-libc-link test-math test-user-tls test-atomics
 	python3 tests/userspace/runtime_stdio_test.py "$(HOST_CC)"
 
 .PHONY: test-atomics
-test-atomics: $(USER_CRT) $(USER_LIBC) $(USER_LIBGCC)
+test-atomics: test-atomic-orders $(USER_CRT) $(USER_LIBC) $(USER_LIBGCC)
 	@mkdir -p "$(BUILD_DIR)/tests"
 	$(HOST_CC) -std=gnu17 -Wall -Wextra -Werror -O1 -g -fno-builtin \
 		-fsanitize=address,undefined -fno-sanitize-recover=all -pthread \
@@ -1424,6 +1424,17 @@ test-atomics: $(USER_CRT) $(USER_LIBC) $(USER_LIBGCC)
 		echo "atomic probe unexpectedly requires an atomic runtime" >&2; exit 1; \
 	fi
 	@echo "C17 atomic host and native-link probes: PASS"
+
+.PHONY: test-atomic-orders
+test-atomic-orders:
+	@mkdir -p "$(BUILD_DIR)/tests"
+	@for level in 0 1 2; do \
+		$(HOST_CC) -std=gnu17 -Wall -Wextra -Werror -Winit-self \
+			-Wuninitialized -O$$level -fsanitize=address,undefined \
+			tests/userspace/stdatomic_order_test.c \
+			-o "$(BUILD_DIR)/tests/atomic-order-$$level" && \
+		ASAN_OPTIONS=detect_leaks=0 "$(BUILD_DIR)/tests/atomic-order-$$level" || exit $$?; \
+	done
 
 .PHONY: test-user-sync
 test-user-sync:

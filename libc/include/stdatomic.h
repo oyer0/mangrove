@@ -140,19 +140,19 @@ static inline int __mangrove_atomic_failure_order(memory_order order)
 }
 
 #define __MANGROVE_ATOMIC_POINTER_FETCH_ADD(object, operand, order) ({ \
-    __auto_type __mg_atomic_object = (object); \
-    __auto_type __mg_atomic_operand = (operand); \
-    memory_order __mg_atomic_order = (order); \
-    __auto_type __mg_atomic_old = \
-        __atomic_load_n(__mg_atomic_object, __ATOMIC_RELAXED); \
-    __typeof__(__mg_atomic_old) __mg_atomic_desired; \
+    __auto_type __mg_pointer_object = (object); \
+    __auto_type __mg_pointer_operand = (operand); \
+    memory_order __mg_pointer_order = (order); \
+    __auto_type __mg_pointer_old = \
+        __atomic_load_n(__mg_pointer_object, __ATOMIC_RELAXED); \
+    __typeof__(__mg_pointer_old) __mg_pointer_desired; \
     do { \
-        __mg_atomic_desired = __mg_atomic_old + __mg_atomic_operand; \
+        __mg_pointer_desired = __mg_pointer_old + __mg_pointer_operand; \
     } while (!__atomic_compare_exchange_n( \
-        __mg_atomic_object, &__mg_atomic_old, __mg_atomic_desired, false, \
-        (int)__mg_atomic_order, \
-        __mangrove_atomic_failure_order(__mg_atomic_order))); \
-    __mg_atomic_old; \
+        __mg_pointer_object, &__mg_pointer_old, __mg_pointer_desired, false, \
+        (int)__mg_pointer_order, \
+        __mangrove_atomic_failure_order(__mg_pointer_order))); \
+    __mg_pointer_old; \
 })
 
 #define atomic_fetch_add_explicit(object, operand, order) ({ \
@@ -170,19 +170,19 @@ static inline int __mangrove_atomic_failure_order(memory_order order)
     atomic_fetch_sub_explicit((object), (operand), memory_order_seq_cst)
 
 #define __MANGROVE_ATOMIC_POINTER_FETCH_SUB(object, operand, order) ({ \
-    __auto_type __mg_atomic_object = (object); \
-    __auto_type __mg_atomic_operand = (operand); \
-    memory_order __mg_atomic_order = (order); \
-    __auto_type __mg_atomic_old = \
-        __atomic_load_n(__mg_atomic_object, __ATOMIC_RELAXED); \
-    __typeof__(__mg_atomic_old) __mg_atomic_desired; \
+    __auto_type __mg_pointer_object = (object); \
+    __auto_type __mg_pointer_operand = (operand); \
+    memory_order __mg_pointer_order = (order); \
+    __auto_type __mg_pointer_old = \
+        __atomic_load_n(__mg_pointer_object, __ATOMIC_RELAXED); \
+    __typeof__(__mg_pointer_old) __mg_pointer_desired; \
     do { \
-        __mg_atomic_desired = __mg_atomic_old - __mg_atomic_operand; \
+        __mg_pointer_desired = __mg_pointer_old - __mg_pointer_operand; \
     } while (!__atomic_compare_exchange_n( \
-        __mg_atomic_object, &__mg_atomic_old, __mg_atomic_desired, false, \
-        (int)__mg_atomic_order, \
-        __mangrove_atomic_failure_order(__mg_atomic_order))); \
-    __mg_atomic_old; \
+        __mg_pointer_object, &__mg_pointer_old, __mg_pointer_desired, false, \
+        (int)__mg_pointer_order, \
+        __mangrove_atomic_failure_order(__mg_pointer_order))); \
+    __mg_pointer_old; \
 })
 
 #define atomic_fetch_sub_explicit(object, operand, order) ({ \
