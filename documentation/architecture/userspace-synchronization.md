@@ -16,7 +16,10 @@ arithmetic, `atomic_flag`, and thread/signal fences. Fetch operations return
 the prior value and evaluate each argument once. These operations link without
 `libatomic`. Larger or aggregate atomic objects are outside the supported
 contract; native links intentionally do not supply an atomic helper runtime.
-Atomic objects must meet their compiler-provided natural alignment.
+Atomic objects must meet their compiler-provided natural alignment. Pointer
+fetch operations use compare/exchange with the requested success order and
+the corresponding legal failure order; internal captures evaluate that order
+once.
 
 Acquire/release operations provide the normal publication relationship. For
 example, a producer stores shared data and then publishes a state with
