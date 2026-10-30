@@ -15,6 +15,9 @@
 
 #define MUTEX_ITERATIONS 2000U
 
+/* Controlled scheduler refusal, not a claim of normal native reachability. */
+static _Thread_local unsigned controlled_refusals;
+static _Thread_local bool refusal_changes_word;
 static _Thread_local process_t *current_process;
 static _Thread_local kernel_thread_t *current_thread;
 static pthread_mutex_t park_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -79,6 +82,17 @@ static void park_end(void)
 
 bool scheduler_block(void)
 {
+    if (controlled_refusals) {
+        unsigned prior = controlled_refusals--;
+        if (prior == 2U || refusal_changes_word) {
+            if (refusal_changes_word)
+                __atomic_store_n((u32 *)(uintptr_t)current_process->mapped_word,
+                                  8U, __ATOMIC_RELEASE);
+            assert(user_sync_wake_u32(current_process,
+                current_process->mapped_word, 1U) == 1);
+        }
+        return false;
+    }
     kernel_thread_t *thread = current_thread;
     fail_pthread(pthread_mutex_lock(&thread->event_lock));
     if (thread->event_pending) {
@@ -763,10 +777,36 @@ static void test_concurrent_timeout_wake_races(void)
     }
 }
 
+static void test_refusal_after_notification(void)
+{
+    _Atomic u32 word = 7U;
+    process_t process;
+    kernel_thread_t thread;
+    process_fixture_init(&process, (volatile u32 *)&word);
+    thread_fixture_init(&thread, &process);
+    current_context(&process, &thread);
+    controlled_refusals = 2U;
+    refusal_changes_word = false;
+    assert(mg_sync_wait_u32((volatile u32 *)&word, 7U,
+                            MG_SYNC_WAIT_FOREVER) == MG_ERR_BUSY);
+    assert(!controlled_refusals && word == 7U && !process.active_leases);
+    assert(mg_sync_wake_u32((volatile u32 *)&word, 1U) == 0);
+    controlled_refusals = 1U;
+    refusal_changes_word = true;
+    assert(mg_sync_wait_u32((volatile u32 *)&word, 7U,
+                            MG_SYNC_WAIT_FOREVER) == MG_OK);
+    assert(!controlled_refusals && word == 8U && !process.active_leases);
+    assert(mg_sync_wake_u32((volatile u32 *)&word, 1U) == 0);
+    refusal_changes_word = false;
+    thread_fixture_destroy(&thread);
+    fail_pthread(pthread_mutex_destroy(&process.mapping_lock));
+}
+
 int main(void)
 {
     clock_gettime(CLOCK_MONOTONIC, &clock_origin);
     user_sync_init();
+    test_refusal_after_notification();
     test_address_wait_contract();
     test_wait_wake_and_lease();
     test_multiple_waiters_and_address_space_key();
