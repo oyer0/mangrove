@@ -180,8 +180,10 @@ mg_result_t user_sync_wait_u32(struct process *process,
                 waiter.linked = false;
             spin_unlock_irqrestore(&user_sync_lock, lock_flags);
             if (woken) {
-                user_sync_finish_waiter(&waiter, &lease);
-                return MG_OK;
+                /* A selected wake is only a notification, even when blocking
+                 * refused. Recheck the word/interruption/deadline through the
+                 * same loop instead of reporting unchanged data as success. */
+                continue;
             }
             scheduler_clear_event_wake(thread);
             vmm_user_range_release(&lease);

@@ -52,7 +52,9 @@ Wake returns the number selected, including zero. A successful wait returns
 only after a wake and an acquire read observes a value different from the
 expected value; a wake that finds the word unchanged atomically re-registers
 the waiter. Kernel scheduler events may cause an internal spurious reschedule,
-but do not by themselves complete the wait. If the value already differs at
+but do not by themselves complete the wait. A notification racing a scheduler
+blocking refusal also rechecks the word; refusal without a qualifying change
+returns `MG_ERR_BUSY`, with no registered waiter or retained lease. If the value already differs at
 entry, wait returns `MG_ERR_WOULD_BLOCK`; timeout, Ctrl+C, and orderly shutdown
 return `MG_ERR_TIMEOUT`, `MG_ERR_INTERRUPTED`, and `MG_ERR_SHUTDOWN`. Process
 exit wakes a blocked waiter and prevents address-space teardown until its
