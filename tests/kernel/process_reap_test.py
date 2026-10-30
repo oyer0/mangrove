@@ -149,6 +149,7 @@ static void spin_unlock(u32 *lock){spin_unlock_irqrestore(lock,0);}
 static u64 process_cli_save(void){return 1;}
 static void process_cli_restore(u64 flags){(void)flags;}
 static kernel_thread_t *thread_current(void){return &parent_thread;}
+static void scheduler_clear_event_wake(kernel_thread_t*t){t->event_wake_pending=false;}
 static bool scheduler_wake_waiter(kernel_thread_t *thread)
 {if(!thread)return false;thread->event_wake_pending=true;return true;}
 static scheduler_wake_result_t scheduler_wake_waiter_result(
@@ -256,7 +257,7 @@ for name in ('process_thread_list_complete_locked',
              'process_thread_member_locked',
              'process_session_collection_ready_locked',
              'process_worker_records_release_all',
-             'process_waiter_wake_release',
+             'process_waiter_wake_locked',
              'process_publish_terminated_locked',
              'process_scheduler_handoff_complete_internal',
              'process_scheduler_handoff_complete',
@@ -295,7 +296,7 @@ static void reset(bool active)
  destroyed_roots=released_memory=frees=external_terminations=0;
  block_success=sleep_success=true;request_shutdown=false;
  parent.threads=parent.main_thread=&parent_thread;parent.thread_count=1;
- parent_thread.process=&parent;
+ parent_thread.process=&parent;parent_thread.process_reference_held=true;
  parent_thread.process_state=THREAD_PROCESS_ATTACHED;
  parent_thread.state=THREAD_STATE_RUNNING;
 }

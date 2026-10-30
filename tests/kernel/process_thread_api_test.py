@@ -349,11 +349,8 @@ static bool process_user_context_prepare_worker(process_t *p,kernel_thread_t*t,
  t->user_context.rdi=arg;t->user_context.stack_pointer=s->mapping_base+8*4096;
  t->user_fs_base=tls->mapping_base;return true;}
 static bool process_user_context_discard_worker(process_t*p,kernel_thread_t*t);
-static kernel_thread_t *process_publish_terminated_locked(process_t*p,
-                                                         process_t **waiter)
-{(void)p;if(waiter)*waiter=NULL;return NULL;}
-static void process_waiter_wake_release(process_t*p,kernel_thread_t*t)
-{(void)p;(void)t;}
+static bool process_publish_terminated_locked(process_t*p)
+{(void)p;return false;}
 static bool process_cleanup_exit_resources(process_t*p){(void)p;return true;}
 static bool scheduler_unblock_locked(kernel_thread_t*t)
 {if(!t||t->state!=THREAD_STATE_BLOCKED||t->queued||
