@@ -238,7 +238,11 @@ exit while its launch is still unpublished. If publication observes the
 process in `EXITING`, it re-notifies the existing cleanup worker after releasing
 the registry lock. The worker uses the process registry as its authoritative
 work list; its event is a latched notification, so an exit completed before
-publication cannot be stranded by an earlier worker scan.
+publication cannot be stranded by an earlier worker scan. A sibling that
+retains the child's handle before spawn returns receives BUSY from wait until
+`launch_ready` is published. Unpublished rollback therefore cannot leave a
+parent wait registration, thread-list pin or retained child reference asleep
+without a completion event.
 
 Every returning syscall is admitted under the process registry lock and holds
 a process-object reference until its syscall frame and user-memory leases have
