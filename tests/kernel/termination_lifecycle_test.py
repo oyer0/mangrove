@@ -226,7 +226,7 @@ scheduler_functions = "".join(function(path, name) for path, name in (
     ("kernel/src/process.c", "process_thread_list_read_acquire_locked"),
     ("kernel/src/process.c", "process_thread_list_read_release"),
     ("kernel/src/scheduler.c", "scheduler_thread_state_snapshot"),
-    ("kernel/src/process.c", "process_waiter_wake_release"),
+    ("kernel/src/process.c", "process_waiter_wake_locked"),
     ("kernel/src/process.c", "process_storage_authorization_clear_locked"),
     ("kernel/src/process.c", "process_publish_terminated_locked"),
     ("kernel/src/process.c", "process_finish_termination"),

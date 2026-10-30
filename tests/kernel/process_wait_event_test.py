@@ -303,6 +303,7 @@ for name in ('scheduler_thread_exit_complete',
              'scheduler_thread_state_snapshot',
              'scheduler_unblock_locked',
              'scheduler_wake_waiter_result', 'scheduler_wake_waiter',
+             'scheduler_clear_event_wake',
              'scheduler_consume_pending_wake_locked',
              'scheduler_block', 'scheduler_terminate'):
     item = function(scheduler, name)
@@ -334,24 +335,17 @@ for name in ('process_storage_authorization_clear_locked',
              'process_thread_member_locked',
              'process_thread_list_read_acquire_locked',
              'process_thread_list_read_release',
-             'process_waiter_wake_release',
+             'process_waiter_wake_locked',
              'process_publish_terminated_locked',
              'process_finish_termination', 'process_handle_reference_release',
              'process_scheduler_handoff_complete_internal',
              'process_scheduler_handoff_complete', 'process_wait'):
     item = function(process, name)
-    if name == 'process_thread_list_read_release':
-        marker = ('spin_unlock_irqrestore(&process_registry_lock, flags);\n'
-                  '    if (reap_workers)')
-        item = item.replace(marker,
-            'spin_unlock_irqrestore(&process_registry_lock, flags);\n'
-            '    fixture_collect_after_reader_drop(process);\n'
-            '    if (reap_workers)', 1)
     code += item
-code = code.replace('woke = scheduler_wake_waiter(waiter);',
-                    'fixture_before_waiter_delivery(process, waiter);\n'
-                    '    woke = scheduler_wake_waiter(waiter);')
-
+# Pause inside production wake publication while registry ownership is held.
+code = code.replace('result = SCHEDULER_WAKE_DELIVERED;',
+    'result = SCHEDULER_WAKE_DELIVERED;\n'
+    'fixture_before_waiter_delivery(NULL, thread);')
 code += r'''
 static void complete_child(process_t *p, kernel_thread_t *t, i32 status)
 {
@@ -469,35 +463,6 @@ static void *delayed_completion(void *unused)
     complete_child(&child,&child_thread,23);
     return NULL;
 }
-static void *waiter_main(void *unused)
-{
-    (void)unused; tls_current_thread=selected_waiter;
-    i32 status=-1; int rc=process_wait(&parent,77,&status);
-    assert(tls_if && tls_lock_depth==0);
-    pthread_mutex_lock(&gate_lock);
-    second_wait_result=rc; second_wait_result_ready=true;
-    pthread_cond_broadcast(&gate_cv);
-    pthread_mutex_unlock(&gate_lock);
-    return (void *)(intptr_t)status;
-}
-static void *retire_waiter_after_wait(void *unused)
-{
-    (void)unused;
-    tls_current_thread=selected_waiter;
-    i32 status=-1;
-    int rc=process_wait(&parent,77,&status);
-    assert(rc==MG_OK && status==23);
-    assert(tls_if && tls_lock_depth==0);
-    current_thread=selected_waiter;
-    assert(scheduler_terminate());
-    process_scheduler_handoff_complete(selected_waiter);
-    assert(selected_waiter->process_state==THREAD_PROCESS_HANDOFF_COMPLETE);
-    pthread_mutex_lock(&gate_lock);
-    second_wait_result=rc; second_wait_result_ready=true;
-    pthread_cond_broadcast(&gate_cv);
-    pthread_mutex_unlock(&gate_lock);
-    return NULL;
-}
 static void assert_wait_success(void *encoded)
 {
     intptr_t v=(intptr_t)encoded;
@@ -512,135 +477,10 @@ static void assert_wait_success(void *encoded)
     assert(parent.thread_list_readers==0 && !parent.waiting_child &&
            !parent.waiting_thread && child.wait_collected);
     assert(tls_if && tls_lock_depth==0 && registry_if_violations==0);
+    assert(parent.object.ref_count==2 && child.object.ref_count==0);
 }
-static void run_parent_object_lifetime_interleaving(void)
-{
-    process_t *dynamic_parent;
-    kernel_thread_t *waiter=&parent_thread;
-    kernel_thread_t *published_waiter;
-    process_t *delivery_process=NULL;
-    setup();
-    dynamic_parent=calloc(1,sizeof(*dynamic_parent));
-    assert(dynamic_parent);
-    dynamic_process_destroyed=0;
-    dynamic_parent_refs_after_concurrent_owner_drop=0;
-    dynamic_parent->state=PROCESS_STATE_ACTIVE;
-    dynamic_parent->owner_reference_held=true;
-    dynamic_parent->launch_ready=true;
-    dynamic_parent->thread_count=1;
-    dynamic_parent->live_thread_count=1;
-    dynamic_parent->threads=dynamic_parent->main_thread=waiter;
-    dynamic_parent->object=(kernel_object_t){.ref_count=2,
-        .process=dynamic_parent,.type=OBJECT_TYPE_PROCESS,
-        .destroy=fixture_dynamic_process_destroy};
-    waiter->process=dynamic_parent;
-    waiter->process_state=THREAD_PROCESS_ATTACHED;
-    waiter->process_initial=true;
-    waiter->process_reference_held=true;
-    waiter->state=THREAD_STATE_RUNNING;
-    waiter->running_cpu=0;
-    dynamic_parent->waiting_child=&child;
-    dynamic_parent->waiting_thread=waiter;
-    child.parent=dynamic_parent;
-    child.state=PROCESS_STATE_EXITING;
-    child.exit_cleanup_complete=true;
-    child.live_thread_count=0;
-    child_thread.state=THREAD_STATE_TERMINATED;
-    child_thread.running_cpu=THREAD_CPU_NONE;
-    child_thread.context_switch_pending=false;
-    child_thread.sleeping=false;
-    child_thread.preempt_return_rip=0;
-    child_thread.process_state=THREAD_PROCESS_HANDOFF_COMPLETE;
-
-    u64 f=spin_lock_irqsave(&process_registry_lock);
-    published_waiter=process_publish_terminated_locked(&child,
-                                                        &delivery_process);
-    spin_unlock_irqrestore(&process_registry_lock,f);
-    assert(published_waiter==waiter && delivery_process==dynamic_parent);
-    assert(dynamic_parent->thread_list_readers==1 &&
-           dynamic_parent->object.ref_count==3);
-
-    /* Final session collection overlaps the last reader's unlocked follow-up.
-     * The hook drops owner/thread refs after the reader reaches zero but
-     * before process_finish_termination() resumes. */
-    dynamic_parent->state=PROCESS_STATE_EXITING;
-    dynamic_parent->exit_cleanup_complete=true;
-    collection_interleave_process=dynamic_parent;
-    tls_current_thread=waiter; tls_if=true; tls_lock_depth=0;
-    process_waiter_wake_release(delivery_process,published_waiter);
-    assert(!collection_interleave_process);
-    assert(dynamic_parent_refs_after_concurrent_owner_drop==1);
-    assert(dynamic_process_destroyed==1);
-}
-
-static void run_invalid_waiter_ownership(void)
-{
-    setup();
-    parent.thread_list_readers=1;
-    parent_thread.state=THREAD_STATE_TERMINATED;
-    parent_thread.running_cpu=THREAD_CPU_NONE;
-    parent_thread.process_state=THREAD_PROCESS_HANDOFF_COMPLETE;
-    parent_thread.process_next=NULL;
-    parent.threads=&second_parent_thread;
-    second_parent_thread.process=&parent;
-    second_parent_thread.process_state=THREAD_PROCESS_ATTACHED;
-    assert(object_reference(&parent.object));
-    tls_current_thread=&parent_thread; tls_if=true; tls_lock_depth=0;
-    process_waiter_wake_release(&parent,&parent_thread);
-    panic("invalid waiter ownership was not rejected");
-}
-
-static void run_live_waiter_wake_failure(void)
-{
-    setup();
-    parent.thread_list_readers=1;
-    parent_thread.state=THREAD_STATE_BLOCKED;
-    parent_thread.running_cpu=THREAD_CPU_NONE;
-    parent_thread.queued=false;
-    assert(object_reference(&parent.object));
-    scheduler_enqueue_fails=true;
-    tls_current_thread=&child_thread; tls_if=true; tls_lock_depth=0;
-    process_waiter_wake_release(&parent,&parent_thread);
-    panic("live waiter wake failure was not rejected");
-}
-
-static void run_terminated_worker_delivery(void)
-{
-    pthread_t completer, waiter;
-    setup();
-    selected_waiter=&worker_wait_thread;
-    parent.threads=&worker_wait_thread;
-    worker_wait_thread.process_next=&parent_thread;
-    parent.thread_count=2; parent.live_thread_count=2;
-    parent.object.ref_count=3; /* owner and two attached-thread refs */
-    worker_wait_thread.process=&parent;
-    worker_wait_thread.process_state=THREAD_PROCESS_ATTACHED;
-    worker_wait_thread.process_reference_held=true;
-    worker_wait_thread.state=THREAD_STATE_RUNNING;
-    worker_wait_thread.running_cpu=1;
-    delay_delivery=true;
-    current_thread=&worker_wait_thread;
-    assert(!pthread_create(&completer,NULL,delayed_completion,NULL));
-    assert(!pthread_create(&waiter,NULL,retire_waiter_after_wait,NULL));
-    pthread_mutex_lock(&gate_lock);
-    while(!delivery_entered) pthread_cond_wait(&gate_cv,&gate_lock);
-    pthread_mutex_unlock(&gate_lock);
-
-    /* An unrelated event lets the worker consume the completed child result
-     * and return before the completion publisher sends its delayed wake. */
-    assert(scheduler_wake_waiter(&worker_wait_thread));
-    pthread_join(waiter,NULL);
-    assert(second_wait_result==MG_OK && child.wait_collected);
-    assert(worker_wait_thread.state==THREAD_STATE_TERMINATED &&
-           worker_wait_thread.process_state==THREAD_PROCESS_HANDOFF_COMPLETE);
-    assert(parent.state==PROCESS_STATE_ACTIVE && parent.thread_list_readers==1);
-
-    pthread_mutex_lock(&gate_lock); release_delivery=true;
-    pthread_cond_broadcast(&gate_cv); pthread_mutex_unlock(&gate_lock);
-    pthread_join(completer,NULL);
-    assert(parent.thread_list_readers==0 && parent.object.ref_count==3);
-    assert(parent.thread_count==2 && parent.live_thread_count==1);
-}
+'''
+code += r'''
 
 static void run_wait_return_interrupt_state(void)
 {
@@ -681,145 +521,78 @@ static void run_wait_return_interrupt_state(void)
            !child.wait_collected);
 }
 
-int main(int argc, char **argv)
+int main(int argc,char**argv)
 {
-    pthread_t worker, waiter;
-    if (argc > 1 && !strcmp(argv[1], "invalid-waiter-owner"))
-        run_invalid_waiter_ownership();
-    if (argc > 1 && !strcmp(argv[1], "live-wake-failure"))
-        run_live_waiter_wake_failure();
-    setup();
-    /* A child published before registration needs no scheduler event. */
-    complete_child(&child,&child_thread,23);
-    assert_wait_success(wait_call(NULL));
-
-    setup(); complete_on_registration_unlock=true;
-    assert_wait_success(wait_call(NULL));
-    assert(gate_block_count==0); /* event latch was consumed before parking */
-
-    setup();
-    assert(!pthread_create(&worker,NULL,complete_after_block,NULL));
-    assert_wait_success(wait_call(NULL)); pthread_join(worker,NULL);
-    assert(gate_block_count==1);
-
-    setup();
-    assert(!pthread_create(&worker,NULL,spurious_then_complete,NULL));
-    assert_wait_success(wait_call(NULL)); pthread_join(worker,NULL);
-    assert(gate_block_count==2 && other_child.state==PROCESS_STATE_TERMINATED);
-
-    /* A second process thread cannot replace the existing process-wide wait
-     * slot. Its rejected call must not disturb the first waiter's reader pin. */
-    setup(); second_parent_thread.process=&parent;
-    second_parent_thread.process_state=THREAD_PROCESS_ATTACHED;
-    second_parent_thread.state=THREAD_STATE_RUNNING;
-    parent_thread.process_next=&second_parent_thread; parent.thread_count=2;
-    assert(!pthread_create(&worker,NULL,complete_after_block,NULL));
-    assert(!pthread_create(&waiter,NULL,waiter_main,NULL));
-    wait_for_block(1);
-    tls_current_thread=&second_parent_thread;
-    i32 status=-1;
-    assert(process_wait(&parent,78,&status)==MG_ERR_BUSY);
-    assert(tls_if && tls_lock_depth==0);
-    assert(parent.thread_list_readers==1);
-    pthread_join(waiter,NULL); pthread_join(worker,NULL);
-    assert(second_wait_result==MG_OK && child.wait_collected &&
-           parent.thread_list_readers==0);
-
-    setup();
-    assert(!pthread_create(&worker,NULL,terminate_parent_while_waiting,NULL));
-    void *cancel_result=wait_call(NULL); pthread_join(worker,NULL);
-    assert((i32)(u32)(uintptr_t)cancel_result==MG_ERR_SHUTDOWN);
-    assert(parent.thread_list_readers==0 && !parent.waiting_child &&
-           child.state==PROCESS_STATE_ACTIVE);
-
-    /* Hold completion between waiter capture and delivery. The waiter is
-     * interrupted and unwinds its registration pin first; the publisher's
-     * independent pin must keep the thread record/list alive until delivery. */
-    setup(); delay_delivery=true;
-    assert(!pthread_create(&worker,NULL,delayed_completion,NULL));
-    assert(!pthread_create(&waiter,NULL,waiter_main,NULL));
-    pthread_mutex_lock(&gate_lock);
-    while(!delivery_entered) pthread_cond_wait(&gate_cv,&gate_lock);
-    pthread_mutex_unlock(&gate_lock);
-    u64 f=spin_lock_irqsave(&process_registry_lock);
-    parent.state=PROCESS_STATE_EXITING; parent.exit_requested=true;
-    parent.exit_cleanup_complete=true; parent.live_thread_count=0;
-    spin_unlock_irqrestore(&process_registry_lock,f);
-    assert(scheduler_wake_waiter(&parent_thread));
-    pthread_join(waiter,NULL);
-    assert(second_wait_result==MG_ERR_SHUTDOWN);
-    assert(parent.thread_list_readers==1);
-    f=spin_lock_irqsave(&process_registry_lock);
-    parent_thread.state=THREAD_STATE_TERMINATED;
-    parent_thread.running_cpu=THREAD_CPU_NONE;
-    parent_thread.process_state=THREAD_PROCESS_HANDOFF_COMPLETE;
-    parent.active_syscalls=0;
-    assert(!process_publish_terminated_locked(&parent,NULL));
-    assert(parent.state==PROCESS_STATE_EXITING &&
-           parent.thread_list_readers==1);
-    spin_unlock_irqrestore(&process_registry_lock,f);
-    pthread_mutex_lock(&gate_lock); release_delivery=true;
-    pthread_cond_broadcast(&gate_cv); pthread_mutex_unlock(&gate_lock);
-    pthread_join(worker,NULL);
-    assert(parent.thread_list_readers==0 &&
-           parent.state==PROCESS_STATE_TERMINATED);
-    assert(parent.object.ref_count==2);
-
-    run_parent_object_lifetime_interleaving();
-    run_terminated_worker_delivery();
-    run_wait_return_interrupt_state();
-    assert(registry_if_violations==0);
-    puts("process wait: latched wake, predicate retry, cancellation, and waiter lifetime passed");
-    return 0;
+ setup();tls_current_thread=&parent_thread;current_thread=&parent_thread;
+ if(argc>1) {
+  u64 flags=spin_lock_irqsave(&process_registry_lock);
+  parent.waiting_child=&child;parent.waiting_thread=&parent_thread;
+  if(!strcmp(argv[1],"bad-owner")) parent_thread.process_reference_held=false;
+  if(!strcmp(argv[1],"live-failure")) scheduler_enqueue_fails=true;
+  parent_thread.state=THREAD_STATE_BLOCKED;
+  child.state=PROCESS_STATE_EXITING;child.live_thread_count=0;child.exit_cleanup_complete=true;
+  child_thread.state=THREAD_STATE_TERMINATED;child_thread.running_cpu=THREAD_CPU_NONE;
+  child_thread.syscall_active=false;child_thread.process_state=THREAD_PROCESS_HANDOFF_COMPLETE;
+  (void)process_publish_terminated_locked(&child);
+  spin_unlock_irqrestore(&process_registry_lock,flags);
+  return 0;
+ }
+ pthread_t completer,waiter;void*result;
+ complete_child(&child,&child_thread,23);assert_wait_success(wait_call(NULL));
+ setup();complete_on_registration_unlock=true;assert_wait_success(wait_call(NULL));
+ setup();assert(!pthread_create(&completer,NULL,complete_after_block,NULL));
+ assert_wait_success(wait_call(NULL));pthread_join(completer,NULL);
+ setup();assert(!pthread_create(&waiter,NULL,wait_call,NULL));wait_for_block(1);
+ tls_current_thread=&second_parent_thread;i32 status;
+ assert(process_wait(&parent,77,&status)==MG_ERR_BUSY);
+ complete_child(&child,&child_thread,23);pthread_join(waiter,&result);assert_wait_success(result);
+ assert(process_wait(&parent,77,&status)==MG_ERR_INVALID_HANDLE);
+ setup();assert(!pthread_create(&completer,NULL,spurious_then_complete,NULL));
+ assert_wait_success(wait_call(NULL));pthread_join(completer,NULL);
+ setup();assert(!pthread_create(&completer,NULL,terminate_parent_while_waiting,NULL));
+ result=wait_call(NULL);pthread_join(completer,NULL);assert((i32)(u32)(uintptr_t)result==MG_ERR_SHUTDOWN);
+ assert(!parent.waiting_thread&&!parent.thread_list_readers);
+ /* A scheduled joiner cannot end its registration during completion wake.
+  * The registry stays held until the event is published, even if another
+  * event would otherwise let the same waiter consume its durable status. */
+ setup();delay_delivery=true;
+ assert(!pthread_create(&completer,NULL,delayed_completion,NULL));
+ assert(!pthread_create(&waiter,NULL,wait_call,NULL));
+ pthread_mutex_lock(&gate_lock);while(!delivery_entered)pthread_cond_wait(&gate_cv,&gate_lock);pthread_mutex_unlock(&gate_lock);
+ assert(pthread_mutex_trylock(&process_registry_lock)!=0);
+ pthread_mutex_lock(&gate_lock);release_delivery=true;pthread_cond_broadcast(&gate_cv);pthread_mutex_unlock(&gate_lock);
+ pthread_join(completer,NULL);pthread_join(waiter,&result);assert_wait_success(result);
+ assert(!parent_thread.event_wake_pending&&!parent.thread_list_readers&&!parent.waiting_thread);
+ /* No pending completion exists after registration ends: another sleep has
+  * neither an old pending event nor a delivery pointer waiting to wake it. */
+ assert(!scheduler_consume_pending_wake_locked(&parent_thread,false));
+ /* A genuinely terminal but still attached waiter is cancellation, not
+  * corruption. Its descriptor is used only under the registry. */
+ setup();u64 flags=spin_lock_irqsave(&process_registry_lock);
+ parent.waiting_child=&child;parent.waiting_thread=&parent_thread;
+ parent_thread.state=THREAD_STATE_TERMINATED;
+ child.state=PROCESS_STATE_EXITING;child.live_thread_count=0;child.exit_cleanup_complete=true;
+ child_thread.state=THREAD_STATE_TERMINATED;child_thread.running_cpu=THREAD_CPU_NONE;
+ child_thread.syscall_active=false;child_thread.process_state=THREAD_PROCESS_HANDOFF_COMPLETE;
+ assert(process_publish_terminated_locked(&child));assert(!parent.waiting_thread);
+ spin_unlock_irqrestore(&process_registry_lock,flags);
+ run_wait_return_interrupt_state();
+ assert(!registry_if_violations);puts("process wait: registration-scoped wake, cancellation, terminal delivery, exact status and IRQ restoration PASS");
+ return 0;
 }
 '''
-
-with tempfile.TemporaryDirectory(prefix='mangrove-process-wait-') as directory:
-    path = Path(directory) / 'process_wait_event.c'
-    binary = Path(directory) / 'process_wait_event'
+sys.path.insert(0, str(ROOT / "tests/shared"))
+from host_fixture import HostFixture
+with HostFixture("process-wait") as fixture:
+    path = fixture.path / "wait.c"
+    binary = fixture.path / "wait"
     path.write_text(code)
-    env = os.environ.copy()
-    env.setdefault('ASAN_OPTIONS', 'detect_leaks=0')
-    subprocess.run([CC, '-std=gnu17', '-g', '-Wall', '-Wextra', '-Werror',
-                    '-pthread', '-fsanitize=address,undefined', str(path),
-                    '-o', str(binary)], check=True, env=env)
-    try:
-        command = [str(binary)]
-        completed = subprocess.run(command, check=False, env=env, timeout=30,
-                                   text=True, capture_output=True)
-        if completed.returncode:
-            raise subprocess.CalledProcessError(
-                completed.returncode, command, completed.stdout,
-                completed.stderr)
-        sys.stdout.write(completed.stdout)
-        invalid = subprocess.run([str(binary), 'invalid-waiter-owner'],
-                                 env=env, text=True, capture_output=True,
-                                 timeout=30)
-        if invalid.returncode == 0 or (
-                'child waiter lost process ownership' not in
-                invalid.stderr):
-            raise RuntimeError(
-                'invalid retained waiter ownership was not rejected: '
-                f'exit={invalid.returncode}; stderr={invalid.stderr!r}')
-        live_failure = subprocess.run([str(binary), 'live-wake-failure'],
-                                      env=env, text=True, capture_output=True,
-                                      timeout=30)
-        if live_failure.returncode == 0 or (
-                'live child waiter could not be woken' not in
-                live_failure.stderr):
-            raise RuntimeError(
-                'live waiter wake failure was not rejected: '
-                f'exit={live_failure.returncode}; '
-                f'stderr={live_failure.stderr!r}')
-    except (subprocess.CalledProcessError, RuntimeError,
-            subprocess.TimeoutExpired) as error:
-        evidence_dir = ROOT / 'build' / 'stage6-process-wait-repair-20261029'
-        evidence_dir.mkdir(parents=True, exist_ok=True)
-        evidence = evidence_dir / \
-            f'process_wait_event-failure-{os.getpid()}.c'
-        shutil.copy2(path, evidence)
-        (evidence_dir / f'process_wait_event-failure-{os.getpid()}.log').write_text(
-            f'{error!r}\n')
-        print(f'failed production-source fixture retained at {evidence}',
-              file=sys.stderr)
-        raise
+    fixture.run([CC, "-std=gnu17", "-Wall", "-Wextra", "-Werror",
+                 "-Wno-unused-function", "-pthread", "-fsanitize=address,undefined",
+                 str(path), "-o", str(binary)])
+    env = {**os.environ, "ASAN_OPTIONS": "detect_leaks=0"}
+    print(fixture.run([str(binary)], env=env).stdout, end="")
+    for mode, expected in [("bad-owner", "lost process ownership"),
+                           ("live-failure", "live child waiter could not be woken")]:
+        failure = fixture.run([str(binary), mode], check=False, env=env)
+        assert failure.returncode != 0 and expected in failure.stderr

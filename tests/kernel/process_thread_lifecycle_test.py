@@ -269,7 +269,7 @@ names = (
     "process_thread_member_locked",
     "process_thread_list_read_acquire_locked",
     "process_thread_list_read_release",
-    "process_waiter_wake_release",
+    "process_waiter_wake_locked",
     "process_cleanup_candidate_locked",
     "process_cleanup_worker_release_handoffs_once",
     "process_cleanup_worker_run_once",

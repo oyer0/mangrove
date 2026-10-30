@@ -329,7 +329,7 @@ for name in (
         'process_thread_member_locked',
         'process_session_collection_ready_locked',
         'process_worker_records_release_all',
-        'process_waiter_wake_release',
+        'process_waiter_wake_locked',
         'process_publish_terminated_locked',
         'process_finish_termination',
         'process_scheduler_handoff_complete_internal',
