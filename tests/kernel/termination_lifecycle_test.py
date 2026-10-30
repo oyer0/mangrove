@@ -206,8 +206,8 @@ static scheduler_wake_result_t scheduler_wake_waiter_result(
         SCHEDULER_WAKE_FAILED;}
 static void process_worker_reclaim_pending(process_t *process)
 {assert(process && !process_registry_lock); worker_reap_calls++;}
-static void process_cleanup_worker_wake(process_t *process)
-{assert(process && !process_registry_lock);}
+static bool process_cleanup_worker_wake(process_t *process)
+{assert(process && !process_registry_lock); return true;}
 static bool process_exit(process_t *process, i32 status)
 {(void)status; assert(process->state == PROCESS_STATE_ACTIVE &&
                       !process->active_syscalls);

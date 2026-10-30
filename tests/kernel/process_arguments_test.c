@@ -232,6 +232,7 @@ static void boundaries(void)
 }
 
 #define PROCESS_STATE_ACTIVE 0
+#define PROCESS_STATE_EXITING 1
 #define PROCESS_NO_SESSION 0
 #define PROCESS_INITIAL_STDIN_HANDLE 2
 #define PROCESS_INITIAL_CONSOLE_HANDLE 1
@@ -248,6 +249,8 @@ static u64 spin_lock_irqsave(u32 *lock)
 {assert(!*lock);*lock=1;return 0;}
 static void spin_unlock_irqrestore(u32 *lock,u64 flags)
 {(void)flags;assert(*lock);*lock=0;}
+static bool process_cleanup_worker_wake(process_t *process)
+{assert(process && !process_registry_lock);return true;}
 static bool thread_live, child_live, parent_handle_live;
 static unsigned child_handles;
 static process_t spawned;

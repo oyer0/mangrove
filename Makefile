@@ -1837,7 +1837,8 @@ test-ipc-capacity:
 	ASAN_OPTIONS=detect_leaks=0 "$(BUILD_DIR)/tests/ipc_capacity_test"
 
 test-sync: test-spinlock-context test-ipc-capacity test-preemption-accounting \
-		test-irq-lifecycle test-atomics test-user-sync test-storage-authorization
+		test-irq-lifecycle test-atomics test-user-sync test-storage-authorization \
+		test-process-launch-publication
 	python3 tests/filesystems/mgfs/mgfs_handoff_test.py "$(HOST_CC)"
 	python3 tests/filesystems/fat32/fat_handoff_test.py "$(HOST_CC)"
 	python3 tests/filesystems/vfs/vfs_location_test.py "$(HOST_CC)"
@@ -3339,6 +3340,10 @@ test-process-handles:
 .PHONY: test-process-wait
 test-process-wait:
 	python3 tests/kernel/process_wait_event_test.py "$(HOST_CC)"
+
+.PHONY: test-process-launch-publication
+test-process-launch-publication:
+	python3 tests/kernel/process_launch_publication_test.py "$(HOST_CC)"
 
 .PHONY: test-syscall-user-memory
 test-syscall-user-memory:

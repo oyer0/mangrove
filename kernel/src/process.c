@@ -2601,6 +2601,7 @@ bool process_exit(process_t *process, i32 status)
 
 bool process_publish_launch(process_t *process)
 {
+    bool retry_cleanup;
     u64 flags;
 
     if (!process) return false;
@@ -2612,7 +2613,15 @@ bool process_publish_launch(process_t *process)
     /* The creator calls this only after all process resources are installed
      * and the thread is enqueued (or PID 1's image is fully prepared). */
     process->launch_ready = true;
+    /* The initial thread is runnable before launch publication. It may finish
+     * and its handoff notification may already have been consumed while the
+     * cleanup worker correctly ignored this unpublished process. Capture the
+     * lifecycle state in the same registry critical section as publication,
+     * then reassert the worker event after dropping the lock. */
+    retry_cleanup = process->state == PROCESS_STATE_EXITING;
     spin_unlock_irqrestore(&process_registry_lock, flags);
+    if (retry_cleanup && !process_cleanup_worker_wake(process))
+        panic("process: launch publication could not notify cleanup worker");
     return true;
 }
 
