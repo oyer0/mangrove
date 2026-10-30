@@ -25,6 +25,13 @@ in endpoint FIFO order. Allocation failure rejects a new request before it is
 published. Each pending request consumes kernel heap for its fixed request
 and reply envelopes until reply, cancellation, or endpoint exit.
 
+Wait registration, cancellation and scheduler event publication share the IPC
+lock. A wake latches for a running or ready thread and enqueues a blocked
+thread, closing cross-CPU reply/enqueue races before parking. Every receive
+return removes its own registration, including timeout/dequeue and overflow
+paths, before its syscall lifetime ends. An endpoint retains no returned
+receiver's scheduler pointer. Competing blocked receivers return `BUSY`.
+
 Kernel event publication may run in interrupt context and cannot allocate.
 Each endpoint therefore keeps a fixed eight-event ring. If it fills, new
 events are coalesced into an explicit overflow indication so the service can

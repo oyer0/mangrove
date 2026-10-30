@@ -1838,6 +1838,10 @@ test-dev-tools: test-qmp-client test-artifact-lifecycle
 test-spinlock-context:
 	python3 tests/kernel/spinlock_context_test.py "$(HOST_CC)"
 
+.PHONY: test-ipc-waiters
+test-ipc-waiters:
+	python3 tests/kernel/ipc_waiter_test.py "$(HOST_CC)"
+
 .PHONY: test-ipc-capacity
 test-ipc-capacity:
 	mkdir -p "$(BUILD_DIR)/tests"
@@ -1848,7 +1852,7 @@ test-ipc-capacity:
 		-o "$(BUILD_DIR)/tests/ipc_capacity_test"
 	ASAN_OPTIONS=detect_leaks=0 "$(BUILD_DIR)/tests/ipc_capacity_test"
 
-test-sync: test-spinlock-context test-ipc-capacity test-preemption-accounting \
+test-sync: test-spinlock-context test-ipc-capacity test-ipc-waiters test-preemption-accounting \
 		test-irq-lifecycle test-atomics test-user-sync test-storage-authorization \
 		test-process-launch-publication
 	python3 tests/filesystems/mgfs/mgfs_handoff_test.py "$(HOST_CC)"

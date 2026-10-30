@@ -59,7 +59,17 @@ void spin_unlock_irqrestore(spinlock_t *lock, u64 flags)
 { (void)lock; (void)flags; }
 void spin_lock(spinlock_t *lock) { (void)lock; }
 void spin_unlock(spinlock_t *lock) { (void)lock; }
-bool scheduler_unblock(kernel_thread_t *thread) { (void)thread; return true; }
+scheduler_wake_result_t scheduler_wake_waiter_result(kernel_thread_t *thread)
+{
+    if (!thread) return SCHEDULER_WAKE_FAILED;
+    if (thread->state == THREAD_STATE_TERMINATED)
+        return SCHEDULER_WAKE_ALREADY_TERMINATED;
+    thread->event_wake_pending = true;
+    return SCHEDULER_WAKE_DELIVERED;
+}
+void scheduler_clear_event_wake(kernel_thread_t *thread)
+{ if (thread) thread->event_wake_pending = false; }
+void panic(const char *reason) { fprintf(stderr, "%s\n", reason); abort(); }
 
 static void test_endpoint_registry(void)
 {
