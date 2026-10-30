@@ -207,6 +207,13 @@ lock and retained VFS locations. These ownership rules keep process metadata
 stable for concurrent kernel readers; they do not provide per-thread
 application-level synchronization.
 
+The initial thread is enqueued before `launch_ready` is published, so it can
+exit while its launch is still unpublished. If publication observes the
+process in `EXITING`, it re-notifies the existing cleanup worker after releasing
+the registry lock. The worker uses the process registry as its authoritative
+work list; its event is a latched notification, so an exit completed before
+publication cannot be stranded by an earlier worker scan.
+
 Every returning syscall is admitted under the process registry lock and holds
 a process-object reference until its syscall frame and user-memory leases have
 been released. The active-syscall count prevents external termination and
