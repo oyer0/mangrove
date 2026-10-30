@@ -42,6 +42,7 @@ for name in ('process_termination_begin', 'process_cleanup_request', 'process_cl
 code += r'''
 static bool process_cleanup_worker_release_deferred_references_once(void){return false;}
 static bool process_session_collection_retry_pending;
+static void session_cleanup_progress(void){}
 static bool process_cleanup_worker_retry_session_collections_once(void){process_session_collection_retry_pending=false;return false;}
 static process_t*process_cleanup_candidate_locked(void){return NULL;}
 '''

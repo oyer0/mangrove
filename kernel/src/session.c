@@ -2,6 +2,9 @@
 #include <session.h>
 
 #include <identity.h>
+#include <process_cleanup.h>
+#include <panic.h>
+#include <scheduler.h>
 #include <ipc.h>
 #include <mangrove_errors.h>
 #include <mg/service.h>
@@ -20,10 +23,15 @@ typedef struct {
     mg_session_activity_t activity;
     bool active;
     bool retirement_in_progress;
+    bool retirement_dirty;
+    enum { SESSION_LAUNCH_NONE, SESSION_LAUNCH_PREPARING,
+           SESSION_LAUNCH_COMMITTED } launch_phase;
+    u64 launch_attempt, launch_thread, launch_pid;
 } session_record_t;
 
 static session_record_t session_records[SESSION_MAX_ACTIVE];
 static mg_session_id_t next_session_id;
+static u64 next_launch_attempt;
 static bool autologin_attempted;
 static spinlock_t session_lock;
 
@@ -32,6 +40,7 @@ bool session_init(void)
     spinlock_init(&session_lock);
     memset(session_records, 0, sizeof(session_records));
     next_session_id = 1;
+    next_launch_attempt = 1;
     autologin_attempted = false;
     return true;
 }
@@ -68,76 +77,109 @@ static session_record_t *session_find(mg_session_id_t id)
     return NULL;
 }
 
-static session_record_t *session_allocate(void)
+/* Called only by the process module while the registry protects frontend
+ * liveness. Lock order: process registry -> session. No slot pointer escapes. */
+int session_publish_active(u64 frontend_pid, const user_identity_t *identity,
+                           mg_session_id_t *out_id)
 {
-    u64 saved_flags = spin_lock_irqsave(&session_lock);
-    session_record_t *record = NULL;
-
-    if (next_session_id != 0) {
-        for (u32 index = 0; index < SESSION_MAX_ACTIVE; index++) {
-            if (!session_records[index].active) {
-                record = &session_records[index];
-                record->id = next_session_id++;
-                record->shell_pid = 0;
-                record->owner_pid = 0;
-                record->state = MG_SESSION_STATE_CREATING;
-                record->activity = MG_SESSION_ACTIVITY_INACTIVE;
-                record->active = true;
-                record->retirement_in_progress = false;
-                break;
-            }
-        }
+    u64 flags = spin_lock_irqsave(&session_lock);
+    if (!next_session_id) {
+        spin_unlock_irqrestore(&session_lock, flags);
+        return MG_ERR_BUSY;
     }
-    spin_unlock_irqrestore(&session_lock, saved_flags);
-    return record;
+    for (u32 i = 0; i < SESSION_MAX_ACTIVE; i++) {
+        session_record_t *record = &session_records[i];
+        if (record->active) continue;
+        memset(record, 0, sizeof(*record));
+        record->id = next_session_id++;
+        record->owner_pid = frontend_pid;
+        record->identity = *identity;
+        record->state = MG_SESSION_STATE_ACTIVE;
+        record->activity = MG_SESSION_ACTIVITY_ACTIVE;
+        record->active = true; /* Full scalar identity is initialized first. */
+        *out_id = record->id;
+        spin_unlock_irqrestore(&session_lock, flags);
+        return MG_OK;
+    }
+    spin_unlock_irqrestore(&session_lock, flags);
+    return MG_ERR_BUSY;
 }
 
-static void session_release_id(mg_session_id_t id)
+/* Caller owns registry, so parent exit cannot cross this authorization point.
+ * The exact token is retained until enqueue/publication or complete rollback. */
+bool session_commit_launch(mg_session_id_t id, u64 attempt, u64 owner_pid,
+                            u64 owner_thread, u64 child_pid)
 {
-    session_record_t *record;
-    u64 saved_flags;
+    u64 flags = spin_lock_irqsave(&session_lock);
+    session_record_t *record = session_find(id);
+    bool allowed = record && record->state == MG_SESSION_STATE_ACTIVE &&
+        record->launch_phase == SESSION_LAUNCH_PREPARING &&
+        record->launch_attempt == attempt && record->owner_pid == owner_pid &&
+        record->launch_thread == owner_thread && child_pid;
+    if (allowed) {
+        record->launch_pid = child_pid;
+        record->launch_phase = SESSION_LAUNCH_COMMITTED;
+    }
+    spin_unlock_irqrestore(&session_lock, flags);
+    return allowed;
+}
 
-    if (!id) return;
-    saved_flags = spin_lock_irqsave(&session_lock);
-    record = session_find(id);
-    if (!record) {
-        spin_unlock_irqrestore(&session_lock, saved_flags);
+static bool session_mark_ending_locked(session_record_t *record)
+{
+    if (!record || record->state == MG_SESSION_STATE_ENDING) return false;
+    record->state = MG_SESSION_STATE_ENDING;
+    record->retirement_dirty = true;
+    return true;
+}
+
+static void session_try_retire(mg_session_id_t id)
+{
+    u64 flags = spin_lock_irqsave(&session_lock);
+    session_record_t *record = session_find(id);
+    if (!record || record->state != MG_SESSION_STATE_ENDING ||
+        !record->retirement_dirty || record->retirement_in_progress ||
+        record->launch_phase != SESSION_LAUNCH_NONE) {
+        spin_unlock_irqrestore(&session_lock, flags);
         return;
     }
-    record->active = false;
-    record->retirement_in_progress = false;
-    record->shell_pid = 0;
-    record->owner_pid = 0;
-    record->state = MG_SESSION_STATE_ENDED;
-    record->activity = MG_SESSION_ACTIVITY_INACTIVE;
-    memset(&record->identity, 0, sizeof(record->identity));
-    record->id = 0;
-    spin_unlock_irqrestore(&session_lock, saved_flags);
+    record->retirement_dirty = false;
+    record->retirement_in_progress = true;
+    spin_unlock_irqrestore(&session_lock, flags);
+
+    /* This cooperative operation never discards a live kernel continuation.
+     * A blocked dependency owns its next real progress notification. */
+    bool complete = process_retire_session_members(id);
+    process_reap_session_members(id);
+    flags = spin_lock_irqsave(&session_lock);
+    record = session_find(id);
+    if (!record || !record->retirement_in_progress ||
+        record->state != MG_SESSION_STATE_ENDING ||
+        record->launch_phase != SESSION_LAUNCH_NONE)
+        panic("session: retirement claim lost ownership");
+    if (complete) {
+        memset(record, 0, sizeof(*record));
+    } else {
+        record->retirement_in_progress = false;
+    }
+    spin_unlock_irqrestore(&session_lock, flags);
 }
 
-/* Keep an ending record visible if a member still owns a live syscall frame.
- * A later authorized session_end_process() can retry the same ID. */
-static bool session_try_retire(mg_session_id_t id)
+/* Only the ordinary cleanup worker executes retirement. A global semantic
+ * event outlives any process whose exit made retirement newly possible. */
+void session_cleanup_progress(void)
 {
-    u64 saved_flags = spin_lock_irqsave(&session_lock);
-    session_record_t *record = session_find(id);
-    if (!record || record->retirement_in_progress) {
-        spin_unlock_irqrestore(&session_lock, saved_flags);
-        return false;
+    mg_session_id_t ids[SESSION_MAX_ACTIVE];
+    u32 count = 0;
+    u64 flags = spin_lock_irqsave(&session_lock);
+    for (u32 i = 0; i < SESSION_MAX_ACTIVE; i++) {
+        session_record_t *record = &session_records[i];
+        if (!record->active || record->state != MG_SESSION_STATE_ENDING)
+            continue;
+        record->retirement_dirty = true;
+        ids[count++] = record->id;
     }
-    record->state = MG_SESSION_STATE_ENDING;
-    record->retirement_in_progress = true;
-    spin_unlock_irqrestore(&session_lock, saved_flags);
-    if (!process_terminate_session_members(id)) {
-        saved_flags = spin_lock_irqsave(&session_lock);
-        record = session_find(id);
-        if (record) record->retirement_in_progress = false;
-        spin_unlock_irqrestore(&session_lock, saved_flags);
-        return false;
-    }
-    process_reap_session_members(id);
-    session_release_id(id);
-    return true;
+    spin_unlock_irqrestore(&session_lock, flags);
+    for (u32 i = 0; i < count; i++) session_try_retire(ids[i]);
 }
 
 static void session_status_from_record(const session_record_t *record,
@@ -187,7 +229,6 @@ int session_create_process(process_t *requester,
                            const char *username,
                            mg_session_info_t *session)
 {
-    session_record_t *record;
     user_identity_t identity;
     u64 frontend_pid = 0;
 
@@ -201,17 +242,10 @@ int session_create_process(process_t *requester,
         return MG_ERR_PRIVILEGE_REQUIRED;
     if (!identity_registry_lookup_username(username, &identity))
         return MG_ERR_NOT_FOUND;
-    record = session_allocate();
-    if (!record) return MG_ERR_BUSY;
-    {
-        u64 saved_flags = spin_lock_irqsave(&session_lock);
-        record->owner_pid = frontend_pid;
-        record->identity = identity;
-        record->state = MG_SESSION_STATE_ACTIVE;
-        record->activity = MG_SESSION_ACTIVITY_ACTIVE;
-        session->id = record->id;
-        spin_unlock_irqrestore(&session_lock, saved_flags);
-    }
+    mg_session_id_t id;
+    int result = process_activate_session(requester, frontend_pid, &identity, &id);
+    if (result != MG_OK) return result;
+    session->id = id;
     session->shell = 0;
     return MG_OK;
 }
@@ -221,58 +255,75 @@ int session_launch_process(process_t *requester,
                            process_handle_t *out_shell)
 {
     session_record_t snapshot;
-    session_record_t *record;
     process_credentials_t credentials;
-    u64 saved_flags;
-
+    kernel_thread_t *creator = thread_current();
     if (!out_shell || !session_frontend_authorized(requester))
         return MG_ERR_PRIVILEGE_REQUIRED;
-    saved_flags = spin_lock_irqsave(&session_lock);
-    record = session_find(session_id);
+    if (!creator || creator->process != requester) return MG_ERR_BAD_ARGUMENT;
+
+    u64 flags = spin_lock_irqsave(&session_lock);
+    session_record_t *record = session_find(session_id);
     if (!record || record->owner_pid != requester->pid ||
         record->state != MG_SESSION_STATE_ACTIVE || record->shell_pid) {
-        spin_unlock_irqrestore(&session_lock, saved_flags);
+        spin_unlock_irqrestore(&session_lock, flags);
         return MG_ERR_NOT_FOUND;
     }
-    snapshot = *record;
-    spin_unlock_irqrestore(&session_lock, saved_flags);
-    if (!identity_credentials_from_user(&snapshot.identity, &credentials))
-        return MG_ERR_ACCESS_DENIED;
-    const char *shell_argv[] = { "/bin/shoot" };
-    if (!process_spawn_argv_with_context(requester, shell_argv, 1U,
-                                    &credentials, snapshot.id, true,
-                                    snapshot.identity.home, out_shell))
-        return MG_ERR_INVALID_EXEC;
-    saved_flags = spin_lock_irqsave(&session_lock);
-    record = session_find(snapshot.id);
-    if (record && record->owner_pid == requester->pid &&
-        record->state == MG_SESSION_STATE_ACTIVE && !record->shell_pid)
-        record->shell_pid = process_handle_pid(requester, *out_shell);
-    u64 shell_pid = record ? record->shell_pid : 0;
-    spin_unlock_irqrestore(&session_lock, saved_flags);
-    if (!shell_pid) {
-        (void)session_try_retire(snapshot.id);
-        (void)process_handle_close(requester, *out_shell);
-        return MG_ERR_IO;
+    if (record->launch_phase != SESSION_LAUNCH_NONE || !next_launch_attempt) {
+        spin_unlock_irqrestore(&session_lock, flags);
+        return MG_ERR_BUSY;
     }
-    return MG_OK;
+    record->launch_phase = SESSION_LAUNCH_PREPARING;
+    record->launch_attempt = next_launch_attempt++;
+    record->launch_thread = creator->id;
+    snapshot = *record;
+    spin_unlock_irqrestore(&session_lock, flags);
+
+    process_session_launch_t launch = {.attempt = snapshot.launch_attempt};
+    int result = MG_ERR_ACCESS_DENIED;
+    if (identity_credentials_from_user(&snapshot.identity, &credentials)) {
+        result = process_spawn_session_shell(requester, &credentials,
+            snapshot.id, snapshot.launch_attempt, snapshot.identity.home, &launch);
+    }
+    flags = spin_lock_irqsave(&session_lock);
+    record = session_find(snapshot.id);
+    if (!record || record->owner_pid != requester->pid ||
+        record->launch_attempt != snapshot.launch_attempt ||
+        record->launch_thread != creator->id ||
+        (record->launch_phase != SESSION_LAUNCH_PREPARING &&
+         record->launch_phase != SESSION_LAUNCH_COMMITTED))
+        panic("session: shell launch token lost ownership");
+    if (result == MG_OK) {
+        if (record->launch_phase != SESSION_LAUNCH_COMMITTED ||
+            record->launch_pid != launch.pid || !launch.child)
+            panic("session: successful shell lacks commit permit");
+        record->shell_pid = launch.pid;
+    } else if (launch.child) {
+        panic("session: failed launch retained an unpublished child");
+    }
+    record->launch_phase = SESSION_LAUNCH_NONE;
+    record->launch_attempt = record->launch_thread = record->launch_pid = 0;
+    if (record->state == MG_SESSION_STATE_ENDING) record->retirement_dirty = true;
+    spin_unlock_irqrestore(&session_lock, flags);
+    if (launch.child) process_handle_reference_release(&launch.child->object);
+    process_cleanup_request(PROCESS_CLEANUP_SESSION_PROGRESS);
+    if (result == MG_OK) *out_shell = launch.handle;
+    return result;
 }
 
 int session_end_process(process_t *requester, mg_session_id_t session_id)
 {
-    session_record_t *record;
-    u64 saved_flags;
-
     if (!session_backend_authorized(requester))
         return MG_ERR_PRIVILEGE_REQUIRED;
-    saved_flags = spin_lock_irqsave(&session_lock);
-    record = session_find(session_id);
+    u64 flags = spin_lock_irqsave(&session_lock);
+    session_record_t *record = session_find(session_id);
     if (!record) {
-        spin_unlock_irqrestore(&session_lock, saved_flags);
+        spin_unlock_irqrestore(&session_lock, flags);
         return MG_ERR_NOT_FOUND;
     }
-    spin_unlock_irqrestore(&session_lock, saved_flags);
-    return session_try_retire(session_id) ? MG_OK : MG_ERR_BUSY;
+    bool changed = session_mark_ending_locked(record);
+    spin_unlock_irqrestore(&session_lock, flags);
+    if (changed) process_cleanup_request(PROCESS_CLEANUP_SESSION_PROGRESS);
+    return MG_ERR_BUSY; /* The worker owns eventual completion. */
 }
 
 int session_query_process(process_t *requester, mg_session_id_t session_id,
@@ -323,27 +374,17 @@ int session_list_process(process_t *requester, u32 offset,
 
 void session_process_exited(process_t *process)
 {
-    mg_session_id_t ended[SESSION_MAX_ACTIVE];
-    u32 ended_count = 0;
-    u64 saved_flags;
-
     if (!process) return;
-    saved_flags = spin_lock_irqsave(&session_lock);
-    for (u32 index = 0; index < SESSION_MAX_ACTIVE; index++) {
-        session_record_t *record = &session_records[index];
-        bool owned_by_frontend = record->active &&
-                                  record->owner_pid == process->pid;
+    bool changed = false;
+    u64 flags = spin_lock_irqsave(&session_lock);
+    for (u32 i = 0; i < SESSION_MAX_ACTIVE; i++) {
+        session_record_t *record = &session_records[i];
         bool backend_lost = process->system_service &&
                             process->service_id == MG_SERVICE_SESSIOND;
-        if (owned_by_frontend || (backend_lost && record->active)) {
-            if (ended_count < SESSION_MAX_ACTIVE)
-                ended[ended_count++] = record->id;
-        }
+        if (record->active &&
+            (record->owner_pid == process->pid || backend_lost))
+            changed |= session_mark_ending_locked(record);
     }
-    spin_unlock_irqrestore(&session_lock, saved_flags);
-    for (u32 index = 0; index < ended_count; index++) {
-        /* A service restart must never strand the old login shell or carry it
-         * into a session created by the replacement service. */
-        (void)session_try_retire(ended[index]);
-    }
+    spin_unlock_irqrestore(&session_lock, flags);
+    if (changed) process_cleanup_request(PROCESS_CLEANUP_SESSION_PROGRESS);
 }

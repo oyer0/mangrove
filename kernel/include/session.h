@@ -21,3 +21,12 @@ int session_list_process(process_t *requester, u32 offset,
                          mg_session_status_t *status, u32 capacity,
                          u32 *out_count, u32 *out_total);
 void session_process_exited(process_t *process);
+
+/* Process-registry -> session scalar transactions; never call process or
+ * scheduler operations while holding the session lock. */
+int session_publish_active(u64 frontend_pid, const user_identity_t *identity,
+                           mg_session_id_t *out_id);
+bool session_commit_launch(mg_session_id_t id, u64 attempt, u64 owner_pid,
+                            u64 owner_thread, u64 child_pid);
+/* Safe processless cleanup-worker context only. */
+void session_cleanup_progress(void);

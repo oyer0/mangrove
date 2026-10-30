@@ -225,6 +225,14 @@ lock and retained VFS locations. These ownership rules keep process metadata
 stable for concurrent kernel readers; they do not provide per-thread
 application-level synchronization.
 
+Session shell creation uses the same ELF/argument/CWD/handle preparation engine
+as ordinary spawn. All fallible preparation precedes the exact session permit.
+A creator pin covers enqueue/publication and the caller's token settlement;
+failures abort the suspended child and release handles/pins before token release.
+Registry -> session is the only nested lock edge for activation and permit;
+session-held code performs no process lookup, final reference drop, allocation,
+scheduler wait or VMM operation.
+
 The initial thread is enqueued before `launch_ready` is published, so it can
 exit while its launch is still unpublished. If publication observes the
 process in `EXITING`, it re-notifies the existing cleanup worker after releasing
@@ -272,10 +280,14 @@ syscall, is in a scheduler handoff, or is executing on a CPU; no subset is
 terminated. Safe ready or blocked threads are stopped as a group, then their
 wait registrations and process accounting are retired outside the scheduler
 lock. This path never unwinds a live frame or releases process resources while
-a sibling remains active. A session whose backend disappears stays visible
-in ENDING state if a member is busy; an authorized replacement backend can
-retry ending the same session ID. There is no forced cancellation of a syscall
-that remains blocked indefinitely.
+a sibling remains active. Session retirement instead uses cooperative process
+exit with retained object and list-reader ownership across notification. Its
+cleanup worker closes new member admission, waits for live continuations and
+committed launch tokens, and retires the exact session after no ACTIVE/EXITING
+member remains. Global semantic progress survives process collection, without
+requiring a replacement backend or another user syscall. A permanently blocked
+operation keeps ENDING visible; it is never forcibly unwound. The full session
+transaction is documented in [identity and authorization](../security/identity-and-authorization.md).
 
 ## Foreground interruption
 

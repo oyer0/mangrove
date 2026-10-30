@@ -135,10 +135,36 @@ The kernel verifies their service identities and the authenticated origin of
 cross-service requests.
 
 A session has a monotonic boot-local ID, owner, user identity, lifecycle state,
-activity state, and shell PID. The current table holds at most eight active
-records. A launched shell and its children receive the session's credentials,
-home/current-directory context, and session ID. Ending a session terminates
-its member processes and releases the record.
+activity state, and one shell PID. The current table holds at most eight active
+records. Activation validates frontend liveness under the process registry
+lock, then initializes the complete slot under the session lock and copies
+its ID before unlock. No table-slot pointer escapes. IDs are never reused;
+exhaustion refuses creation. Frontend exit either prevents activation or is
+observed by the later process-exit callback for that exact published identity.
+
+Shell launch reserves an exclusive attempt before preparing the suspended
+child. A registry-to-session transaction validates the live parent and commits
+the exact child PID immediately before enqueue. Publication and token settlement
+retain a child object pin, so sibling handle closure or early child exit cannot
+change the registered identity. Failure before successful enqueue completes
+rollback before releasing the reservation. A launched shell and descendants
+receive the session's credentials, home/current-directory context, and session
+ID; a session does not admit a replacement shell.
+
+Ending changes the record to ENDING and closes launch admission. An uncommitted
+creator rolls back; a committed creator must publish or finish pre-enqueue
+rollback before retirement can finish. The process cleanup worker requests
+cooperative exit of published members with retained process/list ownership.
+It never discards live syscall or mutex continuations. The record stays visible
+while any launch token or ACTIVE/EXITING member remains. `session_end` returns
+BUSY while the worker owns completion, and NOT_FOUND after retirement. Logind
+waits for retirement before clearing terminal history and admitting another login.
+
+Retirement retries follow semantic lifecycle changes through a global work
+latch, which survives member destruction. Reference housekeeping alone does
+not schedule another attempt. A dependency that remains blocked leaves ENDING
+visible until its actual completion produces the next event; no polling worker
+or forced asynchronous cancellation is used.
 
 Autologin policy is read from `/conf/session/config`. Eligibility is a
 boot-scoped one-shot token consumed by logind; restarting a service cannot

@@ -133,7 +133,12 @@ static void handle_request(const mg_ipc_received_t *received)
             break;
     }
     response.result = result;
-    (void)send_response(received, &response);
+    /* Exactly one original response attempt. A failed duplicate reply cannot
+     * establish non-delivery and must never revoke an accepted session. */
+    bool delivered = send_response(received, &response);
+    if (!delivered && request.operation == MG_SESSION_OP_CREATE &&
+        result == MG_OK && session.id)
+        (void)session_end(session.id); /* BUSY transfers progress to the worker. */
 }
 
 int main(void)

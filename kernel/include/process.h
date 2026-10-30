@@ -22,6 +22,14 @@ struct vfs_location;
 struct vfs_node;
 typedef struct process process_t;
 typedef u32 process_handle_t;
+/* Private launch transaction. Success transfers one child object pin to the
+ * session module until its exact token is settled outside process locks. */
+typedef struct {
+    process_t *child;
+    process_handle_t handle;
+    u64 pid, attempt;
+} process_session_launch_t;
+
 
 #define PROCESS_NO_SESSION ((mg_session_id_t)0)
 
@@ -328,12 +336,12 @@ bool process_spawn_with_output(process_t *parent, const char *cmdline,
 bool process_redirect_output(process_t *process, process_handle_t output_handle,
                              process_handle_t *saved_handle);
 bool process_restore_output(process_t *process, process_handle_t saved_handle);
-bool process_spawn_argv_with_context(process_t *parent,
-                                const char *const *argv, u32 argc,
-                                const process_credentials_t *credentials,
-                                mg_session_id_t session_id,
-                                bool session_shell, const char *initial_cwd,
-                                process_handle_t *out_handle);
+int process_spawn_session_shell(process_t *parent,
+    const process_credentials_t *credentials, mg_session_id_t session_id,
+    u64 attempt, const char *initial_cwd, process_session_launch_t *launch);
+int process_activate_session(process_t *backend, u64 frontend_pid,
+    const user_identity_t *identity, mg_session_id_t *out_id);
+bool process_retire_session_members(mg_session_id_t session_id);
 bool process_spawn_service(process_t *parent, u32 service_id,
                            process_handle_t *out_handle);
 int process_spawn_service_result(process_t *parent, u32 service_id,
@@ -344,7 +352,6 @@ int process_poll(process_t *parent, process_handle_t handle, i32 *out_status);
 int process_terminate_child(process_t *parent, process_handle_t handle,
                             i32 status);
 bool process_terminate_external(process_t *process, i32 status);
-bool process_terminate_session_members(mg_session_id_t session_id);
 void process_reap_session_members(mg_session_id_t session_id);
 u64 process_handle_pid(process_t *process, process_handle_t handle);
 mg_session_id_t process_session_id(const process_t *process);

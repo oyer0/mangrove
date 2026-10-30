@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <process_arguments.h>
+#include "process_cleanup_fixture.h"
 #include <mg/filesystem.h>
 #define VMM_PAGE_SIZE 4096U
 #define PTE_USER 4U
@@ -36,6 +37,7 @@ static void process_spawn_object_refs_release(process_spawn_object_refs_t *refs)
     __attribute__((cleanup(process_spawn_object_refs_release)))
 typedef struct {
     void *address_space;
+    u64 pid;
     int state;
     bool system_service, credentials_initialized, session_shell;
     bool launch_ready;
@@ -49,6 +51,20 @@ typedef struct {
     kernel_object_t object;
     uintptr_t user_stack_top, user_stack_sp, user_argc, user_argv;
 } process_t;
+typedef struct {process_t *child; process_handle_t handle; u64 pid,attempt;}
+ process_session_launch_t;
+static unsigned creator_pins;
+static bool stage_ok(void);
+static bool object_reference(kernel_object_t *o)
+{(void)o;if(!stage_ok())return false;assert(!creator_pins);creator_pins++;return true;}
+static void process_handle_reference_release(kernel_object_t *o)
+{assert(creator_pins==1);creator_pins--;object_release(o);}
+static bool refuse_permit;
+static bool process_session_launch_permit(process_t *p,mg_session_id_t id,u64 attempt,u64 child)
+{(void)p;(void)child;assert(id==23&&attempt);return !refuse_permit;}
+#ifndef VFS_ERR_CANCELLED
+#define VFS_ERR_CANCELLED (-28)
+#endif
 bool process_user_context_prepare_initial(process_t *process)
 { return process != NULL; }
 static usize allocations, live_allocations, live_bytes, peak_bytes, fail_allocation = (usize)-1;
@@ -327,11 +343,11 @@ static void lifecycle(void)
     assert(process_arguments_collect(&args,(uintptr_t)argv,3,NULL)==MG_OK);
     for(unsigned failure=1;failure<=9;failure++) {
         stage=0;failed_stage=failure;process_handle_t handle=12345;
-        assert(process_spawn_args_with_context_internal(&parent,&args,NULL,0,false,NULL,false,0,true,0,&handle)!=VFS_OK);
-        assert(handle==12345 && !child_live && !thread_live && !parent_handle_live && !child_handles && !live_frames);
+        assert(process_spawn_args_with_context_internal(&parent,&args,NULL,0,false,NULL,false,0,true,0,&handle,NULL)!=VFS_OK);
+        assert(handle==12345 && !child_live && !thread_live && !parent_handle_live && !child_handles && !live_frames && !creator_pins);
     }
     stage=failed_stage=0;process_handle_t handle=0;
-    assert(process_spawn_args_with_context_internal(&parent,&args,NULL,0,false,NULL,false,0,true,0,&handle)==VFS_OK);
+    assert(process_spawn_args_with_context_internal(&parent,&args,NULL,0,false,NULL,false,0,true,0,&handle,NULL)==VFS_OK);
     assert(handle==77 && parent_handle_live && child_live && thread_live &&
            spawned.launch_ready && !process_registry_lock);
     verify_child(&spawned,argv,3);
@@ -340,21 +356,31 @@ static void lifecycle(void)
     const char *empty_executable[]={""};
     assert(process_arguments_collect(&args,(uintptr_t)empty_executable,1,NULL)==MG_OK);
     handle=12345;stage=0;
-    assert(process_spawn_args_with_context_internal(&parent,&args,NULL,0,false,NULL,false,0,true,0,&handle)==VFS_ERR_INVALID_PARAM);
+    assert(process_spawn_args_with_context_internal(&parent,&args,NULL,0,false,NULL,false,0,true,0,&handle,NULL)==VFS_ERR_INVALID_PARAM);
     assert(!stage && handle==12345 && !child_live && !thread_live && !parent_handle_live);
     process_arguments_destroy(&args);assert(!live_allocations);
 
     const char *session_argv[]={"/bin/fixture","","中文 space"};
     process_credentials_t session_credentials={.unused=7};
     handle=0;stage=failed_stage=0;
-    assert(process_spawn_argv_with_context(&parent,session_argv,3,
-        &session_credentials,23U,true,"/home/test",&handle));
+    process_session_launch_t launch={.attempt=1};
+    assert(process_spawn_kernel_argv_with_context(&parent,session_argv,3,
+        &session_credentials,23U,true,"/home/test",false,0,false,0,&handle,&launch)==VFS_OK);
+    assert(launch.child==&spawned && launch.handle==handle);
+    process_handle_reference_release(&launch.child->object);
     assert(handle==77 && spawned.session_id==23U && spawned.session_shell &&
            spawned.credentials_initialized && spawned.credentials.unused==7);
     verify_child(&spawned,session_argv,3);
     process_handle_close(&parent,handle);process_abort(&spawned);
-    assert(!live_allocations);
-    puts("spawn lookup/thread/process/ELF/child handles/parent handle/enqueue failure cleanup PASS");
+    assert(!live_allocations && !creator_pins);
+    stage=failed_stage=0;refuse_permit=true;handle=12345;
+    launch=(process_session_launch_t){.attempt=2};
+    assert(process_spawn_kernel_argv_with_context(&parent,session_argv,3,
+        &session_credentials,23U,true,"/home/test",false,0,false,0,&handle,&launch)==VFS_ERR_CANCELLED);
+    assert(!launch.child && !creator_pins && !child_live && !thread_live &&
+           !parent_handle_live && !child_handles && !live_frames && !live_allocations);
+    refuse_permit=false;
+    puts("spawn lookup/thread/process/ELF/child handles/parent handle/permit/enqueue failure cleanup PASS");
 }
 static void output_selection(void)
 {
@@ -366,7 +392,7 @@ static void output_selection(void)
     for(usize i=0;i<sizeof(handles)/sizeof(handles[0]);i++) {
         process_handle_t handle=12345;stage=failed_stage=0;installed_output=NULL;
         assert(process_spawn_args_with_context_internal(&parent,&args,NULL,0,false,NULL,false,0,
-            handles[i]==0,handles[i],&handle)==VFS_OK);
+            handles[i]==0,handles[i],&handle,NULL)==VFS_OK);
         assert(installed_output==(i==0 || handles[i]==44?&output_file:&console));
         process_handle_close(&parent,handle);process_abort(&spawned);
     }
@@ -374,15 +400,15 @@ static void output_selection(void)
         for(unsigned failure=1;failure<=9;failure++) {
             process_handle_t handle=12345;stage=0;failed_stage=failure;
             assert(process_spawn_args_with_context_internal(&parent,&args,NULL,0,false,NULL,false,0,
-                false,output,&handle)!=VFS_OK);
-            assert(handle==12345 && !child_live && !thread_live && !parent_handle_live && !child_handles && !live_frames);
+                false,output,&handle,NULL)!=VFS_OK);
+            assert(handle==12345 && !child_live && !thread_live && !parent_handle_live && !child_handles && !live_frames && !creator_pins);
         }
     }
     const process_handle_t invalid[]={45,46,47};
     for(usize i=0;i<sizeof(invalid)/sizeof(invalid[0]);i++) {
         process_handle_t handle=12345;stage=failed_stage=0;
         assert(process_spawn_args_with_context_internal(&parent,&args,NULL,0,false,NULL,false,0,
-            false,invalid[i],&handle)==VFS_ERR_BAD_FORMAT);
+            false,invalid[i],&handle,NULL)==VFS_ERR_BAD_FORMAT);
         assert(handle==12345 && stage==2 && !child_live && !thread_live && !parent_handle_live);
     }
     redirected_output=false;
