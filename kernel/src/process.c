@@ -4732,6 +4732,15 @@ int process_wait(process_t *parent, process_handle_t handle,
         process_handle_reference_release(object);
         return MG_ERR_INVALID_HANDLE;
     }
+    /* A sibling can observe a newly installed handle before the creator has
+     * enqueued/published its child. Rollback has no normal completion event,
+     * so private construction must never acquire a parent wait registration. */
+    if (!child->launch_ready) {
+        spin_unlock(&process_registry_lock);
+        process_cli_restore(wait_flags);
+        process_handle_reference_release(object);
+        return MG_ERR_BUSY;
+    }
     if (child->state != PROCESS_STATE_TERMINATED) {
         thread = thread_current();
         if (parent->waiting_child || !thread ||

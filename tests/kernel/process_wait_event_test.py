@@ -382,7 +382,7 @@ static void setup(void)
     parent_thread.process_state=THREAD_PROCESS_ATTACHED;
     parent_thread.state=THREAD_STATE_RUNNING; parent_thread.running_cpu=0;
     current_thread=&parent_thread; tls_current_thread=&parent_thread;
-    child.state=PROCESS_STATE_ACTIVE; child.parent=&parent;
+    child.state=PROCESS_STATE_ACTIVE; child.parent=&parent;child.launch_ready=true;
     child.threads=child.main_thread=&child_thread; child.thread_count=1;
     child.live_thread_count=1; child.object.ref_count=1;
     child.object.process=&child; child.object.type=OBJECT_TYPE_PROCESS;
@@ -393,7 +393,7 @@ static void setup(void)
     child_thread.process_state=THREAD_PROCESS_ATTACHED;
     child_thread.state=THREAD_STATE_RUNNING; child_thread.running_cpu=1;
     parent.first_child=&child;
-    other_child.state=PROCESS_STATE_ACTIVE; other_child.parent=&parent;
+    other_child.state=PROCESS_STATE_ACTIVE; other_child.parent=&parent;other_child.launch_ready=true;
     other_child.threads=other_child.main_thread=&other_child_thread;
     other_child.thread_count=1; other_child.live_thread_count=1;
     other_child.object.ref_count=1; other_child.object.process=&other_child;
@@ -537,6 +537,15 @@ int main(int argc,char**argv)
   spin_unlock_irqrestore(&process_registry_lock,flags);
   return 0;
  }
+ /* A handle retained before spawn returns must not create a wait obligation
+  * on a private child that can still roll back without completion delivery. */
+ child.launch_ready=false;i32 private_status=-1;
+ unsigned private_refs=child.object.ref_count;
+ assert(process_wait(&parent,77,&private_status)==MG_ERR_BUSY);
+ assert(!gate_block_count&&!parent.thread_list_readers&&!parent.waiting_child&&
+        !parent.waiting_thread&&private_status==-1&&
+        child.object.ref_count==private_refs&&tls_if&&!tls_lock_depth);
+ setup();
  pthread_t completer,waiter;void*result;
  complete_child(&child,&child_thread,23);assert_wait_success(wait_call(NULL));
  setup();complete_on_registration_unlock=true;assert_wait_success(wait_call(NULL));
