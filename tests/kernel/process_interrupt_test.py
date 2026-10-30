@@ -4,11 +4,11 @@
 from pathlib import Path
 import os
 import re
-import subprocess
 import sys
-import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "tests/shared"))
+from host_fixture import HostFixture
 source = (ROOT / 'kernel/src/process.c').read_text()
 
 
@@ -155,14 +155,15 @@ int main(void)
 }
 '''
 
-with tempfile.TemporaryDirectory(prefix='mangrove-process-interrupt-') as temp:
+with HostFixture("process-interrupt") as workspace:
+    temp = workspace.path
     cfile = Path(temp) / 'process_interrupt.c'
     binary = Path(temp) / 'process_interrupt'
     cfile.write_text('#include "' + str(ROOT / "tests/kernel/process_cleanup_fixture.h") + '"\n' + prelude + body + postlude)
     compiler = sys.argv[1] if len(sys.argv) > 1 else 'cc'
-    subprocess.run([compiler, '-std=c11', '-Wall', '-Wextra', '-Werror',
+    workspace.run([compiler, '-std=c11', '-Wall', '-Wextra', '-Werror',
                     '-fsanitize=address,undefined', str(cfile), '-o', str(binary)],
                    check=True)
     environment = os.environ.copy()
     environment.setdefault('ASAN_OPTIONS', 'detect_leaks=0')
-    subprocess.run([str(binary)], check=True, env=environment)
+    workspace.run([str(binary)], check=True, env=environment)

@@ -4,11 +4,11 @@
 from pathlib import Path
 import os
 import re
-import subprocess
 import sys
-import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "tests/shared"))
+from host_fixture import HostFixture
 CC = sys.argv[1] if len(sys.argv) > 1 else "cc"
 
 
@@ -664,13 +664,14 @@ scheduler_state_snapshot = function_from(
     "kernel/src/scheduler.c", "scheduler_thread_state_snapshot")
 code = prefix + scheduler_state_snapshot + \
        "".join(function(name) for name in names) + suffix
-with tempfile.TemporaryDirectory(prefix="mangrove-process-thread-") as directory:
+with HostFixture("process-thread-lifecycle") as workspace:
+    directory = workspace.path
     path = Path(directory) / "process_thread_lifecycle.c"
     binary = Path(directory) / "process_thread_lifecycle"
     path.write_text('#include "' + str(ROOT / "tests/kernel/process_cleanup_fixture.h") + '"\n' + code)
-    subprocess.run([CC, "-std=gnu17", "-Wall", "-Wextra", "-Werror",
+    workspace.run([CC, "-std=gnu17", "-Wall", "-Wextra", "-Werror",
                     "-fsanitize=address,undefined", "-pthread", str(path),
                     "-o", str(binary)], check=True)
     env = os.environ.copy()
     env["ASAN_OPTIONS"] = "detect_leaks=0"
-    subprocess.run([str(binary)], check=True, env=env)
+    workspace.run([str(binary)], check=True, env=env)

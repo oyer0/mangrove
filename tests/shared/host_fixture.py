@@ -26,8 +26,15 @@ class HostFixture:
             stream.write(repr(command) + "\n")
             stream.flush()
             try:
+                child_env = dict(os.environ if env is None else env)
+                temporary = Path(child_env.get("TMPDIR") or self.path).resolve()
+                if not temporary.is_dir():
+                    raise ValueError(f"configured TMPDIR is not a directory: {temporary}")
+                # Resolve relative caller paths before switching the child cwd.
+                # A missing compiler temp root must never fall back to /tmp.
+                child_env["TMPDIR"] = str(temporary)
                 process = subprocess.Popen(command, cwd=self.path,
-                    env=env, stdout=stream, stderr=subprocess.STDOUT,
+                    env=child_env, stdout=stream, stderr=subprocess.STDOUT,
                     start_new_session=True)
                 result = process.wait(timeout=timeout)
             except BaseException:

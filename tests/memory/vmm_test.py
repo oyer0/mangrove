@@ -3,11 +3,11 @@
 """Exercise production launch-path functions with host memory/filesystem stubs."""
 from pathlib import Path
 import re
-import subprocess
 import sys
-import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "tests/shared"))
+from host_fixture import HostFixture
 CC = sys.argv[1] if len(sys.argv) > 1 else 'cc'
 
 
@@ -73,13 +73,14 @@ typedef long long i64; typedef size_t usize; typedef long isize;
 
 
 def run(name, source):
-    with tempfile.TemporaryDirectory(prefix='mangrove-launch-') as directory:
+    with HostFixture("vmm-" + name) as workspace:
+        directory = workspace.path
         path = Path(directory) / (name + '.c')
         binary = path.with_suffix('')
-        path.write_text('#include "' + str(ROOT / "tests/kernel/process_cleanup_fixture.h") + '"\n' + COMMON + source)
-        subprocess.run([CC, '-std=c11', '-Wall', '-Wextra', '-Werror', '-pthread',
+        path.write_text(COMMON + '#include "' + str(ROOT / "tests/kernel/process_cleanup_fixture.h") + '"\n' + source)
+        workspace.run([CC, '-std=c11', '-Wall', '-Wextra', '-Werror', '-pthread',
                         '-fsanitize=address,undefined', str(path), '-o', str(binary)], check=True)
-        subprocess.run([str(binary)], check=True)
+        workspace.run([str(binary)], check=True)
 
 
 vmm = r'''

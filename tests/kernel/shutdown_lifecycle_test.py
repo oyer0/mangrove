@@ -8,11 +8,11 @@ process, scheduler, and storage callbacks. They do not emulate ACPI hardware.
 from pathlib import Path
 import re
 import os
-import subprocess
 import sys
-import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "tests/shared"))
+from host_fixture import HostFixture
 CC = sys.argv[1] if len(sys.argv) > 1 else "cc"
 
 
@@ -32,18 +32,19 @@ def function(path, name):
 
 
 def run(name, source):
-    with tempfile.TemporaryDirectory(prefix=f"mangrove-{name}-") as tmp:
+    with HostFixture("shutdown-lifecycle") as workspace:
+        tmp = workspace.path
         path = Path(tmp) / f"{name}.c"
         binary = Path(tmp) / name
         path.write_text('#include "' + str(ROOT / "tests/kernel/process_cleanup_fixture.h") + '"\n' + source)
-        subprocess.run([CC, "-std=c11", "-Wall", "-Wextra", "-Werror",
+        workspace.run([CC, "-std=c11", "-Wall", "-Wextra", "-Werror",
                         "-fsanitize=address,undefined", str(path), "-o",
                         str(binary)], check=True)
         env = os.environ.copy()
         # LeakSanitizer cannot initialize reliably in this guest/container
         # environment; retain AddressSanitizer and UBSan coverage.
         env["ASAN_OPTIONS"] = "detect_leaks=0"
-        subprocess.run([str(binary)], check=True, env=env)
+        workspace.run([str(binary)], check=True, env=env)
 
 
 process_prefix = r'''

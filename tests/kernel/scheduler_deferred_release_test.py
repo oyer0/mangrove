@@ -5,11 +5,11 @@ from pathlib import Path
 import ast
 import os
 import re
-import subprocess
 import sys
-import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "tests/shared"))
+from host_fixture import HostFixture
 CC = sys.argv[1] if len(sys.argv) > 1 else os.environ.get('HOST_CC', 'gcc')
 
 
@@ -1265,16 +1265,17 @@ int main(void)
 '''
 
 code = prefix + functions + main
-with tempfile.TemporaryDirectory(prefix='mangrove-deferred-ref-') as directory:
+with HostFixture("scheduler-deferred-release") as workspace:
+    directory = workspace.path
     directory = Path(directory)
     source = directory / 'deferred_release.c'
     binary = directory / 'deferred_release'
     source.write_text('#define PROCESS_FIXTURE_REAL_COLLECTION_LATCH\n#include "' + str(ROOT / "tests/kernel/process_cleanup_fixture.h") + '"\n' + code)
     env = dict(os.environ)
     env['ASAN_OPTIONS'] = env.get('ASAN_OPTIONS', 'detect_leaks=0')
-    subprocess.run([
+    workspace.run([
         CC, '-std=gnu17', '-O1', '-g', '-Wall', '-Wextra', '-Werror',
         '-Wno-unused-function', '-Wno-unused-variable',
         '-fsanitize=address,undefined', '-pthread', str(source), '-o',
         str(binary)], check=True, env=env)
-    subprocess.run([str(binary)], check=True, env=env, timeout=30)
+    workspace.run([str(binary)], check=True, env=env, timeout=30)

@@ -2,13 +2,14 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Production process wait/poll/reap after thread cleanup and stack handoff."""
 from pathlib import Path
+import sys
 import argparse
 import os
 import re
-import subprocess
-import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "tests/shared"))
+from host_fixture import HostFixture
 parser = argparse.ArgumentParser()
 parser.add_argument('cc', nargs='?', default='cc')
 parser.add_argument('--process-source', type=Path,
@@ -409,13 +410,14 @@ int main(void)
  puts("process reaping: wake-before-exit, suspended cleanup, remote handoff, poll, session collection, and shutdown cancellation passed");
 }
 '''
-with tempfile.TemporaryDirectory(prefix='mangrove-process-reap-') as directory:
+with HostFixture("process-reap") as workspace:
+    directory = workspace.path
     path = Path(directory) / 'reap.c'
     path.write_text('#include "' + str(ROOT / "tests/kernel/process_cleanup_fixture.h") + '"\n' + code)
     binary = path.with_suffix('')
-    subprocess.run([args.cc, '-std=c11', '-Wall', '-Wextra', '-Werror',
+    workspace.run([args.cc, '-std=c11', '-Wall', '-Wextra', '-Werror',
                     '-fsanitize=address,undefined', str(path), '-o', str(binary)],
                    check=True)
     env = os.environ.copy()
     env['ASAN_OPTIONS'] = 'detect_leaks=0'
-    subprocess.run([str(binary)], check=True, env=env)
+    workspace.run([str(binary)], check=True, env=env)

@@ -4,11 +4,11 @@
 from pathlib import Path
 import os
 import re
-import subprocess
 import sys
-import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "tests/shared"))
+from host_fixture import HostFixture
 CC = sys.argv[1] if len(sys.argv) > 1 else "gcc"
 
 
@@ -253,13 +253,14 @@ int main(void)
 }
 '''
 
-with tempfile.TemporaryDirectory(prefix="mangrove-user-regions-") as folder:
+with HostFixture("user-regions") as workspace:
+    folder = workspace.path
     folder = Path(folder)
     source = folder / "user_regions_test.c"
     binary = folder / "user_regions_test"
     source.write_text('#include "' + str(ROOT / "tests/kernel/process_cleanup_fixture.h") + '"\n' + fixture)
-    subprocess.run([CC, "-std=gnu17", "-O1", "-g", "-Wall", "-Wextra",
+    workspace.run([CC, "-std=gnu17", "-O1", "-g", "-Wall", "-Wextra",
         "-Werror", "-fsanitize=address,undefined", "-pthread", str(source),
         "-o", str(binary)], check=True)
-    subprocess.run([str(binary)], check=True,
+    workspace.run([str(binary)], check=True,
         env={**os.environ, "ASAN_OPTIONS": "detect_leaks=0"})

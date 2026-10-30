@@ -17,6 +17,18 @@ from host_fixture import HostFixture
 
 
 class FixtureTests(unittest.TestCase):
+    def test_compiler_temp_root(self):
+        with HostFixture("compiler-temp") as fixture:
+            environment = dict(os.environ)
+            environment.pop("TMPDIR", None)
+            result = fixture.run([sys.executable, "-c",
+                "import os;print(os.environ['TMPDIR'])"], env=environment)
+            self.assertEqual(result.stdout.splitlines()[-1], str(fixture.path))
+            environment["TMPDIR"] = str(fixture.path / "missing")
+            with self.assertRaisesRegex(ValueError, "configured TMPDIR"):
+                fixture.run([sys.executable, "-c", "raise SystemExit(99)"],
+                            env=environment)
+
     def test_owned_lifetimes(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
