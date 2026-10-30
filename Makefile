@@ -1812,6 +1812,7 @@ test-qmp-client:
 .PHONY: test-artifact-lifecycle
 test-artifact-lifecycle:
 	python3 tests/guest/artifact_lifecycle_test.py
+	python3 tests/kernel/host_fixture_test.py
 
 test-dev-tools: test-qmp-client test-artifact-lifecycle
 	python3 tests/guest/guest_reed_watchdog_test.py
