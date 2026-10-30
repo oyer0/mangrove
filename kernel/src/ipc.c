@@ -10,6 +10,7 @@
 #include <string.h>
 #include <timer.h>
 #include <spinlock.h>
+#include <panic.h>
 
 #ifndef NULL
 #define NULL ((void *)0)
@@ -115,8 +116,8 @@ static void ipc_irq_restore(u64 flags)
 }
 
 /* The receive-side scheduler handoff cannot hold ipc_lock while it sleeps.
- * Interrupt exclusion is retained for that short legacy handoff until the
- * scheduler's atomic block/wakeup primitive is introduced. */
+ * Local interrupt exclusion preserves the caller flags across handoff; event
+ * latching, not CLI, closes concurrent cross-CPU notification races. */
 static u64 ipc_cli_save(void)
 {
     u64 flags;
@@ -244,24 +245,38 @@ static void request_reclaim_retired(void)
     }
 }
 
+/* ipc_lock serializes registration cancellation with this publication.
+ * Syscall admission keeps a registered scheduler record alive until unlink. */
+static void ipc_wake_registered(kernel_thread_t *thread)
+{
+    if (scheduler_wake_waiter_result(thread) != SCHEDULER_WAKE_DELIVERED)
+        panic("ipc: live registered waiter could not be woken");
+}
+
+static void endpoint_wake_receiver_locked(ipc_endpoint_t *endpoint)
+{
+    if (endpoint->receiver_waiter) {
+        ipc_wake_registered(endpoint->receiver_waiter);
+        endpoint->receiver_waiter = NULL;
+    }
+}
+
+static void endpoint_receiver_finish_locked(ipc_endpoint_t *endpoint,
+                                             kernel_thread_t *self)
+{
+    if (endpoint->receiver_waiter == self)
+        endpoint->receiver_waiter = NULL;
+    scheduler_clear_event_wake(self);
+}
+
 static void request_wake_client(ipc_request_t *request)
 {
-    kernel_thread_t *thread;
-
-    /* Caller must hold ipc_lock. */
     if (!request || !request->client_active || !request->client_blocked ||
         !request->client_thread)
         return;
-    thread = request->client_thread;
+    ipc_wake_registered(request->client_thread);
     request->client_blocked = false;
     request->client_thread = NULL;
-    if (thread->state == THREAD_STATE_BLOCKED &&
-        !scheduler_unblock(thread)) {
-        /* Keep the waiter associated with the request if the scheduler could
-         * not enqueue it.  This is defensive; a normal wakeup succeeds. */
-        request->client_blocked = true;
-        request->client_thread = thread;
-    }
 }
 
 static void request_fail(ipc_request_t *request)
@@ -572,7 +587,6 @@ int ipc_kernel_request(process_t *process, process_handle_t endpoint_handle,
     ipc_endpoint_t *endpoint;
     ipc_request_t *request;
     process_credentials_t credentials;
-    kernel_thread_t *waiter;
     u64 saved_flags;
     int result = MG_OK;
 
@@ -629,11 +643,7 @@ int ipc_kernel_request(process_t *process, process_handle_t endpoint_handle,
         request_reclaim_retired();
         return MG_ERR_QUEUE_FULL;
     }
-    waiter = endpoint->receiver_waiter;
-    endpoint->receiver_waiter = NULL;
-    if (waiter && !scheduler_unblock(waiter)) {
-        endpoint->receiver_waiter = waiter;
-    }
+    endpoint_wake_receiver_locked(endpoint);
     ipc_irq_restore(saved_flags);
 
     for (;;) {
@@ -643,6 +653,7 @@ int ipc_kernel_request(process_t *process, process_handle_t endpoint_handle,
          * reply race with the block and strand the requester. */
         saved_flags = ipc_cli_save();
         spin_lock(&ipc_lock);
+        scheduler_clear_event_wake(thread_current());
         if (request->state != IPC_REQUEST_PENDING &&
             request->state != IPC_REQUEST_DELIVERED) {
             if (request->state == IPC_REQUEST_REPLIED) {
@@ -663,6 +674,7 @@ int ipc_kernel_request(process_t *process, process_handle_t endpoint_handle,
             if (process->ipc_outstanding == request)
                 process->ipc_outstanding = NULL;
             request_maybe_free(request);
+            scheduler_clear_event_wake(thread_current());
             spin_unlock(&ipc_lock);
             ipc_cli_restore(saved_flags);
             break;
@@ -677,6 +689,7 @@ int ipc_kernel_request(process_t *process, process_handle_t endpoint_handle,
                 process->ipc_outstanding = NULL;
             request_maybe_free(request);
             result = MG_ERR_SHUTDOWN;
+            scheduler_clear_event_wake(thread_current());
             spin_unlock(&ipc_lock);
             ipc_cli_restore(saved_flags);
             break;
@@ -691,10 +704,12 @@ int ipc_kernel_request(process_t *process, process_handle_t endpoint_handle,
                 process->ipc_outstanding = NULL;
             request_maybe_free(request);
             result = MG_ERR_INTERRUPTED;
+            scheduler_clear_event_wake(thread_current());
             spin_unlock(&ipc_lock);
             ipc_cli_restore(saved_flags);
             break;
         }
+        request->client_thread = thread_current();
         request->client_blocked = true;
         spin_unlock(&ipc_lock);
         if (!scheduler_block()) {
@@ -708,6 +723,7 @@ int ipc_kernel_request(process_t *process, process_handle_t endpoint_handle,
             if (process->ipc_outstanding == request)
                 process->ipc_outstanding = NULL;
             request_maybe_free(request);
+            scheduler_clear_event_wake(thread_current());
             spin_unlock(&ipc_lock);
             ipc_cli_restore(saved_flags);
             break;
@@ -753,22 +769,22 @@ static int ipc_kernel_receive_internal(process_t *process,
     for (;;) {
         u64 saved_flags = ipc_cli_save();
         u64 lock_flags = spin_lock_irqsave(&ipc_lock);
+        scheduler_clear_event_wake(self);
 
         if (process_shutdown_requested(process)) {
-            if (endpoint->receiver_waiter == self)
-                endpoint->receiver_waiter = NULL;
+            endpoint_receiver_finish_locked(endpoint, self);
             spin_unlock_irqrestore(&ipc_lock, lock_flags);
             ipc_cli_restore(saved_flags);
             return MG_ERR_SHUTDOWN;
         }
         if (process_take_interrupt(process)) {
-            if (endpoint->receiver_waiter == self)
-                endpoint->receiver_waiter = NULL;
+            endpoint_receiver_finish_locked(endpoint, self);
             spin_unlock_irqrestore(&ipc_lock, lock_flags);
             ipc_cli_restore(saved_flags);
             return MG_ERR_INTERRUPTED;
         }
         if (!endpoint->live) {
+            endpoint_receiver_finish_locked(endpoint, self);
             spin_unlock_irqrestore(&ipc_lock, lock_flags);
             ipc_cli_restore(saved_flags);
             return MG_ERR_SERVICE_UNAVAILABLE;
@@ -777,23 +793,27 @@ static int ipc_kernel_receive_internal(process_t *process,
             endpoint->event_count == 0) {
             endpoint->event_overflow = false;
             overflow = true;
+            endpoint_receiver_finish_locked(endpoint, self);
             spin_unlock_irqrestore(&ipc_lock, lock_flags);
             ipc_cli_restore(saved_flags);
             break;
         }
         if (endpoint->request_head || endpoint->event_count != 0) {
             bool dequeued = endpoint_dequeue(endpoint, &delivery);
+            endpoint_receiver_finish_locked(endpoint, self);
             spin_unlock_irqrestore(&ipc_lock, lock_flags);
             ipc_cli_restore(saved_flags);
             if (!dequeued) return MG_ERR_SERVICE_UNAVAILABLE;
             break;
         }
         if (!wait) {
+            endpoint_receiver_finish_locked(endpoint, self);
             spin_unlock_irqrestore(&ipc_lock, lock_flags);
             ipc_cli_restore(saved_flags);
             return MG_ERR_WOULD_BLOCK;
         }
         if (endpoint->receiver_waiter && endpoint->receiver_waiter != self) {
+            endpoint_receiver_finish_locked(endpoint, self);
             spin_unlock_irqrestore(&ipc_lock, lock_flags);
             ipc_cli_restore(saved_flags);
             return MG_ERR_BUSY;
@@ -803,8 +823,7 @@ static int ipc_kernel_receive_internal(process_t *process,
             u64 now = timer_uptime_ms();
             u64 remaining = now >= deadline ? 0 : deadline - now;
             if (remaining == 0) {
-                if (endpoint->receiver_waiter == self)
-                    endpoint->receiver_waiter = NULL;
+                endpoint_receiver_finish_locked(endpoint, self);
                 spin_unlock_irqrestore(&ipc_lock, lock_flags);
                 ipc_cli_restore(saved_flags);
                 return MG_ERR_TIMEOUT;
@@ -812,8 +831,7 @@ static int ipc_kernel_receive_internal(process_t *process,
             spin_unlock_irqrestore(&ipc_lock, lock_flags);
             if (!scheduler_sleep(remaining)) {
                 lock_flags = spin_lock_irqsave(&ipc_lock);
-                if (endpoint->receiver_waiter == self)
-                    endpoint->receiver_waiter = NULL;
+                endpoint_receiver_finish_locked(endpoint, self);
                 spin_unlock_irqrestore(&ipc_lock, lock_flags);
                 ipc_cli_restore(saved_flags);
                 return MG_ERR_BUSY;
@@ -822,8 +840,7 @@ static int ipc_kernel_receive_internal(process_t *process,
             spin_unlock_irqrestore(&ipc_lock, lock_flags);
             if (!scheduler_block()) {
                 lock_flags = spin_lock_irqsave(&ipc_lock);
-                if (endpoint->receiver_waiter == self)
-                    endpoint->receiver_waiter = NULL;
+                endpoint_receiver_finish_locked(endpoint, self);
                 spin_unlock_irqrestore(&ipc_lock, lock_flags);
                 ipc_cli_restore(saved_flags);
                 return MG_ERR_BUSY;
@@ -1162,7 +1179,6 @@ void ipc_publish_event(u32 event_class, u16 type, u64 resource_id,
     if (event.sequence == 0) event.sequence = next_request_id++;
     for (ipc_endpoint_t *endpoint = endpoint_list; endpoint;
          endpoint = endpoint->next) {
-        kernel_thread_t *waiter;
         if (!endpoint->live || !(endpoint->event_classes & event_class))
             continue;
         if (!endpoint_enqueue_event(endpoint, &event)) {
@@ -1172,10 +1188,7 @@ void ipc_publish_event(u32 event_class, u16 type, u64 resource_id,
             endpoint->event_overflow = true;
             continue;
         }
-        waiter = endpoint->receiver_waiter;
-        endpoint->receiver_waiter = NULL;
-        if (waiter && !scheduler_unblock(waiter))
-            endpoint->receiver_waiter = waiter;
+        endpoint_wake_receiver_locked(endpoint);
     }
     ipc_irq_restore(saved_flags);
 }
