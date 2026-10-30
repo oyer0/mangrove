@@ -6,10 +6,11 @@ import os
 import re
 import subprocess
 import sys
-import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
 CC = sys.argv[1] if len(sys.argv) > 1 else "cc"
+sys.path.insert(0, str(ROOT / "tests/shared"))
+from host_fixture import HostFixture
 
 
 def function(path, name):
@@ -447,16 +448,13 @@ int main(void) {
 '''
 
 code = prefix + object_functions + process_functions + scheduler_functions + suffix
-workspace_parent = Path(os.environ.get("TMPDIR") or
-                        ROOT / "build" / "test-workspaces")
-workspace_parent.mkdir(parents=True, exist_ok=True)
-with tempfile.TemporaryDirectory(prefix="mangrove-launch-publication-",
-                                 dir=workspace_parent) as tmp:
-    source = Path(tmp) / "launch_publication.c"
-    binary = Path(tmp) / "launch_publication"
+with HostFixture("launch-publication") as fixture:
+    source = fixture.path / "launch_publication.c"
+    binary = fixture.path / "launch_publication"
     source.write_text(code)
-    subprocess.run([CC, "-std=gnu17", "-O1", "-g", "-Wall", "-Wextra",
-                    "-Werror", "-fsanitize=address,undefined", "-pthread",
-                    str(source), "-o", str(binary)], check=True)
-    subprocess.run([str(binary)], check=True, cwd=tmp,
-                   env={**os.environ, "ASAN_OPTIONS": "detect_leaks=0"})
+    fixture.run([CC, "-std=gnu17", "-O1", "-g", "-Wall", "-Wextra",
+                 "-Werror", "-fsanitize=address,undefined", "-pthread",
+                 str(source), "-o", str(binary)])
+    result = fixture.run([str(binary)],
+        env={**os.environ, "ASAN_OPTIONS": "detect_leaks=0"})
+    print(result.stdout, end="")

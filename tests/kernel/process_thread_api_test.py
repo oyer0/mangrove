@@ -7,10 +7,11 @@ import re
 import resource
 import subprocess
 import sys
-import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
 CC = sys.argv[1] if len(sys.argv) > 1 else "cc"
+sys.path.insert(0, str(ROOT / "tests/shared"))
+from host_fixture import HostFixture
 
 
 def function(path, name):
@@ -897,6 +898,8 @@ int main(int argc,char **argv)
  worker_complete(joining_record,0x2233U);
  process_worker_reclaim_pending(&p);
  assert(!p.thread_records&&p.thread_count==1);
+ assert(joining_record->object.ref_count==1);
+ object_release(&joining_record->object); /* fixture-only retained pin */
 
  /* A waiter that is already a terminated, still process-owned descriptor is
   * a canceled registration. Completion retains the result and makes it
@@ -1064,19 +1067,19 @@ mutex_source = re.sub(
     "static void mutex_irq_restore(u64 flags) {(void)flags;}", mutex_source,
     count=1, flags=re.S)
 code = prefix + mutex_source + "\n".join(functions) + suffix
-with tempfile.TemporaryDirectory(prefix="mangrove-thread-api-") as directory:
+with HostFixture("thread-api") as fixture:
+    directory = fixture.path
     path = Path(directory) / "process_thread_api.c"
     binary = Path(directory) / "process_thread_api"
     path.write_text(code)
-    subprocess.run([CC, "-std=gnu17", "-Wall", "-Wextra", "-Werror",
+    fixture.run([CC, "-std=gnu17", "-Wall", "-Wextra", "-Werror",
                     "-fsanitize=address,undefined", "-pthread", str(path),
                     "-o", str(binary)], check=True)
     env = os.environ.copy()
     env["ASAN_OPTIONS"] = "detect_leaks=0"
-    subprocess.run([str(binary)], check=True, env=env, cwd=directory)
+    print(fixture.run([str(binary)], env=env).stdout, end="")
 
-    def disable_core_dumps():
-        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 
     for mode, expected in (
         ("--bad-join-pair", "inconsistent worker join registration"),
@@ -1084,9 +1087,7 @@ with tempfile.TemporaryDirectory(prefix="mangrove-thread-api-") as directory:
         ("--missing-join-member", "worker joiner lost process ownership"),
         ("--live-wake-failure", "failed to wake completed worker joiner"),
     ):
-        failure = subprocess.run([str(binary), mode], env=env, cwd=directory,
-                                 capture_output=True, text=True,
-                                 preexec_fn=disable_core_dumps)
+        failure = fixture.run([str(binary), mode], env=env, check=False)
         if failure.returncode == 0 or expected not in failure.stderr:
             raise AssertionError(
                 f"{mode} did not fail at {expected!r}: "
