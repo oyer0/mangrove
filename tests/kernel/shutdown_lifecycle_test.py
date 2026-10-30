@@ -35,7 +35,7 @@ def run(name, source):
     with tempfile.TemporaryDirectory(prefix=f"mangrove-{name}-") as tmp:
         path = Path(tmp) / f"{name}.c"
         binary = Path(tmp) / name
-        path.write_text(source)
+        path.write_text('#include "' + str(ROOT / "tests/kernel/process_cleanup_fixture.h") + '"\n' + source)
         subprocess.run([CC, "-std=c11", "-Wall", "-Wextra", "-Werror",
                         "-fsanitize=address,undefined", str(path), "-o",
                         str(binary)], check=True)
@@ -100,7 +100,7 @@ static void panic(const char *message)
 { (void)message; assert(!"unexpected process panic"); }
 static bool process_finish_termination(process_t *process)
 { (void)process; return false; }
-static void process_worker_reclaim_pending(process_t *process)
+static __attribute__((unused)) void process_worker_reclaim_pending(process_t *process)
 { (void)process; assert(!process_registry_lock); }
 static void process_cleanup_worker_wake(process_t *process)
 { assert(process && !process_registry_lock); }

@@ -56,6 +56,7 @@ static process_t *process_current(void){return local_thread?local_thread->proces
 static bool scheduler_terminate_thread_group(kernel_thread_t *,usize);
 '''
 process_functions=(
+ 'process_cleanup_reference_candidate_locked',
  'process_storage_authorization_clear_locked',
  'process_thread_register_locked',
  'process_thread_list_complete_locked',
