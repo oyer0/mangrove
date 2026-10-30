@@ -265,7 +265,7 @@ for name in ('process_thread_list_complete_locked',
              'process_finalize_exit',
              'process_wait', 'process_poll', 'process_collect_completed', 'process_reap_session_members',
              'process_handle_reference_release',
-             'process_terminate_session_members', 'process_object_destroy'):
+             'process_object_destroy'):
     code += function(source, name)
 code += r'''
 static void reset(bool active)
@@ -354,9 +354,11 @@ int main(void)
 
  reset(true);
  child.active_syscalls=1;
- assert(!process_terminate_session_members(42) && child.owner_reference_held);
+ assert(!process_terminate_external(&child,-1) && child.owner_reference_held);
  child.active_syscalls=0;
- assert(process_terminate_session_members(42) && owner_releases==1 &&
+ assert(process_terminate_external(&child,-1));
+ process_reap_session_members(42);
+ assert(owner_releases==1 &&
         child.state==PROCESS_STATE_TERMINATED && !child.thread_count &&
         !child.owner_reference_held &&
         child_thread.process_state==THREAD_PROCESS_UNATTACHED &&

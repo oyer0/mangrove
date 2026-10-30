@@ -64,6 +64,13 @@ endpoint, fails pending requests, and leaves existing client handles referring
 only to a dead object. Services treat failure to register or receive on their
 mandatory endpoint as fatal so Sprout can observe and restart the process.
 
+Session creation in sessiond makes exactly one original reply attempt. A
+non-OK result from that attempt retires the exact created session ID; BUSY
+means the cleanup worker owns eventual retirement. Accepted replies return OK
+from the kernel. Failure of a duplicate reply cannot establish non-delivery
+and never causes rollback. Frontend/backend exit independently marks existing
+sessions ENDING, including when a service dies before handling reply failure.
+
 ## Kernel service definitions
 
 The kernel fixes each service executable, capability set, and optional

@@ -311,7 +311,7 @@ static void process_object_destroy(kernel_object_t *object)
         process->first_child = NULL;
         spin_unlock_irqrestore(&process_registry_lock, flags);
     }
-    process_cleanup_request(PROCESS_CLEANUP_COLLECTION);
+    process_cleanup_request(PROCESS_CLEANUP_COLLECTION | PROCESS_CLEANUP_SESSION_PROGRESS);
     process_memory_release_all(process);
     vmm_destroy_address_space(process->address_space);
     process_user_region_metadata_release(process);
@@ -679,8 +679,9 @@ void process_cleanup_request(unsigned int work)
      * then inspect ready. A single SC order prevents both sides observing
      * the old value and leaving pre-start work unnotified. */
     __atomic_fetch_or(&process_cleanup_work_pending, work, __ATOMIC_SEQ_CST);
-    if (__atomic_load_n(&process_cleanup_worker_ready, __ATOMIC_SEQ_CST))
-        (void)process_cleanup_worker_wake(NULL);
+    if (__atomic_load_n(&process_cleanup_worker_ready, __ATOMIC_SEQ_CST) &&
+        !process_cleanup_worker_wake(NULL))
+        panic("process: cleanup work lost its worker");
 }
 
 /* A finite PID sweep tries each current process once. Deferred leases/readers
@@ -769,6 +770,10 @@ static bool process_cleanup_worker_run_once(void)
                          __ATOMIC_RELEASE);
     if (process_cleanup_worker_retry_session_collections_once())
         worked = true;
+    if (work & PROCESS_CLEANUP_SESSION_PROGRESS) {
+        session_cleanup_progress();
+        worked = true;
+    }
     /* A finite sweep can publish its own continuation without an external
      * scheduler wake. Consume that work before considering a park. */
     return worked || __atomic_load_n(&process_cleanup_work_pending,
@@ -989,7 +994,7 @@ static bool process_publish_terminated_locked(process_t *process)
         parent->waiting_child = NULL;
         parent->waiting_thread = NULL;
     }
-    process_cleanup_request(PROCESS_CLEANUP_COLLECTION);
+    process_cleanup_request(PROCESS_CLEANUP_COLLECTION | PROCESS_CLEANUP_SESSION_PROGRESS);
     return true;
 }
 
@@ -2634,7 +2639,7 @@ bool process_exit(process_t *process, i32 status)
     }
     if (process->state == PROCESS_STATE_ACTIVE) {
         process->state = PROCESS_STATE_EXITING;
-        process_cleanup_request(PROCESS_CLEANUP_COLLECTION);
+        process_cleanup_request(PROCESS_CLEANUP_COLLECTION | PROCESS_CLEANUP_SESSION_PROGRESS);
         process->termination_pending = true;
         process_storage_authorization_clear_locked(process);
         /* A self-exit may win against an external termination reservation.
@@ -2701,6 +2706,7 @@ bool process_publish_launch(process_t *process)
     spin_unlock_irqrestore(&process_registry_lock, flags);
     if (retry_cleanup && !process_cleanup_worker_wake(process))
         panic("process: launch publication could not notify cleanup worker");
+    process_cleanup_request(PROCESS_CLEANUP_SESSION_PROGRESS);
     return true;
 }
 
@@ -2736,7 +2742,8 @@ void process_syscall_leave(process_t *process)
     queue_cleanup = process->active_syscalls == 0U &&
         process->state == PROCESS_STATE_EXITING;
     spin_unlock_irqrestore(&process_registry_lock, flags);
-    if (queue_cleanup) process_cleanup_worker_wake(process);
+    if (queue_cleanup)
+        process_cleanup_request(PROCESS_CLEANUP_EXIT | PROCESS_CLEANUP_SESSION_PROGRESS);
     if (queue_cleanup)
         process_handle_reference_release(&process->object);
     else
@@ -2769,10 +2776,13 @@ static void process_termination_cancel(process_t *process)
 
     if (!process) return;
     flags = spin_lock_irqsave(&process_registry_lock);
+    bool changed = process->external_termination_in_progress;
     process->external_termination_in_progress = false;
     if (process->state == PROCESS_STATE_ACTIVE)
         process->termination_pending = false;
     spin_unlock_irqrestore(&process_registry_lock, flags);
+    if (changed)
+        process_cleanup_request(PROCESS_CLEANUP_EXIT | PROCESS_CLEANUP_SESSION_PROGRESS);
 }
 
 bool process_terminate_current_exception(i32 status)
@@ -2963,7 +2973,8 @@ void process_scheduler_post_handoff(process_t *process)
         &process->scheduler_handoff_releases_pending, 1U, __ATOMIC_RELEASE);
     if (pending == ~(u32)0)
         panic("process: scheduler handoff release count overflow");
-    process_cleanup_request(PROCESS_CLEANUP_WORKER_REAP | PROCESS_CLEANUP_EXIT);
+    process_cleanup_request(PROCESS_CLEANUP_WORKER_REAP | PROCESS_CLEANUP_EXIT |
+                            PROCESS_CLEANUP_SESSION_PROGRESS);
     if (!process_cleanup_worker_wake(process))
         panic("process: scheduler handoff before cleanup worker startup");
 }
@@ -2977,6 +2988,7 @@ static void process_unlink_locked(process_t *process)
     if (*cursor == process) *cursor = process->next_sibling;
     process->parent = NULL;
     process->next_sibling = NULL;
+    process_cleanup_request(PROCESS_CLEANUP_COLLECTION | PROCESS_CLEANUP_SESSION_PROGRESS);
 }
 
 static void process_unlink_all_locked(process_t *process)
@@ -3058,7 +3070,7 @@ static void process_abort(process_t *process)
     process->owner_reference_held = false;
     spin_unlock_irqrestore(&process_registry_lock, flags);
     object_release(&process->object);
-    process_cleanup_request(PROCESS_CLEANUP_COLLECTION);
+    process_cleanup_request(PROCESS_CLEANUP_COLLECTION | PROCESS_CLEANUP_SESSION_PROGRESS);
 }
 
 bool process_terminate_external(process_t *process, i32 status)
@@ -3132,7 +3144,7 @@ bool process_terminate_external(process_t *process, i32 status)
     }
     if (process->state == PROCESS_STATE_ACTIVE) {
         process->state = PROCESS_STATE_EXITING;
-        process_cleanup_request(PROCESS_CLEANUP_COLLECTION);
+        process_cleanup_request(PROCESS_CLEANUP_COLLECTION | PROCESS_CLEANUP_SESSION_PROGRESS);
         process_storage_authorization_clear_locked(process);
         __atomic_store_n(&process->exit_requested, true, __ATOMIC_RELEASE);
         process->exit_status = status;
@@ -3162,33 +3174,67 @@ bool process_terminate_external(process_t *process, i32 status)
     return terminated;
 }
 
-bool process_terminate_session_members(mg_session_id_t session_id)
+/* Session retirement closes admission cooperatively. The list reader and
+ * object pin protect wake traversal even if the last target thread completes
+ * on another CPU. No live kernel continuation is discarded. */
+bool process_retire_session_members(mg_session_id_t session_id)
 {
-    bool result = true;
-
-    if (session_id == PROCESS_NO_SESSION) return false;
+    if (!session_id) return false;
+    if (!process_cleanup_context_valid())
+        panic("process: unsafe session retirement context");
+    u64 after = 0, limit = 0;
+    u64 flags = spin_lock_irqsave(&process_registry_lock);
+    for (process_t *p = all_processes; p; p = p->next_all)
+        if (p->pid > limit) limit = p->pid;
+    spin_unlock_irqrestore(&process_registry_lock, flags);
     for (;;) {
-        process_t *process = NULL;
-        u64 flags = spin_lock_irqsave(&process_registry_lock);
-
-        for (process = all_processes; process; process = process->next_all) {
-            if (process->session_id == session_id &&
-                (process->state == PROCESS_STATE_ACTIVE ||
-                 process->state == PROCESS_STATE_EXITING) &&
-                object_reference(&process->object)) {
-                break;
+        process_t *target = NULL;
+        flags = spin_lock_irqsave(&process_registry_lock);
+        for (process_t *p = all_processes; p; p = p->next_all) {
+            if (p->session_id == session_id && p->launch_ready &&
+                p->pid > after && p->pid <= limit &&
+                p->state == PROCESS_STATE_ACTIVE &&
+                (!target || p->pid < target->pid)) target = p;
+        }
+        if (target) {
+            if (!process_thread_list_read_acquire_locked(target) ||
+                !object_reference(&target->object))
+                panic("process: session retirement lost member ownership");
+            after = target->pid;
+            target->state = PROCESS_STATE_EXITING;
+            target->termination_pending = true;
+            target->external_termination_in_progress = false;
+            target->exit_status = -1;
+            process_storage_authorization_clear_locked(target);
+            __atomic_store_n(&target->exit_requested, true, __ATOMIC_RELEASE);
+            for (kernel_thread_t *t = target->threads; t; t = t->process_next) {
+                __atomic_store_n(&t->process_exit_requested, true, __ATOMIC_RELEASE);
+                if (t->process_state == THREAD_PROCESS_ATTACHED)
+                    t->process_state = THREAD_PROCESS_EXIT_REQUESTED;
             }
         }
         spin_unlock_irqrestore(&process_registry_lock, flags);
-        if (!process) break;
-        if (!process_terminate_external(process, -1)) {
-            result = false;
-            process_handle_reference_release(&process->object);
+        if (!target) break;
+        for (kernel_thread_t *t = target->threads; t; t = t->process_next) {
+            console_cancel_waiter(t);
+            (void)scheduler_wake_waiter(t);
+        }
+        process_thread_list_read_release(target);
+        process_handle_reference_release(&target->object);
+        process_cleanup_request(PROCESS_CLEANUP_EXIT | PROCESS_CLEANUP_COLLECTION |
+                                PROCESS_CLEANUP_SESSION_PROGRESS);
+    }
+    flags = spin_lock_irqsave(&process_registry_lock);
+    bool complete = true;
+    for (process_t *p = all_processes; p; p = p->next_all) {
+        if (p->session_id == session_id &&
+            (p->state == PROCESS_STATE_ACTIVE || p->state == PROCESS_STATE_EXITING)) {
+            complete = false;
             break;
         }
-        process_handle_reference_release(&process->object);
     }
-    return result;
+    spin_unlock_irqrestore(&process_registry_lock, flags);
+    return complete;
 }
 
 static void process_collect_completed(mg_session_id_t session_id, bool abandoned)
@@ -4080,12 +4126,45 @@ static void process_user_thread_entry(void *argument)
     process_user_context_enter();
 }
 
+int process_activate_session(process_t *backend, u64 frontend_pid,
+    const user_identity_t *identity, mg_session_id_t *out_id)
+{
+    int result = MG_ERR_SHUTDOWN;
+    u64 flags = spin_lock_irqsave(&process_registry_lock);
+    if (backend && backend->state == PROCESS_STATE_ACTIVE &&
+        !backend->termination_pending && !backend->exit_requested) {
+        for (process_t *frontend = all_processes; frontend;
+             frontend = frontend->next_all) {
+            if (frontend->pid != frontend_pid) continue;
+            if (frontend->launch_ready && frontend->state == PROCESS_STATE_ACTIVE &&
+                !frontend->termination_pending && !frontend->exit_requested)
+                result = session_publish_active(frontend_pid, identity, out_id);
+            break;
+        }
+    }
+    spin_unlock_irqrestore(&process_registry_lock, flags);
+    return result;
+}
+
+static bool process_session_launch_permit(process_t *parent,
+    mg_session_id_t id, u64 attempt, u64 child_pid)
+{
+    kernel_thread_t *creator = thread_current();
+    u64 flags = spin_lock_irqsave(&process_registry_lock);
+    bool allowed = creator && creator->process == parent &&
+        parent->state == PROCESS_STATE_ACTIVE &&
+        !parent->termination_pending && !parent->exit_requested &&
+        session_commit_launch(id, attempt, parent->pid, creator->id, child_pid);
+    spin_unlock_irqrestore(&process_registry_lock, flags);
+    return allowed;
+}
+
 static int process_spawn_args_with_context_internal(
     process_t *parent, const process_args_t *args,
     const process_credentials_t *credentials, mg_session_id_t session_id,
     bool session_shell, const char *initial_cwd, bool system_service,
     u32 service_id, bool inherit_output, process_handle_t output_handle,
-    process_handle_t *out_handle)
+    process_handle_t *out_handle, process_session_launch_t *launch)
 {
     kernel_thread_t *thread;
     process_t *child;
@@ -4101,7 +4180,8 @@ static int process_spawn_args_with_context_internal(
     const char *process_name_source;
 
     if (!parent || parent->state != PROCESS_STATE_ACTIVE || !args ||
-        !out_handle || (credentials && !identity_credentials_valid(credentials)) ||
+        !out_handle || (session_shell && (!launch || !session_id)) ||
+        (credentials && !identity_credentials_valid(credentials)) ||
         (!credentials && parent->system_service) ||
         (system_service && (!credentials || !identity_credentials_is_system(credentials) ||
                             !service_id)) ||
@@ -4238,14 +4318,38 @@ static int process_spawn_args_with_context_internal(
         return VFS_ERR_NO_MEM;
     }
 
+    /* No fallible image/handle preparation remains. Retain the exact child
+     * through publication and session settlement even if a sibling closes
+     * its newly installed handle or the child exits immediately. */
+    if (!object_reference(&child->object)) {
+        process_handle_close(parent, parent_handle);
+        process_abort(child);
+        return VFS_ERR_NO_MEM;
+    }
+    u64 child_pid = child->pid;
+    if (launch && !process_session_launch_permit(parent, session_id,
+                                                 launch->attempt, child_pid)) {
+        process_handle_close(parent, parent_handle);
+        process_abort(child);
+        process_handle_reference_release(&child->object);
+        return VFS_ERR_CANCELLED;
+    }
     if (!scheduler_enqueue(thread)) {
         process_handle_close(parent, parent_handle);
         process_abort(child);
+        process_handle_reference_release(&child->object);
         return VFS_ERR_BAD_FORMAT;
     }
     if (!process_publish_launch(child))
         panic("process: failed to publish completed child launch");
     *out_handle = parent_handle;
+    if (launch) {
+        launch->child = child;
+        launch->handle = parent_handle;
+        launch->pid = child_pid;
+    } else {
+        process_handle_reference_release(&child->object);
+    }
     return VFS_OK;
 }
 
@@ -4257,7 +4361,7 @@ int process_spawn_result(process_t *parent, const char *cmdline,
     if (!cmdline || !parse_spawn_cmdline(cmdline, bin_path, sizeof(bin_path), &args))
         return VFS_ERR_INVALID_PARAM;
     int result = process_spawn_args_with_context_internal(parent, &args, NULL,
-        PROCESS_NO_SESSION, false, NULL, false, 0, false, 0, out_handle);
+        PROCESS_NO_SESSION, false, NULL, false, 0, false, 0, out_handle, NULL);
     process_arguments_destroy(&args);
     return result;
 }
@@ -4273,7 +4377,7 @@ int process_spawn_arguments_result(process_t *parent,
 {
     return process_spawn_args_with_context_internal(parent, args, NULL,
         PROCESS_NO_SESSION, false, NULL, false, 0, inherit_output,
-        output_handle, out_handle);
+        output_handle, out_handle, NULL);
 }
 
 static int process_spawn_kernel_argv_with_context(
@@ -4281,7 +4385,7 @@ static int process_spawn_kernel_argv_with_context(
     const process_credentials_t *credentials, mg_session_id_t session_id,
     bool session_shell, const char *initial_cwd, bool system_service,
     u32 service_id, bool inherit_output, process_handle_t output_handle,
-    process_handle_t *out_handle)
+    process_handle_t *out_handle, process_session_launch_t *launch)
 {
     process_args_t args;
     mg_result_t copied = process_arguments_collect(&args, (uintptr_t)argv, argc, NULL);
@@ -4289,7 +4393,7 @@ static int process_spawn_kernel_argv_with_context(
         return copied == MG_ERR_NO_MEMORY ? VFS_ERR_NO_MEM : VFS_ERR_INVALID_PARAM;
     int result = process_spawn_args_with_context_internal(
         parent, &args, credentials, session_id, session_shell, initial_cwd,
-        system_service, service_id, inherit_output, output_handle, out_handle);
+        system_service, service_id, inherit_output, output_handle, out_handle, launch);
     process_arguments_destroy(&args);
     return result;
 }
@@ -4300,7 +4404,7 @@ static int process_spawn_kernel_argv(process_t *parent, const char *const *argv,
 {
     return process_spawn_kernel_argv_with_context(parent, argv, argc, NULL,
         PROCESS_NO_SESSION, false, NULL, false, 0, inherit_output,
-        output_handle, out_handle);
+        output_handle, out_handle, NULL);
 }
 
 int process_spawn_argv_result(process_t *parent, const char *const *argv,
@@ -4333,7 +4437,7 @@ int process_spawn_with_output_result(process_t *parent, const char *cmdline,
     if (!cmdline || !parse_spawn_cmdline(cmdline, bin_path, sizeof(bin_path), &args))
         return VFS_ERR_INVALID_PARAM;
     int result = process_spawn_args_with_context_internal(parent, &args, NULL,
-        PROCESS_NO_SESSION, false, NULL, false, 0, false, output_handle, out_handle);
+        PROCESS_NO_SESSION, false, NULL, false, 0, false, output_handle, out_handle, NULL);
     process_arguments_destroy(&args);
     return result;
 }
@@ -4463,16 +4567,20 @@ bool process_restore_output(process_t *process, process_handle_t saved_handle)
     return true;
 }
 
-bool process_spawn_argv_with_context(process_t *parent,
-                                const char *const *argv, u32 argc,
-                                const process_credentials_t *credentials,
-                                mg_session_id_t session_id,
-                                bool session_shell, const char *initial_cwd,
-                                process_handle_t *out_handle)
+int process_spawn_session_shell(process_t *parent,
+    const process_credentials_t *credentials, mg_session_id_t session_id,
+    u64 attempt, const char *initial_cwd, process_session_launch_t *launch)
 {
-    return process_spawn_kernel_argv_with_context(parent, argv, argc,
-        credentials, session_id, session_shell, initial_cwd, false, 0,
-        false, 0, out_handle) == VFS_OK;
+    if (!launch || !attempt) return MG_ERR_BAD_ARGUMENT;
+    *launch = (process_session_launch_t){.attempt = attempt};
+    const char *argv[] = {"/bin/shoot"};
+    int result = process_spawn_kernel_argv_with_context(parent, argv, 1U,
+        credentials, session_id, true, initial_cwd, false, 0,
+        false, 0, &launch->handle, launch);
+    if (result == VFS_OK) return MG_OK;
+    if (result == VFS_ERR_NO_MEM) return MG_ERR_NO_MEMORY;
+    if (result == VFS_ERR_CANCELLED) return MG_ERR_SHUTDOWN;
+    return MG_ERR_INVALID_EXEC;
 }
 
 int process_spawn_service_result(process_t *parent, u32 service_id,
@@ -4496,7 +4604,7 @@ int process_spawn_service_result(process_t *parent, u32 service_id,
     const char *service_argv[] = { definition->path };
     if (process_spawn_kernel_argv_with_context(
             parent, service_argv, 1U, &credentials, PROCESS_NO_SESSION, false,
-            NULL, true, service_id, false, 0, out_handle) != VFS_OK) {
+            NULL, true, service_id, false, 0, out_handle, NULL) != VFS_OK) {
         return MG_ERR_INVALID_EXEC;
     }
     object = process_handle_lookup_any(parent, *out_handle,

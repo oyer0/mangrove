@@ -28,7 +28,7 @@ spawn = (extract_function('static int process_arguments_executable_path(') +
          extract_function('bool process_publish_launch(') +
          extract_function('static int process_spawn_args_with_context_internal(') +
          extract_function('static int process_spawn_kernel_argv_with_context(') +
-         extract_function('bool process_spawn_argv_with_context('))
+         extract_function('int process_spawn_session_shell('))
 with tempfile.TemporaryDirectory(prefix='mangrove-argv-',
                                  dir=workspace_parent) as folder:
     folder = Path(folder)
@@ -37,7 +37,7 @@ with tempfile.TemporaryDirectory(prefix='mangrove-argv-',
     executable = folder / 'test'
     subprocess.run([sys.argv[1] if len(sys.argv) > 1 else 'gcc', '-std=gnu17',
         '-O1', '-g', '-Wall', '-Wextra', '-Werror', '-fsanitize=address,undefined',
-        '-I'+str(ROOT/'kernel/include'), '-I'+str(ROOT/'include'),
+        '-I'+str(ROOT/'tests/kernel'), '-I'+str(ROOT/'kernel/include'), '-I'+str(ROOT/'include'),
         '-idirafter', str(ROOT/'libc/include'), str(folder/'fixture.c'),
         str(ROOT/'kernel/src/process_arguments.c'), '-o', str(executable)], check=True)
     subprocess.run([str(executable)], check=True,

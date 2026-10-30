@@ -1838,6 +1838,18 @@ test-dev-tools: test-qmp-client test-artifact-lifecycle
 test-spinlock-context:
 	python3 tests/kernel/spinlock_context_test.py "$(HOST_CC)"
 
+.PHONY: test-thread-reclaim-observer
+test-thread-reclaim-observer:
+	python3 tests/userspace/thread_reclaim_observer_test.py "$(HOST_CC)"
+test-sync: test-thread-reclaim-observer
+
+.PHONY: test-session-lifecycle test-session-reply
+test-session-lifecycle:
+	python3 tests/kernel/session_lifecycle_test.py "$(HOST_CC)"
+test-session-reply:
+	python3 tests/userspace/session_reply_test.py "$(HOST_CC)"
+test-sync: test-session-reply
+
 .PHONY: test-process-orphan-collection
 test-process-orphan-collection:
 	python3 tests/kernel/process_orphan_collection_test.py "$(HOST_CC)"

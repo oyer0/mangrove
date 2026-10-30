@@ -6,6 +6,7 @@
 #include <mg/inspection.h>
 #include <mg/memory.h>
 #include <mg/process_status.h>
+#include <mg/log_service.h>
 #include <stdatomic.h>
 #include <errno.h>
 #include <stdio.h>
@@ -110,8 +111,8 @@ static bool own_process_memory_bytes(u64 *bytes, u32 *flags)
     return process_memory_bytes_for(process_current_pid(), bytes, flags, NULL);
 }
 
-/* A process snapshot can race autonomous cleanup. Use consecutive startup
- * observations when establishing the initial mapping baseline. */
+/* Capture only before this process creates its first worker. Repeated equal
+ * readings after join are not a reclamation boundary. */
 static bool own_process_memory_stable(u64 deadline, u64 *out_bytes)
 {
     u64 previous = 0;
@@ -120,7 +121,9 @@ static bool own_process_memory_stable(u64 deadline, u64 *out_bytes)
     if (!out_bytes) return false;
     while (uptime_ms() < deadline) {
         u64 current = 0;
-        if (own_process_memory_bytes(&current, NULL)) {
+        u32 flags = 0;
+        if (own_process_memory_bytes(&current, &flags) &&
+            !(flags & MG_PROCESS_FLAG_REAP_STATE_MASK)) {
             if (consecutive && current == previous) {
                 if (++consecutive == 2U) {
                     *out_bytes = current;
@@ -538,15 +541,160 @@ static int verify_autonomous_reap(void)
     return 0;
 }
 
+/* An intermediate parent abandons a child completion.
+ * The observer owns no grandchild handle and must see registry collection. */
+static int orphan_mode(const char *mode, const char *base)
+{
+    char ready[160], go[160];
+    snprintf(ready, sizeof(ready), "%s.ready", base);
+    snprintf(go, sizeof(go), "%s.go", base);
+    if (!strcmp(mode, "orphan-parent")) {
+        const char *command[] = {"/bin/threadtest", "orphan-target", base};
+        mg_result_t made = process_spawn_argv(command, 3U);
+        if (made <= 0) return 81;
+        u64 pid = process_handle_pid((mg_handle_t)made);
+        mg_handle_t file;
+        if (!pid || file_create_contents(ready, &pid, sizeof(pid), &file) != MG_OK ||
+            handle_close(file) != MG_OK) return 82;
+        /* Exit closes the child handle without consuming the child owner. */
+        process_exit(0);
+    }
+    u64 deadline = uptime_ms() + 8000U;
+    while (uptime_ms() < deadline) {
+        mg_result_t opened = file_open(go, MG_OPEN_READ);
+        if (opened > 0) {
+            (void)handle_close((mg_handle_t)opened);
+            process_exit(0);
+        }
+        (void)process_yield();
+    }
+    return 83;
+}
+
+static int verify_orphan_collection(void)
+{
+    char base[128], ready[160], go[160];
+    snprintf(base, sizeof(base), "/temp/thread-orphan-%llu",
+             (unsigned long long)process_current_pid());
+    snprintf(ready, sizeof(ready), "%s.ready", base);
+    snprintf(go, sizeof(go), "%s.go", base);
+    const char *command[] = {"/bin/threadtest", "orphan-parent", base};
+    mg_result_t made = process_spawn_argv(command, 3U);
+    if (made <= 0) return 84;
+    i32 status = -1;
+    if (process_wait((mg_handle_t)made, &status) != MG_OK ||
+        handle_close((mg_handle_t)made) != MG_OK || status != 0) return 85;
+    u64 pid = 0;
+    mg_result_t opened = file_open(ready, MG_OPEN_READ);
+    if (opened <= 0) return 86;
+    mg_result_t read = object_read((mg_handle_t)opened, &pid, sizeof(pid));
+    (void)handle_close((mg_handle_t)opened);
+    u64 bytes; u32 state;
+    if (read != (mg_result_t)sizeof(pid) || !pid ||
+        !process_memory_bytes_for(pid, &bytes, NULL, &state) ||
+        state == MG_PROCESS_INSPECTION_EXITED) return 87;
+    mg_handle_t file;
+    if (file_create_contents(go, "1", 1U, &file) != MG_OK ||
+        handle_close(file) != MG_OK) return 88;
+    bool collected = false;
+    u64 deadline = uptime_ms() + 8000U;
+    while (uptime_ms() < deadline) {
+        if (!process_memory_bytes_for(pid, &bytes, NULL, NULL)) {
+            collected = true;
+            break;
+        }
+        (void)process_yield();
+    }
+    (void)path_remove(ready); (void)path_remove(go);
+    return collected ? 0 : 89;
+}
+
+/* One request per process remains the IPC contract. A real worker performs
+ * sequential bounded round trips while its initial thread blocks in join. */
+static mg_thread_result_t native_ipc_worker(void *unused)
+{
+    (void)unused;
+    /* logd accepts submissions only from named system services. Preserve that
+     * negative control, then exercise successful public query round trips. */
+    if (mg_log_submit(MG_LOG_INFO, "thread lifecycle IPC probe") !=
+            MG_ERR_PRIVILEGE_REQUIRED) return 0x9901U;
+    mg_handle_t endpoint;
+    mg_result_t result = service_lookup("log", &endpoint);
+    if (result != MG_OK) return (mg_thread_result_t)(i64)result;
+    for (unsigned i = 0; i < 32U; i++) {
+        mg_ipc_message_t request = {0}, reply = {0};
+        mg_log_request_t query = {.version = MG_LOG_PROTOCOL_VERSION,
+            .operation = MG_LOG_OP_QUERY, .severity = MG_LOG_SEVERITY_ANY};
+        request.version = MG_IPC_PROTOCOL_VERSION;
+        request.type = MG_LOG_REQUEST;
+        request.payload_length = sizeof(query);
+        memcpy(request.payload, &query, sizeof(query));
+        result = ipc_request(endpoint, &request, &reply);
+        if (result != MG_OK) break;
+        if (reply.version != MG_IPC_PROTOCOL_VERSION ||
+            reply.type != MG_LOG_RESPONSE ||
+            reply.payload_length != sizeof(mg_log_response_t)) {
+            result = MG_ERR_PROTOCOL;
+            break;
+        }
+        mg_log_response_t response;
+        memcpy(&response, reply.payload, sizeof(response));
+        result = response.result;
+        if (result != MG_OK || response.count > MG_LOG_QUERY_MAX) {
+            if (result == MG_OK) result = MG_ERR_PROTOCOL;
+            break;
+        }
+    }
+    mg_result_t closed = handle_close(endpoint);
+    if (result != MG_OK) return (mg_thread_result_t)(i64)result;
+    return closed == MG_OK ? 0x9900U : (mg_thread_result_t)(i64)closed;
+}
+
+static int verify_native_ipc(u64 baseline)
+{
+    mg_thread_created_t worker;
+    mg_thread_result_t result = 0;
+    if (mg_thread_create(&worker, native_ipc_worker, NULL) != MG_OK) return 90;
+    mg_result_t joined = mg_thread_join(worker.handle, &result);
+    if (joined != MG_OK || result != 0x9900U) {
+        printf("THREADS1 IPC diagnostic join=%lld result=%lld\n",
+               (long long)joined, (long long)(i64)result);
+        return 91;
+    }
+    u64 last = 0; u32 flags = 0, samples = 0;
+    if (!own_process_memory_wait_for(baseline, uptime_ms() + 5000U,
+                                      &last, &flags, &samples)) {
+        printf("THREADS1 IPC reclaim baseline=%llu last=%llu flags=%x samples=%u\n",
+               (unsigned long long)baseline, (unsigned long long)last, flags, samples);
+        return 92;
+    }
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 3 && !strcmp(argv[1], "autonomous-target"))
         return autonomous_target(argv[2]);
+    if (argc == 3 && (!strcmp(argv[1], "orphan-parent") ||
+                      !strcmp(argv[1], "orphan-target")))
+        return orphan_mode(argv[1], argv[2]);
     if (argc == 2) return child_mode(argv[1]);
     REQUIRE(argc == 1, "arguments");
     int autonomous_result = verify_autonomous_reap();
     if (autonomous_result) printf("THREADS1 autonomous case=%d\n", autonomous_result);
     REQUIRE(autonomous_result == 0, "autonomous CPU-inactive reap");
+    int orphan_result = verify_orphan_collection();
+    if (orphan_result) printf("THREADS1 orphan case=%d\n", orphan_result);
+    REQUIRE(orphan_result == 0, "abandoned completion collection");
+    /* No worker has ever been created in this process at this point. Child
+     * processes have independent address spaces and cannot inflate this oracle. */
+    u64 persistent_user_bytes = 0;
+    REQUIRE(own_process_memory_stable(uptime_ms() + 5000U,
+                                      &persistent_user_bytes),
+            "initial process memory snapshot");
+    int ipc_result = verify_native_ipc(persistent_user_bytes);
+    if (ipc_result) printf("THREADS1 ipc case=%d\n", ipc_result);
+    REQUIRE(ipc_result == 0, "native worker IPC");
     REQUIRE(verify_syscall_entry_stack() == 0,
             "trusted syscall stack, user-memory isolation, and flags");
     worker_arg_t arguments[WORKERS] = {{.index = 0U}, {.index = 1U}};
@@ -561,10 +709,6 @@ int main(int argc, char **argv)
     atomic_init(&cpu_witness_workers, 0U);
     atomic_init(&wait_ready, 0U);
     errno = 79;
-    u64 persistent_user_bytes = 0;
-    REQUIRE(own_process_memory_stable(uptime_ms() + 5000U,
-                                      &persistent_user_bytes),
-            "initial process memory snapshot");
 
     REQUIRE(mg_mutex_lock(&gate_mutex) == MG_OK, "main startup lock");
     for (unsigned i = 0; i < WORKERS; i++)
@@ -728,7 +872,7 @@ int main(int argc, char **argv)
     int length = snprintf(transcript, sizeof(transcript),
         "THREADS1 PASS cpus=2 workers=%u iterations=%u atomic=%u mutex=%u "
         "tls=isolated return=join explicit-exit=pass detached=%u "
-        "termination=spin,wait,fault autonomous=cpu-inactive\n",
+        "termination=spin,wait,fault autonomous=cpu-inactive orphan=collected ipc=32\n",
         WORKERS, ITERATIONS, WORKERS * ITERATIONS,
         WORKERS * ITERATIONS, REPEAT_WORKERS);
     REQUIRE(length > 0 && (usize)length < sizeof(transcript), "format log");
