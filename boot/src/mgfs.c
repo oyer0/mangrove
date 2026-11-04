@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include <mgfs.h>
+#include <block_io.h>
 #include <memory.h>
 
 #define MGFS_MAGIC_U64 0x000031765346474DULL
@@ -35,10 +36,10 @@
  * placing them in individual call frames.  Boot-time MGFS access is
  * single-threaded and these buffers have deliberately separate roles so a
  * nested metadata read cannot overwrite its caller's block. */
-static u8 MgfsBootSuperblock[MGFS_BOOT_BLOCK_BYTES];
-static u8 MgfsBootBlock[MGFS_BOOT_BLOCK_BYTES];
-static u8 MgfsBootListBlock[MGFS_BOOT_BLOCK_BYTES];
-static u8 MgfsBootFileBlock[MGFS_BOOT_BLOCK_BYTES];
+static _Alignas(EFI_PAGE_SIZE) u8 MgfsBootSuperblock[MGFS_BOOT_BLOCK_BYTES];
+static _Alignas(EFI_PAGE_SIZE) u8 MgfsBootBlock[MGFS_BOOT_BLOCK_BYTES];
+static _Alignas(EFI_PAGE_SIZE) u8 MgfsBootListBlock[MGFS_BOOT_BLOCK_BYTES];
+static _Alignas(EFI_PAGE_SIZE) u8 MgfsBootFileBlock[MGFS_BOOT_BLOCK_BYTES];
 
 static u64 mgfs_boot_le64(const u8 *data)
 {
@@ -117,8 +118,9 @@ static bool mgfs_boot_read_block(MGFS_BOOT_FS *fs, u64 block, u8 *buffer)
     lba = fs->partition_start + sector_offset;
     if (lba > fs->block_io->Media->LastBlock ||
         fs->block_io->Media->LastBlock - lba < 7ULL) return false;
-    return fs->block_io->ReadBlocks(fs->block_io, fs->media_id, lba,
-                                    MGFS_BOOT_BLOCK_BYTES, buffer) == EFI_SUCCESS;
+    return block_io_read_blocks(fs->boot_services, fs->block_io, fs->media_id,
+                                lba, MGFS_BOOT_BLOCK_BYTES, buffer) ==
+           EFI_SUCCESS;
 }
 
 static bool mgfs_boot_validate_layout(MGFS_BOOT_FS *fs, u64 total_blocks,
@@ -423,6 +425,7 @@ static bool mgfs_boot_find_child(MGFS_BOOT_FS *fs, u64 parent_id,
 }
 
 EFI_STATUS mgfs_boot_init(MGFS_BOOT_FS *fs,
+                          EFI_BOOT_SERVICES *boot_services,
                           EFI_BLOCK_IO_PROTOCOL *block_io,
                           u64 media_id,
                           u64 partition_start,
@@ -433,11 +436,13 @@ EFI_STATUS mgfs_boot_init(MGFS_BOOT_FS *fs,
     u64 bitmap_blocks;
     u64 bitmap_bytes;
 
-    if (!fs || !block_io || !block_io->Media || !block_io->ReadBlocks ||
+    if (!fs || !boot_services || !block_io || !block_io->Media ||
+        !block_io->ReadBlocks ||
         block_io->Media->BlockSize != 512U || partition_blocks < 8ULL) {
         return EFI_INVALID_PARAMETER;
     }
     mgfs_boot_zero(fs, sizeof(*fs));
+    fs->boot_services = boot_services;
     fs->block_io = block_io;
     fs->media_id = (u32)media_id;
     fs->partition_start = partition_start;

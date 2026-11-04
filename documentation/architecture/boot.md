@@ -14,6 +14,11 @@ System Partition named `MANGROVE_ESP`. When UEFI reports the loaded image as a
 GPT partition, the role-associated ESP must be that partition. More than one
 matching disk is treated as ambiguous and boot is refused.
 
+Every Block I/O read uses an `EFI_BOOT_SERVICES_DATA` pool buffer aligned to
+the media's `IoAlign`, then copies successful reads into the loader's scratch
+buffer. This keeps firmware/DMA-facing storage buffers in firmware-allocated
+memory while preserving the loader's static scratch-buffer ownership.
+
 The root partition contains MGFS. The loader mounts it with its dedicated,
 read-only MGFS reader and opens `/boot/pith.elf`. It validates a 64-bit,
 little-endian x86-64 executable ELF image, loads each `PT_LOAD` segment at the

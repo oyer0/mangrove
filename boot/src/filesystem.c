@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include <filesystem.h>
+#include <block_io.h>
 #include <memory.h>
 
 #define GPT_HEADER_BYTES 92U
@@ -44,7 +45,8 @@ static bool filesystem_read_blocks(EFI_BLOCK_IO_PROTOCOL *block_io,
     if (media->BlockSize != 512U || lba > media->LastBlock ||
         count - 1U > media->LastBlock - lba) return false;
     bytes = (usize)count * media->BlockSize;
-    return block_io->ReadBlocks(block_io, media_id, lba, bytes, buffer) == EFI_SUCCESS;
+    return block_io_read_blocks(BootServices, block_io, media_id, lba,
+                                bytes, buffer) == EFI_SUCCESS;
 }
 
 static bool filesystem_gpt_name(const u8 *entry, const char *name)
@@ -225,8 +227,8 @@ EFI_STATUS filesystem_init(EFI_HANDLE ImageHandle,
                                   loaded_partition, &root_disk,
                                   &esp_start, &esp_end);
     if (EFI_ERROR(status)) return status;
-    return mgfs_boot_init(&RootFs, root_disk, root_disk->Media->MediaId,
-                          esp_start, esp_end);
+    return mgfs_boot_init(&RootFs, BootServices, root_disk,
+                          root_disk->Media->MediaId, esp_start, esp_end);
 }
 
 EFI_STATUS filesystem_open(const char *Path, BOOT_FILE **File)

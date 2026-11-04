@@ -17,6 +17,7 @@
 
 typedef struct
 {
+    EFI_BOOT_SERVICES *boot_services;
     EFI_BLOCK_IO_PROTOCOL *block_io;
     u32 media_id;
     u64 partition_start;
@@ -30,7 +31,7 @@ typedef struct
     u64 data_blocks;
     u8 *record_bitmap;
     usize record_bitmap_size;
-    u8 table_block[MGFS_BOOT_BLOCK_BYTES];
+    _Alignas(EFI_PAGE_SIZE) u8 table_block[MGFS_BOOT_BLOCK_BYTES];
     u64 table_block_number;
     bool table_block_valid;
 } MGFS_BOOT_FS;
@@ -44,6 +45,7 @@ typedef struct
 } MGFS_BOOT_FILE;
 
 EFI_STATUS mgfs_boot_init(MGFS_BOOT_FS *fs,
+                          EFI_BOOT_SERVICES *boot_services,
                           EFI_BLOCK_IO_PROTOCOL *block_io,
                           u64 media_id,
                           u64 partition_start,

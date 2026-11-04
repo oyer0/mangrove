@@ -30,6 +30,16 @@ def main():
     compiler = sys.argv[3]
     checker = ROOT / "tools/check_mgfs_version.py"
     with tempfile.TemporaryDirectory(prefix="mangrove-mgfs-version-") as temp:
+        block_io_test = pathlib.Path(temp) / "block-io-pool-test"
+        subprocess.run([compiler, "-std=gnu11", "-Wall", "-Wextra", "-Werror",
+                        "-Wno-unused-variable", *native_uefi_flags(),
+                        "-I" + str(ROOT / "boot/include"),
+                        "-I" + str(ROOT / "include"),
+                        str(ROOT / "tests/filesystems/mgfs/block_io_pool_test.c"),
+                        str(ROOT / "boot/src/block_io.c"), "-o",
+                        str(block_io_test)], check=True)
+        subprocess.run([str(block_io_test)], check=True)
+
         boot_test = pathlib.Path(temp) / "boot-version-test"
         subprocess.run([compiler, "-std=gnu11", "-Wall", "-Wextra", "-Werror",
                         "-Wno-unused-variable", *native_uefi_flags(),
@@ -37,7 +47,8 @@ def main():
                         *dead_strip_flags(), "-I" + str(ROOT / "boot/include"),
                         "-I" + str(ROOT / "include"),
                         str(ROOT / "tests/filesystems/mgfs/mgfs_boot_version_test.c"),
-                        str(ROOT / "boot/src/mgfs.c"), "-o", str(boot_test)],
+                        str(ROOT / "boot/src/mgfs.c"),
+                        str(ROOT / "boot/src/block_io.c"), "-o", str(boot_test)],
                        check=True)
         current = pathlib.Path(temp) / "current.img"
         # Leave enough Record IDs for the production CA trust-store entries
