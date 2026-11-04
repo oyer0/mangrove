@@ -20,9 +20,14 @@ readonly MAX_CAPACITY_BYTES=$((16 * 1024 * 1024 * 1024))
 readonly HELPER=/usr/local/libexec/mangrove-physical-sandisk-usbctl
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-IMAGE=$ROOT/build/Mangrove/MangroveUSB.img
-OVMF_CODE=/usr/share/OVMF/OVMF_CODE_4M.fd
-OVMF_VARS=/usr/share/OVMF/OVMF_VARS_4M.fd
+BUILD_DIR=${BUILD_DIR:-build}
+case "$BUILD_DIR" in
+    /*) ;;
+    *) BUILD_DIR=$ROOT/$BUILD_DIR ;;
+esac
+IMAGE=${MANGROVE_USB_IMAGE:-$BUILD_DIR/Mangrove/MangroveUSB.img}
+OVMF_CODE=${OVMF_CODE_SOURCE:-${OVMF_CODE:-$(python3 "$ROOT/tests/guest/ovmf_firmware.py" --kind code)}}
+OVMF_VARS=${OVMF_VARS_SOURCE:-${OVMF_VARS:-$(python3 "$ROOT/tests/guest/ovmf_firmware.py" --kind vars)}}
 readonly QEMU=qemu-system-x86_64
 
 die()

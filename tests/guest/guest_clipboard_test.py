@@ -8,6 +8,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+from ovmf_firmware import default_path
 import time
 import zlib
 import struct
@@ -44,8 +45,8 @@ def main():
     parser.add_argument('--output', type=Path)
     parser.add_argument('--accel', choices=('kvm','tcg'), default=qemu_accel.default_accel())
     parser.add_argument('--qemu', default='qemu-system-x86_64')
-    parser.add_argument('--ovmf-code', type=Path, default=Path('/usr/share/OVMF/OVMF_CODE_4M.fd'))
-    parser.add_argument('--ovmf-vars', type=Path, default=Path('/usr/share/OVMF/OVMF_VARS_4M.fd'))
+    parser.add_argument('--ovmf-code', type=Path, default=default_path('code'))
+    parser.add_argument('--ovmf-vars', type=Path, default=default_path('vars'))
     artifacts.add_retention_argument(parser)
     args = parser.parse_args()
     source = SOURCE

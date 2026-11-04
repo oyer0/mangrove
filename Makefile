@@ -87,13 +87,13 @@ else
 endif
     QEMU_CPU          := max
     QEMU_DISPLAY_ARGS ?= -display cocoa,zoom-to-fit=on
-    OVMF_CODE_SOURCE  := $(QEMU_PREFIX)/share/qemu/edk2-x86_64-code.fd
-    OVMF_VARS_SOURCE  := $(QEMU_PREFIX)/share/qemu/edk2-i386-vars.fd
+    OVMF_CODE_SOURCE  ?= $(QEMU_PREFIX)/share/qemu/edk2-x86_64-code.fd
+    OVMF_VARS_SOURCE  ?= $(QEMU_PREFIX)/share/qemu/edk2-i386-vars.fd
 else
     QEMU_ACCEL        := kvm
     QEMU_CPU          := host
-    OVMF_CODE_SOURCE := /usr/share/OVMF/OVMF_CODE_4M.fd
-    OVMF_VARS_SOURCE := /usr/share/OVMF/OVMF_VARS_4M.fd
+    OVMF_CODE_SOURCE  ?= $(shell python3 tests/guest/ovmf_firmware.py --kind code)
+    OVMF_VARS_SOURCE  ?= $(shell python3 tests/guest/ovmf_firmware.py --kind vars)
 endif
 
 QEMU_PLATFORM_ARGS := -accel $(QEMU_ACCEL) -cpu $(QEMU_CPU)
@@ -665,7 +665,7 @@ DEPS := $(BOOT_OBJS:.o=.d) $(ALL_KERNEL_OBJS:.o=.d)
 .PHONY: all help make fresh run fresh-run usb clean test exfat-upcase \
         binaries font sprout sessiond logind logd networkd deviced volumed clipd mount unmount eject lspci lsusb lsdsk diskutil crew about view info mem time tmon logv hello shoot clear copy list locate move mkdir plant type wait reed del say shutdown reboot uptime date version where fstest nettest ping resolve fetch netinfo netcfg power identity user \
         image fresh-image usb-image run-usb mkmgfs mgfsck test-time test-terminal test-mgfs-version test-mgfs-reconcile test-reed test-math test-kernel-stack test-http-wire kernel-stack-usage test-guest-kernel-stack \
-        check-image-deps check-usb-deps check-qemu-deps qemu-warning dev-image fresh-dev-image flash-image test-launch test-password test-random test-vmm test-heap test-history test-copy test-move test-del test-mfqs test-sync test-spinlock-context test-storage test-dev-tools test-font test-unicode test-shoot test-shoot-help test-pager test-view test-info test-help test-list test-cli-options test-fetch test-fetch-transport test-tcp test-startup-presentation test-x250-boot-trace test-power-presentation test-rtc-build-policy test-say
+        check-image-deps check-usb-deps check-qemu-deps qemu-warning dev-image fresh-dev-image flash-image test-launch test-password test-random test-vmm test-heap test-history test-copy test-move test-del test-mfqs test-sync test-spinlock-context test-storage test-dev-tools test-font test-unicode test-shoot test-shoot-help test-pager test-view test-info test-help test-list test-cli-options test-fetch test-fetch-transport test-tcp test-startup-presentation test-power-presentation test-rtc-build-policy test-say test-ovmf-discovery
 
 # Everyday targets
 all: image
@@ -680,7 +680,7 @@ help:
 	@echo "  make run         Build and boot the persistent USB/xHCI development image"
 	@echo "  make fresh       Reset the persistent development image"
 	@echo "  make fresh-run   Reset the development image and boot it"
-	@echo "  make usb         Build build/Mangrove/MangroveUSB.img for hardware"
+	@echo "  make usb         Build $(USB_IMAGE) for hardware"
 	@echo "  make clean       Remove disposable build artifacts; preserve .mangrove/"
 	@echo "  make test        Run the available host-side test suites"
 	@echo "  make test-guest  MTS standard guest qualification (27 boots; not a quick test)"
@@ -899,6 +899,9 @@ mkmgfs: $(MKMGFS)
 
 mgfsck: $(BUILD_DIR)/mgfsck
 
+test-ovmf-discovery:
+	python3 tests/guest/ovmf_firmware_test.py
+
 test-startup-presentation:
 	python3 tests/kernel/startup_presentation_test.py "$(HOST_CC)"
 	python3 tests/kernel/init_trace_test.py "$(HOST_CC)"
@@ -910,7 +913,6 @@ test-x250-boot-trace:
 		-idirafter libc/include tests/kernel/x250_boot_trace_test.c \
 		-o $(HOST_TEST_DIR)/mangrove-x250-boot-trace-test
 	$(HOST_TEST_DIR)/mangrove-x250-boot-trace-test
-
 
 test-rtc-build-policy:
 	python3 tests/kernel/rtc_build_policy_test.py
@@ -2064,19 +2066,19 @@ endif
 
 dev-image: check-usb-deps binaries $(MKMGFS) $(OVMF_VARS)
 	@mkdir -p $(STATE_DIR)
-	./scripts/update_dev_image.sh --disk "$(DEV_IMAGE)" --root "$(DEV_ROOT_IMAGE)"
+	./scripts/update_dev_image.sh --build-dir "$(BUILD_DIR)" --disk "$(DEV_IMAGE)" --root "$(DEV_ROOT_IMAGE)"
 
 fresh-dev-image: check-usb-deps binaries $(MKMGFS) $(OVMF_VARS)
 	@mkdir -p $(STATE_DIR)
 	@echo "[FRESH] Factory-resetting persistent development image $(DEV_IMAGE)"
-	./scripts/update_dev_image.sh --fresh --disk "$(DEV_IMAGE)" --root "$(DEV_ROOT_IMAGE)"
+	./scripts/update_dev_image.sh --build-dir "$(BUILD_DIR)" --fresh --disk "$(DEV_IMAGE)" --root "$(DEV_ROOT_IMAGE)"
 
 # The standard QEMU development environment explicitly sets its RTC to UTC.
 # This assertion flows to binaries and the kernel objects needed by the image.
 dev-image fresh-dev-image: override RTC_UTC_TRUST = 1
 
 flash-image: check-usb-deps binaries $(MKMGFS) $(OVMF_VARS)
-	./scripts/make_image.sh --fresh --root "$(FLASH_ROOT_IMAGE)" --autologin developer
+	./scripts/make_image.sh --build-dir "$(BUILD_DIR)" --fresh --root "$(FLASH_ROOT_IMAGE)" --autologin developer
 	@mkdir -p $(MANGROVE_DIR)
 	@rm -f $(USB_IMAGE)
 	@dd if=/dev/zero of=$(USB_IMAGE) bs=1 count=0 seek=135283200 2>/dev/null

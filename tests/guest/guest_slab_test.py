@@ -10,6 +10,7 @@ import secrets
 import statistics
 import subprocess
 import sys
+from ovmf_firmware import default_path
 sys.dont_write_bytecode = True
 from pathlib import Path as _TestPath
 import sys as _test_sys
@@ -850,9 +851,9 @@ def main():
     parser.add_argument('--accel', choices=('tcg', 'kvm'), default=guest.default_accel())
     parser.add_argument('--qemu', default='qemu-system-x86_64')
     parser.add_argument('--ovmf-code', type=Path,
-                        default=Path('/usr/share/OVMF/OVMF_CODE_4M.fd'))
+                        default=default_path('code'))
     parser.add_argument('--ovmf-vars', type=Path,
-                        default=Path('/usr/share/OVMF/OVMF_VARS_4M.fd'))
+                        default=default_path('vars'))
     parser.add_argument('--timeout', type=int, default=180)
     parser.add_argument('--benchmark', action='store_true')
     parser.add_argument('--free-profile', action='store_true')

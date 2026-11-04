@@ -16,6 +16,7 @@ import stat
 import struct
 import subprocess
 import sys
+from ovmf_firmware import default_path
 import time
 from pathlib import Path as _TestPath
 import sys as _test_sys
@@ -1870,8 +1871,8 @@ def main():
     parser.add_argument('--build-dir', type=Path, required=True)
     parser.add_argument('--accel', choices=('tcg', 'kvm'), default=default_accel())
     parser.add_argument('--qemu', default='qemu-system-x86_64')
-    parser.add_argument('--ovmf-code', type=Path, default=Path('/usr/share/OVMF/OVMF_CODE_4M.fd'))
-    parser.add_argument('--ovmf-vars', type=Path, default=Path('/usr/share/OVMF/OVMF_VARS_4M.fd'))
+    parser.add_argument('--ovmf-code', type=Path, default=default_path('code'))
+    parser.add_argument('--ovmf-vars', type=Path, default=default_path('vars'))
     parser.add_argument('--timeout', type=int, default=180)
     parser.add_argument('--cpus', type=int, choices=(1, 2), default=1,
                         help='QEMU vCPU count (the two-CPU option exercises AP startup)')

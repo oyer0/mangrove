@@ -3,8 +3,9 @@
 `make test-guest-mgfs` explicitly builds an isolated system and runs two fresh
 QEMU campaigns. It never invokes `make run`, opens `.mangrove/`, or installs
 `fstest` in the normal image manifest. Dependencies are QEMU x86-64, OVMF,
-`sgdisk`, `mkfs.fat`, mtools, and the normal GNU build tools. Debian defaults
-use firmware under `/usr/share/OVMF/`. Run from the repository root:
+`sgdisk`, `mkfs.fat`, mtools, and the normal GNU build tools. Firmware is
+discovered from the Arch or Debian package layout; `OVMF_CODE_SOURCE` and
+`OVMF_VARS_SOURCE` can override either path. Run from the repository root:
 
 ```sh
 make test-guest-mgfs \

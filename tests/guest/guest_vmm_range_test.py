@@ -9,6 +9,7 @@ import re
 import secrets
 import subprocess
 import sys
+from ovmf_firmware import default_path
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.dont_write_bytecode = True
@@ -65,9 +66,9 @@ def main():
     parser.add_argument('--accel', choices=('tcg', 'kvm'), default=guest.default_accel())
     parser.add_argument('--qemu', default='qemu-system-x86_64')
     parser.add_argument('--ovmf-code', type=Path,
-                        default=Path('/usr/share/OVMF/OVMF_CODE_4M.fd'))
+                        default=default_path('code'))
     parser.add_argument('--ovmf-vars', type=Path,
-                        default=Path('/usr/share/OVMF/OVMF_VARS_4M.fd'))
+                        default=default_path('vars'))
     parser.add_argument('--timeout', type=int, default=180)
     parser.add_argument('--hybrid-routing', type=int, choices=(0, 1), required=True)
     args = parser.parse_args()

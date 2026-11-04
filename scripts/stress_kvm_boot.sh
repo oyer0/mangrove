@@ -9,14 +9,19 @@
 set -euo pipefail
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-image=${MANGROVE_USB_IMAGE:-"$root/build/Mangrove/MangroveUSB.img"}
-ovmf_code=${OVMF_CODE:-/usr/share/OVMF/OVMF_CODE_4M.fd}
-ovmf_vars=${OVMF_VARS:-/usr/share/OVMF/OVMF_VARS_4M.fd}
+build_dir=${BUILD_DIR:-build}
+case "$build_dir" in
+    /*) ;;
+    *) build_dir="$root/$build_dir" ;;
+esac
+image=${MANGROVE_USB_IMAGE:-"$build_dir/Mangrove/MangroveUSB.img"}
+ovmf_code=${OVMF_CODE_SOURCE:-${OVMF_CODE:-$(python3 "$root/tests/guest/ovmf_firmware.py" --kind code)}}
+ovmf_vars=${OVMF_VARS_SOURCE:-${OVMF_VARS:-$(python3 "$root/tests/guest/ovmf_firmware.py" --kind vars)}}
 qemu=${QEMU:-qemu-system-x86_64}
 runs=${1:-20}
 seconds=${BOOT_SECONDS:-25}
 smp=${QEMU_SMP:-2}
-output=${BOOT_STRESS_OUTPUT:-"$root/build/boot-stress"}
+output=${BOOT_STRESS_OUTPUT:-"$build_dir/boot-stress"}
 
 if ! [[ $runs =~ ^[1-9][0-9]*$ ]] ||
    ! [[ $seconds =~ ^[1-9][0-9]*$ ]] ||

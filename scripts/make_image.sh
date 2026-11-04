@@ -2,61 +2,10 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 set -e
 
-BOOT_IMAGE=build/Mangrove/Boot.img
-ROOT_IMAGE=build/Mangrove/Mangrove.img
-MKMGFS=build/mkmgfs
-PITH=build/Mangrove/pith.elf
-SPROUT=build/sprout/sprout.elf
-SPROUT_CMD=build/sproutcmd/sprout.elf
-SESSIOND=build/sessiond/sessiond.elf
-LOGIND=build/logind/logind.elf
-LOGD=build/logd/logd.elf
-NETWORKD=build/networkd/networkd.elf
-DEVICED=build/deviced/deviced.elf
-VOLUMED=build/volumed/volumed.elf
-CLIPD=build/clipd/clipd.elf
-MOUNT=build/mount/mount.elf
-UNMOUNT=build/unmount/unmount.elf
-EJECT=build/eject/eject.elf
-DISKUTIL=build/diskutil/diskutil.elf
-LSPCI=build/lspci/lspci.elf
-LSUSB=build/lsusb/lsusb.elf
-LSDISK=build/lsdsk/lsdsk.elf
-CREW=build/crew/crew.elf
-MEM=build/mem/mem.elf
-TIME=build/time/time.elf
-TMON=build/tmon/tmon.elf
-LOGV=build/logv/logv.elf
-SHOOT=build/shoot/shoot.elf
-CLEAR=build/clear/clear.elf
-COPY=build/copy/copy.elf
-LIST=build/list/list.elf
-LOCATE=build/locate/locate.elf
-MOVE=build/move/move.elf
-PLANT=build/plant/plant.elf
-TYPE=build/type/type.elf
-WAIT=build/wait/wait.elf
-DEL=build/del/del.elf
-MKDIR=build/mkdir/mkdir.elf
-SAY=build/say/say.elf
-UPTIME=build/uptime/uptime.elf
-DATE=build/date/date.elf
-ABOUT=build/about/about.elf
-REED=build/reed/reed.elf
-VIEW=build/view/view.elf
-INFO=build/info/info.elf
-PING=build/ping/ping.elf
-RESOLVE=build/resolve/resolve.elf
-FETCH=build/fetch/fetch.elf
-NETINFO=build/netinfo/netinfo.elf
-NETCFG=build/netcfg/netcfg.elf
-POWER=build/power/power.elf
-IDENTITY=build/identity/identity.elf
-USER_CMD=build/user/user.elf
-SHUTDOWN=build/shutdown/shutdown.elf
-REBOOT=build/reboot/reboot.elf
-VERSION=build/version/version.elf
-WHERE=build/where/where.elf
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$ROOT"
+BUILD_DIR=${BUILD_DIR:-build}
+ROOT_IMAGE=
 PCI_IDS=share/hardware/pci.ids
 USB_IDS=share/hardware/usb.ids
 HARDWARE_README=share/hardware/README.txt
@@ -76,27 +25,98 @@ while [ "$#" -gt 0 ]; do
             fi
             ROOT_IMAGE=$1
             ;;
+        --build-dir)
+            shift
+            if [ "$#" -eq 0 ]; then
+                echo "Usage: $0 [--fresh] [--build-dir directory] [--root image] [--autologin user]" >&2
+                exit 2
+            fi
+            BUILD_DIR=$1
+            ;;
         --autologin)
             shift
             if [ "$#" -eq 0 ]; then
-                echo "Usage: $0 [--fresh] [--root image] [--autologin user]" >&2
+                echo "Usage: $0 [--fresh] [--build-dir directory] [--root image] [--autologin user]" >&2
                 exit 2
             fi
             AUTOLOGIN=$1
             ;;
         *)
-            echo "Usage: $0 [--fresh] [--root image] [--autologin user]" >&2
+            echo "Usage: $0 [--fresh] [--build-dir directory] [--root image] [--autologin user]" >&2
             exit 2
             ;;
     esac
     shift
 done
 
+case "$BUILD_DIR" in
+    /*) ;;
+    *) BUILD_DIR="$ROOT/$BUILD_DIR" ;;
+esac
+if [ -z "$ROOT_IMAGE" ]; then
+    ROOT_IMAGE="$BUILD_DIR/Mangrove/Mangrove.img"
+fi
+
+BOOT_IMAGE="$BUILD_DIR/Mangrove/Boot.img"
+MKMGFS="$BUILD_DIR/mkmgfs"
+PITH="$BUILD_DIR/Mangrove/pith.elf"
+SPROUT="$BUILD_DIR/sprout/sprout.elf"
+SPROUT_CMD="$BUILD_DIR/sproutcmd/sprout.elf"
+SESSIOND="$BUILD_DIR/sessiond/sessiond.elf"
+LOGIND="$BUILD_DIR/logind/logind.elf"
+LOGD="$BUILD_DIR/logd/logd.elf"
+NETWORKD="$BUILD_DIR/networkd/networkd.elf"
+DEVICED="$BUILD_DIR/deviced/deviced.elf"
+VOLUMED="$BUILD_DIR/volumed/volumed.elf"
+CLIPD="$BUILD_DIR/clipd/clipd.elf"
+MOUNT="$BUILD_DIR/mount/mount.elf"
+UNMOUNT="$BUILD_DIR/unmount/unmount.elf"
+EJECT="$BUILD_DIR/eject/eject.elf"
+DISKUTIL="$BUILD_DIR/diskutil/diskutil.elf"
+LSPCI="$BUILD_DIR/lspci/lspci.elf"
+LSUSB="$BUILD_DIR/lsusb/lsusb.elf"
+LSDISK="$BUILD_DIR/lsdsk/lsdsk.elf"
+CREW="$BUILD_DIR/crew/crew.elf"
+MEM="$BUILD_DIR/mem/mem.elf"
+TIME="$BUILD_DIR/time/time.elf"
+TMON="$BUILD_DIR/tmon/tmon.elf"
+LOGV="$BUILD_DIR/logv/logv.elf"
+SHOOT="$BUILD_DIR/shoot/shoot.elf"
+CLEAR="$BUILD_DIR/clear/clear.elf"
+COPY="$BUILD_DIR/copy/copy.elf"
+LIST="$BUILD_DIR/list/list.elf"
+LOCATE="$BUILD_DIR/locate/locate.elf"
+MOVE="$BUILD_DIR/move/move.elf"
+PLANT="$BUILD_DIR/plant/plant.elf"
+TYPE="$BUILD_DIR/type/type.elf"
+WAIT="$BUILD_DIR/wait/wait.elf"
+DEL="$BUILD_DIR/del/del.elf"
+MKDIR="$BUILD_DIR/mkdir/mkdir.elf"
+SAY="$BUILD_DIR/say/say.elf"
+UPTIME="$BUILD_DIR/uptime/uptime.elf"
+DATE="$BUILD_DIR/date/date.elf"
+ABOUT="$BUILD_DIR/about/about.elf"
+REED="$BUILD_DIR/reed/reed.elf"
+VIEW="$BUILD_DIR/view/view.elf"
+INFO="$BUILD_DIR/info/info.elf"
+PING="$BUILD_DIR/ping/ping.elf"
+RESOLVE="$BUILD_DIR/resolve/resolve.elf"
+FETCH="$BUILD_DIR/fetch/fetch.elf"
+NETINFO="$BUILD_DIR/netinfo/netinfo.elf"
+NETCFG="$BUILD_DIR/netcfg/netcfg.elf"
+POWER="$BUILD_DIR/power/power.elf"
+IDENTITY="$BUILD_DIR/identity/identity.elf"
+USER_CMD="$BUILD_DIR/user/user.elf"
+SHUTDOWN="$BUILD_DIR/shutdown/shutdown.elf"
+REBOOT="$BUILD_DIR/reboot/reboot.elf"
+VERSION="$BUILD_DIR/version/version.elf"
+WHERE="$BUILD_DIR/where/where.elf"
+
 if [ "$FRESH" -eq 0 ] && [ -f "$ROOT_IMAGE" ]; then
     python3 tools/check_mgfs_version.py "$ROOT_IMAGE"
 fi
 
-mkdir -p build/Mangrove
+mkdir -p "$BUILD_DIR/Mangrove"
 mkdir -p "$(dirname "$ROOT_IMAGE")"
 
 # Keep the ordered payload list in one place for both fresh population and
@@ -127,7 +147,7 @@ mkfs.fat -F32 "$BOOT_IMAGE"
 mmd -i "$BOOT_IMAGE" ::/EFI
 mmd -i "$BOOT_IMAGE" ::/EFI/BOOT
 
-mcopy -i "$BOOT_IMAGE" build/EFI/BOOT/BOOTX64.EFI ::/EFI/BOOT/
+mcopy -i "$BOOT_IMAGE" "$BUILD_DIR/EFI/BOOT/BOOTX64.EFI" ::/EFI/BOOT/
 
 if [ "$FRESH" -eq 1 ]; then
     echo "[IMAGE] Resetting MGFS image: $ROOT_IMAGE"

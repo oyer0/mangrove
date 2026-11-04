@@ -32,8 +32,8 @@ Run the following before the first build:
 command -v gcc ld.bfd ar objcopy
 command -v x86_64-w64-mingw32-gcc x86_64-w64-mingw32-ld
 command -v make python3 qemu-system-x86_64 mkfs.fat mmd mcopy parted
-test -r /usr/share/OVMF/OVMF_CODE_4M.fd
-test -r /usr/share/OVMF/OVMF_VARS_4M.fd
+test -r "$(python3 tests/guest/ovmf_firmware.py --kind code)"
+test -r "$(python3 tests/guest/ovmf_firmware.py --kind vars)"
 ```
 
 The Makefile checks the MinGW-w64 commands when invoked. The image and QEMU
@@ -58,11 +58,13 @@ Image creation and host-side tests do not require KVM. A manual QEMU TCG
 invocation is possible for debugging, but there is no supported no-KVM Linux
 override in the current Makefile.
 
-The standard OVMF files are expected at:
+The Makefile discovers installed OVMF code and variable-store files on Linux.
+It recognizes both the Arch package layout under `edk2/x64` and the Debian
+layout under `OVMF`. Override either selected file explicitly when needed:
 
 ```text
-/usr/share/OVMF/OVMF_CODE_4M.fd
-/usr/share/OVMF/OVMF_VARS_4M.fd
+OVMF_CODE_SOURCE=/path/to/OVMF_CODE.fd
+OVMF_VARS_SOURCE=/path/to/OVMF_VARS.fd
 ```
 
 Useful validation commands are:
@@ -79,9 +81,16 @@ make check-qemu-deps
 
 ## Outputs and cleanup
 
-The loader, kernel, programs, and host tools are placed under `build/`.
-`make usb-image` creates `build/Mangrove/MangroveUSB.img`. The persistent QEMU
-disk and its staged root are under `.mangrove/`.
+The loader, kernel, programs, and host tools are placed under `build/` by
+default. Set `BUILD_DIR` to select another isolated output tree; image
+population scripts receive the same directory from Make:
+
+```sh
+make BUILD_DIR=build/x250-diagnostic usb-image
+```
+
+The persistent QEMU disk and its staged root remain under `.mangrove/` unless
+`STATE_DIR` is overridden.
 
 ```sh
 make clean

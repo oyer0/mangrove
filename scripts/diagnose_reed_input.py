@@ -20,11 +20,13 @@ import time
 
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
-sys.path[:0] = [str(ROOT / 'tests/guest'), str(ROOT / 'tests/shared')]
+sys.path[:0] = [str(ROOT / 'tests/guest'), str(ROOT / 'tests/shared'),
+                str(ROOT / 'tools')]
 import artifact_lifecycle as artifacts
 import guest_mgfs_test as guest
 import guest_secondary_test as secondary
 import qemu_accel
+import ovmf_firmware
 
 NAV = {35: ('h', 0x0b), 36: ('j', 0x0d), 37: ('k', 0x0e), 38: ('l', 0x0f)}
 KINDS = {1: 'hid', 2: 'repeat', 3: 'queue', 4: 'read', 5: 'cancel',
@@ -328,7 +330,9 @@ def run(args):
                 variables = folder / 'vars.fd'
                 source = Path(argument.split('file=', 1)[1])
                 if not source.is_file():
-                    source = Path('/usr/share/OVMF/OVMF_VARS_4M.fd')
+                    source = ovmf_firmware.default_path('vars')
+                if not source.is_file():
+                    raise RuntimeError(f'OVMF variable-store firmware is unavailable: {source}')
                 shutil.copyfile(source, variables)
                 platform[i] = f'if=pflash,format=raw,file={variables}'
         for path in (disk, folder / 'vars.fd'):

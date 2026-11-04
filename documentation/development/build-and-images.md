@@ -34,7 +34,8 @@ Run these from the repository root:
 | --- | --- |
 | `make -B binaries -j4` | Rebuild the loader, kernel, libc, userspace, services, and host tools. |
 | `make fresh-image` | Recreate the persistent development image from a fresh root. |
-| `make usb-image` | Build a fresh GPT USB image at `build/Mangrove/MangroveUSB.img`. |
+| `make usb-image` | Build a fresh GPT USB image at `$(BUILD_DIR)/Mangrove/MangroveUSB.img` (`build/` by default). |
+| `make BUILD_DIR=build/x250-diagnostic usb-image` | Build into an isolated output tree without replacing the default `build/` artifacts. |
 | `make run` | Build the QEMU development image with a trusted UTC RTC, then boot the persistent image with two vCPUs by default. |
 | `QEMU_SMP=1 make run` | Boot with one vCPU for single-core regression testing. |
 | `QEMU_SMP=4 make run` | Boot with four vCPUs for a larger SMP test. |
@@ -54,10 +55,19 @@ Run these from the repository root:
 Use the available validation targets above and the guest/runtime network
 commands documented by the current image.
 
+`X250_BOOT_TRACE=1` enables the temporary compact X250 boot overlay and the
+extra firmware storage-discovery report. It is disabled by default. The
+firmware checkpoint halt markers use the separate `BOOT_HANDOFF_CHECKPOINT`
+option; its default `0` does not halt.
+
+`make test-ovmf-discovery` exercises the Arch and Debian OVMF path layouts and
+the explicit source override behavior without using host firmware files.
+
 ## Generated outputs
 
-The disposable `build/` tree contains per-program output directories and
-shared build products. Important outputs include:
+The disposable build tree, selected by `BUILD_DIR` and defaulting to `build/`,
+contains per-program output directories and shared products. Important outputs
+include:
 
 ```text
 build/EFI/BOOT/BOOTX64.EFI     UEFI loader
@@ -99,9 +109,14 @@ an ESP and an MGFS root partition. It checks partition bounds and refuses to
 update an image that is in use.
 It also checks the existing raw or GPT root image format before changing it.
 
+Both image scripts accept `--build-dir directory`; the `BUILD_DIR` environment
+variable provides the same override for direct script use. Their input
+binaries and generated ESP images are resolved within that tree, while the
+repository's `tools/` and `share/` resources remain source inputs.
+
 `make usb-image` runs the fresh-image path for a new output image and writes
 the ESP and MGFS root into fixed GPT partition ranges in
-`build/Mangrove/MangroveUSB.img`. It uses `parted` on Linux and `sgdisk` on
+`$(BUILD_DIR)/Mangrove/MangroveUSB.img`. It uses `parted` on Linux and `sgdisk` on
 macOS for GPT creation.
 
 The image population scripts install the loader on the ESP, `/boot/pith.elf`
@@ -150,7 +165,7 @@ with a warning because the guest is x86-64.
 
 `make run` boots the persistent `.mangrove/MangroveDev.img`. The current
 `run-usb` target is only an alias for `run`; it does not boot
-`build/Mangrove/MangroveUSB.img`. Use the USB image with a separate QEMU
+`$(BUILD_DIR)/Mangrove/MangroveUSB.img`. Use the USB image with a separate QEMU
 invocation or the physical-media test procedure.
 
 Host fixtures and target compilation do not validate QEMU guest execution.

@@ -2,6 +2,9 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 set -e
 
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$ROOT"
+BUILD_DIR=${BUILD_DIR:-build}
 DISK_IMAGE=.mangrove/MangroveDev.img
 ROOT_IMAGE=.mangrove/MangroveDevRoot.img
 FRESH=0
@@ -9,30 +12,41 @@ DISK_CREATED=0
 
 DISK_SECTORS=264225
 DISK_BYTES=$((DISK_SECTORS * 512))
-LEGACY_ROOT=build/Mangrove/Mangrove.img
-
 while [ "$#" -gt 0 ]; do
     case "$1" in
+        --build-dir)
+            shift
+            [ "$#" -gt 0 ] || { echo "Usage: $0 [--build-dir directory] [--fresh] --disk image --root image" >&2; exit 2; }
+            BUILD_DIR=$1
+            ;;
         --disk)
             shift
-            [ "$#" -gt 0 ] || { echo "Usage: $0 [--fresh] --disk image --root image" >&2; exit 2; }
+            [ "$#" -gt 0 ] || { echo "Usage: $0 [--build-dir directory] [--fresh] --disk image --root image" >&2; exit 2; }
             DISK_IMAGE=$1
             ;;
         --root)
             shift
-            [ "$#" -gt 0 ] || { echo "Usage: $0 [--fresh] --disk image --root image" >&2; exit 2; }
+            [ "$#" -gt 0 ] || { echo "Usage: $0 [--build-dir directory] [--fresh] --disk image --root image" >&2; exit 2; }
             ROOT_IMAGE=$1
             ;;
         --fresh)
             FRESH=1
             ;;
         *)
-            echo "Usage: $0 [--fresh] --disk image --root image" >&2
+            echo "Usage: $0 [--build-dir directory] [--fresh] --disk image --root image" >&2
             exit 2
             ;;
     esac
     shift
 done
+
+case "$BUILD_DIR" in
+    /*) ;;
+    *) BUILD_DIR="$ROOT/$BUILD_DIR" ;;
+esac
+LEGACY_ROOT="$BUILD_DIR/Mangrove/Mangrove.img"
+BOOT_IMAGE="$BUILD_DIR/Mangrove/Boot.img"
+EFI_IMAGE="$BUILD_DIR/EFI/BOOT/BOOTX64.EFI"
 
 mkdir -p "$(dirname "$DISK_IMAGE")" "$(dirname "$ROOT_IMAGE")"
 
@@ -98,11 +112,11 @@ if [ -f "$DISK_IMAGE" ]; then
 fi
 
 if [ "$FRESH" -eq 1 ]; then
-    ./scripts/make_image.sh --fresh --root "$ROOT_IMAGE" --autologin developer
+    ./scripts/make_image.sh --build-dir "$BUILD_DIR" --fresh --root "$ROOT_IMAGE" --autologin developer
 elif [ -f "$ROOT_IMAGE" ]; then
-    ./scripts/make_image.sh --root "$ROOT_IMAGE" --autologin developer
+    ./scripts/make_image.sh --build-dir "$BUILD_DIR" --root "$ROOT_IMAGE" --autologin developer
 else
-    ./scripts/make_image.sh --fresh --root "$ROOT_IMAGE" --autologin developer
+    ./scripts/make_image.sh --build-dir "$BUILD_DIR" --fresh --root "$ROOT_IMAGE" --autologin developer
 fi
 
 if [ ! -f "$DISK_IMAGE" ]; then
@@ -135,7 +149,7 @@ fi
 # existing development disk, update only Mangrove's loader so unrelated ESP
 # files survive an incremental image update.
 if [ "$DISK_CREATED" -eq 1 ]; then
-    dd if=build/Mangrove/Boot.img of="$DISK_IMAGE" bs=512 seek=2048 conv=notrunc 2>/dev/null
+    dd if="$BOOT_IMAGE" of="$DISK_IMAGE" bs=512 seek=2048 conv=notrunc 2>/dev/null
 else
     ESP_IMAGE="$DISK_IMAGE@@1048576"
     # mmd asks its controlling terminal how to handle an existing directory.
@@ -153,7 +167,7 @@ else
 
     ensure_esp_directory ::/EFI
     ensure_esp_directory ::/EFI/BOOT
-    mcopy -o -i "$ESP_IMAGE" build/EFI/BOOT/BOOTX64.EFI ::/EFI/BOOT/ >/dev/null
+    mcopy -o -i "$ESP_IMAGE" "$EFI_IMAGE" ::/EFI/BOOT/ >/dev/null
     for old_path in \
         ::/MANGROVE/kernel.elf \
         ::/MANGROVE/KERNEL.ELF \
