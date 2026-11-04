@@ -5,6 +5,7 @@
 #include <mangrove_version.h>
 #include <stddef.h>
 #include <io.h>
+#include <x250_boot_trace.h>
 
 /* Bounded delay for framebuffer capture; independent of timer interrupts. */
 #define PANIC_DEBUG_DELAY_LOOPS 1000000000ULL
@@ -13,6 +14,9 @@ static void panic_internal(
     const char *message,
     struct cpu_registers *regs)
 {
+    u64 cr2 = 0;
+    u64 cr3 = 0;
+
     /* Independent emergency evidence even if the terminal is unavailable. */
     const char *trace = "PITH_PANIC ";
     while (*trace) outb(0xe9, (u8)*trace++);
@@ -43,8 +47,6 @@ static void panic_internal(
 
     if (regs != NULL)
     {
-        u64 cr2, cr3;
-
         asm volatile("mov %%cr2, %0" : "=r"(cr2));
         asm volatile("mov %%cr3, %0" : "=r"(cr3));
 
@@ -86,6 +88,8 @@ static void panic_internal(
 
     kprint("\nSystem halted.\n");
     kprint("Halting in 3 seconds...\n");
+
+    x250_boot_trace_panic(message, regs, cr2, cr3);
 
     volatile u64 delay = PANIC_DEBUG_DELAY_LOOPS;
     while (delay != 0) {

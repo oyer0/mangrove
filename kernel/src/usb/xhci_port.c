@@ -266,6 +266,8 @@ failed:
     xhci_port_reset_log(port_id, state, status, failure_reason);
     xhci_set_port_state(xhc, port_id, XHCI_PORT_FAILED, status,
                         failure_reason);
+    xhci_set_port_result(xhc, port_id, XHCI_ERR_PORT_RESET_FAIL,
+                         failure_reason);
     xhci_diag_timeline_at("post-reset", (uintptr_t)portsc_ptr, status);
     xhci_clear_portsc_bit(portsc_ptr, status & XHCI_PORTSC_RW1C_MASK);
     return XHCI_ERR_PORT_RESET_FAIL;
@@ -458,6 +460,8 @@ void xhci_process_deferred_port_change(xhci_controller_t *xhc, u8 port_id)
         if (err == XHCI_SUCCESS && !(status & XHCI_PORTSC_CCS)) {
             (void)xhci_abandon_device(xhc, port_id);
             err = XHCI_ERR_TRANSACTION;
+            xhci_set_port_result(xhc, port_id, err,
+                                 "disconnected-during-device-setup");
         }
         if (err != XHCI_SUCCESS) {
             if (!(status & XHCI_PORTSC_CCS)) {
@@ -467,11 +471,15 @@ void xhci_process_deferred_port_change(xhci_controller_t *xhc, u8 port_id)
             }
             xhci_set_port_state(xhc, port_id, XHCI_PORT_FAILED,
                                 status, "runtime-device-setup-failed");
+            xhci_set_port_result(xhc, port_id, err,
+                                 "runtime-device-setup-failed");
             kprint("[xHCI Error] Failed to setup device on port %d (Code: %d)\n",
                    port_id, err);
         } else {
             xhci_set_port_state(xhc, port_id, XHCI_PORT_READY,
                                 status, "runtime-device-ready");
+            xhci_set_port_result(xhc, port_id, XHCI_SUCCESS,
+                                 "runtime-device-ready");
             {
                 u8 slot_id = xhci_device_slot_for_port(xhc, port_id);
                 if (slot_id)
@@ -484,6 +492,8 @@ void xhci_process_deferred_port_change(xhci_controller_t *xhc, u8 port_id)
             }
         }
     } else {
+        xhci_set_port_result(xhc, port_id, XHCI_ERR_PORT_RESET_FAIL,
+                             "port-reset-failed");
         kprint("[xHCI Error] Port %d hotplug reset failed.\n", port_id);
     }
 }

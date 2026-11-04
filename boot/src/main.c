@@ -6,6 +6,7 @@
 #include <bootinfo.h>
 #include <handoff.h>
 #include <bootstrap.h>
+#include <boot_checkpoint.h>
 
 static const EFI_GUID ACPI20_TABLE_GUID =
 {
@@ -62,16 +63,43 @@ EFI_STATUS EFIAPI efi_main(
     console_set_cursor(0, 2);
     console_set_attribute(CONSOLE_WHITE);
 
+#if X250_BOOT_TRACE
+    FILESYSTEM_FAILURE FilesystemFailure;
     EFI_STATUS Status = filesystem_init(
         ImageHandle,
-        SystemTable
+        SystemTable,
+        &FilesystemFailure
     );
+#else
+    EFI_STATUS Status = filesystem_init(ImageHandle, SystemTable);
+#endif
 
     if (Status != EFI_SUCCESS)
     {
+#if X250_BOOT_TRACE
+        switch (FilesystemFailure)
+        {
+            case FILESYSTEM_FAILURE_ROOT_NOT_FOUND:
+                console_write(L"No matching Mangrove GPT root partition (status ");
+                break;
+            case FILESYSTEM_FAILURE_AMBIGUOUS_ROOT:
+                console_write(L"Multiple matching Mangrove GPT root disks (status ");
+                break;
+            case FILESYSTEM_FAILURE_MGFS:
+                console_write(L"Mangrove MGFS validation or read failed (status ");
+                break;
+            default:
+                console_write(L"UEFI boot-device discovery failed (status ");
+                break;
+        }
+#else
         console_write(L"Mangrove root filesystem unavailable (status ");
+#endif
         console_write_hex(Status);
         console_write(L").\r\n");
+#if X250_BOOT_TRACE
+        filesystem_report_diagnostics();
+#endif
         for (;;) {}
     }
 
@@ -143,7 +171,49 @@ EFI_STATUS EFIAPI efi_main(
 
     if (Status != EFI_SUCCESS)
     {
+#if X250_BOOT_TRACE
+        switch (LoadFailure.Stage)
+        {
+            case ELF_LOAD_FAILURE_ALIGNMENT:
+                console_write(L"ELF align fail i=");
+                break;
+            case ELF_LOAD_FAILURE_SEGMENT:
+                console_write(L"ELF segment invalid i=");
+                break;
+            case ELF_LOAD_FAILURE_ALLOCATION:
+                console_write(L"ELF alloc fail i=");
+                break;
+            case ELF_LOAD_FAILURE_SEEK:
+                console_write(L"ELF seek fail i=");
+                break;
+            case ELF_LOAD_FAILURE_READ:
+                console_write(L"ELF read fail i=");
+                break;
+            default:
+                console_write(L"Kernel loading failed!\r\n");
+                break;
+        }
+        if (LoadFailure.Stage != ELF_LOAD_FAILURE_NONE)
+        {
+            console_write_hex(LoadFailure.ProgramHeaderIndex);
+            if (LoadFailure.Stage == ELF_LOAD_FAILURE_ALLOCATION)
+            {
+                console_write(L" pa=");
+                console_write_hex(LoadFailure.PhysicalAddress);
+                console_write(L" pg=");
+                console_write_hex(LoadFailure.Pages);
+            }
+            else if (LoadFailure.Stage == ELF_LOAD_FAILURE_SEEK ||
+                     LoadFailure.Stage == ELF_LOAD_FAILURE_READ)
+            {
+                console_write(L" off=");
+                console_write_hex(LoadFailure.FileOffset);
+            }
+            console_write(L"\r\n");
+        }
+#else
         console_write(L"Kernel loading failed!\r\n");
+#endif
         console_write_hex(Status);
         console_write(L"\r\n");
         for (;;) {}
@@ -205,7 +275,14 @@ EFI_STATUS EFIAPI efi_main(
 
     if (EFI_ERROR(Status))
     {
+#if X250_BOOT_TRACE
+        console_write(L"Handoff stack allocation failed (status ");
+        console_write_hex(Status);
+        console_write(L").\r\n");
+        for (;;) {}
+#else
         return Status;
+#endif
     }
 
     void *StackTop = (void *)(StackBase + (16 * EFI_PAGE_SIZE));
@@ -251,6 +328,14 @@ EFI_STATUS EFIAPI efi_main(
         for (;;) {}
     }
 
+#if BOOT_HANDOFF_CHECKPOINT == 1
+    console_write(L"CHECKPOINT 1: page tables ready; before ExitBootServices.\r\n");
+    boot_checkpoint_mark((volatile u32 *)BootInfo.FramebufferBase,
+                         BootInfo.FramebufferWidth, BootInfo.FramebufferHeight,
+                         BootInfo.PixelsPerScanLine, 0x00FF0000U);
+    boot_checkpoint_halt();
+#endif
+
     Status = memory_exit_boot_services(
         ImageHandle,
         &Map
@@ -263,6 +348,13 @@ EFI_STATUS EFIAPI efi_main(
         fail_fb[0] = 0x00FF0000; 
         for (;;) {}
     }
+
+#if BOOT_HANDOFF_CHECKPOINT == 2
+    boot_checkpoint_mark((volatile u32 *)BootInfo.FramebufferBase,
+                         BootInfo.FramebufferWidth, BootInfo.FramebufferHeight,
+                         BootInfo.PixelsPerScanLine, 0x00FF8000U);
+    boot_checkpoint_halt();
+#endif
 
     /* memory_exit_boot_services() may have replaced the map buffer while
      * recovering from a stale map key.  Publish the map that actually

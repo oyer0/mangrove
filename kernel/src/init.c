@@ -37,6 +37,7 @@
 #include <vfs.h>
 #include <vmm.h>
 #include <xhci.h>
+#include <xhci_storage.h>
 #include <xhci_regs.h>
 #include <net/dns.h>
 #include <net/ipv4.h>
@@ -51,6 +52,7 @@
 #include <ipc.h>
 #include <smp.h>
 #include <string.h>
+#include <x250_boot_trace.h>
 #if defined(KERNEL_HYBRID_ALLOCATOR) || defined(SLAB_CORE_GUEST_TEST)
 #include <slab.h>
 #endif
@@ -292,13 +294,19 @@ static init_result_t init_cpu_irqs_enabled(const char **reason)
 
 static init_result_t init_storage(const char **reason)
 {
+    u32 block_devices = block_device_count();
+    bool xhci_ready = kernel_init_state(INIT_XHCI) == INIT_READY;
+
+    x250_boot_trace_storage_inventory(
+        block_devices, xhci_storage_device_count(), xhci_ready);
+
     /* init_xhci already confirmed boot discovery before resuming keyboard
      * work. Runtime transfers need not be idle at this later admission point. */
-    if (g_xhc && kernel_init_state(INIT_XHCI) != INIT_READY) {
+    if (g_xhc && !xhci_ready) {
         *reason = "xHCI boot discovery did not complete";
         return INIT_RESULT_UNAVAILABLE;
     }
-    if (block_device_count() == 0) {
+    if (block_devices == 0) {
         *reason = "no persistent block device";
         return INIT_RESULT_UNAVAILABLE;
     }
@@ -343,6 +351,12 @@ static init_result_t init_xhci(const char **reason)
         *reason = "xHCI MMIO mapping failed";
         return INIT_RESULT_FAILED;
     }
+
+#if X250_BOOT_TRACE
+    kprint("[X250] xHCI BAR=%016llx VA=%016llx mapped=%08x\n",
+           (u64)xhci_mmio_phys, (u64)xhci_mmio_base,
+           (u32)xhci_mmio_size);
+#endif
 
     if (!irq_register_vector(IRQ_VECTOR_XHCI, init_xhci_irq_handler)) {
         *reason = "xHCI interrupt vector already owned";
@@ -401,6 +415,7 @@ static init_result_t init_xhci(const char **reason)
         *reason = "xHCI boot enumeration did not quiesce";
         return INIT_RESULT_FAILED;
     }
+    xhci_trace_boot_discovery(g_xhc);
     xhci_acknowledge_boot_interrupts(g_xhc);
     xhci_complete_boot_enumeration(g_xhc);
 
@@ -552,6 +567,62 @@ static init_result_t init_rootfs(const char **reason)
         *reason = "filesystem drivers unavailable";
         return INIT_RESULT_FAILED;
     }
+
+#if X250_BOOT_TRACE
+    {
+        u32 block_count = block_device_count();
+        u32 whole_disks = 0;
+        u32 partition_devices = 0;
+        u32 root_candidates = 0;
+
+        for (u32 index = 0; index < block_count; index++) {
+            block_device_t *device = block_get_device(index);
+            gpt_partition_info_t partition;
+
+            if (!device)
+                continue;
+            if (device->type == BLOCK_DEVICE_PARTITION) {
+                if (gpt_get_partition_info(device, &partition)) {
+                    partition_devices++;
+                    if (strcmp(partition.name,
+                               GPT_MANGROVE_ROOT_NAME) == 0)
+                        root_candidates++;
+                }
+                continue;
+            }
+
+            whole_disks++;
+            u32 registered_partitions = 0;
+            u32 disk_root_candidates = 0;
+            for (u32 child_index = 0; child_index < block_count;
+                 child_index++) {
+                block_device_t *child = block_get_device(child_index);
+                gpt_partition_info_t child_info;
+
+                if (child && child->type == BLOCK_DEVICE_PARTITION &&
+                    gpt_get_partition_info(child, &child_info) &&
+                    gpt_partition_parent_matches(&child_info, device)) {
+                    registered_partitions++;
+                    if (strcmp(child_info.name,
+                               GPT_MANGROVE_ROOT_NAME) == 0)
+                        disk_root_candidates++;
+                }
+            }
+
+            gpt_table_info_t table = {0};
+            int gpt_result = device->type == BLOCK_DEVICE_USB
+                ? X250_TRACE_GPT_USB_SCAN_REPORTED
+                : gpt_get_table_info(device, &table);
+            x250_boot_trace_block_device(
+                index, block_type_name(device->type), device->sector_size,
+                device->sector_count, device->model, gpt_result,
+                (u32)table.type, table.partition_count,
+                registered_partitions, disk_root_candidates);
+        }
+        x250_boot_trace_root_inventory(block_count, whole_disks,
+                                       partition_devices, root_candidates);
+    }
+#endif
 
     /* The GPT partition name is a persistent installation role marker.  It
        is deliberately required so an unrelated MGFS volume cannot become /. */
@@ -835,11 +906,19 @@ static bool init_graph_error;
 
 static void init_report_optional_network_status(void)
 {
-    init_state_t state = descriptors[INIT_NETWORK_DEVICE].status.state;
+    const init_status_t *status = &descriptors[INIT_NETWORK_DEVICE].status;
+    init_state_t state = status->state;
 
     if (state == INIT_UNAVAILABLE || state == INIT_FAILED ||
         state == INIT_SKIPPED)
         kprint("[WARN] Network unavailable\n");
+
+    x250_boot_trace_result(40U, state == INIT_READY,
+                           "network device", false, true,
+                           status->result, state == INIT_READY ? "READY" :
+                           state == INIT_UNAVAILABLE ? "UNAVAILABLE" :
+                           state == INIT_FAILED ? "FAILED" : "SKIPPED",
+                           status->reason);
 }
 
 #define KERNEL_BOOT_LOG_WRITE_CHUNK 4096U
@@ -904,6 +983,32 @@ static bool init_id_valid(init_id_t id)
     return id >= 0 && id < INIT_COUNT;
 }
 
+#if X250_BOOT_TRACE
+static const char *init_state_name(init_state_t state)
+{
+    switch (state) {
+    case INIT_UNINITIALIZED: return "UNINITIALIZED";
+    case INIT_INITIALIZING: return "INITIALIZING";
+    case INIT_READY: return "READY";
+    case INIT_UNAVAILABLE: return "UNAVAILABLE";
+    case INIT_FAILED: return "FAILED";
+    case INIT_SKIPPED: return "SKIPPED";
+    default: return "INVALID";
+    }
+}
+
+static void init_trace_status(const init_descriptor_t *node)
+{
+    x250_boot_trace_result(37U, node->status.state == INIT_READY,
+                           node->status.name, node->required_for_boot, true,
+                           node->status.result,
+                           init_state_name(node->status.state),
+                           node->status.reason);
+}
+#else
+#define init_trace_status(node) ((void)0)
+#endif
+
 static bool init_start_node(init_id_t id)
 {
     init_descriptor_t *node;
@@ -924,6 +1029,7 @@ static bool init_start_node(init_id_t id)
         node->status.state = INIT_FAILED;
         node->status.result = INIT_RESULT_DEPENDENCY;
         node->status.reason = "dependency cycle";
+        init_trace_status(node);
         return false;
     }
 
@@ -937,6 +1043,7 @@ static bool init_start_node(init_id_t id)
             node->status.result = INIT_RESULT_DEPENDENCY;
             node->status.reason = descriptors[dep].status.reason ?
                 descriptors[dep].status.reason : descriptors[dep].status.name;
+            init_trace_status(node);
             if (node->required_for_boot)
                 kprint("[FAIL] %s skipped: dependency %s\n",
                        node->status.name, descriptors[dep].status.name);
@@ -951,30 +1058,38 @@ static bool init_start_node(init_id_t id)
             node->status.state = INIT_FAILED;
             node->status.result = INIT_RESULT_DEPENDENCY;
             node->status.reason = "dependency cycle";
+            init_trace_status(node);
             return false;
         }
     }
 
+    if (id == INIT_XHCI)
+        x250_boot_trace_begin();
+    x250_boot_trace_stage(37, false, node->status.name);
     node->status.result = node->start(&reason);
     node->status.reason = reason;
     switch (node->status.result) {
     case INIT_RESULT_OK:
         node->status.state = INIT_READY;
+        init_trace_status(node);
         return true;
     case INIT_RESULT_UNAVAILABLE:
         node->status.state = INIT_UNAVAILABLE;
+        init_trace_status(node);
         if (node->required_for_boot)
             kprint("[FAIL] %s unavailable: %s\n", node->status.name,
                    reason ? reason : "not present");
         return false;
     case INIT_RESULT_DEPENDENCY:
         node->status.state = INIT_SKIPPED;
+        init_trace_status(node);
         if (node->required_for_boot)
             kprint("[FAIL] %s skipped: %s\n", node->status.name,
                    reason ? reason : "dependency");
         return false;
     default:
         node->status.state = INIT_FAILED;
+        init_trace_status(node);
         kprint("[FAIL] %s: %s\n", node->status.name,
                reason ? reason : "initialization error");
         return false;
@@ -984,6 +1099,9 @@ static bool init_start_node(init_id_t id)
 bool kernel_bringup(void)
 {
     bool required_ok = true;
+    bool bringup_ok;
+    bool boot_log_saved;
+    const char *failure_reason = NULL;
 
     init_graph_error = false;
 
@@ -995,10 +1113,34 @@ bool kernel_bringup(void)
 
     init_report_optional_network_status();
 
-    if (!init_persist_boot_log())
+    boot_log_saved = init_persist_boot_log();
+    if (!boot_log_saved)
         kprint("[WARN] Kernel boot log could not be saved\n");
 
-    return required_ok && !init_graph_error;
+    x250_boot_trace_result(41U, boot_log_saved, "kernel boot log", false,
+                           true, boot_log_saved ? 0 : 1,
+                           boot_log_saved ? "SAVED" : "UNAVAILABLE",
+                           boot_log_saved ? NULL :
+                               "boot.log persistence failed");
+
+    bringup_ok = required_ok && !init_graph_error;
+    if (!bringup_ok) {
+        for (init_id_t id = 0; id < INIT_COUNT; id++) {
+            const init_descriptor_t *node = &descriptors[id];
+            if (node->required_for_boot && node->status.state != INIT_READY) {
+                failure_reason = node->status.reason ? node->status.reason :
+                    "required subsystem did not become ready";
+                break;
+            }
+        }
+        if (!failure_reason && init_graph_error)
+            failure_reason = "initialization dependency graph cycle";
+    }
+    x250_boot_trace_result(21U, bringup_ok, "required kernel bring-up", true,
+                           true, bringup_ok ? 0 : 1,
+                           bringup_ok ? "READY" : "FAILED", failure_reason);
+
+    return bringup_ok;
 }
 
 init_state_t kernel_init_state(init_id_t id)

@@ -16,8 +16,13 @@ code = r'''
 static void *g_xhc;
 static init_state_t state;
 static unsigned devices;
+static unsigned usb_devices;
 init_state_t kernel_init_state(init_id_t id) { assert(id == INIT_XHCI); return state; }
 static unsigned block_device_count(void) { return devices; }
+static unsigned xhci_storage_device_count(void) { return usb_devices; }
+static void x250_boot_trace_storage_inventory(unsigned blocks,
+                                               unsigned usb, bool ready)
+{ (void)blocks; (void)usb; (void)ready; }
 '''+s[a:b]+r'''
 int main(void) {
     const char *reason = NULL;

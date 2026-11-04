@@ -49,4 +49,10 @@ typedef struct
 
 } BOOT_INFO;
 
+_Static_assert(__builtin_offsetof(BOOT_INFO, FramebufferBase) == 48U &&
+               __builtin_offsetof(BOOT_INFO, FramebufferWidth) == 72U &&
+               __builtin_offsetof(BOOT_INFO, FramebufferHeight) == 76U &&
+               __builtin_offsetof(BOOT_INFO, PixelsPerScanLine) == 80U,
+               "handoff checkpoint assembly depends on BOOT_INFO offsets");
+
 typedef void (*KERNEL_ENTRY)(BOOT_INFO *BootInfo);

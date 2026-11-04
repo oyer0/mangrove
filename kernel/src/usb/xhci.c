@@ -17,6 +17,7 @@
 #include <stddef.h>
 #include <block.h>
 #include <input_trace.h>
+#include <x250_boot_trace.h>
 
 /* ==============================================================================
  * External Subsystem Dependencies
@@ -110,6 +111,12 @@ typedef struct {
     u32 last_status;
     u32 generation;
     u64 reset_completed_ms;
+#if X250_BOOT_TRACE
+    int last_result;
+    bool result_valid;
+    bool device_enumerated;
+    const char *last_reason;
+#endif
 } xhci_port_record_t;
 
 struct xhci_device {
@@ -477,6 +484,13 @@ void xhci_set_port_state(xhci_controller_t *xhc, u8 port_id,
     }
     port->state = state;
     port->last_status = status;
+#if X250_BOOT_TRACE
+    if (state == XHCI_PORT_CONNECTED_OBSERVED) {
+        port->result_valid = false;
+        port->device_enumerated = false;
+        port->last_reason = NULL;
+    }
+#endif
     if (state == XHCI_PORT_DISCONNECTED ||
         state == XHCI_PORT_RESET_REQUESTED)
         port->reset_completed_ms = 0;
@@ -485,6 +499,58 @@ void xhci_set_port_state(xhci_controller_t *xhc, u8 port_id,
     port->generation = __atomic_load_n(&xhc->port_change_generation,
                                        __ATOMIC_ACQUIRE);
 }
+
+#if X250_BOOT_TRACE
+void xhci_set_port_result(xhci_controller_t *xhc, u8 port_id,
+                          xhci_status_t result, const char *reason)
+{
+    xhci_port_record_t *port;
+
+    if (!xhc || port_id == 0 || port_id > xhc->max_ports)
+        return;
+    port = &xhc->ports[port_id];
+    port->last_result = (int)result;
+    port->result_valid = true;
+    port->last_reason = reason;
+}
+
+void xhci_trace_boot_discovery(xhci_controller_t *xhc)
+{
+    u32 connected = 0;
+    u32 enumerated = 0;
+    u32 failed = 0;
+
+    if (!xhc)
+        return;
+    for (u32 port_id = 1; port_id <= xhc->max_ports; port_id++) {
+        xhci_port_record_t *port = &xhc->ports[port_id];
+        volatile u32 *portsc = xhci_get_portsc_ptr(xhc, (u8)port_id);
+        u32 status = portsc ? *portsc : port->last_status;
+
+        if (status & XHCI_PORTSC_CCS)
+            connected++;
+        if (port->device_enumerated)
+            enumerated++;
+        if (port->state == XHCI_PORT_FAILED)
+            failed++;
+    }
+    x250_boot_trace_xhci_summary(xhc->max_ports, connected, enumerated,
+                                failed, xhci_storage_device_count());
+    for (u32 port_id = 1; port_id <= xhc->max_ports; port_id++) {
+        xhci_port_record_t *port = &xhc->ports[port_id];
+        volatile u32 *portsc = xhci_get_portsc_ptr(xhc, (u8)port_id);
+        u32 status = portsc ? *portsc : port->last_status;
+
+        if (!(status & XHCI_PORTSC_CCS) &&
+            port->state != XHCI_PORT_FAILED && !port->result_valid)
+            continue;
+        x250_boot_trace_xhci_port(port_id, status,
+                                  xhci_port_state_name(port->state),
+                                  port->result_valid, port->last_result,
+                                  port->last_reason);
+    }
+}
+#endif
 
 #define XHCI_EXT_CAP_ID_LEGACY       1U
 #define XHCI_LEGACY_BIOS_OWNED       (1U << 16)
@@ -514,6 +580,12 @@ static bool xhci_legacy_handoff(xhci_controller_t *xhc)
     u32 hccparams1 = xhc->cap_regs->hccparams1;
     u32 offset = XHCI_HCCPARAMS1_XECP(hccparams1) << 2;
 
+#if X250_BOOT_TRACE
+    kprint("[X250] xHCI MMIO=%016llx BAR=%016llx HCC=%08x XECP=%08x\n",
+           (u64)xhc->mmio_base, xhc->mmio_phys_base,
+           hccparams1, offset);
+#endif
+
     for (u32 count = 0; offset && count < XHCI_MAX_EXT_CAPS; count++) {
         volatile u32 *cap = xhci_extended_capability(
             xhc, offset, XHCI_EXT_CAP_HEADER_SIZE);
@@ -523,6 +595,11 @@ static bool xhci_legacy_handoff(xhci_controller_t *xhc)
             return false;
         }
 
+#if X250_BOOT_TRACE
+        kprint("[X250] xHCI capability offset=%08x VA=%016llx PA=%016llx\n",
+               offset, (u64)(uintptr_t)cap,
+               xhc->mmio_phys_base + offset);
+#endif
         u32 value = *cap;
         u32 next = (value >> 8) & 0xFFU;
 
@@ -1676,7 +1753,15 @@ xhci_controller_t* xhci_init(uintptr_t mmio_base, u64 mmio_phys_base,
     xhc->db_array = (volatile u32 *)(mmio_base + xhc->cap_regs->dboff);
     xhc->run_regs = (xhci_run_regs_t *)(mmio_base + xhc->cap_regs->rtsoff);
 
+    x250_boot_trace_stage(38, false,
+                          "scan xHCI extended capabilities");
     bool legacy_handoff_valid = xhci_legacy_handoff(xhc);
+    x250_boot_trace_result(38U, legacy_handoff_valid,
+                           "xHCI extended capability scan", false, true,
+                           legacy_handoff_valid ? 0 : 1,
+                           legacy_handoff_valid ? "READY" : "FAILED",
+                           legacy_handoff_valid ? NULL :
+                               "invalid extended capability chain");
     if (!legacy_handoff_valid) {
         xhci_set_controller_state(xhc, XHCI_CONTROLLER_FAILED,
                                   "invalid-extended-capability-chain");
@@ -2554,10 +2639,11 @@ static xhci_status_t xhci_setup_device_topology(
     bool has_hid = xhci_get_keyboard_endpoint_info(
         xhc, slot_id, &hid_ep, &hid_pkt, &hid_interval, &hid_cfg, &hid_iface,
         &hid_report_length) == XHCI_SUCCESS;
-    bool has_storage = xhci_get_mass_storage_endpoint_info(xhc, slot_id, &bulk_in_ep,
-                                                           &bulk_in_pkt, &bulk_out_ep,
-                                                           &bulk_out_pkt, &storage_cfg,
-                                                           false) == XHCI_SUCCESS;
+    xhci_status_t storage_endpoint_result =
+        xhci_get_mass_storage_endpoint_info(
+            xhc, slot_id, &bulk_in_ep, &bulk_in_pkt, &bulk_out_ep,
+            &bulk_out_pkt, &storage_cfg, false);
+    bool has_storage = storage_endpoint_result == XHCI_SUCCESS;
     bool has_hub = !has_hid && !has_storage &&
         xhci_get_hub_endpoint_info(xhc, slot_id, speed, &hub_endpoint) ==
             XHCI_SUCCESS;
@@ -2565,6 +2651,13 @@ static xhci_status_t xhci_setup_device_topology(
                        (has_storage ? XHCI_DEVICE_CLASS_STORAGE : 0) |
                        (has_hub ? XHCI_DEVICE_CLASS_HUB : 0);
     dev->class_ready = !(has_hid || has_storage || has_hub);
+#if X250_BOOT_TRACE
+    xhc->ports[port_id].device_enumerated = true;
+#endif
+    x250_boot_trace_usb_device(
+        port_id, slot_id, speed, dev->vendor_id, dev->product_id,
+        dev->usb_class, dev->usb_subclass, dev->usb_protocol,
+        (int)storage_endpoint_result);
     XHCI_DEBUG_LOG("[xHCI-DIAG] p%u s%u sp%u interface-discovery hid=%u storage=%u hub=%u\n",
                    port_id, slot_id, speed, has_hid, has_storage, has_hub);
     u8 max_dci = 1;
@@ -2762,7 +2855,7 @@ static xhci_status_t xhci_setup_device_topology(
         }
         if (has_storage) {
             xhci_diag_set_phase("mass-storage-first-operation");
-            if (!xhci_storage_init_device(xhc, slot_id, bulk_in_ep,
+            if (!xhci_storage_init_device(xhc, port_id, slot_id, bulk_in_ep,
                                           bulk_out_ep, &dev->storage_probe) ||
                 !dev->storage_probe.bot_initialized ||
                 !dev->storage_probe.capacity_known ||
@@ -2880,6 +2973,7 @@ static const char *xhci_storage_stage_name(xhci_storage_stage_t stage)
     switch (stage) {
         case XHCI_STORAGE_STAGE_DMA:            return "dma";
         case XHCI_STORAGE_STAGE_INQUIRY:        return "inquiry";
+        case XHCI_STORAGE_STAGE_TEST_READY:     return "ready-test";
         case XHCI_STORAGE_STAGE_CAPACITY:       return "capacity";
         case XHCI_STORAGE_STAGE_GEOMETRY:       return "geometry";
         case XHCI_STORAGE_STAGE_BLOCK_REGISTER:return "register";

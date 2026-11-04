@@ -5,6 +5,10 @@
 #include <block.h>
 #include <xhci.h>
 
+#ifndef X250_BOOT_TRACE
+#define X250_BOOT_TRACE 0
+#endif
+
 typedef struct {
     xhci_controller_t *xhc;
     u8 slot_id;
@@ -31,6 +35,7 @@ typedef enum {
     XHCI_STORAGE_STAGE_NONE = 0,
     XHCI_STORAGE_STAGE_DMA,
     XHCI_STORAGE_STAGE_INQUIRY,
+    XHCI_STORAGE_STAGE_TEST_READY,
     XHCI_STORAGE_STAGE_CAPACITY,
     XHCI_STORAGE_STAGE_GEOMETRY,
     XHCI_STORAGE_STAGE_BLOCK_REGISTER,
@@ -39,14 +44,20 @@ typedef enum {
 
 typedef struct {
     xhci_storage_stage_t stage;
+#if X250_BOOT_TRACE
+    xhci_status_t result;
+#endif
     bool bot_initialized;
     bool capacity_known;
     bool block_registered;
     bool gpt_scan_ran;
     bool gpt_found;
+#if X250_BOOT_TRACE
+    u32 gpt_partition_count;
+#endif
 } xhci_storage_probe_result_t;
 
-bool xhci_storage_init_device(xhci_controller_t *xhc, u8 slot_id,
+bool xhci_storage_init_device(xhci_controller_t *xhc, u8 port_id, u8 slot_id,
                               u8 bulk_in_ep, u8 bulk_out_ep,
                               xhci_storage_probe_result_t *out_result);
 u32 xhci_storage_device_count(void);

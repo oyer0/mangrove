@@ -56,15 +56,35 @@ prefix = r'''
 #include <assert.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdbool.h>
 #include <string.h>
 enum { INIT_READY = 2, INIT_UNAVAILABLE = 3, INIT_FAILED = 4,
        INIT_SKIPPED = 5, INIT_NETWORK_DEVICE = 0 };
 typedef int init_state_t;
-typedef struct { int state; } status_t;
-typedef struct { status_t status; } descriptor_t;
+typedef struct {
+    const char *name;
+    int state;
+    int result;
+    const char *reason;
+} init_status_t;
+typedef struct { init_status_t status; } descriptor_t;
 static descriptor_t descriptors[1];
 static char output[128];
 static size_t output_size;
+static void x250_boot_trace_result(unsigned checkpoint, bool passed,
+                                   const char *description, bool required,
+                                   bool status_available, int status,
+                                   const char *state, const char *reason)
+{
+    (void)checkpoint;
+    (void)passed;
+    (void)description;
+    (void)required;
+    (void)status_available;
+    (void)status;
+    (void)state;
+    (void)reason;
+}
 static void kprint(const char *format, ...)
 {
     va_list arguments;

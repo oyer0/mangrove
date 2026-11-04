@@ -52,6 +52,8 @@
 #include <elf_loader.h>
 #include <init.h>
 #include <mg/service.h>
+#include <boot_checkpoint.h>
+#include <x250_boot_trace.h>
 
 #ifndef NULL
 #define NULL ((void*)0)
@@ -767,22 +769,74 @@ void kernel_debug_runtime_tests(void)
 
 static bool early_bootstrap(BOOT_INFO *source_boot_info)
 {
+    x250_boot_trace_event(source_boot_info, 7, true,
+                          "early Pith C entry reached");
+    x250_boot_trace_event(source_boot_info, 8, false,
+                          "copy BOOT_INFO; enable physical direct map");
     boot_info_convert_to_direct_map(source_boot_info);
     BOOT_INFO *BootInfo = &kernel_boot_info;
+    x250_boot_trace_event(BootInfo, 8, true,
+                          "BOOT_INFO direct-map conversion complete");
+#if BOOT_HANDOFF_CHECKPOINT == 7
+    boot_checkpoint_mark((volatile u32 *)BootInfo->FramebufferBase,
+                         BootInfo->FramebufferWidth, BootInfo->FramebufferHeight,
+                         BootInfo->PixelsPerScanLine, 0x00ff00ffU);
+    boot_checkpoint_halt();
+#endif
+    x250_boot_trace_event(BootInfo, 36, false,
+                          "establish BSP CPU-local GS base");
     if (!cpu_activate_kernel_gs(cpu_bootstrap_local())) {
         for (;;) __asm__ volatile("cli; hlt");
     }
+    x250_boot_trace_event(BootInfo, 36, true,
+                          "BSP CPU-local GS base established");
+    x250_boot_trace_event(BootInfo, 9, false,
+                          "initialize framebuffer and terminal");
     u32 *fb = (u32 *)BootInfo->FramebufferBase;
     usize total_pixels = BootInfo->FramebufferSize / sizeof(u32);
+#if !X250_BOOT_TRACE
     for (usize i = 0; i < total_pixels; i++)
         fb[i] = terminal_palette_rgb[TERMINAL_COLOR_BLACK];
+#else
+    (void)fb;
+    (void)total_pixels;
+#endif
 
+    x250_boot_trace_event(BootInfo, 24, false,
+                          "09.1 initialize framebuffer state");
     framebuffer_init(BootInfo);
+    x250_boot_trace_event(BootInfo, 24, true,
+                          "09.1 framebuffer state initialized");
+    x250_boot_trace_event(BootInfo, 25, false,
+                          "09.2 switch trace to framebuffer API");
+    x250_boot_trace_use_framebuffer_api();
+    x250_boot_trace_event(BootInfo, 25, true,
+                          "09.2 framebuffer API is active");
+    x250_boot_trace_event(BootInfo, 26, false,
+                          "09.3 parse embedded font");
     font_init(BootInfo);
+    x250_boot_trace_event(BootInfo, 26, true,
+                          "09.3 embedded font initialized");
+    x250_boot_trace_event(BootInfo, 27, false,
+                          "09.4 initialize terminal");
     terminal_init(BootInfo);
+    x250_boot_trace_event(BootInfo, 33, false,
+                          "09.5 initialize console");
     console_init();
+    x250_boot_trace_event(BootInfo, 33, true,
+                          "09.5 console initialized");
+    x250_boot_trace_event(BootInfo, 9, true,
+                          "framebuffer and terminal initialized");
     kprint("%s %s\n", MANGROVE_NAME, MANGROVE_VERSION);
+#if BOOT_HANDOFF_CHECKPOINT == 8
+    boot_checkpoint_mark((volatile u32 *)BootInfo->FramebufferBase,
+                         BootInfo->FramebufferWidth, BootInfo->FramebufferHeight,
+                         BootInfo->PixelsPerScanLine, 0x0000ff00U);
+    boot_checkpoint_halt();
+#endif
 
+    x250_boot_trace_event(BootInfo, 10, false,
+                          "initialize CPU descriptors and interrupt devices");
     if (!gdt_init()) {
         kprint("[FAIL] CPU descriptor initialization failed\n");
         return false;
@@ -792,20 +846,36 @@ static bool early_bootstrap(BOOT_INFO *source_boot_info)
     pit_init(TIMER_FREQUENCY);
     timer_init();
     keyboard_init();
+    x250_boot_trace_event(BootInfo, 10, true,
+                          "CPU descriptors and interrupt devices ready");
     KERNEL_BOOT_DEBUG_LOG(
         "[BOOT] CPU descriptors, timer, and interrupt foundations ready\n");
 
+    x250_boot_trace_event(BootInfo, 11, false,
+                          "initialize physical memory manager");
     if (!pmm_init(BootInfo)) {
         kprint("[BOOT] physical memory map cannot be managed safely\n");
         return false;
     }
+    x250_boot_trace_event(BootInfo, 11, true,
+                          "physical memory manager ready");
+    x250_boot_trace_event(BootInfo, 12, false,
+                          "discover ACPI platform tables");
     acpi_init(BootInfo);
     if (!acpi_present())
         kprint("[WARN] ACPI platform unavailable\n");
+    x250_boot_trace_event(BootInfo, 12, true,
+                          "ACPI discovery returned");
+    x250_boot_trace_event(BootInfo, 13, false,
+                          "establish BSP CPU cache policy");
     if (!x86_cache_init_bsp()) {
         kprint("[BOOT] CPU cache policy cannot be established safely\n");
         return false;
     }
+    x250_boot_trace_event(BootInfo, 13, true,
+                          "BSP CPU cache policy ready");
+    x250_boot_trace_event(BootInfo, 14, false,
+                          "create permanent page-table root");
     vmm_init();
     phys_addr_t k_pml4_phys = pmm_alloc_frame();
     page_table_t *k_pml4 = (page_table_t *)phys_to_virt(k_pml4_phys);
@@ -833,7 +903,11 @@ static bool early_bootstrap(BOOT_INFO *source_boot_info)
         kprint("[BOOT] kernel image mapping failed\n");
         return false;
     }
+    x250_boot_trace_event(BootInfo, 14, true,
+                          "kernel image mapped in permanent root");
 
+    x250_boot_trace_event(BootInfo, 15, false,
+                          "map RAM and permanent framebuffer");
     MANGROVE_MEMORY_DESCRIPTOR *mmap =
         (MANGROVE_MEMORY_DESCRIPTOR *)BootInfo->MemoryMap;
     u64 mmap_entries = BootInfo->MemoryMapSize / BootInfo->DescriptorSize;
@@ -855,13 +929,24 @@ static bool early_bootstrap(BOOT_INFO *source_boot_info)
         kprint("[BOOT] framebuffer MMIO mapping failed\n");
         return false;
     }
-    framebuffer_set_mapping(framebuffer_mmio, framebuffer_wc);
-    BootInfo->FramebufferBase = framebuffer_mmio;
+    x250_boot_trace_event(BootInfo, 15, true,
+                          "RAM and framebuffer mappings prepared");
 
     /* Drain the loader alias before activating the sole permanent mapping.
      * This is a boot transition, not an in-place SMP cache-type change. */
+    x250_boot_trace_event(BootInfo, 16, false,
+                          "activate permanent kernel page tables");
+    framebuffer_set_mapping(framebuffer_mmio, framebuffer_wc);
+    BootInfo->FramebufferBase = framebuffer_mmio;
     x86_cache_activate_boot_root(k_pml4_phys);
+    x250_boot_trace_rebind(framebuffer_mmio, BootInfo->FramebufferWidth,
+                           BootInfo->FramebufferHeight,
+                           BootInfo->PixelsPerScanLine);
+    x250_boot_trace_event(BootInfo, 16, true,
+                          "permanent kernel page tables active");
 
+    x250_boot_trace_event(BootInfo, 17, false,
+                          "enable direct map and verify mappings");
     vmm_enable_direct_map();
     pmm_enable_direct_map();
     k_pml4 = vmm_get_kernel_pml4();
@@ -874,16 +959,28 @@ static bool early_bootstrap(BOOT_INFO *source_boot_info)
         kprint("[BOOT] permanent kernel mapping invariant failed\n");
         return false;
     }
+    x250_boot_trace_event(BootInfo, 17, true,
+                          "direct map and mapping invariants ready");
 
+    x250_boot_trace_event(BootInfo, 18, false,
+                          "initialize kernel heap");
     if (!heap_init()) {
         kprint("[BOOT] initial kernel heap mapping failed\n");
         return false;
     }
+    x250_boot_trace_event(BootInfo, 18, true,
+                          "kernel heap ready");
+    x250_boot_trace_event(BootInfo, 19, false,
+                          "allocate guarded exception stacks");
     if (!gdt_install_guarded_ists(cpu_bootstrap_local())) {
         kprint("[BOOT] guarded exception-stack allocation failed\n");
         return false;
     }
+    x250_boot_trace_event(BootInfo, 19, true,
+                          "guarded exception stacks ready");
     framebuffer_enable_backbuffer();
+    x250_boot_trace_event(BootInfo, 20, false,
+                          "initialize clocks and embedded controller");
     KERNEL_BOOT_DEBUG_LOG("[BOOT] memory, permanent VMM, and heap ready\n");
     if (timer_monotonic_init())
         KERNEL_BOOT_DEBUG_LOG(
@@ -898,11 +995,15 @@ static bool early_bootstrap(BOOT_INFO *source_boot_info)
     if (!timekeeping_realtime_available())
         kprint("[WARN] realtime clock unavailable\n");
     (void)ec_init();
+    x250_boot_trace_event(BootInfo, 20, true,
+                          "early hardware initialization complete");
     return true;
 }
 
 static void start_pid1(void)
 {
+    x250_boot_trace_event(&kernel_boot_info, 22, false,
+                          "prepare PID 1 process and Shoot image");
     /* Represent the loaded userspace image as PID 1 and expose
      * only explicitly installed, process-local capabilities to it. */
     __asm__ volatile("cli" ::: "memory");
@@ -918,16 +1019,26 @@ static void start_pid1(void)
         &creation_status);
     __asm__ volatile("cli" ::: "memory");
     if (!ring3_process) {
+        x250_boot_trace_result(22U, false, "PID 1 process creation", true,
+                               true, creation_status, "FAILED",
+                               creation_stage ? creation_stage :
+                                   "unknown stage");
         kprint("[FAIL] Ring 3 process creation failed at %s (status=%d)\n",
                creation_stage ? creation_stage : "unknown stage",
                creation_status);
         for (;;) __asm__ volatile("cli; hlt");
     }
     if (!ring3_process->address_space) {
+        x250_boot_trace_result(22U, false, "PID 1 address space", true,
+                               false, 0, "FAILED",
+                               "process has no address space");
         kprint("[FAIL] Ring 3 process has no address space\n");
         for (;;) __asm__ volatile("cli; hlt");
     }
     if (ring3_process->address_space == vmm_get_kernel_pml4()) {
+        x250_boot_trace_result(22U, false, "PID 1 address space", true,
+                               false, 0, "FAILED",
+                               "aliases kernel address space");
         kprint("[FAIL] Ring 3 process aliases the kernel address space\n");
         for (;;) __asm__ volatile("cli; hlt");
     }
@@ -936,6 +1047,9 @@ static void start_pid1(void)
     ring3_process->executable_path[
         sizeof(ring3_process->executable_path) - 1U] = '\0';
     if (!process_assign_system_service(ring3_process, MG_SERVICE_SPROUT)) {
+        x250_boot_trace_result(22U, false, "PID 1 service identity", true,
+                               false, 0, "FAILED",
+                               "Sprout service assignment failed");
         kprint("[FAIL] Sprout service identity assignment failed\n");
         for (;;) __asm__ volatile("cli; hlt");
     }
@@ -948,6 +1062,9 @@ static void start_pid1(void)
         !process_handle_install(ring3_process, console_object,
                                 PROCESS_HANDLE_RIGHT_READ |
                                 PROCESS_HANDLE_RIGHT_WRITE, &console_handle)) {
+        x250_boot_trace_result(22U, false, "PID 1 console handle", true,
+                               false, 0, "FAILED",
+                               "console capability installation failed");
         kprint("[FAIL] PID 1 console handle installation failed\n");
         if (console_object) object_release(console_object);
         for (;;) __asm__ volatile("cli; hlt");
@@ -959,6 +1076,9 @@ static void start_pid1(void)
                               OBJECT_TYPE_CONSOLE,
                               OBJECT_RIGHT_WRITE) != NULL ||
         process_handle_close(ring3_process, 0xdeadbeef)) {
+        x250_boot_trace_result(22U, false, "PID 1 console handle validation",
+                               true, false, 0, "FAILED",
+                               "initial handle or invalid-handle check failed");
         kprint("[FAIL] PID 1 console handle validation failed\n");
         for (;;) __asm__ volatile("cli; hlt");
     }
@@ -975,15 +1095,24 @@ static void start_pid1(void)
     vmm_switch_address_space(vmm_get_kernel_pml4());
     if (!elf_load_process(ring3_process, "/core/sprout", &user_entry,
                           &user_stack)) {
+        x250_boot_trace_result(22U, false, "PID 1 image load", true,
+                               false, 0, "FAILED",
+                               "could not load /core/sprout ELF");
         kprint("[FAIL] Could not load /core/sprout ELF\n");
         for (;;) __asm__ volatile("cli; hlt");
     }
     const char *sprout_argv[] = { "/core/sprout" };
     if (!process_setup_argv(ring3_process, sprout_argv, 1U)) {
+        x250_boot_trace_result(22U, false, "PID 1 arguments", true,
+                               false, 0, "FAILED",
+                               "could not construct /core/sprout arguments");
         kprint("[FAIL] Could not construct /core/sprout arguments\n");
         for (;;) __asm__ volatile("cli; hlt");
     }
     if (!process_publish_launch(ring3_process)) {
+        x250_boot_trace_result(22U, false, "PID 1 publication", true,
+                               false, 0, "FAILED",
+                               "process publication failed");
         kprint("[FAIL] PID 1 process publication failed\n");
         for (;;) __asm__ volatile("cli; hlt");
     }
@@ -996,7 +1125,13 @@ static void start_pid1(void)
     (void)terminal_presentation_start();
     __asm__ volatile("cli" ::: "memory");
     vmm_switch_address_space(ring3_process->address_space);
+#if !X250_BOOT_TRACE
     terminal_clear();
+#endif
+    x250_boot_trace_result(22U, true, "PID 1 preparation", true, false, 0,
+                           "READY", "Sprout loaded and published");
+    x250_boot_trace_event(&kernel_boot_info, 23, false,
+                          "enter PID 1 userspace");
     __asm__ volatile("sti" ::: "memory");
     process_user_context_enter();
 
@@ -1050,5 +1185,7 @@ void kmain_high(BOOT_INFO *source_boot_info)
 #ifdef TIMEKEEPING_QMP_TEST
     timekeeping_qmp_probe();
 #endif
+    x250_boot_trace_event(&kernel_boot_info, 22, false,
+                          "prepare PID 1 and transfer to Shoot");
     start_pid1();
 }

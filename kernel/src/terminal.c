@@ -13,6 +13,7 @@
 #include <stdbool.h>
 #include <string.h>
 #include <input_trace.h>
+#include <x250_boot_trace.h>
 #if INPUT_TRACE_DIAGNOSTICS
 #include <cpu.h>
 #endif
@@ -512,19 +513,23 @@ static void terminal_scrollback_live_locked(void)
 }
 
 void terminal_init(BOOT_INFO *BootInfo){
-    (void)BootInfo;
-
+    x250_boot_trace_event(BootInfo, 28, false,
+                          "09.4.1 initialize terminal lock");
     spinlock_init(&terminal_lock);
     terminal_lock_ready = false;
     presentation_pending = false;
     presentation_worker_started = false;
     presentation_worker = NULL;
+    x250_boot_trace_event(BootInfo, 28, true,
+                          "09.4.1 terminal lock initialized");
 
     terminal_style_t default_style = terminal_style_for_role(
         TERMINAL_STYLE_DEFAULT);
     terminal.fg_color = (u8)default_style.foreground;
     terminal.bg_color = (u8)default_style.background;
 
+    x250_boot_trace_event(BootInfo, 29, false,
+                          "09.4.2 read display and font dimensions");
     terminal.width  = BootInfo->FramebufferWidth;
     terminal.height = BootInfo->FramebufferHeight;
 
@@ -546,7 +551,11 @@ void terminal_init(BOOT_INFO *BootInfo){
     if (!terminal.visible_rows) terminal.visible_rows = 1U;
     if (terminal.visible_rows > TERMINAL_BUFFER_ROWS)
         terminal.visible_rows = TERMINAL_BUFFER_ROWS;
+    x250_boot_trace_event(BootInfo, 29, true,
+                          "09.4.2 terminal dimensions ready");
 
+    x250_boot_trace_event(BootInfo, 30, false,
+                          "09.4.3 initialize terminal state");
     terminal.top_row_idx = 0;
     terminal.live_top_row_idx = 0;
     terminal.history_rows = 0;
@@ -573,14 +582,32 @@ void terminal_init(BOOT_INFO *BootInfo){
     terminal.saved_normal.valid = false;
     cursor_blink_pending = false;
     cursor_blink_deadline_ms = 0;
+    x250_boot_trace_event(BootInfo, 34, false,
+                          "09.4.3.1 reset terminal dirty rows");
     terminal_reset_dirty();
+    x250_boot_trace_event(BootInfo, 34, true,
+                          "09.4.3.1 terminal dirty rows reset");
+    x250_boot_trace_event(BootInfo, 35, false,
+                          "09.4.3.2 reset terminal statistics");
     terminal_reset_stats();
+    x250_boot_trace_event(BootInfo, 35, true,
+                          "09.4.3.2 terminal statistics reset");
+    x250_boot_trace_event(BootInfo, 30, true,
+                          "09.4.3 terminal state initialized");
 
+    x250_boot_trace_event(BootInfo, 31, false,
+                          "09.4.4 clear terminal cell history");
     for (u32 r = 0; r < TERMINAL_BUFFER_ROWS; r++) {
         terminal_clear_phys_row(r, terminal.bg_color);
     }
+    x250_boot_trace_event(BootInfo, 31, true,
+                          "09.4.4 terminal cell history cleared");
 
+    x250_boot_trace_event(BootInfo, 32, false,
+                          "09.4.5 clear and present framebuffer");
     terminal_clear_locked();
+    x250_boot_trace_event(BootInfo, 32, true,
+                          "09.4.5 framebuffer clear returned");
     terminal_lock_ready = true;
 }
 

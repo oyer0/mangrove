@@ -21,12 +21,33 @@ memory while preserving the loader's static scratch-buffer ownership.
 
 The root partition contains MGFS. The loader mounts it with its dedicated,
 read-only MGFS reader and opens `/boot/pith.elf`. It validates a 64-bit,
-little-endian executable ELF image, loads each `PT_LOAD` segment at the
+little-endian x86-64 executable ELF image, loads each `PT_LOAD` segment at the
 preferred physical offset recorded by the image within one firmware-selected
 contiguous range, while retaining the linked high-half virtual addresses. The
 selected physical base is passed in `BOOT_INFO`; bootstrap and permanent
 kernel page tables map each segment using the same relocation offset and
-preserve each segment's write and execute permissions.
+preserve the segment write and execute permissions.
+Segment-load failures identify whether alignment validation, physical page
+allocation, file seeking, or segment reading failed; allocation diagnostics
+include the requested physical range.
+UEFI Simple File System exposes files only on firmware-supported filesystems;
+it is not a raw-sector interface and cannot substitute for validated GPT and
+MGFS reads. UEFI Disk I/O is byte-oriented but is layered on Block I/O, so it
+does not provide an independent storage fallback.
+
+Root-partition discovery errors identify missing versus ambiguous matching
+disks in the opt-in `X250_BOOT_TRACE=1` firmware diagnostic build. MGFS
+admission failures are reported separately from discovery failures; the boot
+status remains the exact EFI status returned by the failing operation. The
+trace build prints a bounded summary designed to fit the firmware text screen
+without scrolling. It includes loaded-ESP protocol status, the device-path
+partition range, enumerated partition handles' reported GPT role and
+device-path partition number/range, parent-path match, and LBA 0 prefix, plus
+whole-disk geometry and LBA 0/LBA 1 results. For candidate disks it also
+compares Disk I/O LBA 1 and the parent read at the loaded ESP's starting LBA.
+These diagnostic probes do not alter GPT selection or integrity validation
+and are limited to four whole-disk and four partition handles. Production
+builds omit the extra probes and detailed report.
 
 ## Firmware state collected
 
@@ -41,6 +62,19 @@ Before leaving boot services, the loader collects:
 All persistent loader allocations are complete before the final memory-map
 snapshot. If `ExitBootServices` requires a refreshed map, the loader publishes
 the map that accompanied the successful call.
+
+Hardware handoff diagnostics are opt-in through
+`BOOT_HANDOFF_CHECKPOINT=1..8`; the default `0` has no checkpoint halts.
+Checkpoints halt at the completed-bootstrap/pre-`ExitBootServices` boundary,
+after successful `ExitBootServices`, after the bootstrap CR3 load, after
+handoff-stack installation, at kernel entry, after the relocated kernel stack
+is selected, at first C entry, and after Pith initializes its console. The
+checkpoint is shown as a colored 16-by-16 block at the bottom-right of the
+framebuffer; checkpoint 1 also prints its stage in firmware text. Each
+checkpoint image deliberately halts at only its selected stage, so a reset
+before the marker indicates that the selected boundary was not reached.
+Handoff-stack allocation errors are printed and halted rather than returned
+silently to the firmware boot manager.
 
 ## `BOOT_INFO` contract
 

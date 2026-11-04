@@ -110,6 +110,9 @@ typedef struct EFI_BLOCK_IO_PROTOCOL
 typedef struct EFI_BLOCK_IO_MEDIA
     EFI_BLOCK_IO_MEDIA;
 
+typedef struct EFI_DISK_IO_PROTOCOL
+    EFI_DISK_IO_PROTOCOL;
+
 typedef struct EFI_PARTITION_INFO_PROTOCOL
     EFI_PARTITION_INFO_PROTOCOL;
 
@@ -170,6 +173,11 @@ typedef EFI_STATUS (EFIAPI *EFI_ALLOCATE_PAGES) (
     EFI_MEMORY_TYPE MemoryType,
     usize Pages,
     EFI_PHYSICAL_ADDRESS *Memory
+);
+
+typedef EFI_STATUS (EFIAPI *EFI_FREE_PAGES) (
+    EFI_PHYSICAL_ADDRESS Memory,
+    usize Pages
 );
 
 typedef EFI_STATUS (EFIAPI *EFI_ALLOCATE_POOL) (
@@ -263,6 +271,22 @@ typedef EFI_STATUS (EFIAPI *EFI_BLOCK_FLUSH_BLOCKS)(
     EFI_BLOCK_IO_PROTOCOL *This
 );
 
+typedef EFI_STATUS (EFIAPI *EFI_DISK_READ)(
+    EFI_DISK_IO_PROTOCOL *This,
+    u32 MediaId,
+    u64 Offset,
+    usize BufferSize,
+    void *Buffer
+);
+
+typedef EFI_STATUS (EFIAPI *EFI_DISK_WRITE)(
+    EFI_DISK_IO_PROTOCOL *This,
+    u32 MediaId,
+    u64 Offset,
+    usize BufferSize,
+    const void *Buffer
+);
+
 /* Structures */
 
 struct EFI_TABLE_HEADER
@@ -334,7 +358,7 @@ struct EFI_BOOT_SERVICES
     void *RestoreTPL;
 
     EFI_ALLOCATE_PAGES AllocatePages;
-    void *FreePages;
+    EFI_FREE_PAGES FreePages;
 
     EFI_GET_MEMORY_MAP GetMemoryMap;
     EFI_ALLOCATE_POOL AllocatePool;
@@ -391,7 +415,7 @@ struct EFI_BOOT_SERVICES
     /* Library Services */
     
     void *ProtocolsPerHandle;
-    void *LocateHandleBuffer;
+    EFI_LOCATE_HANDLE_BUFFER LocateHandleBuffer;
 
     EFI_LOCATE_PROTOCOL LocateProtocol;
 
@@ -483,6 +507,15 @@ struct EFI_BLOCK_IO_PROTOCOL
     EFI_BLOCK_FLUSH_BLOCKS FlushBlocks;
 };
 
+#define EFI_DISK_IO_PROTOCOL_REVISION 0x00010000U
+
+struct EFI_DISK_IO_PROTOCOL
+{
+    u64 Revision;
+    EFI_DISK_READ ReadDisk;
+    EFI_DISK_WRITE WriteDisk;
+};
+
 #define EFI_PARTITION_TYPE_OTHER 0U
 #define EFI_PARTITION_TYPE_MBR   1U
 #define EFI_PARTITION_TYPE_GPT   2U
@@ -569,6 +602,14 @@ static EFI_GUID EFI_BLOCK_IO_PROTOCOL_GUID =
     0x6459,
     0x11d2,
     { 0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b }
+};
+
+static EFI_GUID EFI_DISK_IO_PROTOCOL_GUID =
+{
+    0xce345171,
+    0xba0b,
+    0x11d2,
+    { 0x8e, 0x4f, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b }
 };
 
 static EFI_GUID EFI_PARTITION_INFO_PROTOCOL_GUID =

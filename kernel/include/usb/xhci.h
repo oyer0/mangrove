@@ -6,6 +6,10 @@
 #include <xhci_context.h>
 #include <kprint.h>
 
+#ifndef X250_BOOT_TRACE
+#define X250_BOOT_TRACE 0
+#endif
+
 #ifndef XHCI_DEBUG
 #define XHCI_DEBUG 0
 #endif
@@ -192,6 +196,14 @@ xhci_port_state_t xhci_get_port_state(xhci_controller_t *xhc, u8 port_id);
 void xhci_set_port_state(xhci_controller_t *xhc, u8 port_id,
                          xhci_port_state_t state, u32 status,
                          const char *reason);
+#if X250_BOOT_TRACE
+void xhci_set_port_result(xhci_controller_t *xhc, u8 port_id,
+                          xhci_status_t result, const char *reason);
+void xhci_trace_boot_discovery(xhci_controller_t *xhc);
+#else
+#define xhci_set_port_result(...) ((void)0)
+#define xhci_trace_boot_discovery(...) ((void)0)
+#endif
 
 /*
  * Halts the controller (USBCMD.RS = 0) and waits for the HCH (HCHalted) status bit.

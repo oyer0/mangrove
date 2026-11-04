@@ -30,6 +30,29 @@ def main():
     compiler = sys.argv[3]
     checker = ROOT / "tools/check_mgfs_version.py"
     with tempfile.TemporaryDirectory(prefix="mangrove-mgfs-version-") as temp:
+        for trace in (0, 1):
+            filesystem_object = pathlib.Path(temp) / f"filesystem-trace-{trace}.o"
+            subprocess.run(
+                [compiler, "-std=gnu11", "-Wall", "-Wextra", "-Werror",
+                 "-Wno-unused-variable", "-fshort-wchar",
+                 *native_uefi_flags(),
+                 f"-DX250_BOOT_TRACE={trace}",
+                 "-I" + str(ROOT / "boot/include"),
+                 "-I" + str(ROOT / "include"), "-c",
+                 str(ROOT / "boot/src/filesystem.c"), "-o",
+                 str(filesystem_object)], check=True)
+            symbols = subprocess.run(
+                ["nm", "-a", str(filesystem_object)],
+                check=True, capture_output=True, text=True).stdout
+            diagnostic_symbols = (
+                "FilesystemDiagnosticBlock", "FilesystemDiagnostics",
+                "filesystem_diagnostic_capture_loaded_esp",
+                "filesystem_report_diagnostics")
+            if trace:
+                assert all(symbol in symbols for symbol in diagnostic_symbols)
+            else:
+                assert all(symbol not in symbols for symbol in diagnostic_symbols)
+
         loader_test = pathlib.Path(temp) / "kernel-loader-test"
         subprocess.run([compiler, "-std=gnu11", "-Wall", "-Wextra", "-Werror",
                         "-Wno-unused-variable",
@@ -333,6 +356,17 @@ def main():
         assert update_mgfs.directory_find(directory(help_id), "info") is not None
 
         subprocess.run([str(boot_test), str(current), str(legacy_one)], check=True)
+        device_path_test = pathlib.Path(temp) / "device-path-test"
+        subprocess.run(
+            [compiler, "-std=gnu11", "-Wall", "-Wextra", "-Werror",
+             "-Wno-unused-variable", "-fshort-wchar", *native_uefi_flags(),
+             "-ffunction-sections", "-fdata-sections",
+             *dead_strip_flags(), "-I" + str(ROOT / "boot/include"),
+             "-I" + str(ROOT / "include"),
+             str(ROOT / "tests/filesystems/mgfs/filesystem_device_path_test.c"),
+             str(ROOT / "boot/src/block_io.c"),
+             "-o", str(device_path_test)], check=True)
+        subprocess.run([str(device_path_test)], check=True)
         assert current.read_bytes() == original
     print("MGFS 1.2 formatter/checker accepted; old minors rejected without media changes")
 

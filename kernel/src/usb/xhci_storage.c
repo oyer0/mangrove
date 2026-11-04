@@ -11,6 +11,13 @@
 #include <timer.h>
 #include <dma.h>
 #include <vmm.h>
+#include <x250_boot_trace.h>
+
+#if X250_BOOT_TRACE
+#define STORAGE_TRACE_RESULT(probe, value) ((probe)->result = (value))
+#else
+#define STORAGE_TRACE_RESULT(...) ((void)0)
+#endif
 
 extern void *xhci_dma_alloc(usize size, uintptr_t *phys_out);
 extern void xhci_dma_free(void *virt, usize size);
@@ -57,6 +64,57 @@ u32 xhci_storage_device_count(void)
 {
     return device_count;
 }
+
+#if X250_BOOT_TRACE
+static const char *storage_probe_stage_name(xhci_storage_stage_t stage)
+{
+    switch (stage) {
+        case XHCI_STORAGE_STAGE_DMA:             return "dma";
+        case XHCI_STORAGE_STAGE_INQUIRY:         return "inquiry";
+        case XHCI_STORAGE_STAGE_TEST_READY:      return "ready-test";
+        case XHCI_STORAGE_STAGE_CAPACITY:        return "capacity";
+        case XHCI_STORAGE_STAGE_GEOMETRY:        return "geometry";
+        case XHCI_STORAGE_STAGE_BLOCK_REGISTER:  return "register";
+        case XHCI_STORAGE_STAGE_READY:            return "ready";
+        default:                                 return "start";
+    }
+}
+
+static u32 storage_partition_count(block_device_t *parent)
+{
+    u32 count = 0;
+
+    if (!parent)
+        return 0;
+    for (u32 index = 0; index < block_device_count(); index++) {
+        block_device_t *device = block_get_device(index);
+        gpt_partition_info_t info;
+
+        if (device && gpt_get_partition_info(device, &info) &&
+            gpt_partition_parent_matches(&info, parent))
+            count++;
+    }
+    return count;
+}
+static void storage_trace_probe(u32 port_id, u32 slot_id,
+                                const xhci_storage_probe_result_t *result,
+                                const block_device_t *block)
+{
+    if (!result)
+        return;
+    x250_boot_trace_msc_probe(
+        port_id, slot_id, storage_probe_stage_name(result->stage),
+        (int)result->result, result->bot_initialized,
+        result->capacity_known, result->block_registered,
+        result->gpt_scan_ran, result->gpt_found,
+        result->gpt_partition_count,
+        block ? block->sector_size : 0U,
+        block ? block->sector_count : 0U,
+        block ? block->model : NULL);
+}
+#else
+#define storage_trace_probe(...) ((void)0)
+#endif
 
 /* Logical loss first, but keep the BOT owner alive through hardware teardown. */
 bool xhci_storage_prepare_teardown(xhci_controller_t *xhc, u8 slot_id)
@@ -728,7 +786,7 @@ static bool storage_query_write_cache(usb_mass_storage_device_t *dev)
     return dev->write_cache_known;
 }
 
-bool xhci_storage_init_device(xhci_controller_t *xhc, u8 slot_id,
+bool xhci_storage_init_device(xhci_controller_t *xhc, u8 port_id, u8 slot_id,
                               u8 bulk_in_ep, u8 bulk_out_ep,
                               xhci_storage_probe_result_t *out_result)
 {
@@ -739,9 +797,17 @@ bool xhci_storage_init_device(xhci_controller_t *xhc, u8 slot_id,
     u8 inquiry_cdb[6] = { 0x12, 0, 0, 0, 36, 0 };
     u8 capacity_cdb[10] = { 0x25 };
 
+#if !X250_BOOT_TRACE
+    (void)port_id;
+#endif
     if (!out_result) out_result = &local_result;
     memset(out_result, 0, sizeof(*out_result));
-    if (!xhc || device_count >= 4) return false;
+    if (!xhc || device_count >= 4) {
+        STORAGE_TRACE_RESULT(out_result, xhc ? XHCI_ERR_NO_MEMORY :
+                                                XHCI_ERR_INVALID_PARAM);
+        storage_trace_probe(port_id, slot_id, out_result, NULL);
+        return false;
+    }
 
     dev = NULL;
     for (u32 index = 0; index < 4U; index++) {
@@ -750,7 +816,11 @@ bool xhci_storage_init_device(xhci_controller_t *xhc, u8 slot_id,
             break;
         }
     }
-    if (!dev) return false;
+    if (!dev) {
+        STORAGE_TRACE_RESULT(out_result, XHCI_ERR_NO_MEMORY);
+        storage_trace_probe(port_id, slot_id, out_result, NULL);
+        return false;
+    }
     memset(dev, 0, sizeof(*dev));
     dev->xhc = xhc;
     dev->slot_id = slot_id;
@@ -763,6 +833,8 @@ bool xhci_storage_init_device(xhci_controller_t *xhc, u8 slot_id,
     if (!inquiry || !capacity) {
         if (inquiry) xhci_dma_free(inquiry, 36);
         if (capacity) xhci_dma_free(capacity, 8);
+        STORAGE_TRACE_RESULT(out_result, XHCI_ERR_NO_MEMORY);
+        storage_trace_probe(port_id, slot_id, out_result, &dev->block);
         return false;
     }
 
@@ -770,12 +842,17 @@ bool xhci_storage_init_device(xhci_controller_t *xhc, u8 slot_id,
     if (!bot_command(dev, inquiry_cdb, 6, inquiry, inquiry_phys, 36, true)) {
         xhci_dma_free(inquiry, 36);
         xhci_dma_free(capacity, 8);
+        STORAGE_TRACE_RESULT(out_result, XHCI_ERR_TRANSACTION);
+        storage_trace_probe(port_id, slot_id, out_result, &dev->block);
         return false;
     }
 
+    out_result->stage = XHCI_STORAGE_STAGE_TEST_READY;
     if (!bot_wait_until_ready(dev)) {
         xhci_dma_free(inquiry, 36);
         xhci_dma_free(capacity, 8);
+        STORAGE_TRACE_RESULT(out_result, XHCI_ERR_TRANSACTION);
+        storage_trace_probe(port_id, slot_id, out_result, &dev->block);
         return false;
     }
 
@@ -784,6 +861,8 @@ bool xhci_storage_init_device(xhci_controller_t *xhc, u8 slot_id,
                                       capacity_phys, 8, true)) {
         xhci_dma_free(inquiry, 36);
         xhci_dma_free(capacity, 8);
+        STORAGE_TRACE_RESULT(out_result, XHCI_ERR_TRANSACTION);
+        storage_trace_probe(port_id, slot_id, out_result, &dev->block);
         return false;
     }
 
@@ -800,6 +879,8 @@ bool xhci_storage_init_device(xhci_controller_t *xhc, u8 slot_id,
     if (dev->block_size != 512 || !dev->block_count) {
         if (!gpt_remove_partitions_for_parent(&dev->block))
             dev->teardown_pending = true;
+        STORAGE_TRACE_RESULT(out_result, XHCI_ERR_NOT_SUPPORTED);
+        storage_trace_probe(port_id, slot_id, out_result, &dev->block);
         return false;
     }
     out_result->capacity_known = true;
@@ -825,7 +906,16 @@ bool xhci_storage_init_device(xhci_controller_t *xhc, u8 slot_id,
     dev->active = true;
 
     out_result->gpt_scan_ran = true;
+#if X250_BOOT_TRACE
+    u32 partitions_before_scan = storage_partition_count(&dev->block);
+#endif
     out_result->gpt_found = gpt_scan_device(&dev->block);
+#if X250_BOOT_TRACE
+    u32 partitions_after_scan = storage_partition_count(&dev->block);
+    out_result->gpt_partition_count =
+        partitions_after_scan >= partitions_before_scan
+            ? partitions_after_scan - partitions_before_scan : 0U;
+#endif
 
     /* Publish the storage device only after GPT discovery has completed.
        INIT_STORAGE uses block registration as its readiness boundary; the
@@ -836,6 +926,8 @@ bool xhci_storage_init_device(xhci_controller_t *xhc, u8 slot_id,
         !block_register(&dev->block)) {
         if (!gpt_remove_partitions_for_parent(&dev->block))
             dev->teardown_pending = true;
+        STORAGE_TRACE_RESULT(out_result, XHCI_ERR_TRANSACTION);
+        storage_trace_probe(port_id, slot_id, out_result, &dev->block);
         return false;
     }
     dev->block_registered = true;
@@ -845,5 +937,7 @@ bool xhci_storage_init_device(xhci_controller_t *xhc, u8 slot_id,
                           dev->block_count);
 
     out_result->stage = XHCI_STORAGE_STAGE_READY;
+    STORAGE_TRACE_RESULT(out_result, XHCI_SUCCESS);
+    storage_trace_probe(port_id, slot_id, out_result, &dev->block);
     return true;
 }

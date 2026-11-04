@@ -298,6 +298,18 @@ DEPFLAGS     := -MMD -MP
 
 BOOT_CFLAGS  := -std=gnu11 -ffreestanding -mno-red-zone -fno-asynchronous-unwind-tables -fno-unwind-tables -fno-stack-protector -Iboot/include -Iinclude $(DEPFLAGS)
 BOOT_ASFLAGS :=
+BOOT_HANDOFF_CHECKPOINT ?= 0
+X250_BOOT_TRACE ?= 0
+ifneq ($(filter-out 0 1 2 3 4 5 6 7 8,$(BOOT_HANDOFF_CHECKPOINT)),)
+$(error BOOT_HANDOFF_CHECKPOINT must be between 0 and 8)
+endif
+ifneq ($(filter-out 0 1,$(X250_BOOT_TRACE)),)
+$(error X250_BOOT_TRACE must be 0 or 1)
+endif
+BOOT_CFLAGS += -DBOOT_HANDOFF_CHECKPOINT=$(BOOT_HANDOFF_CHECKPOINT)
+BOOT_ASFLAGS += -Wa,--defsym,BOOT_HANDOFF_CHECKPOINT=$(BOOT_HANDOFF_CHECKPOINT)
+BOOT_CFLAGS += -DX250_BOOT_TRACE=$(X250_BOOT_TRACE)
+BOOT_ASFLAGS += -Wa,--defsym,X250_BOOT_TRACE=$(X250_BOOT_TRACE)
 # GNU ld uses numeric subsystem 10 for EFI applications.  Direct linking
 # intentionally omits MinGW CRT/startup objects and all default libraries.
 BOOT_LDFLAGS := --subsystem 10 --entry efi_main --enable-reloc-section --dynamicbase --disable-auto-import --no-insert-timestamp
@@ -307,7 +319,10 @@ BOOT_LDFLAGS := --subsystem 10 --entry efi_main --enable-reloc-section --dynamic
 # threads own an eager FXSAVE/FXRSTOR context, so userspace may use the normal
 # x86-64 floating-point/SSE ABI without exposing that state to kernel C code.
 KERNEL_CFLAGS  := -std=gnu11 -ffreestanding -fno-asynchronous-unwind-tables -fno-stack-protector -fno-pic -fno-pie -mcmodel=kernel -Ikernel/include -Ikernel/include/usb -Ikernel/include/pci -Ikernel/include/storage -Iinclude -Ilibc/include -mno-red-zone -mno-sse -mno-sse2 -mno-mmx -msoft-float $(DEPFLAGS)
-KERNEL_ASFLAGS := -m64
+KERNEL_CFLAGS += -DBOOT_HANDOFF_CHECKPOINT=$(BOOT_HANDOFF_CHECKPOINT)
+KERNEL_CFLAGS += -DX250_BOOT_TRACE=$(X250_BOOT_TRACE)
+KERNEL_ASFLAGS := -m64 -Wa,--defsym,BOOT_HANDOFF_CHECKPOINT=$(BOOT_HANDOFF_CHECKPOINT)
+KERNEL_ASFLAGS += -Wa,--defsym,X250_BOOT_TRACE=$(X250_BOOT_TRACE)
 KERNEL_STACK_USAGE ?= 0
 KERNEL_STACK_DIAGNOSTICS ?= 0
 KERNEL_STACK_OVERFLOW_GUEST_TEST ?= 0
@@ -650,7 +665,7 @@ DEPS := $(BOOT_OBJS:.o=.d) $(ALL_KERNEL_OBJS:.o=.d)
 .PHONY: all help make fresh run fresh-run usb clean test exfat-upcase \
         binaries font sprout sessiond logind logd networkd deviced volumed clipd mount unmount eject lspci lsusb lsdsk diskutil crew about view info mem time tmon logv hello shoot clear copy list locate move mkdir plant type wait reed del say shutdown reboot uptime date version where fstest nettest ping resolve fetch netinfo netcfg power identity user \
         image fresh-image usb-image run-usb mkmgfs mgfsck test-time test-terminal test-mgfs-version test-mgfs-reconcile test-reed test-math test-kernel-stack test-http-wire kernel-stack-usage test-guest-kernel-stack \
-        check-image-deps check-usb-deps check-qemu-deps qemu-warning dev-image fresh-dev-image flash-image test-launch test-password test-random test-vmm test-heap test-history test-copy test-move test-del test-mfqs test-sync test-spinlock-context test-storage test-dev-tools test-font test-unicode test-shoot test-shoot-help test-pager test-view test-info test-help test-list test-cli-options test-fetch test-fetch-transport test-tcp test-startup-presentation test-power-presentation test-rtc-build-policy test-say
+        check-image-deps check-usb-deps check-qemu-deps qemu-warning dev-image fresh-dev-image flash-image test-launch test-password test-random test-vmm test-heap test-history test-copy test-move test-del test-mfqs test-sync test-spinlock-context test-storage test-dev-tools test-font test-unicode test-shoot test-shoot-help test-pager test-view test-info test-help test-list test-cli-options test-fetch test-fetch-transport test-tcp test-startup-presentation test-x250-boot-trace test-power-presentation test-rtc-build-policy test-say
 
 # Everyday targets
 all: image
@@ -886,6 +901,16 @@ mgfsck: $(BUILD_DIR)/mgfsck
 
 test-startup-presentation:
 	python3 tests/kernel/startup_presentation_test.py "$(HOST_CC)"
+	python3 tests/kernel/init_trace_test.py "$(HOST_CC)"
+
+test-x250-boot-trace:
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -Wno-unused-function \
+		-ffunction-sections \
+		-fdata-sections -Wl,--gc-sections -Ikernel/include -Iinclude \
+		-idirafter libc/include tests/kernel/x250_boot_trace_test.c \
+		-o $(HOST_TEST_DIR)/mangrove-x250-boot-trace-test
+	$(HOST_TEST_DIR)/mangrove-x250-boot-trace-test
+
 
 test-rtc-build-policy:
 	python3 tests/kernel/rtc_build_policy_test.py
@@ -1920,6 +1945,7 @@ test-storage: test-storage-authorization
 		tests/storage/xhci_regs_layout_test.c \
 		-o $(HOST_TEST_DIR)/mangrove-xhci-regs-layout-test
 	$(HOST_TEST_DIR)/mangrove-xhci-regs-layout-test
+	python3 tests/storage/xhci_mmio_map_test.py "$(HOST_CC)"
 	python3 tests/storage/ahci_signature_test.py "$(HOST_CC)"
 	python3 tests/storage/storage_coherency_test.py "$(HOST_CC)"
 	python3 tests/filesystems/exfat/storage_format_test.py "$(HOST_CC)"
