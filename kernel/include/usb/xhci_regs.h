@@ -37,6 +37,46 @@ typedef struct {
 #define XHCI_HCCPARAMS1_CSZ              (1 << 2)  /* Context Size: 0 = 32-byte, 1 = 64-byte */
 #define XHCI_HCCPARAMS1_XECP(x)          (((x) >> 16) & 0xFFFF) /* xHCI Extended Capabilities Pointer */
 
+/* XECP is a 16-bit DWORD offset from the MMIO base, so the complete
+ * representable extended-capability range occupies 256 KiB. The controller's
+ * ordinary register mapping remains limited to its existing 16 KiB extent. */
+#define XHCI_MMIO_APERTURE_SIZE           0x00040000U
+#define XHCI_MMIO_BASE_APERTURE_SIZE      0x00004000U
+#define XHCI_EXT_CAP_HEADER_SIZE          4U
+
+static inline bool xhci_ext_cap_range_valid(u32 offset, u32 size)
+{
+    return size != 0U && (offset & 3U) == 0U &&
+           offset <= XHCI_MMIO_APERTURE_SIZE &&
+           size <= XHCI_MMIO_APERTURE_SIZE - offset;
+}
+
+static inline bool xhci_mmio_base_range_valid(u32 offset, u32 size)
+{
+    return size != 0U && (offset & 3U) == 0U &&
+           offset <= XHCI_MMIO_BASE_APERTURE_SIZE &&
+           size <= XHCI_MMIO_BASE_APERTURE_SIZE - offset;
+}
+
+/* The Next Capability Pointer is a relative DWORD offset. */
+static inline bool xhci_ext_cap_next_offset(u32 current_offset,
+                                             u32 next_dwords,
+                                             u32 *next_offset)
+{
+    u32 delta;
+
+    if (!next_offset || !next_dwords ||
+        !xhci_ext_cap_range_valid(current_offset,
+                                  XHCI_EXT_CAP_HEADER_SIZE))
+        return false;
+    delta = next_dwords << 2;
+    if (current_offset > XHCI_MMIO_APERTURE_SIZE - delta)
+        return false;
+    *next_offset = current_offset + delta;
+    return xhci_ext_cap_range_valid(*next_offset,
+                                    XHCI_EXT_CAP_HEADER_SIZE);
+}
+
 
 /* ==============================================================================
  * xHCI Operational Registers

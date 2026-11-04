@@ -11,6 +11,7 @@
 #include <xhci_hub.h>
 #include <scheduler.h>
 #include <address_space.h>
+#include <vmm.h>
 #include <timer.h>
 #include <kprint.h>
 #include <stddef.h>
@@ -166,6 +167,7 @@ struct xhci_device {
 
 struct xhci_controller {
     uintptr_t mmio_base;
+    u64 mmio_phys_base;
     u8 irq_number;
     bool is_running;
     bool quarantined;
@@ -491,17 +493,47 @@ void xhci_set_port_state(xhci_controller_t *xhc, u8 port_id,
 #define XHCI_LEGACY_SMI_EVENTS       (0x7U << 29)
 #define XHCI_MAX_EXT_CAPS            50U
 
-/* Claim the xHC from pre-OS firmware before touching operational registers. */
-static void xhci_legacy_handoff(xhci_controller_t *xhc)
+static volatile u32 *xhci_extended_capability(xhci_controller_t *xhc,
+                                               u32 offset, u32 size)
 {
-    u32 offset = XHCI_HCCPARAMS1_XECP(xhc->cap_regs->hccparams1) << 2;
+    if (!xhc || !xhci_ext_cap_range_valid(offset, size))
+        return NULL;
+
+    if (xhci_mmio_base_range_valid(offset, size))
+        return (volatile u32 *)(xhc->mmio_base + offset);
+
+    if (xhc->mmio_phys_base > ~(u64)0 - offset)
+        return NULL;
+    return (volatile u32 *)vmm_map_mmio(
+        (phys_addr_t)(xhc->mmio_phys_base + offset), size);
+}
+
+/* Claim the xHC from pre-OS firmware before touching operational registers. */
+static bool xhci_legacy_handoff(xhci_controller_t *xhc)
+{
+    u32 hccparams1 = xhc->cap_regs->hccparams1;
+    u32 offset = XHCI_HCCPARAMS1_XECP(hccparams1) << 2;
 
     for (u32 count = 0; offset && count < XHCI_MAX_EXT_CAPS; count++) {
-        volatile u32 *cap = (volatile u32 *)(xhc->mmio_base + offset);
+        volatile u32 *cap = xhci_extended_capability(
+            xhc, offset, XHCI_EXT_CAP_HEADER_SIZE);
+        if (!cap) {
+            kprint("[xHCI] Invalid extended capability offset %08x\n",
+                   offset);
+            return false;
+        }
+
         u32 value = *cap;
         u32 next = (value >> 8) & 0xFFU;
 
         if ((value & 0xFFU) == XHCI_EXT_CAP_ID_LEGACY) {
+            cap = xhci_extended_capability(xhc, offset,
+                                           2U * sizeof(u32));
+            if (!cap) {
+                kprint("[xHCI] Truncated legacy capability at %08x\n",
+                       offset);
+                return false;
+            }
             bool forced = false;
             u32 initial = value;
 
@@ -537,13 +569,19 @@ static void xhci_legacy_handoff(xhci_controller_t *xhc)
                            (initial & XHCI_LEGACY_BIOS_OWNED) != 0,
                            (value & XHCI_LEGACY_BIOS_OWNED) != 0,
                            (value & XHCI_LEGACY_OS_OWNED) != 0, forced);
-            return;
+            return true;
         }
 
         if (!next)
-            return;
-        offset += next << 2;
+            return true;
+        if (!xhci_ext_cap_next_offset(offset, next, &offset)) {
+            kprint("[xHCI] Invalid extended capability link at %08x\n",
+                   offset);
+            return false;
+        }
     }
+
+    return offset == 0U;
 }
 
 void xhci_queue_port_change(xhci_controller_t *xhc, u8 port_id,
@@ -1588,7 +1626,8 @@ u32 xhci_get_ep0_state(xhci_controller_t *xhc, u8 slot_id)
  * Core Controller API (Phase 1)
  * ============================================================================== */
 
-xhci_controller_t* xhci_init(uintptr_t mmio_base, u8 irq_number) {
+xhci_controller_t* xhci_init(uintptr_t mmio_base, u64 mmio_phys_base,
+                             u8 irq_number) {
     xhci_controller_t *xhc = &g_xhc_instance;
 
     if (g_xhc_init_started)
@@ -1601,6 +1640,7 @@ xhci_controller_t* xhci_init(uintptr_t mmio_base, u8 irq_number) {
                               "ownership-entry");
 
     xhc->mmio_base = mmio_base;
+    xhc->mmio_phys_base = mmio_phys_base;
     xhc->irq_number = irq_number;
     xhc->is_running = false;
     xhc->keyboard_callback = NULL;
@@ -1636,7 +1676,12 @@ xhci_controller_t* xhci_init(uintptr_t mmio_base, u8 irq_number) {
     xhc->db_array = (volatile u32 *)(mmio_base + xhc->cap_regs->dboff);
     xhc->run_regs = (xhci_run_regs_t *)(mmio_base + xhc->cap_regs->rtsoff);
 
-    xhci_legacy_handoff(xhc);
+    bool legacy_handoff_valid = xhci_legacy_handoff(xhc);
+    if (!legacy_handoff_valid) {
+        xhci_set_controller_state(xhc, XHCI_CONTROLLER_FAILED,
+                                  "invalid-extended-capability-chain");
+        return NULL;
+    }
     xhci_set_controller_state(xhc, XHCI_CONTROLLER_RESETTING,
                               "firmware-ownership-claimed");
 

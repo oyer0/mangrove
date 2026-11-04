@@ -37,6 +37,7 @@
 #include <vfs.h>
 #include <vmm.h>
 #include <xhci.h>
+#include <xhci_regs.h>
 #include <net/dns.h>
 #include <net/ipv4.h>
 #include <net/tcp.h>
@@ -317,7 +318,7 @@ static init_result_t init_xhci(const char **reason)
 {
     const pci_device_t *xhci_pdev = NULL;
     phys_addr_t xhci_mmio_phys = 0;
-    const usize xhci_mmio_size = 0x4000;
+    const usize xhci_mmio_size = XHCI_MMIO_BASE_APERTURE_SIZE;
     u8 xhci_irq = 11;
 
     for (u32 i = 0; i < pci_get_device_count(); i++) {
@@ -347,7 +348,7 @@ static init_result_t init_xhci(const char **reason)
         *reason = "xHCI interrupt vector already owned";
         return INIT_RESULT_FAILED;
     }
-    g_xhc = xhci_init(xhci_mmio_base, xhci_irq);
+    g_xhc = xhci_init(xhci_mmio_base, (u64)xhci_mmio_phys, xhci_irq);
     if (!g_xhc) {
         irq_unregister_vector(IRQ_VECTOR_XHCI);
         *reason = "xHCI controller initialization failed";

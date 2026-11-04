@@ -71,6 +71,17 @@ valid only for physical addresses below the 64 TiB map limit. MMIO is
 deliberately excluded from that map and receives separate cache-controlled
 ioremap addresses.
 
+`vmm_map_mmio()` creates permanent page-aligned UC mappings and returns the
+requested physical address's offset within the mapping. xHCI's ordinary
+registers use the existing 16 KiB BAR mapping. HCCPARAMS1's 16-bit DWORD
+extended-capability pointer can address a 256 KiB range; its offsets are
+bounds-checked, and pages beyond the ordinary mapping are mapped on demand at
+the physical BAR offset reported by the controller. A legacy handoff
+capability must have both register DWORDs mapped before access. These aliases
+remain permanent because the generic MMIO mapper has no unmap operation; the
+driver maps only pages containing advertised capability registers and does
+not infer or map the physical BAR's full size.
+
 The heap interval is a 512 GiB virtual reservation, not a pre-mapped or
 physically reserved 512 GiB pool. Only its monotonically committed prefix has
 page mappings and PMM-backed frames. The direct map ends at the heap base; the

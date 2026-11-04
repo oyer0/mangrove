@@ -164,11 +164,13 @@ typedef struct {
 /* * Initializes a new xHCI controller instance.
  * Allocates primary memory structures (DCBAA, Command Ring, Event Ring, Scratchpads)
  * but leaves the controller in a Halted state.
- * * @param mmio_base     The 64-bit virtual memory address mapped to the controller's PCI BAR.
+ * * @param mmio_base     The virtual address of the mapped controller registers.
+ * * @param mmio_phys_base The physical base address of the controller's PCI BAR.
  * @param irq_number    The hardware IRQ (or GSI) assigned to this controller.
  * @return              Pointer to the initialized controller instance, or NULL on failure.
  */
-xhci_controller_t* xhci_init(uintptr_t mmio_base, u8 irq_number);
+xhci_controller_t* xhci_init(uintptr_t mmio_base, u64 mmio_phys_base,
+                              u8 irq_number);
 
 /*
  * Transitions the controller into the Running state (USBCMD.RS = 1) 
