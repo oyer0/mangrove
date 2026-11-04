@@ -55,8 +55,10 @@ The loader installs the bootstrap CR3 and stack with interrupts disabled, then
 jumps to the ELF entry with a pointer to `BOOT_INFO`. Kernel assembly switches
 immediately to the kernel image stack before entering `kmain_high`. Early
 kernel code copies the handoff record, converts physical firmware pointers to
-the direct map, initializes memory management, builds the permanent kernel page
-tables, and replaces the transitional mappings.
+the direct map, and establishes the BSP's kernel GS base before terminal or
+spinlock use. It then initializes memory management, builds the permanent
+kernel page tables, and replaces the transitional mappings. GDT setup reloads
+the BSP's segment state and re-establishes the kernel GS base.
 
 Before that construction, the BSP establishes its PAT policy without changing
 firmware MTRRs or any PAT selector used by the loader. The permanent GOP

@@ -29,6 +29,13 @@ def production_function(path, name):
 
 main_source = (ROOT / "kernel/src/main.c").read_text()
 init_source = (ROOT / "kernel/src/init.c").read_text()
+early_bootstrap = production_function("kernel/src/main.c", "early_bootstrap")
+gs_setup = early_bootstrap.find("cpu_activate_kernel_gs(cpu_bootstrap_local())")
+framebuffer_setup = early_bootstrap.find("framebuffer_init(BootInfo)")
+terminal_setup = early_bootstrap.find("terminal_init(BootInfo)")
+assert gs_setup >= 0, "BSP GS base is not initialized during early bootstrap"
+assert framebuffer_setup > gs_setup and terminal_setup > gs_setup, (
+    "BSP GS base must be initialized before framebuffer and terminal setup")
 assert 'kprint("%s %s\\n", MANGROVE_NAME, MANGROVE_VERSION);' in main_source
 for routine in ("Starting system...", "Input ready\\n", "Platform ready\\n",
                 "Starting Sprout...\\n"):
@@ -41,7 +48,7 @@ assert '[WARN] hybrid slab backend unavailable' in init_source
 assert '[FAIL] %s unavailable: %s\\n' in init_source
 assert '[WARN] ACPI platform unavailable\\n' in main_source
 assert '[WARN] realtime clock unavailable\\n' in main_source
-assert '[WARN] monotonic platform timing unavailable\\n' in main_source
+assert '[WARN] degraded PIT clocksource active\\n' in main_source
 
 function = production_function("kernel/src/init.c",
                                "init_report_optional_network_status")

@@ -515,7 +515,7 @@ void terminal_init(BOOT_INFO *BootInfo){
     (void)BootInfo;
 
     spinlock_init(&terminal_lock);
-    terminal_lock_ready = true;
+    terminal_lock_ready = false;
     presentation_pending = false;
     presentation_worker_started = false;
     presentation_worker = NULL;
@@ -580,7 +580,8 @@ void terminal_init(BOOT_INFO *BootInfo){
         terminal_clear_phys_row(r, terminal.bg_color);
     }
 
-    terminal_clear();
+    terminal_clear_locked();
+    terminal_lock_ready = true;
 }
 
 static void terminal_cursor_render_show_locked(void){

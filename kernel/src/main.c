@@ -769,6 +769,9 @@ static bool early_bootstrap(BOOT_INFO *source_boot_info)
 {
     boot_info_convert_to_direct_map(source_boot_info);
     BOOT_INFO *BootInfo = &kernel_boot_info;
+    if (!cpu_activate_kernel_gs(cpu_bootstrap_local())) {
+        for (;;) __asm__ volatile("cli; hlt");
+    }
     u32 *fb = (u32 *)BootInfo->FramebufferBase;
     usize total_pixels = BootInfo->FramebufferSize / sizeof(u32);
     for (usize i = 0; i < total_pixels; i++)
