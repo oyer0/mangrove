@@ -59,11 +59,14 @@ below occupy separate high-half PML4 branches where required by the VMM.
 | Leased kernel virtual range | `0xffffc10000000000` | `0xffffc18000000000` | Explicit VMM range leases |
 | Kernel image | `0xffffffff80000000` | linked image extent | Pith text, data, and BSS |
 
-The kernel image is loaded at physical address `0x00100000` and linked at
-`0xffffffff80000000`. The fixed 1 MiB placement fits the current QEMU/OVMF
-map. A fixed placement can conflict with firmware reservations as the kernel
-grows; relocatable or firmware-selected placement is not implemented. This is
-not a universal UEFI placement guarantee. Direct-map conversions are
+The kernel ELF is linked at `0xffffffff80100000`, with preferred physical
+addresses beginning at `0x00100000`. The loader allocates one contiguous
+firmware-owned range for the image at any available physical address and
+relocates every loadable segment by the same offset. `BOOT_INFO` carries the
+selected physical base so both the bootstrap mappings and Pith's permanent
+high-half mappings preserve the linked virtual addresses. The image range
+remains EFI loader data through handoff and is not admitted as free PMM memory.
+The loader still reserves low memory independently. Direct-map conversions are
 valid only for physical addresses below the 64 TiB map limit. MMIO is
 deliberately excluded from that map and receives separate cache-controlled
 ioremap addresses.

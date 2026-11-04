@@ -61,6 +61,25 @@ typedef struct
     u64 Alignment;
 } ELF_PROGRAM_HEADER;
 
+typedef enum
+{
+    ELF_LOAD_FAILURE_NONE,
+    ELF_LOAD_FAILURE_ALIGNMENT,
+    ELF_LOAD_FAILURE_SEGMENT,
+    ELF_LOAD_FAILURE_ALLOCATION,
+    ELF_LOAD_FAILURE_SEEK,
+    ELF_LOAD_FAILURE_READ
+} ELF_LOAD_FAILURE_STAGE;
+
+typedef struct
+{
+    ELF_LOAD_FAILURE_STAGE Stage;
+    usize ProgramHeaderIndex;
+    u64 PhysicalAddress;
+    usize Pages;
+    u64 FileOffset;
+} ELF_LOAD_FAILURE;
+
 EFI_STATUS elf_validate(
     ELF_HEADER *Header,
     usize HeaderSize
@@ -76,5 +95,7 @@ EFI_STATUS elf_load_segments(
     BOOT_FILE *Kernel,
     ELF_HEADER *Header,
     ELF_PROGRAM_HEADER *ProgramHeaders,
-    void **KernelEntry
+    void **KernelEntry,
+    u64 *ImagePhysicalBase,
+    ELF_LOAD_FAILURE *Failure
 );

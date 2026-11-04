@@ -227,7 +227,8 @@ bool pmm_init(BOOT_INFO *boot_info) {
         }
     }
 
-    /* Reserve low memory & kernel image region (0 to 4MB) */
+    /* Keep legacy low memory unavailable to the allocator. The loaded kernel
+     * is separately excluded by its EFI_LOADER_DATA descriptors. */
     for (u64 f = 0; f < 0x400; f++) {
         if (f < total_frames && !bitmap_test(f)) {
             bitmap_set(f);

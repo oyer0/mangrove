@@ -129,12 +129,16 @@ EFI_STATUS EFIAPI efi_main(
     }
 
     void *KernelEntry;
+    ELF_LOAD_FAILURE LoadFailure;
+    u64 KernelPhysicalBase;
 
     Status = elf_load_segments(
             Kernel,
             &Header,
             ProgramHeaders,
-            &KernelEntry
+            &KernelEntry,
+            &KernelPhysicalBase,
+            &LoadFailure
     );
 
     if (Status != EFI_SUCCESS)
@@ -179,6 +183,7 @@ EFI_STATUS EFIAPI efi_main(
     BOOT_INFO BootInfo;
 
     BootInfo.Size = sizeof(BOOT_INFO);
+    BootInfo.KernelPhysicalBase = KernelPhysicalBase;
 
     BootInfo.FramebufferBase = (void *)Gop->Mode->FrameBufferBase;
     BootInfo.FramebufferPhysicalBase = (u64)Gop->Mode->FrameBufferBase;
@@ -224,6 +229,7 @@ EFI_STATUS EFIAPI efi_main(
     EFI_PHYSICAL_ADDRESS BootstrapPml4 = 0;
     Status = bootstrap_build_page_tables(
         &Map, &Header, ProgramHeaders,
+        KernelPhysicalBase,
         (u64)StackBase, 16 * EFI_PAGE_SIZE,
         (u64)Gop->Mode->FrameBufferBase, (u64)Gop->Mode->FrameBufferSize,
         (u64)(uintptr_t)Rsdp,

@@ -19,10 +19,12 @@
 #define KERNEL_VMM_RANGE_BASE  0xffffc10000000000ULL
 #define KERNEL_VMM_RANGE_LIMIT 0xffffc18000000000ULL
 
-/* Stage-2 kernel image placement.  The image is loaded at the physical
- * address while its linked/executing address is in the canonical high half. */
+/* Stage-2 kernel image placement. ELF physical addresses are preferred
+ * offsets from KERNEL_PHYS_BASE; the loader may choose another physical base
+ * while the image remains linked in the canonical high half. */
 #define KERNEL_PHYS_BASE 0x00100000ULL
 #define KERNEL_VIRT_BASE 0xffffffff80000000ULL
+#define KERNEL_IMAGE_VIRT_BASE (KERNEL_VIRT_BASE + KERNEL_PHYS_BASE)
 
 _Static_assert(KERNEL_HEAP_BASE < KERNEL_HEAP_LIMIT &&
                PHYS_MAP_BASE + PHYS_MAP_SIZE == KERNEL_HEAP_BASE &&
@@ -36,7 +38,14 @@ _Static_assert(((KERNEL_VMM_RANGE_BASE >> 39) & 0x1ffULL) ==
                (((KERNEL_VMM_RANGE_LIMIT - 1ULL) >> 39) & 0x1ffULL),
                "owned kernel virtual range must fit one PML4 branch");
 
-static inline u64 kernel_image_virt_to_phys(uintptr_t virt)
+static inline u64 kernel_image_virt_to_phys(uintptr_t virt,
+                                            u64 physical_base)
 {
-    return (u64)virt - KERNEL_VIRT_BASE;
+    return physical_base + ((u64)virt - KERNEL_IMAGE_VIRT_BASE);
+}
+
+static inline u64 kernel_image_relocate_phys(u64 linked_physical,
+                                            u64 physical_base)
+{
+    return physical_base + (linked_physical - KERNEL_PHYS_BASE);
 }

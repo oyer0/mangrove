@@ -30,6 +30,17 @@ def main():
     compiler = sys.argv[3]
     checker = ROOT / "tools/check_mgfs_version.py"
     with tempfile.TemporaryDirectory(prefix="mangrove-mgfs-version-") as temp:
+        loader_test = pathlib.Path(temp) / "kernel-loader-test"
+        subprocess.run([compiler, "-std=gnu11", "-Wall", "-Wextra", "-Werror",
+                        "-Wno-unused-variable",
+                        *native_uefi_flags(),
+                        "-I" + str(ROOT / "boot/include"),
+                        "-I" + str(ROOT / "include"),
+                        str(ROOT / "tests/boot/kloader_test.c"),
+                        str(ROOT / "boot/src/kloader.c"), "-o",
+                        str(loader_test)], check=True)
+        subprocess.run([str(loader_test)], check=True)
+
         block_io_test = pathlib.Path(temp) / "block-io-pool-test"
         subprocess.run([compiler, "-std=gnu11", "-Wall", "-Wextra", "-Werror",
                         "-Wno-unused-variable", *native_uefi_flags(),

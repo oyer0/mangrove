@@ -103,7 +103,8 @@ static bool map_kernel_image_range(page_table_t *pml4, uintptr_t start,
     uintptr_t limit = (end + PAGE_SIZE - 1) & ~(uintptr_t)(PAGE_SIZE - 1);
 
     for (; page < limit; page += PAGE_SIZE) {
-        phys_addr_t phys = kernel_image_virt_to_phys(page);
+        phys_addr_t phys = kernel_image_virt_to_phys(
+            page, kernel_boot_info.KernelPhysicalBase);
         if (!vmm_map(pml4, (void *)page, phys,
                      flags | PTE_PRESENT | PTE_GLOBAL)) {
             return false;

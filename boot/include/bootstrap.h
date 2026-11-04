@@ -8,6 +8,7 @@ EFI_STATUS bootstrap_build_page_tables(
     MEMORY_MAP *Map,
     ELF_HEADER *Header,
     ELF_PROGRAM_HEADER *ProgramHeaders,
+    u64 KernelPhysicalBase,
     u64 HandoffStackBase,
     u64 HandoffStackSize,
     u64 FramebufferBase,

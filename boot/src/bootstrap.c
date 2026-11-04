@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include <bootstrap.h>
 #include <address_layout.h>
+#include <kloader.h>
 
 #define BOOT_P  (1ULL << 0)
 #define BOOT_W  (1ULL << 1)
@@ -153,6 +154,7 @@ EFI_STATUS bootstrap_build_page_tables(
     MEMORY_MAP *Map,
     ELF_HEADER *Header,
     ELF_PROGRAM_HEADER *ProgramHeaders,
+    u64 KernelPhysicalBase,
     u64 HandoffStackBase,
     u64 HandoffStackSize,
     u64 FramebufferBase,
@@ -229,7 +231,9 @@ EFI_STATUS bootstrap_build_page_tables(
         ELF_PROGRAM_HEADER *ph = &ProgramHeaders[i];
         if (ph->Type != PT_LOAD) continue;
         u64 v = ph->VirtualAddress & ~(EFI_PAGE_SIZE - 1);
-        u64 p = ph->PhysicalAddress & ~(EFI_PAGE_SIZE - 1);
+        u64 p = kernel_image_relocate_phys(
+            ph->PhysicalAddress, KernelPhysicalBase) &
+            ~(EFI_PAGE_SIZE - 1);
         u64 pages = (ph->MemorySize + EFI_PAGE_SIZE - 1) / EFI_PAGE_SIZE;
         u64 flags = (ph->Flags & 2) ? BOOT_W : 0;
         if (!(ph->Flags & 1)) flags |= BOOT_NX;

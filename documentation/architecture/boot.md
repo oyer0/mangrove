@@ -21,9 +21,12 @@ memory while preserving the loader's static scratch-buffer ownership.
 
 The root partition contains MGFS. The loader mounts it with its dedicated,
 read-only MGFS reader and opens `/boot/pith.elf`. It validates a 64-bit,
-little-endian x86-64 executable ELF image, loads each `PT_LOAD` segment at the
-physical and high-half virtual addresses recorded by the image, and preserves
-the segment write and execute permissions in the bootstrap page tables.
+little-endian executable ELF image, loads each `PT_LOAD` segment at the
+preferred physical offset recorded by the image within one firmware-selected
+contiguous range, while retaining the linked high-half virtual addresses. The
+selected physical base is passed in `BOOT_INFO`; bootstrap and permanent
+kernel page tables map each segment using the same relocation offset and
+preserve each segment's write and execute permissions.
 
 ## Firmware state collected
 

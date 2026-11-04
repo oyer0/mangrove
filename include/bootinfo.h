@@ -44,6 +44,9 @@ typedef struct
     /* Physical CR3 prepared by the UEFI loader for the high-half handoff. */
     void *BootstrapPml4;
 
+    /* Physical address corresponding to KERNEL_PHYS_BASE in the linked ELF. */
+    u64 KernelPhysicalBase;
+
 } BOOT_INFO;
 
 typedef void (*KERNEL_ENTRY)(BOOT_INFO *BootInfo);
