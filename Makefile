@@ -296,7 +296,7 @@ MGTLS_CFLAGS = $(USER_CFLAGS) -DWOLFSSL_USER_SETTINGS \
 
 DEPFLAGS     := -MMD -MP
 
-BOOT_CFLAGS  := -std=gnu11 -ffreestanding -fno-asynchronous-unwind-tables -fno-unwind-tables -fno-stack-protector -Iboot/include -Iinclude $(DEPFLAGS)
+BOOT_CFLAGS  := -std=gnu11 -ffreestanding -mno-red-zone -fno-asynchronous-unwind-tables -fno-unwind-tables -fno-stack-protector -Iboot/include -Iinclude $(DEPFLAGS)
 BOOT_ASFLAGS :=
 # GNU ld uses numeric subsystem 10 for EFI applications.  Direct linking
 # intentionally omits MinGW CRT/startup objects and all default libraries.
