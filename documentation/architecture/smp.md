@@ -256,6 +256,64 @@ online CPU count. Host VMM/PMM fixtures add malformed ownership, missing-ack,
 and premature-release controls, but their simulated IPI protocol is not
 hardware SMP evidence.
 
+`make test-guest-device-smp` qualifies production device paths in isolated
+Q35/OVMF KVM guests with 2 and 4 vCPUs. Both workloads require the exact online
+CPU mask, positive busy-tick deltas on every requested CPU, useful spin-worker
+work, and a process snapshot showing the test process executing on multiple
+CPUs during the device-operation interval. The storage workload starts one
+native file worker per CPU. Each worker creates, writes, closes, reopens, and
+reads a unique 128 KiB file through the production VFS and MGFS on the QEMU
+xHCI USB mass-storage disk. Its active-worker counter must reach at least two;
+the guest compares every byte and EOF, then the host checks the stopped MGFS
+image and compares every stored file against an independently generated
+payload. This establishes overlapping native storage-operation lifetimes and
+correct data/completion results. It does not claim that multiple BOT commands
+execute on the device at once: the current block/BOT path serializes those
+commands. A clean guest shutdown and host readback do not establish
+power-loss durability.
+
+The network workload uses the production e1000 driver and QEMU user networking.
+While the same process's spin workers run, it requires a timed-out ICMP probe to
+remain a timeout, then receives one recovery reply and 16 further verified
+gateway replies. The native test and a post-run `netinfo interfaces` snapshot
+must show the required RX/TX packet counts, and the native before/after
+counters must advance by at least the reply count. The process-wide CPU
+snapshot and per-CPU busy deltas overlap the receive workload. The e1000 legacy
+IRQ is routed to the BSP by the current interrupt policy, so this exercises its
+receive/completion path while APs remain active. It does not qualify physical
+NICs, live e1000 removal, or DMA shutdown for a still-present device; those
+remain outside the network lifecycle contract.
+
+The host-side device evidence validator has controls for missing CPU
+participation, missing overlap, incomplete storage completion/readback, only
+one active storage worker, an absent-packet timeout incorrectly reported as
+success, too few replies, and missing RX progress. `test-irq-lifecycle`,
+`test-sync`, and `test-net` cover IRQ admission/drain, synchronization, and
+e1000 receive-context/TX descriptor regressions. xHCI lifecycle and BOT tests
+exercise completion timeout/cancellation, DMA retention, teardown and cleanup
+controls. These host fixtures complement, but do not replace, the guest's real
+KVM interrupt and I/O paths.
+
+Storage error behavior is qualified separately from the overlapping success
+workload. A current KVM `guest_lifetime_test.py --kind read` run injects a
+persistent error at the independently identified secondary-volume data sector;
+the native test receives eight failed reads, reports the I/O error rather than
+success or EOF, and leaves the secondary image byte-identical. The
+`--negative-control` run omits that fault and must report the native test's
+expected failure instead of claiming an error. The active-I/O removal guest
+control also observed the USB BOT request canceled after port detach and before
+completion, with the guest responsive. These failure and teardown runs are
+bounded, single-vCPU controls rather than fault injection during the SMP file
+worker workload. DMA-retention and delayed/missing-completion controls remain
+covered by the production xHCI lifecycle host fixture.
+
+The 2026-11-05 2/4-vCPU storage and network KVM matrix passed. Its retained
+per-run reports and stopped guest images are under
+`build/stage6-task2-matrix-20261105-*`; each report records the online CPU set,
+workload counters, embedded Pith/fstest hashes, source hashes, guest shutdown,
+and independent MGFS result. This is QEMU KVM qualification, not physical
+device evidence.
+
 ## Authoritative code
 
 - `kernel/src/acpi.c` and `kernel/include/acpi.h` — MADT topology;
@@ -266,4 +324,9 @@ hardware SMP evidence.
   per-CPU descriptor/syscall entry state;
 - `kernel/src/scheduler.c` — scheduling and ownership;
 - `kernel/src/lapic.c` and `kernel/src/timer.c` — local timers and IPIs; and
-- `kernel/src/vmm.c` — address-space tracking and TLB shootdowns.
+- `kernel/src/vmm.c` — address-space tracking and TLB shootdowns;
+- `kernel/src/irq.c` and `kernel/src/net/e1000.c` — external IRQ registry,
+  BSP-routed e1000 receive handling, and controller lifetime; and
+- `kernel/src/block.c`, `kernel/src/usb/xhci_storage.c`, and
+  `kernel/src/storage/mgfs.c` — serialized block requests, USB BOT completion,
+  and the native filesystem path exercised by the storage workload.
