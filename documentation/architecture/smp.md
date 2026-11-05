@@ -221,6 +221,41 @@ The current implementation does not provide:
 These are deferred capabilities, not requirements for the current bounded SMP
 model.
 
+## Qualification evidence
+
+`make test-guest-scheduler-smp` runs the current native scheduler workload in
+isolated Q35/OVMF guests with 1, 2, and 4 KVM vCPUs. It records the final online
+CPU set and requires the one-vCPU control to show no migration. On multicore
+runs, one identifiable userspace thread is the only runnable thread in its
+process while its parent blocks in join; the worker checks its stable thread
+ID and samples that process's scheduler-owned CPU snapshot. It periodically
+uses the ordinary yield interface to create migration opportunities, and the
+host validator requires the same thread to be sampled on at least two online
+CPUs. This migration witness does not claim timer preemption.
+
+The separate preemption phase starts more spin-only userspace workers than
+online CPUs. Each worker reaches a barrier without yielding or making a
+syscall, so all workers entering the phase requires timer preemption to
+dispatch the oversubscribed workers. While they perform work, the guest
+requires a process snapshot showing simultaneous execution on multiple CPUs
+and positive scheduler busy-tick deltas on every online CPU. The 1-vCPU
+control rejects a multiple-CPU snapshot. These observations demonstrate the
+selected production scheduler paths in bounded QEMU KVM workloads; they do
+not establish fairness, physical-hardware behavior, or exhaustive race
+freedom.
+
+The `test-slab-guest`, `test-hybrid-guest`, and `test-vmm-range-guest` targets
+also run with 1, 2, and 4 vCPUs. Guest witnesses require each requested CPU
+to participate in allocator work and reclamation, require every online CPU to
+acknowledge kernel-range shootdowns, and in multicore runs verify a remote
+CPU invalidates a shared kernel mapping while using a different CR3. The
+owned-frame tests reject release while mapped and require the same physical
+frame to become available only after acknowledged teardown. The guest
+runners independently check stopped MGFS images and verify the requested
+online CPU count. Host VMM/PMM fixtures add malformed ownership, missing-ack,
+and premature-release controls, but their simulated IPI protocol is not
+hardware SMP evidence.
+
 ## Authoritative code
 
 - `kernel/src/acpi.c` and `kernel/include/acpi.h` — MADT topology;

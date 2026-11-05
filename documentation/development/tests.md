@@ -588,25 +588,26 @@ allocator behavior in Pith.
 
 `test-slab-guest` forces a separate kernel with `SLAB_CORE_GUEST_TEST=1`,
 `SLAB_CORE_DIAGNOSTICS=1`, and `VMM_KERNEL_RANGE_GUEST_TEST=1`, then runs a
-focused native MGFS boot under Q35/OVMF with one and two vCPUs and the normal
-e1000 NIC. Linux defaults to KVM; TCG is selected explicitly. A test-only
+focused native MGFS boot under Q35/OVMF with one, two, and four vCPUs and the
+normal e1000 NIC. Linux defaults to KVM; TCG is selected explicitly. A test-only
 kernel hook, called after SMP startup, exercises all
 shared and per-CPU classes, payload-preserving local reuse, concurrent cache
 allocation/free churn, cross-CPU frees, cache draining, bounded
 `slab_reclaim_bounded()` calls during concurrent frees, page retirement, and
 reuse by ordinary heap allocation. A following VMM phase retires a PMM-backed
-slab page while CPU 1 uses a different CR3 and verifies both CPUs acknowledged
-the shootdown before PMM returns the same physical frame for reuse. The runner
+slab page while CPU 1 uses a different CR3 and verifies all online CPUs
+acknowledged the shootdown before PMM returns the same physical frame for reuse. The runner
 also exercises a reclaim pass with local interrupts disabled and verifies the
 saved IF state remains disabled through the return. It requires reclaim
-progress and, on two vCPUs, reclaim activity on both CPUs overlapping
-allocator operations. The concurrency workers rendezvous before allocator
-work, hold after their first successful allocation until all workers have
-allocated once, and report worker-entry and allocator-completion CPU masks
-separately. The two-vCPU witness requires both masks to include CPUs 0 and 1,
-all 192 allocations per phase, all four rendezvous arrivals, and no barrier
-timeout. This removes dependence on cache-mode timing while still requiring
-both CPUs to execute allocator work. The runner's negative controls reject
+progress and, on multicore runs, reclaim activity on every online CPU
+overlapping allocator operations. The concurrency workers rendezvous before
+allocator work, hold after their first successful allocation until all
+workers have allocated once, and report worker-entry and allocator-completion
+CPU masks separately. The witness requires both masks to include every
+requested CPU, all 192 allocations per phase, all four rendezvous arrivals,
+and no barrier timeout. This removes dependence on cache-mode timing while
+still requiring every requested CPU to execute allocator work. The runner's
+negative controls reject
 missing allocator CPU participation, incomplete worker work, or a timed-out
 rendezvous, as well as missing slab, bounded-reclaim, IRQ-disabled-reclaim,
 or PMM/VMM frame-reuse evidence. A
@@ -615,7 +616,7 @@ quiescent; the runtime reclaim API reports partial progress and never claims a
 global drain. The guest runner independently checks the diagnostic kernel's
 persisted boot-log witness, native Shoot process completion, clean MGFS images
 before and after guest execution, online CPU count, and cross-CPU activity in
-the two-vCPU case. It checks that heap-used growth covers retained classifier
+multicore cases. It checks that heap-used growth covers retained classifier
 metadata; slab backing itself is no longer heap committed extent. Temporary
 images are removed after both independent image checks. Supply
 `SLAB_GUEST_OUTPUT` or `HYBRID_GUEST_OUTPUT` to retain the full output tree, or
@@ -630,19 +631,19 @@ count changes, reacquires the released physical frame, and recommits the heap
 through `kmalloc()`. The `HEAP_RECLAIM_GUEST` witness records group/frame/byte
 counts and the VMM shootdown acknowledgment mask. This distinguishes physical
 frame return from ordinary reuse of an already mapped heap free block. The
-indexed-only and hybrid guest targets both compile this hook; two-vCPU runs
-require acknowledgments from both online CPUs. A passing witness does not
+indexed-only and hybrid guest targets both compile this hook; every run
+requires acknowledgments from all online CPUs. A passing witness does not
 qualify arbitrary interior heap-page reclamation: only complete owned tail
 groups are eligible.
 
-`test-vmm-range-guest` builds the bounded VMM-only guest hook and runs one- and
-two-vCPU native boots. The hook acquires a generation-owned PMM frame, maps it
+`test-vmm-range-guest` builds the bounded VMM-only guest hook and runs one-,
+two-, and four-vCPU native boots. The hook acquires a generation-owned PMM frame, maps it
 through the exact leased kernel-range handle, confirms release is rejected
 while mapped, then unmaps and waits for shootdown completion before releasing
 the frame. It immediately allocates again and requires the same physical frame
-to be returned. In the two-vCPU case, a worker is pinned on CPU 1 with a
+to be returned. In multicore runs, a worker is pinned on CPU 1 with a
 different CR3 while it reads the shared mapping; the evidence requires
-acknowledgments from both CPUs and confirmation that CPU 1 invalidated under
+acknowledgments from every online CPU and confirmation that CPU 1 invalidated under
 that other CR3 before frame reuse. The runner requires native child completion
 and independent clean MGFS checks before removing temporary images. Its
 test-only witness also records whether the requested hybrid slab backend was
@@ -672,20 +673,21 @@ throughput or network receive traffic. Those runs used heap-backed slabs and
 do not qualify PMM frame reclamation.
 
 `test-hybrid-guest` forces `KERNEL_HYBRID_ALLOCATOR=1` with the public-routing
-test hook, then runs one- and two-vCPU guests. The hook allocates each of the
+test hook, then runs one-, two-, and four-vCPU guests. The hook allocates each of the
 twenty classes through public `kmalloc()` and frees through public `kfree()`,
 checks the greater-than-384-byte heap path and zero/unrepresentable-size
 behavior, then verifies reclamation and ownership. Four concurrent workers
 allocate and free 192 class-80 objects through the public API while bounded
 reclamation can overlap. The scheduler uses a shared migratable run queue, so
 freeing a neighboring worker's objects does not by itself guarantee a remote
-CPU free. In two-vCPU mode the guest therefore also performs one explicit
+CPU free. In multicore modes the guest therefore also performs one explicit
 remote-free probe: it allocates a public 72-byte object, waits with a bounded
 yield loop for the worker to run on another CPU, and keeps interrupts disabled
 only across that CPU check and the single `kfree()`. The probe and class
-counters must confirm the additional operation; the validator requires both
-CPUs, at least one cross-CPU free, and overlapping allocator activity. The
-public witness reports 192 operations on one CPU and 193 on two CPUs. It is
+counters must confirm the additional operation; the validator requires every
+requested CPU, at least one cross-CPU free, and overlapping allocator activity.
+The public witness reports 192 operations on one CPU and includes the remote
+free in multicore runs. It is
 checked separately from direct slab-core activity and includes
 missing-witness negative controls. The VMM witness also requires a PMM-backed
 slab page to be retired while CPU 1 runs on another CR3, all online CPUs to
