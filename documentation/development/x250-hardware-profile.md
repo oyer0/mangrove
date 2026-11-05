@@ -30,9 +30,9 @@ presented as its physical image identity.
   the CPU inventory note below before interpreting physical SMP results.
 - OpenBSD identifies Intel I218-LM Ethernet, Intel Wireless-AC 7265, and an
   Intel 9 Series xHCI controller. The I218-LM is the physical Ethernet target
-  for later Stage 7 qualification. Mangrove has not qualified a driver for
-  either network device on this machine; their identification alone says
-  nothing about driver support.
+  for future physical Ethernet qualification. Mangrove has not qualified a
+  driver for either network device on this machine; their identification alone
+  says nothing about driver support.
 - OpenBSD attaches the built-in keyboard as an AT Translated Set 2 keyboard
   on i8042/serio0. The Synaptics clickpad is attached through the i8042
   auxiliary input path. Mangrove's native PS/2 keyboard has been confirmed
@@ -59,8 +59,9 @@ presented as its physical image identity.
   and 8 with those devices, but do not establish where their setup failed or
   why. Mangrove currently has no fingerprint, Bluetooth, or camera class
   driver; these peripherals are intentionally unsupported and outside the
-  Stage 7 baseline. A successful device identification with no matching class
-  is distinct from a real enumeration/transfer/setup failure. See
+  current supported-device baseline. A successful device identification with
+  no matching class is distinct from a real enumeration/transfer/setup
+  failure. See
   [USB support policy](../architecture/usb.md).
 - Earlier bring-up traces first showed the internal SATA disk with no USB mass
   storage. A later port-state report showed connection state on ports 1, 6, 7,
@@ -211,10 +212,9 @@ root image, not a captured physical disk. The tracked architecture/test docs
 describe implementation contracts and KVM/host tests; no earlier tracked
 X250 hardware-profile or recovery record was found.
 
-Stage 6's source-matched 1/2/4-vCPU scheduler/memory and 2/4-vCPU device
-qualification is recorded in `ROADMAP.md` and
-[SMP architecture](../architecture/smp.md). It establishes bounded KVM
-behavior only; it is not physical X250 SMP evidence.
+Source-matched 1/2/4-vCPU scheduler/memory and 2/4-vCPU device qualification is
+documented in [SMP architecture](../architecture/smp.md). It establishes
+bounded KVM behavior only; it is not physical X250 SMP evidence.
 
 ## Read-only OpenBSD inventory
 

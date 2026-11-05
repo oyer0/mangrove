@@ -436,7 +436,7 @@ and for the finding that larger capacities did not consistently improve the
 tested pair workload; the default remains two entries with a two-object
 refill.
 
-For the Stage 4.6 host comparison, use five independent invocations with
+For this historical host comparison, use five independent invocations with
 distinct output and assembly names, for example:
 
 ```sh
@@ -631,7 +631,7 @@ metadata; slab backing itself is no longer heap committed extent. Temporary
 images are removed after both independent image checks. Supply
 `SLAB_GUEST_OUTPUT` or `HYBRID_GUEST_OUTPUT` to retain the full output tree, or
 use `--retain-artifacts` for a default temporary workspace. This is focused
-guest evidence, not production `kmalloc` routing or complete Stage 4
+guest evidence, not production `kmalloc` routing or complete allocator
 qualification.
 
 The same guest hook also exercises the production indexed-heap tail reclaimer:
@@ -744,8 +744,8 @@ device interrupt, simultaneous network/allocator execution on both CPUs, or
 physical-NIC throughput. The packet path is exercised by this separate test,
 not by `test-hybrid-guest` or the heap-profile guest. The earlier combined
 time-and-network attempt exited 43 without a valid time/network transcript;
-its precise failing subcheck is unresolved. Later, four Stage 5 Slice 1 MGFS
-guest attempts at one and two vCPUs also exited 43 in `fstest time`. The
+its precise failing subcheck is unresolved. Four later MGFS guest attempts at
+one and two vCPUs also exited 43 in `fstest time`. The
 embedded kernels were built with `RTC_UTC_TRUST=0`, although QEMU used a UTC
 virtual RTC. With that build policy, `timekeeping_init(false)` leaves realtime
 unavailable and the first check in `userspace/fstest/time.c` returns 43 when

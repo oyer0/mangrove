@@ -252,7 +252,8 @@ math phases. See [application qualification](guest-safe-files.md) for exact
 interactive witnesses and the preserved interrupted-write observation. The
 full interactive report remains INCOMPLETE for unobserved native Reed redo;
 stale-save conflict still requires a supported coordination channel. These
-results do not constitute Stage 5 completion or hardware qualification.
+results do not establish complete interactive qualification or physical-hardware
+behavior.
 
 ## Reporting, failures and bounds
 

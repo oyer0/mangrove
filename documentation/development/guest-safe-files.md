@@ -159,7 +159,7 @@ checks reported zero errors and warnings. It recorded 41 Shoot, 333 safe-file,
 Reed and volume assertions in verify and 17/9/23 in read-only. That run
 predated native redo and conflict qualification; the focused run described
 above provides those results. These QEMU results support the tested behavior,
-not completion of all Stage 5 acceptance or physical-hardware qualification.
+not complete interactive qualification or physical-hardware qualification.
 
 The full `test-guest-safe` campaign retains its host loopback UDP rendezvous
 for broader external-mutation workflows. The focused

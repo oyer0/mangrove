@@ -1,19 +1,19 @@
 # Interactive keyboard, text, and clipboard design
 
 This document records the accepted interactive-text architecture, current
-Stage 5 behavior, and deferred proposals. The implementation contract for each
+behavior, and proposed extensions. The implementation contract for each
 component remains in its authoritative guide: [terminal](../architecture/terminal.md),
 [Reed](../editor/README.md), [Shoot](../shell/interactive.md), and
-[IPC/service](../architecture/ipc-services.md). Clipboard and later
-internationalization sections describe future work unless explicitly marked as
-implemented below.
+[IPC/service](../architecture/ipc-services.md). Clipboard and
+internationalization sections distinguish implemented behavior from design
+boundaries.
 
 ## Status and design goals
 
-The immediate Stage 5 goal is a reliable English/US-keyboard console and
-consistent interaction between Shoot and Reed. The project direction is to
-keep text and input interfaces capable of growing beyond that baseline without
-corrupting text or tying applications to kernel-specific shortcuts.
+The current interaction baseline is a reliable English/US-keyboard console
+and consistent interaction between Shoot and Reed. Text and input interfaces
+should remain capable of growing beyond that baseline without corrupting text
+or tying applications to kernel-specific shortcuts.
 
 The following are accepted architectural decisions; their implementation
 status is stated in the relevant sections below:
@@ -43,13 +43,13 @@ versioned ABI, documented in the terminal header and architecture guide.
 
 ## Current implementation
 
-The active keyboard transport is USB HID. The kernel applies a US-style ASCII
-map, modifiers, and repeat. Cooked console readers receive UTF-8 bytes and
-retain legacy semantic editor-action packets for compatibility. The opt-in
-terminal event mode carries HID key identity, modifiers, text code point, and
-repeat state, but no separate release event. A process may claim events on the
-normal screen; on the alternate screen, only its owner may claim them. On
-the normal screen, previously queued cooked bytes are delivered first as
+USB HID and the optional native i8042 keyboard feed the same input path. The
+kernel applies a US-style map, modifiers, and repeat. Cooked console readers
+receive UTF-8 bytes and retain legacy semantic editor-action packets for
+compatibility. The opt-in terminal event mode carries key identity, modifiers,
+text code point, and repeat state, but no separate release event. A process
+may claim events on the normal screen; on the alternate screen, only its owner
+may claim them. On the normal screen, previously queued cooked bytes are delivered first as
 tagged events; alternate-screen raw clients keep an event-only queue. On
 normal-screen release, queued unmodified text is returned to the cooked queue;
 cooked byte readers cannot consume input while an event owner is active. The
@@ -84,7 +84,7 @@ and has no general grapheme, combining-mark, wide-cell, shaping, or
 bidirectional layout. The [runtime contract](../architecture/c-runtime.md)
 and [terminal contract](../architecture/terminal.md) describe these limits.
 
-## Stage 5 keyboard and editing contract
+## Keyboard and editing contract
 
 ### Event and modifier boundary
 
@@ -104,8 +104,8 @@ Ctrl+D, and Ctrl+L for line cancellation, EOF, and terminal clear. Reed uses
 Ctrl+Home/End for document boundaries. These bindings are application-local;
 direct cooked readers such as login do not receive editor action packets. Alt
 is the primary application-command modifier where Reed uses a chord. The
-current USB path remains US-style and does not yet provide key-release events
-or selectable layouts.
+current USB HID and translated i8042 paths use the US-style layout and do not
+provide key-release events or selectable layouts.
 
 ### Reed navigation
 
@@ -122,20 +122,20 @@ Normal and Selection modes use this navigation map:
 | Page Up / Page Down | Move by one text viewport while retaining preferred display column. |
 | `o` / `O` | Open a new logical line below / above the current line and enter Insert mode there. |
 
-Stage 5 is English/US-first and scalar-safe, not grapheme-aware. Reed treats
-ASCII letters, digits, underscore, and each valid non-ASCII scalar as word
-characters. ASCII punctuation, spaces, tabs, carriage returns, and line breaks
-are separators. The motions follow these exact boundary rules:
+The current behavior is English/US-first and scalar-safe, not grapheme-aware.
+Reed treats ASCII letters, digits, underscore, and each valid non-ASCII scalar
+as word characters. ASCII punctuation, spaces, tabs, carriage returns, and
+line breaks are separators. The motions follow these exact boundary rules:
 
-- In Stage 5, ASCII letters, digits, underscore, and non-ASCII scalars form
-  word runs. ASCII punctuation, spaces, tabs, and line breaks are separators;
-  punctuation does not join neighboring runs.
-- Word boundaries are never allowed inside a UTF-8 scalar. The later shared
-  grapheme model will make them grapheme boundaries.
-- Under the later Unicode model, words consist of letter, number, mark, and
+- In the current implementation, ASCII letters, digits, underscore, and
+  non-ASCII scalars form word runs. ASCII punctuation, spaces, tabs, and line
+  breaks are separators; punctuation does not join neighboring runs.
+- Word boundaries are never allowed inside a UTF-8 scalar. A shared grapheme
+  model can make them grapheme boundaries.
+- A Unicode-aware word model could define words as letter, number, mark, and
   connector-punctuation sequences; Unicode-defined internal punctuation may
   connect letters or numbers.
-- Whitespace and line breaks separate words. Under the Unicode model,
+- Whitespace and line breaks separate words. Under a Unicode-aware model,
   punctuation-only and symbol-only spans are skipped; grapheme navigation
   still reaches every symbol and emoji.
 - `b` and `n` land on the first byte of the final scalar of the target word;
@@ -166,9 +166,9 @@ are separators. The motions follow these exact boundary rules:
   the next nonblank paragraph. Missing previous/next paragraphs leave the
   cursor unchanged.
 The exact Unicode word-boundary version and whether word motions advance over
-emoji as separate word-like units remain design questions for the shared text
-specification. Stage 5's scalar-based selection and navigation must not be
-described as grapheme-aware.
+emoji as separate word-like units remain open design questions for a shared
+text specification. The current scalar-based selection and navigation must
+not be described as grapheme-aware.
 
 ### Selection and common operations
 
@@ -258,28 +258,27 @@ Future representations may include rich text, images, file references, and
 larger streaming content. Each requires explicit authorization, ownership,
 size/resource policy, and error semantics. A clipboard service restart may
 lose volatile contents unless a later decision requires recovery; surviving
-the source application's exit is the Stage 5 requirement.
+the source application's exit is a requirement of clipboard ownership.
 
-## Internationalization milestones
+## Internationalization boundaries
 
 Internationalization is broader than accepting UTF-8 bytes. Keep these layers
 separate and expose support honestly:
 
-| Layer | Planned milestone | Support boundary |
+| Layer | Current behavior or design boundary | Support boundary |
 | --- | --- | --- |
-| UTF-8 preservation and validation | Stage 5 | Do not corrupt valid stored or transferred text. Existing Reed and filesystem limits remain format/API-specific. This does not promise a keyboard layout for every script. |
-| Keyboard events and layouts | Stage 5 event boundary; Stage 7 hardware qualification | Stage 5 stabilizes English/US use. Later layout selection must map physical events to text without embedding a US layout in applications. Hardware results inform supported-device claims. |
-| Grapheme editing and Unicode word boundaries | Stage 6 shared text milestone, after Stage 5's input contract | Cursor movement, deletion, selection, and word motions operate on shared boundaries; the Unicode data version and tailoring are explicit. Stage 5 remains scalar-safe and English/US-focused. |
-| Display-cell width and monospace layout | Stage 6 shared terminal/text milestone before wider-script terminal claims | Combining and wide clusters need coherent cell, cursor, selection, wrapping, and fallback behavior. Current one-cell-per-scalar output remains the implementation until changed and tested. |
-| Font fallback and glyph coverage | Stage 7 hardware survey, then Stage 11 desktop integration | Preserve text when a glyph cannot be rendered; distinguish missing glyph from invalid text. A fixed monospace console is not equivalent to full shaping. |
-| Complex shaping and bidirectional ordering | Stage 11 desktop/text-stack design | Arabic, Indic scripts, and mixed-direction text need shaping and bidi-aware layout; do not claim support before integrated cursor and selection behavior exists. |
-| Composition and input methods | Stage 7 input/hardware survey; Stage 11 desktop integration | Composition, preedit, candidate selection, and committed text are separate from key events. No complete IME is a Stage 5 prerequisite. |
-| Multilingual and accessibility qualification | Stage 6 shared text tests, expanded on hardware in Stage 7 and integrated in Stage 11 | Include Arabic, Chinese, Japanese, Korean, Burmese, Thai, and Indic scripts, with explicit per-layer results rather than one binary “Unicode supported” claim. |
+| UTF-8 preservation and validation | Implemented in shared text and filesystem paths | Preserve valid stored or transferred text. Existing Reed and filesystem limits remain format/API-specific. This does not promise a keyboard layout for every script. |
+| Keyboard events and layouts | USB HID and translated i8042 input use a US-style map; event ABI is documented | Layout selection must map physical events to text without embedding a US layout in applications. Hardware results inform supported-device claims. |
+| Grapheme editing and Unicode word boundaries | Reed navigation currently uses scalar boundaries | A future shared text model should define cursor movement, deletion, selection, and word motions on grapheme boundaries, with explicit Unicode version and tailoring. |
+| Display-cell width and monospace layout | Terminal output currently renders one cell per scalar | Combining and wide clusters need coherent cell, cursor, selection, wrapping, and fallback behavior before broader terminal claims. |
+| Font fallback and glyph coverage | The fixed monospace console has limited glyph coverage | Preserve text when a glyph cannot be rendered; distinguish missing glyph from invalid text. A fixed monospace console is not equivalent to full shaping. |
+| Complex shaping and bidirectional ordering | Not implemented | Arabic, Indic scripts, and mixed-direction text need shaping and bidi-aware layout; do not claim support before integrated cursor and selection behavior exists. |
+| Composition and input methods | Not implemented | Composition, preedit, candidate selection, and committed text are separate from key events. |
+| Multilingual and accessibility qualification | Not established | Include representative scripts with explicit per-layer results rather than one binary “Unicode supported” claim. |
 
-The milestone order is a dependency plan, not a promise that every listed
-language feature is required before a usable Stage 11 desktop. Desktop
-completion should state the supported text/input profile and preserve
-unsupported content without corruption.
+These boundaries do not imply that every listed language feature is required
+for every user interface. Product requirements should state the supported
+text profile explicitly and preserve unsupported content without corruption.
 
 ## Decisions still requiring review
 

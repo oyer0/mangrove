@@ -24,12 +24,11 @@ adapter and QEMU results do not establish physical-hardware performance.
 
 ## Historical performance decision
 
-At the time of that Stage 4.6 decision, the 32-bin indexed coalescing heap
-remained the default. The hybrid was available as an explicit production
-build option because it reused the heap's backing, mapping, rollback, and
-growth contracts and offered measured small-object reuse benefits in some
-workloads. The historical evidence did not justify selecting it as the
-default at that time.
+In the earlier comparison, the 32-bin indexed coalescing heap remained the
+default. The hybrid was available as an explicit production build option
+because it reused the heap's backing, mapping, rollback, and growth contracts
+and offered measured small-object reuse benefits in some workloads. The
+evidence then available did not justify selecting it as the default.
 
 **Historical decision: keep the hybrid optional and indexed-only as the
 default.** The public dispatcher preserves pointer, generation, descriptor, bitmap, failure,
@@ -830,8 +829,9 @@ and its fixed 384-byte request path pays classifier dispatch while using the
 heap. The full cutoff reduces that boundary penalty but has the larger fixture
 extent. At that time no candidate had demonstrated a representative
 system-level speed/memory tradeoff to justify changing the indexed-only
-default; Slice 2 has since selected hybrid-256 for the ordinary build without
-new performance data. This selection remains subject to later qualification.
+default. The ordinary build now selects hybrid-256; that integration did not
+add new performance data, so the selection remains subject to further
+qualification.
 The per-type 16-byte demand and 272-byte churn do not yet justify a
 dedicated cache: the VMM records are long-lived and frequently freed remotely,
 while the MGFS population peaks at 43 and is already served by a general size
@@ -860,8 +860,8 @@ metadata and 4 KiB slab backing.
 
 ### Target profile evidence
 
-The format-2 table immediately below is retained historical Stage 4E.1b
-evidence. Format 3 was an intermediate Stage 4.6 capture. The format-4 event
+The format-2 table immediately below is retained historical profile evidence.
+Format 3 was an intermediate capture. The format-4 event
 trace later in this section is retained historical evidence; the format-5
 profile and routing replay above are the current source-matched measurements.
 Earlier snapshots remain in their original ignored build artifacts.
@@ -891,7 +891,7 @@ The profiler evaluated 256, 512, 768, and 1,024-byte cutoffs as well. Moving fro
 
 In the 2-vCPU create trace, 10 of 20 classes had allocation/free activity attributed to both CPUs. Under the 384-byte cutoff, 1,751 of 4,320 frees were cross-CPU. The busiest small class was 16 bytes (4,295 allocations and 1,438 cross-CPU frees), followed by 80 bytes (1,913 allocations, 205 cross-CPU frees) and 288 bytes (947 allocations). This supports accepting remote frees. It does not establish lock contention. The diagnostic per-CPU path records frees on the CPU performing them and bounds each local cache. The corrected pinned host benchmark shows a workload-dependent gain for immediate reuse, while the live-population workload and native guest comparison do not establish an overall advantage.
 
-The intermediate Stage 4.6 format-3 profile rebuilt Pith with
+The intermediate format-3 profile rebuilt Pith with
 `HEAP_PROFILE_DIAGNOSTICS=1`, indexed-only routing, GCC 14.2, and QEMU TCG.
 Its counts are retained below as historical context; the format-4 capture
 that follows was the next source-matched event profile and is now historical
@@ -1016,7 +1016,7 @@ benefit. The 256/288 cutoffs reduce this fixture's committed extent relative
 to full routing, but still exceed indexed-only and the event replay is slower
 at their public paths. At the time, the indexed-only production default
 remained unchanged; cutoff values were controlled build-time experiments.
-The later Slice 2 integration selected hybrid-256 as the ordinary build
+The later integration selected hybrid-256 as the ordinary build
 default; these historical results do not establish its performance.
 
 Reproduce the public host comparison with the summary and matching event CSV

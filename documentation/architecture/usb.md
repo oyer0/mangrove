@@ -35,7 +35,7 @@ OpenBSD 8.0 identifies these integrated peripherals in the X250 USB topology:
 | 8 | SunplusIT integrated camera | `5986:0366` | Unsupported; no camera driver |
 
 Fingerprint, Bluetooth, and webcam functionality are postponed and are not
-required for the current Stage 7 baseline. These identities strongly correlate
+required for the supported device baseline. These identities strongly correlate
 with prior Mangrove reports of runtime setup failures on ports 7 and 8, but do
 not identify the failing setup phase. The observed results were return code 6
 (`CONTROLLER_BAD`) on port 7 and return code 3 (`INVALID_PARAM`) on port 8.

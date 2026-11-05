@@ -68,9 +68,9 @@ procedures. Source code is authoritative for implementation details.
 
 ## Design proposals
 
-- [Interactive text design](design/interactive-text.md): proposed Stage 5
-  keyboard, Unicode, and clipboard direction; it is not an implementation
-  contract.
+- [Interactive text design](design/interactive-text.md): current interaction
+  contracts and proposed keyboard, Unicode, and clipboard extensions; it is
+  not an implementation contract.
 
 ## Storage and filesystems
 
