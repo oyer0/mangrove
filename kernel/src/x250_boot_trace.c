@@ -1119,14 +1119,17 @@ void x250_boot_trace_xhci_port(u32 port, u32 portsc, const char *state,
 void x250_boot_trace_usb_device(u32 port, u32 slot, u32 speed,
                                 u32 vendor_id, u32 product_id,
                                 u32 class_code, u32 subclass,
-                                u32 protocol, int msc_endpoint_result)
+                                u32 protocol, u8 class_flags,
+                                bool mass_storage_endpoints_found,
+                                const char *probe_stage, int probe_result)
 {
     char message[TRACE_MESSAGE_CAPACITY];
     u32 position = 0;
 
     if (!trace_active)
         return;
-    trace_append_prefix(message, &position, 44U, 'I');
+    trace_append_prefix(message, &position, 44U,
+                        probe_result != 0 ? 'F' : 'I');
     trace_append_text(message, &position, "USB p=");
     trace_append_u32(message, &position, port);
     trace_append_text(message, &position, " s=");
@@ -1143,10 +1146,19 @@ void x250_boot_trace_usb_device(u32 port, u32 slot, u32 speed,
     trace_append_hex(message, &position, subclass, 2U);
     trace_append_text(message, &position, "/");
     trace_append_hex(message, &position, protocol, 2U);
-    trace_append_text(message, &position, " msc-ep-rc=");
-    trace_append_i32(message, &position, msc_endpoint_result);
+    if (probe_result != 0) {
+        trace_append_text(message, &position, " bind=failed probe=");
+        trace_append_text(message, &position, probe_stage ? probe_stage : "?");
+        trace_append_text(message, &position, " rc=");
+        trace_append_i32(message, &position, probe_result);
+    } else {
+        trace_append_text(message, &position,
+                          class_flags ? " bind=matched" : " bind=unsupported");
+        trace_append_text(message, &position, mass_storage_endpoints_found ?
+                          " msc-ep=present" : " msc-ep=absent");
+    }
     message[position] = '\0';
-    trace_store_wrapped(message, 'I');
+    trace_store_wrapped(message, probe_result != 0 ? 'F' : 'I');
     trace_render();
 }
 

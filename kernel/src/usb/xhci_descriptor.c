@@ -314,17 +314,25 @@ xhci_status_t xhci_get_keyboard_endpoint_info(xhci_controller_t *xhc, u8 slot_id
     xhci_diag_set_phase("interface discovery");
     u16 offset = 0;
     bool in_keyboard_interface = false;
+    bool keyboard_interface_found = false;
+    bool keyboard_endpoint_found = false;
+    bool malformed = false;
     u8 active_config_value = config_header->bConfigurationValue;
 
     while (offset + 2 <= total_length) {
         u8 desc_len = dma_buffer[offset];
         if (desc_len < 2 || offset + desc_len > total_length) {
-            break; /* Prevent out-of-bounds reads on corrupted device data */
+            malformed = true;
+            break; /* A truncated descriptor is a device error, not no match. */
         }
         
         u8 desc_type = dma_buffer[offset + 1];
 
-        if (desc_type == XHCI_USB_DESC_TYPE_INTERFACE && desc_len >= 9) {
+        if (desc_type == XHCI_USB_DESC_TYPE_INTERFACE) {
+            if (desc_len < 9) {
+                malformed = true;
+                break;
+            }
             usb_interface_descriptor_t *iface = (usb_interface_descriptor_t *)(dma_buffer + offset);
             
             /* Identify standard Boot Protocol Keyboard */
@@ -333,13 +341,18 @@ xhci_status_t xhci_get_keyboard_endpoint_info(xhci_controller_t *xhc, u8 slot_id
                 iface->bInterfaceProtocol == XHCI_USB_PROTOCOL_KEYBOARD) 
             {
                 in_keyboard_interface = true;
+                keyboard_interface_found = true;
                 *out_config_val = active_config_value;
                 *out_interface_num = iface->bInterfaceNumber;
             } else {
                 in_keyboard_interface = false;
             }
         } else if (desc_type == XHCI_USB_DESC_TYPE_HID &&
-                   in_keyboard_interface && desc_len >= 9) {
+                   in_keyboard_interface) {
+            if (desc_len < 9) {
+                malformed = true;
+                break;
+            }
             /* A HID descriptor advertises the length of its report
              * descriptor as a sequence of (type, length) entries starting at
              * byte 6.  Keep only the report-descriptor length; the report
@@ -347,36 +360,49 @@ xhci_status_t xhci_get_keyboard_endpoint_info(xhci_controller_t *xhc, u8 slot_id
             u8 descriptor_count = dma_buffer[offset + 5];
             u16 entry_offset = offset + 6;
             for (u8 entry = 0; entry < descriptor_count; entry++) {
-                if (entry_offset + 3 > offset + desc_len)
+                if (entry_offset + 3 > offset + desc_len) {
+                    malformed = true;
                     break;
+                }
                 if (dma_buffer[entry_offset] == XHCI_USB_DESC_TYPE_HID_REPORT)
                     *out_report_length = usb_descriptor_u16(
                         dma_buffer + entry_offset + 1);
                 entry_offset += 3;
             }
         } else if (desc_type == XHCI_USB_DESC_TYPE_ENDPOINT &&
-                   in_keyboard_interface && desc_len >= 7) {
+                   in_keyboard_interface) {
+            if (desc_len < 7) {
+                malformed = true;
+                break;
+            }
             usb_endpoint_descriptor_t *ep = (usb_endpoint_descriptor_t *)(dma_buffer + offset);
             
             /* Verify it is an Interrupt Endpoint and Direction is IN */
             if ((ep->bmAttributes & XHCI_USB_EP_ATTR_TYPE_MASK) == XHCI_USB_EP_ATTR_INTR && 
-                (ep->bEndpointAddress & XHCI_USB_EP_DIR_IN)) 
+                (ep->bEndpointAddress & XHCI_USB_EP_DIR_IN) &&
+                !keyboard_endpoint_found)
             {
                 *out_ep_addr = ep->bEndpointAddress;
                 /* Mask out transaction opportunities (bits 11:12) to isolate base packet size */
                 *out_max_pkt = ep->wMaxPacketSize & 0x07FF; 
                 *out_interval = ep->bInterval;
-
-                xhci_dma_free(dma_buffer, alloc_size);
-                return XHCI_SUCCESS;
+                keyboard_endpoint_found = true;
             }
         }
 
         offset += desc_len;
     }
 
+    if (offset != total_length)
+        malformed = true;
     XHCI_DEBUG_LOG("[xHCI-DIAG] Device is not a HID Boot Keyboard\n");
     xhci_dma_free(dma_buffer, alloc_size);
+    if (malformed)
+        return XHCI_ERR_TRANSACTION;
+    if (keyboard_endpoint_found)
+        return XHCI_SUCCESS;
+    if (keyboard_interface_found)
+        return XHCI_ERR_TRANSACTION;
     return XHCI_ERR_NOT_SUPPORTED;
 }
 
@@ -576,6 +602,8 @@ xhci_status_t xhci_get_mass_storage_endpoint_info(xhci_controller_t *xhc, u8 slo
     u16 total_length;
     u16 offset;
     bool mass_storage_interface = false;
+    bool mass_storage_interface_found = false;
+    bool malformed = false;
 
     if (!xhc || !out_bulk_in || !out_bulk_in_pkt || !out_bulk_out ||
         !out_bulk_out_pkt || !out_config_val) return XHCI_ERR_INVALID_PARAM;
@@ -583,20 +611,37 @@ xhci_status_t xhci_get_mass_storage_endpoint_info(xhci_controller_t *xhc, u8 slo
     buffer = (u8 *)xhci_dma_alloc(alloc_size, &buffer_phys);
     if (!buffer) return XHCI_ERR_NO_MEMORY;
     xhci_diag_set_phase("config-header read");
-    if (xhci_control_get_descriptor(xhc, slot_id, XHCI_USB_DESC_TYPE_CONFIGURATION,
-                                    0, 9, buffer_phys) != XHCI_SUCCESS) {
+    xhci_status_t result = xhci_control_get_descriptor(
+        xhc, slot_id, XHCI_USB_DESC_TYPE_CONFIGURATION, 0, 9, buffer_phys);
+    if (result != XHCI_SUCCESS) {
         xhci_dma_free(buffer, alloc_size);
-        return XHCI_ERR_NOT_SUPPORTED;
+        return result;
     }
 
-    total_length = ((usb_config_descriptor_t *)buffer)->wTotalLength;
-    *out_config_val = ((usb_config_descriptor_t *)buffer)->bConfigurationValue;
-    xhci_diag_set_phase("config-full read");
-    if (total_length < 9 || total_length > alloc_size ||
-        xhci_control_get_descriptor(xhc, slot_id, XHCI_USB_DESC_TYPE_CONFIGURATION,
-                                    0, total_length, buffer_phys) != XHCI_SUCCESS) {
+    const usb_config_descriptor_t *config =
+        (const usb_config_descriptor_t *)buffer;
+    if (config->bLength < 9 ||
+        config->bDescriptorType != XHCI_USB_DESC_TYPE_CONFIGURATION) {
         xhci_dma_free(buffer, alloc_size);
-        return XHCI_ERR_NOT_SUPPORTED;
+        return XHCI_ERR_TRANSACTION;
+    }
+    total_length = config->wTotalLength;
+    *out_config_val = config->bConfigurationValue;
+    xhci_diag_set_phase("config-full read");
+    if (total_length < 9) {
+        xhci_dma_free(buffer, alloc_size);
+        return XHCI_ERR_TRANSACTION;
+    }
+    if (total_length > alloc_size) {
+        xhci_dma_free(buffer, alloc_size);
+        return XHCI_ERR_NO_MEMORY;
+    }
+    result = xhci_control_get_descriptor(
+        xhc, slot_id, XHCI_USB_DESC_TYPE_CONFIGURATION, 0, total_length,
+        buffer_phys);
+    if (result != XHCI_SUCCESS) {
+        xhci_dma_free(buffer, alloc_size);
+        return result;
     }
 
     xhci_diag_set_phase("interface discovery");
@@ -605,13 +650,30 @@ xhci_status_t xhci_get_mass_storage_endpoint_info(xhci_controller_t *xhc, u8 slo
     for (offset = 0; offset + 2 <= total_length;) {
         u8 length = buffer[offset];
         u8 type = buffer[offset + 1];
-        if (length < 2 || offset + length > total_length) break;
-        if (type == XHCI_USB_DESC_TYPE_INTERFACE && length >= 9) {
+        if (length < 2 || offset + length > total_length) {
+            malformed = true;
+            break;
+        }
+        if (type == XHCI_USB_DESC_TYPE_INTERFACE) {
+            if (length < 9) {
+                malformed = true;
+                break;
+            }
             usb_interface_descriptor_t *iface = (usb_interface_descriptor_t *)(buffer + offset);
             mass_storage_interface = iface->bInterfaceClass == 0x08 &&
                                      iface->bInterfaceSubClass == 0x06 &&
                                      iface->bInterfaceProtocol == 0x50;
-        } else if (type == XHCI_USB_DESC_TYPE_ENDPOINT && mass_storage_interface && length >= 7) {
+            if (mass_storage_interface)
+                mass_storage_interface_found = true;
+        } else if (type == XHCI_USB_DESC_TYPE_ENDPOINT) {
+            if (length < 7) {
+                malformed = true;
+                break;
+            }
+            if (!mass_storage_interface) {
+                offset += length;
+                continue;
+            }
             usb_endpoint_descriptor_t *ep = (usb_endpoint_descriptor_t *)(buffer + offset);
             if ((ep->bmAttributes & XHCI_USB_EP_ATTR_TYPE_MASK) == 2) {
                 if (ep->bEndpointAddress & XHCI_USB_EP_DIR_IN) {
@@ -626,7 +688,13 @@ xhci_status_t xhci_get_mass_storage_endpoint_info(xhci_controller_t *xhc, u8 slo
         offset += length;
     }
 
+    if (offset != total_length)
+        malformed = true;
     bool found = *out_bulk_in && *out_bulk_out;
+    if (malformed || (mass_storage_interface_found && !found)) {
+        xhci_dma_free(buffer, alloc_size);
+        return XHCI_ERR_TRANSACTION;
+    }
     if (!found && dump_on_miss) {
         xhci_dump_configuration(slot_id, buffer, total_length);
         xhci_diag_set_phase("device-descriptor diagnostic");
@@ -656,8 +724,11 @@ xhci_status_t xhci_get_hub_endpoint_info(
     const usize alloc_size = 4096;
     u8 *buffer;
     u16 total_length;
+    u16 offset;
     bool in_hub_interface = false;
+    bool hub_interface_found = false;
     bool found_endpoint = false;
+    bool malformed = false;
 
     if (!xhc || !slot_id || !out_info)
         return XHCI_ERR_INVALID_PARAM;
@@ -668,11 +739,11 @@ xhci_status_t xhci_get_hub_endpoint_info(
         return XHCI_ERR_NO_MEMORY;
 
     xhci_diag_set_phase("hub config-header");
-    if (xhci_control_get_descriptor(xhc, slot_id,
-                                    XHCI_USB_DESC_TYPE_CONFIGURATION, 0, 9,
-                                    buffer_phys) != XHCI_SUCCESS) {
+    xhci_status_t result = xhci_control_get_descriptor(
+        xhc, slot_id, XHCI_USB_DESC_TYPE_CONFIGURATION, 0, 9, buffer_phys);
+    if (result != XHCI_SUCCESS) {
         xhci_dma_free(buffer, alloc_size);
-        return XHCI_ERR_NOT_SUPPORTED;
+        return result;
     }
 
     const usb_config_descriptor_t *config =
@@ -680,62 +751,89 @@ xhci_status_t xhci_get_hub_endpoint_info(
     total_length = config->wTotalLength;
     if (config->bLength < 9 ||
         config->bDescriptorType != XHCI_USB_DESC_TYPE_CONFIGURATION ||
-        total_length < 9 || total_length > alloc_size) {
+        total_length < 9) {
         xhci_dma_free(buffer, alloc_size);
-        return XHCI_ERR_NOT_SUPPORTED;
+        return XHCI_ERR_TRANSACTION;
+    }
+    if (total_length > alloc_size) {
+        xhci_dma_free(buffer, alloc_size);
+        return XHCI_ERR_NO_MEMORY;
     }
     out_info->config_value = config->bConfigurationValue;
 
     xhci_diag_set_phase("hub config-full");
-    if (xhci_control_get_descriptor(xhc, slot_id,
-                                    XHCI_USB_DESC_TYPE_CONFIGURATION, 0,
-                                    total_length, buffer_phys) != XHCI_SUCCESS) {
+    result = xhci_control_get_descriptor(
+        xhc, slot_id, XHCI_USB_DESC_TYPE_CONFIGURATION, 0, total_length,
+        buffer_phys);
+    if (result != XHCI_SUCCESS) {
         xhci_dma_free(buffer, alloc_size);
-        return XHCI_ERR_NOT_SUPPORTED;
+        return result;
     }
 
-    for (u16 offset = 0; offset + 2 <= total_length;) {
+    for (offset = 0; offset + 2 <= total_length;) {
         u8 length = buffer[offset];
         u8 type = buffer[offset + 1];
-        if (length < 2 || offset + length > total_length)
+        if (length < 2 || offset + length > total_length) {
+            malformed = true;
             break;
+        }
 
-        if (type == XHCI_USB_DESC_TYPE_INTERFACE && length >= 9) {
+        if (type == XHCI_USB_DESC_TYPE_INTERFACE) {
+            if (length < 9) {
+                malformed = true;
+                break;
+            }
             const usb_interface_descriptor_t *interface =
                 (const usb_interface_descriptor_t *)(buffer + offset);
             in_hub_interface = interface->bAlternateSetting == 0 &&
                 interface->bInterfaceClass == XHCI_USB_CLASS_HUB;
             if (in_hub_interface) {
+                hub_interface_found = true;
                 out_info->interface_number = interface->bInterfaceNumber;
                 out_info->interface_protocol = interface->bInterfaceProtocol;
             }
-        } else if (type == XHCI_USB_DESC_TYPE_ENDPOINT &&
-                   in_hub_interface && length >= 7) {
-            const usb_endpoint_descriptor_t *endpoint =
-                (const usb_endpoint_descriptor_t *)(buffer + offset);
-            if ((endpoint->bmAttributes & XHCI_USB_EP_ATTR_TYPE_MASK) ==
-                    XHCI_USB_EP_ATTR_INTR &&
-                (endpoint->bEndpointAddress & XHCI_USB_EP_DIR_IN)) {
-                out_info->endpoint_address = endpoint->bEndpointAddress;
-                out_info->max_packet_size =
-                    endpoint->wMaxPacketSize & 0x07ff;
-                out_info->interval = endpoint->bInterval;
-                found_endpoint = true;
+        } else if (type == XHCI_USB_DESC_TYPE_ENDPOINT) {
+            if (length < 7) {
+                malformed = true;
+                break;
             }
-        } else if (type == XHCI_USB_DESC_TYPE_SS_EP_COMPANION &&
-                   found_endpoint && in_hub_interface && length >= 6) {
-            out_info->max_burst = buffer[offset + 2];
-            out_info->mult = buffer[offset + 3] & 0x03;
-            out_info->bytes_per_interval =
-                (u16)buffer[offset + 4] | ((u16)buffer[offset + 5] << 8);
-            out_info->has_ss_companion = true;
+            if (in_hub_interface) {
+                const usb_endpoint_descriptor_t *endpoint =
+                    (const usb_endpoint_descriptor_t *)(buffer + offset);
+                if ((endpoint->bmAttributes & XHCI_USB_EP_ATTR_TYPE_MASK) ==
+                        XHCI_USB_EP_ATTR_INTR &&
+                    (endpoint->bEndpointAddress & XHCI_USB_EP_DIR_IN)) {
+                    out_info->endpoint_address = endpoint->bEndpointAddress;
+                    out_info->max_packet_size =
+                        endpoint->wMaxPacketSize & 0x07ff;
+                    out_info->interval = endpoint->bInterval;
+                    found_endpoint = true;
+                }
+            }
+        } else if (type == XHCI_USB_DESC_TYPE_SS_EP_COMPANION) {
+            if (length < 6) {
+                malformed = true;
+                break;
+            }
+            if (found_endpoint && in_hub_interface) {
+                out_info->max_burst = buffer[offset + 2];
+                out_info->mult = buffer[offset + 3] & 0x03;
+                out_info->bytes_per_interval =
+                    (u16)buffer[offset + 4] | ((u16)buffer[offset + 5] << 8);
+                out_info->has_ss_companion = true;
+            }
         }
         offset += length;
     }
 
+    if (offset != total_length)
+        malformed = true;
     xhci_dma_free(buffer, alloc_size);
-    if (!found_endpoint ||
-        (speed == XHCI_SPEED_SUPER && !out_info->has_ss_companion))
+    if (malformed || (hub_interface_found && !found_endpoint) ||
+        (speed == XHCI_SPEED_SUPER && found_endpoint &&
+         !out_info->has_ss_companion))
+        return XHCI_ERR_TRANSACTION;
+    if (!found_endpoint)
         return XHCI_ERR_NOT_SUPPORTED;
     return XHCI_SUCCESS;
 }

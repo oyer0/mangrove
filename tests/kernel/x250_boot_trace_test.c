@@ -143,7 +143,7 @@ int main(void)
     x250_boot_trace_xhci_port(5U, 0x00000c01U, "FAILED", true, 7,
                               "reset-completion-change-missing");
     x250_boot_trace_usb_device(5U, 2U, 3U, 0x0781U, 0x5567U,
-                               0U, 0U, 0U, 0);
+                               0U, 0U, 0U, 0U, false, NULL, 0);
     x250_boot_trace_msc_probe(5U, 2U, "inquiry", 9, false, false,
                               false, false, false, 0U, 0U, 0U, NULL);
     x250_boot_trace_block_device(0U, "SATA", 512U, 123456U, "ThinkDisk",
@@ -159,7 +159,7 @@ int main(void)
         __builtin_strcmp(trace_test_line(1U),
             "43 [FAIL] port=5 PORTSC=00000c01 CCS=1 PED=0 PLS=0 PP=0 speed=3 state=FAILED rc=7 reason=reset-completion-change-missing") != 0 ||
         __builtin_strcmp(trace_test_line(2U),
-            "44 [INFO] USB p=5 s=2 sp=3 id=0781:5567 cls=00/00/00 msc-ep-rc=0") != 0 ||
+            "44 [INFO] USB p=5 s=2 sp=3 id=0781:5567 cls=00/00/00 bind=unsupported msc-ep=absent") != 0 ||
         __builtin_strcmp(trace_test_line(3U),
             "45 [FAIL] MSC p=5 s=2 stage=inquiry rc=9 BOT=0 cap=0 blk=0 GPT=-") != 0 ||
         __builtin_strcmp(trace_test_line(4U),
@@ -169,6 +169,16 @@ int main(void)
         __builtin_strcmp(trace_test_line(6U),
             "46 [INFO] root scan blocks=3 disks=2 gpt-parts=2 root-role=1") != 0)
         return trace_test_fail("USB discovery diagnostic rows preserve stage and status");
+
+    trace_line_count = 0;
+    trace_line_start = 0;
+    x250_boot_trace_usb_device(7U, 3U, 3U, 0x8087U, 0x0a2aU,
+                               0U, 0U, 0U, 0U, false, "storage",
+                               6);
+    if (trace_line_count != 1U ||
+        __builtin_strcmp(trace_test_line(0U),
+            "44 [FAIL] USB p=7 s=3 sp=3 id=8087:0a2a cls=00/00/00 bind=failed probe=storage rc=6") != 0)
+        return trace_test_fail("descriptor probe failure is not labeled unsupported");
 
     /* Exercise more than the visible panel capacity. The ring must retain
        recent discovery and root-failure evidence instead of silently
@@ -182,7 +192,7 @@ int main(void)
         x250_boot_trace_xhci_port(port, 0x00000c01U, "FAILED", true, 7,
                                   "reset-completion-change-missing");
     x250_boot_trace_usb_device(48U, 2U, 3U, 0x0781U, 0x5567U,
-                               0x08U, 0x06U, 0x50U, 0);
+                               0x08U, 0x06U, 0x50U, 2U, true, NULL, 0);
     x250_boot_trace_msc_probe(48U, 2U, "inquiry", 9, false, false,
                               false, false, false, 0U, 0U, 0U, NULL);
     x250_boot_trace_block_device(0U, "SATA", 512U, 123456U, "ThinkDisk",

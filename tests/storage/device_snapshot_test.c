@@ -61,13 +61,22 @@ bool scheduler_block(void)
 
 static block_device_t disks[2];
 static unsigned disk_count;
+static bool expose_unsupported_usb;
 static bool pause_probe, entered, release_probe, nested, bad_probe, duplicate_capture;
 static unsigned probes;
 static gpt_partition_info_t partition;
 u32 pci_get_device_count(void) { return 0; }
 const pci_device_t *pci_get_device(u32 index) { (void)index;return NULL; }
 u32 xhci_usb_device_snapshot(xhci_usb_device_info_t *out,u32 capacity)
-{ (void)out;(void)capacity;return 0; }
+{
+    if (!expose_unsupported_usb) return 0;
+    if (out && capacity) {
+        out[0]=(xhci_usb_device_info_t){.slot_id=2,.port_id=6,.speed=3,
+            .state=XHCI_DEVICE_READY,.instance_generation=7,
+            .vendor_id=0x1234,.product_id=0xabcd};
+    }
+    return 1;
+}
 bool net_fill_interface(void *out,usize capacity,usize *count)
 { (void)out;(void)capacity;*count=0;return false; }
 u32 block_device_count(void) { return duplicate_capture?2:disk_count; }
@@ -170,6 +179,18 @@ static void *stress(void *unused)
 int main(void)
 {
     kernel_thread_t main_thread={.state=THREAD_STATE_RUNNING};self=&main_thread;
+#ifndef SNAPSHOT_LEGACY_CONTROL
+    expose_unsupported_usb=true;
+    mg_device_info_t usb_page[1];u32 usb_total=0;u64 usb_generation=0;
+    assert(device_snapshot_read(MG_DEVICE_CATEGORY_USB,0,0,0,usb_page,1,
+                                &usb_total,&usb_generation)==1);
+    assert(usb_total==1 && usb_page[0].category==MG_DEVICE_CATEGORY_USB &&
+           usb_page[0].vendor_id==0x1234 && usb_page[0].device_id==0xabcd &&
+           !strcmp(usb_page[0].name,"USB device") &&
+           !strcmp(usb_page[0].driver,"unsupported"));
+    expose_unsupported_usb=false;
+    puts("fully enumerated USB device without a class driver is published as unsupported");
+#endif
     set_disk(10);nested=true;call_t base=read_now(0);
     assert(base.result==1 && base.total==1 && base.out[0].disk_number==1);
     puts("preserved nested-refresh reproducer: recursion rejected, unique ID, original snapshot intact");

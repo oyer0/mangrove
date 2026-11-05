@@ -318,7 +318,7 @@ static const char *usb_driver_name(u8 class_flags)
     if ((class_flags & XHCI_USB_CLASS_HID) != 0) return "hid-keyboard";
     if ((class_flags & XHCI_USB_CLASS_STORAGE) != 0) return "usb-storage";
     if ((class_flags & XHCI_USB_CLASS_HUB) != 0) return "usb-hub";
-    return "-";
+    return "unsupported";
 }
 
 static void usb_class_identity(const xhci_usb_device_info_t *device,

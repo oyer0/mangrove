@@ -47,7 +47,9 @@ void x250_boot_trace_xhci_port(u32 port, u32 portsc, const char *state,
 void x250_boot_trace_usb_device(u32 port, u32 slot, u32 speed,
                                 u32 vendor_id, u32 product_id,
                                 u32 class_code, u32 subclass,
-                                u32 protocol, int msc_endpoint_result);
+                                u32 protocol, u8 class_flags,
+                                bool mass_storage_endpoints_found,
+                                const char *probe_stage, int probe_result);
 void x250_boot_trace_msc_probe(u32 port, u32 slot, const char *stage,
                                int result, bool bot_ready,
                                bool capacity_known, bool block_registered,

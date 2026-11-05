@@ -257,6 +257,49 @@ static bool xhci_cleanup_failed_device(xhci_controller_t *xhc,
                                        xhci_device_t *dev);
 static void xhci_process_pending_teardowns(xhci_controller_t *xhc);
 static void xhci_clear_device_teardown(xhci_controller_t *xhc, u8 slot_id);
+static const char *xhci_device_class_name(u8 class_flags);
+
+/* Only a descriptor parser's explicit no-match result means that Mangrove
+ * lacks a class driver. Transfer, descriptor, controller, and resource errors
+ * must remain setup failures instead of being relabeled as unsupported. */
+static xhci_status_t xhci_class_probe_result(xhci_status_t probe_result,
+                                             bool *out_supported)
+{
+    if (!out_supported)
+        return XHCI_ERR_INVALID_PARAM;
+    *out_supported = false;
+    if (probe_result == XHCI_ERR_NOT_SUPPORTED)
+        return XHCI_SUCCESS;
+    if (probe_result != XHCI_SUCCESS)
+        return probe_result;
+    *out_supported = true;
+    return XHCI_SUCCESS;
+}
+
+/* A correctly addressed/configured device can be useful as an enumerated USB
+ * device even when no class driver matches. Class-driver absence is not an
+ * xHCI setup failure; an incomplete attach for a matched class remains one. */
+static xhci_status_t xhci_class_binding_result(u8 class_flags,
+                                              bool class_ready)
+{
+    if (class_flags == 0 || class_ready)
+        return XHCI_SUCCESS;
+    return XHCI_ERR_TRANSACTION;
+}
+
+static void xhci_trace_device_binding(const xhci_device_t *dev, u32 port_id,
+                                      u32 slot_id, u32 speed, u8 class_flags,
+                                      bool mass_storage_endpoints_found,
+                                      const char *probe_stage,
+                                      xhci_status_t probe_result)
+{
+    if (!dev)
+        return;
+    x250_boot_trace_usb_device(
+        port_id, slot_id, speed, dev->vendor_id, dev->product_id,
+        dev->usb_class, dev->usb_subclass, dev->usb_protocol, class_flags,
+        mass_storage_endpoints_found, probe_stage, (int)probe_result);
+}
 
 /* A slot retirement is executed only by the Event Ring owner.  Waiters may
  * request it, but may neither reclaim its records nor free its DMA memory. */
@@ -2444,9 +2487,10 @@ static xhci_status_t xhci_device_setup_finish(xhci_controller_t *xhc,
                                               xhci_status_t result,
                                               bool owns_lock)
 {
-    bool ready = result == XHCI_SUCCESS && dev &&
-        (dev->class_flags == 0 || dev->class_ready);
-    if (result == XHCI_SUCCESS && !ready)
+    if (result == XHCI_SUCCESS && dev)
+        result = xhci_class_binding_result(dev->class_flags,
+                                           dev->class_ready);
+    else if (result == XHCI_SUCCESS)
         result = XHCI_ERR_TRANSACTION;
     xhc->last_setup_retry_safe = false;
     if (result != XHCI_SUCCESS && dev) {
@@ -2749,17 +2793,40 @@ static xhci_status_t xhci_setup_device_topology(
     u16 bulk_in_pkt = 0, bulk_out_pkt = 0;
     xhci_hub_endpoint_info_t hub_endpoint;
     __builtin_memset(&hub_endpoint, 0, sizeof(hub_endpoint));
-    bool has_hid = xhci_get_keyboard_endpoint_info(
+    xhci_status_t hid_probe_result = xhci_get_keyboard_endpoint_info(
         xhc, slot_id, &hid_ep, &hid_pkt, &hid_interval, &hid_cfg, &hid_iface,
-        &hid_report_length) == XHCI_SUCCESS;
+        &hid_report_length);
+    bool has_hid = false;
+    err = xhci_class_probe_result(hid_probe_result, &has_hid);
+    if (err != XHCI_SUCCESS) {
+        xhci_trace_device_binding(dev, port_id, slot_id, speed, 0, false,
+                                  "hid", hid_probe_result);
+        return xhci_device_setup_finish(xhc, dev, err, owns_lock);
+    }
     xhci_status_t storage_endpoint_result =
         xhci_get_mass_storage_endpoint_info(
             xhc, slot_id, &bulk_in_ep, &bulk_in_pkt, &bulk_out_ep,
             &bulk_out_pkt, &storage_cfg, false);
-    bool has_storage = storage_endpoint_result == XHCI_SUCCESS;
-    bool has_hub = !has_hid && !has_storage &&
-        xhci_get_hub_endpoint_info(xhc, slot_id, speed, &hub_endpoint) ==
-            XHCI_SUCCESS;
+    bool has_storage = false;
+    err = xhci_class_probe_result(storage_endpoint_result, &has_storage);
+    if (err != XHCI_SUCCESS) {
+        xhci_trace_device_binding(
+            dev, port_id, slot_id, speed,
+            has_hid ? XHCI_DEVICE_CLASS_HID : 0, false, "storage",
+            storage_endpoint_result);
+        return xhci_device_setup_finish(xhc, dev, err, owns_lock);
+    }
+    bool has_hub = false;
+    if (!has_hid && !has_storage) {
+        xhci_status_t hub_probe_result = xhci_get_hub_endpoint_info(
+            xhc, slot_id, speed, &hub_endpoint);
+        err = xhci_class_probe_result(hub_probe_result, &has_hub);
+        if (err != XHCI_SUCCESS) {
+            xhci_trace_device_binding(dev, port_id, slot_id, speed, 0,
+                                      false, "hub", hub_probe_result);
+            return xhci_device_setup_finish(xhc, dev, err, owns_lock);
+        }
+    }
     dev->class_flags = (has_hid ? XHCI_DEVICE_CLASS_HID : 0) |
                        (has_storage ? XHCI_DEVICE_CLASS_STORAGE : 0) |
                        (has_hub ? XHCI_DEVICE_CLASS_HUB : 0);
@@ -2767,12 +2834,12 @@ static xhci_status_t xhci_setup_device_topology(
 #if X250_BOOT_TRACE
     xhc->ports[port_id].device_enumerated = true;
 #endif
-    x250_boot_trace_usb_device(
-        port_id, slot_id, speed, dev->vendor_id, dev->product_id,
-        dev->usb_class, dev->usb_subclass, dev->usb_protocol,
-        (int)storage_endpoint_result);
-    XHCI_DEBUG_LOG("[xHCI-DIAG] p%u s%u sp%u interface-discovery hid=%u storage=%u hub=%u\n",
-                   port_id, slot_id, speed, has_hid, has_storage, has_hub);
+    xhci_trace_device_binding(dev, port_id, slot_id, speed, dev->class_flags,
+                              has_storage, NULL, XHCI_SUCCESS);
+    XHCI_DEBUG_LOG("[xHCI-DIAG] p%u s%u sp%u interface-discovery binding=%s hid=%u storage=%u hub=%u\n",
+                   port_id, slot_id, speed,
+                   xhci_device_class_name(dev->class_flags),
+                   has_hid, has_storage, has_hub);
     u8 max_dci = 1;
     u32 endpoint_flags = XHCI_CTX_FLAG_SLOT;
 
@@ -3058,7 +3125,7 @@ static const char *xhci_device_class_name(u8 class_flags)
     if (class_flags == XHCI_DEVICE_CLASS_STORAGE) return "storage";
     if (class_flags == XHCI_DEVICE_CLASS_HUB) return "hub";
     if (class_flags) return "multi";
-    return "other";
+    return "unsupported";
 }
 
 const char *xhci_usb_device_event_name(xhci_controller_t *xhc, u8 slot_id)

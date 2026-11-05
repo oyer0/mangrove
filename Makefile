@@ -1992,6 +1992,8 @@ test-xhci-pci:
 test-xhci-boot:
 	python3 tests/storage/xhci_port_admission_test.py "$(HOST_CC)"
 	python3 tests/storage/xhci_boot_ack_test.py "$(HOST_CC)"
+	python3 tests/storage/xhci_usb_support_test.py "$(HOST_CC)"
+	python3 tests/storage/xhci_descriptor_probe_test.py "$(HOST_CC)"
 	python3 tests/storage/init_storage_test.py "$(HOST_CC)"
 	python3 tests/storage/init_root_discovery_test.py "$(HOST_CC)"
 	python3 tests/storage/xhci_boot_drain_test.py "$(HOST_CC)"
