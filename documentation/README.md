@@ -97,6 +97,10 @@ procedures. Source code is authoritative for implementation details.
   generated inputs, image population, and QEMU topology.
 - [Compact USB flashing](development/usb-flashing.md): explicit Linux device
   admission, confirmation, GPT relocation, and bounded verification.
+- [ThinkPad X250 hardware profile](development/x250-hardware-profile.md):
+  X250 inventory, firmware profile, and physical image evidence.
+- [Physical boot-test preparation and recovery](development/physical-test-recovery.md):
+  reusable preflight, evidence, and recovery procedure for physical targets.
 - [Linux setup](development/linux.md).
 - [macOS setup](development/macos.md).
 - [Mangrove Test Suite](development/test-suite.md): host and guest profiles,
