@@ -599,7 +599,7 @@ parser.add_argument("--profile-summary", type=Path,
 parser.add_argument("--profile-events", type=Path,
                     help="matching bounded allocation-events.csv from Pith")
 parser.add_argument("--output", type=Path,
-                    default=Path("build/stage4_6-hybrid-public.json"))
+                    default=Path("build/hybrid-public-benchmark.json"))
 parser.add_argument("--trials", type=int, default=5)
 args = parser.parse_args()
 if not args.api_check_only and (not args.profile_summary or

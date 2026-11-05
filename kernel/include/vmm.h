@@ -160,7 +160,7 @@ vmm_user_range_revoke_result_t vmm_user_range_revoke(
     page_table_t *pml4, void *virtual_addr, usize page_count);
 phys_addr_t vmm_virtual_to_physical(void *virtual_addr);
 
-/* Stage-4 ownership checks.  These are intentionally independent from
+/* Address-space ownership checks. These are intentionally independent from
  * PTE_USER: that bit is an x86 permission, not a lifetime annotation. */
 bool vmm_address_space_validate(const page_table_t *pml4);
 bool vmm_kernel_mappings_supervisor_only(void);

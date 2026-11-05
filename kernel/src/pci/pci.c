@@ -72,15 +72,14 @@ static void pci_scan_bus(u8 bus);
 
 static void pci_scan(void);
 
-/* Runtime reconciliation follows the buses reachable through bridges that
- * already exist (or are discovered on a reachable bus).  The previous
- * Stage 19.11 implementation probed every one of the 256 possible PCI buses
- * every 500 ms.  Legacy CF8/CFC accesses are comparatively expensive under
- * virtualization, so that scan could keep the background lifecycle thread
- * runnable for hundreds of milliseconds at a time.  A hot-pluggable slot's
- * bridge exists before its child is inserted; scanning bus zero plus each
- * bridge's secondary bus is therefore sufficient for the supported Q35 NIC
- * lifecycle without turning an absent PCI address space into periodic work. */
+/* Runtime reconciliation follows buses reachable through existing bridges
+ * (or bridges discovered on a reachable bus). Probing all 256 possible buses
+ * every 500 ms made the background lifecycle thread runnable for hundreds of
+ * milliseconds under virtualization, where legacy CF8/CFC accesses are
+ * comparatively expensive. A hot-pluggable slot's bridge exists before its
+ * child is inserted; scanning bus zero plus each bridge's secondary bus is
+ * sufficient for the supported Q35 NIC lifecycle without turning an absent
+ * PCI address space into periodic work. */
 static void pci_runtime_scan(void)
 {
     bool reachable[256] = {0};

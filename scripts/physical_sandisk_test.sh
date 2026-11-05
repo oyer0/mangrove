@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
-# Headless physical-media launcher for the one disposable SanDisk Cruzer Blade
-# approved for Stage 19.14i validation.  This script never opens /dev/sdX and
-# never accepts QEMU arguments.  The only privileged calls are the fixed
-# root-owned bind/unbind helper installed from physical_sandisk_usbctl.sh.
+# Headless physical-media launcher for the designated disposable SanDisk
+# Cruzer Blade. This script never opens /dev/sdX and never accepts QEMU
+# arguments. The only privileged calls are the fixed root-owned bind/unbind
+# helper installed from physical_sandisk_usbctl.sh.
 
 set -euo pipefail
 IFS=$' \t\n'

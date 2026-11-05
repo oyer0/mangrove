@@ -588,7 +588,7 @@ static mg_result_t handle_escape(mg_line_editor_t *editor)
         }
     }
 
-    /* Accept the Stage 16.1 cursor packets for compatibility. */
+    /* Accept legacy cursor packets for compatibility. */
     switch (command) {
         case 'D': (void)line_editor_apply_action(editor, EDITOR_ACTION_MOVE_LEFT); break;
         case 'C': (void)line_editor_apply_action(editor, EDITOR_ACTION_MOVE_RIGHT); break;

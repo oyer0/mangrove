@@ -393,7 +393,7 @@ ifeq ($(XHCI_DEBUG),1)
 KERNEL_CFLAGS += -DXHCI_DEBUG=1
 endif
 
-# Opt-in DHCP/boot-network milestone diagnostics.  Normal images remain
+# Opt-in DHCP/boot-network diagnostics. Normal images remain
 # silent; the stream is mirrored to QEMU serial output when enabled.
 ifeq ($(NETWORK_BOOT_DIAG),1)
 KERNEL_CFLAGS += -DNETWORK_BOOT_DIAG=1
@@ -3565,8 +3565,8 @@ test-guest-threads:
 		--accel "$(GUEST_THREADS_ACCEL)" \
 		--ovmf-code "$(OVMF_CODE_SOURCE)" --ovmf-vars "$(OVMF_VARS_SOURCE)"
 
-SMP_SCHEDULER_GUEST_BUILD ?= $(abspath $(BUILD_DIR))/stage6-scheduler-smp-build
-SMP_SCHEDULER_GUEST_OUTPUT ?= $(abspath $(BUILD_DIR))/stage6-scheduler-smp-$(shell date -u +%Y%m%dT%H%M%SZ)
+SMP_SCHEDULER_GUEST_BUILD ?= $(abspath $(BUILD_DIR))/smp-scheduler-guest-build
+SMP_SCHEDULER_GUEST_OUTPUT ?= $(abspath $(BUILD_DIR))/smp-scheduler-guest-$(shell date -u +%Y%m%dT%H%M%SZ)
 SMP_SCHEDULER_GUEST_ACCEL ?= $(NATIVE_GUEST_ACCEL)
 .PHONY: test-scheduler-smp-evidence test-guest-scheduler-smp
 test-scheduler-smp-evidence:
@@ -3597,8 +3597,8 @@ test-guest-scheduler-smp: test-scheduler-smp-evidence
 		--accel "$(SMP_SCHEDULER_GUEST_ACCEL)" \
 		--ovmf-code "$(OVMF_CODE_SOURCE)" --ovmf-vars "$(OVMF_VARS_SOURCE)"
 
-SMP_DEVICE_GUEST_BUILD ?= $(abspath $(BUILD_DIR))/stage6-device-smp-build
-SMP_DEVICE_GUEST_OUTPUT ?= $(abspath $(BUILD_DIR))/stage6-device-smp-$(shell date -u +%Y%m%dT%H%M%SZ)
+SMP_DEVICE_GUEST_BUILD ?= $(abspath $(BUILD_DIR))/smp-device-guest-build
+SMP_DEVICE_GUEST_OUTPUT ?= $(abspath $(BUILD_DIR))/smp-device-guest-$(shell date -u +%Y%m%dT%H%M%SZ)
 SMP_DEVICE_GUEST_ACCEL ?= $(NATIVE_GUEST_ACCEL)
 .PHONY: test-device-smp-evidence test-guest-device-smp
 test-device-smp-evidence:

@@ -19,7 +19,7 @@
 #define KERNEL_VMM_RANGE_BASE  0xffffc10000000000ULL
 #define KERNEL_VMM_RANGE_LIMIT 0xffffc18000000000ULL
 
-/* Stage-2 kernel image placement. ELF physical addresses are preferred
+/* Linked kernel image placement. ELF physical addresses are preferred
  * offsets from KERNEL_PHYS_BASE; the loader may choose another physical base
  * while the image remains linked in the canonical high half. */
 #define KERNEL_PHYS_BASE 0x00100000ULL

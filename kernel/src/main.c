@@ -1648,7 +1648,7 @@ static void start_pid1(void)
         for (;;) __asm__ volatile("cli; hlt");
     }
 
-    /* Install only the capability Sprout needs for this milestone.  The
+    /* Install only the capability Sprout needs for console access. The
      * userspace value is a generation-tagged handle, never a kernel pointer. */
     kernel_object_t *console_object = object_console_create();
     process_handle_t console_handle = 0;

@@ -37,7 +37,7 @@ output = args.output if args.output.is_absolute() else ROOT / args.output
 if output.exists():
     parser.error(f"refusing to overwrite existing evidence: {output}")
 output.parent.mkdir(parents=True, exist_ok=True)
-temp_root = ROOT / "build/stage4.3-tmp"
+temp_root = ROOT / "build/slab-lifecycle-policy-tmp"
 temp_root.mkdir(parents=True, exist_ok=True)
 flags = ["-std=gnu11", "-O2", "-g", "-Wall", "-Wextra", "-Werror",
          "-pthread", "-Iinclude", "-Ikernel/include", "-idirafter",

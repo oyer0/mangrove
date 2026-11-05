@@ -327,7 +327,7 @@ validate_bitmap_negative_control()
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("compiler", nargs="?", default="gcc")
 parser.add_argument("--output", type=Path,
-                    default=ROOT / "build/stage4e3a-slab-benchmark.json")
+                    default=ROOT / "build/slab-benchmark.json")
 parser.add_argument("--assembly-output", type=Path)
 parser.add_argument("--deep-validation", type=int, choices=(0, 1),
                     default=0)
@@ -344,7 +344,7 @@ if not assembly_output.is_absolute():
 assembly_output.parent.mkdir(parents=True, exist_ok=True)
 if output.exists() or assembly_output.exists():
     parser.error("refusing to overwrite benchmark evidence or assembly")
-temp_root = ROOT / "build/stage4e3a-tmp"
+temp_root = ROOT / "build/slab-benchmark-tmp"
 temp_root.mkdir(parents=True, exist_ok=True)
 flags = ["-std=gnu11", "-O2", "-g", "-save-temps=obj",
          "-Wall", "-Wextra", "-Werror",

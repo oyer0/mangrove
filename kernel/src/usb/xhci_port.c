@@ -11,7 +11,7 @@
  * External Dependencies
  * ============================================================================== */
 
-/* Timekeeping subsystem for required physical link delays (Stage 6) */
+/* Timekeeping used to bound required USB link delays. */
 extern void timer_sleep(u64 ms);
 extern u64  timer_uptime_ms(void);
 

@@ -9,7 +9,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
 CC = sys.argv[1] if len(sys.argv) > 1 else "cc"
-TEMP_ROOT = ROOT / "build/stage4.5-spinlock-tmp"
+TEMP_ROOT = ROOT / "build/spinlock-context-test-tmp"
 TEMP_ROOT.mkdir(parents=True, exist_ok=True)
 
 

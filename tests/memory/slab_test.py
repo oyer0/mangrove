@@ -9,7 +9,7 @@ import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
-TEMP_ROOT = ROOT / "build/stage4.5-host-tmp"
+TEMP_ROOT = ROOT / "build/slab-host-test-tmp"
 TEMP_ROOT.mkdir(parents=True, exist_ok=True)
 arguments = list(sys.argv[1:])
 CC = arguments.pop(0) if arguments and not arguments[0].startswith("--") \
