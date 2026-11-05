@@ -3601,7 +3601,7 @@ test-device-smp-evidence:
 test-guest-device-smp: test-device-smp-evidence
 	$(QEMU_ACCEL_PREFLIGHT) "$(SMP_DEVICE_GUEST_ACCEL)"
 	$(MAKE) -B -j4 BUILD_DIR="$(SMP_DEVICE_GUEST_BUILD)" \
-		binaries mkmgfs mgfsck RTC_UTC_TRUST=1
+		binaries fstest mkmgfs mgfsck RTC_UTC_TRUST=1
 	python3 tests/guest/guest_device_smp_test.py \
 		--build-dir "$(SMP_DEVICE_GUEST_BUILD)" --mode storage --cpus 2 \
 		--output "$(SMP_DEVICE_GUEST_OUTPUT)-storage-2vcpu" \
