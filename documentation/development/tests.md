@@ -1,5 +1,15 @@
 # Focused test coverage
 
+`make test-physical-qualification` uses synthetic repository/build/evidence
+files to check creation and validation of physical-run reports. It covers a
+recordable failed boot and successful report, source and artifact identity,
+evidence size/hash/reference checks, explicit operator confirmation, legal
+result transitions, incomplete required recovery, and deferred optional
+devices. It never accesses a physical device and does not produce hardware
+qualification evidence. See the
+[physical test and recovery procedure](physical-test-recovery.md) for report
+creation, operator recording, and evidence boundaries.
+
 ## Native terminal controls and `say` escapes
 
 `make test-terminal` compiles the production terminal renderer under

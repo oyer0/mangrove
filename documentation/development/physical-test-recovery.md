@@ -5,6 +5,288 @@ Machine-specific firmware menus, boot keys, recovery operating systems, and
 media tools belong in each hardware profile. A QEMU result does not substitute
 for a physical test.
 
+## Physical run report and evidence
+
+Use `tools/physical_qualification.py` to create and validate one JSON report per
+physical run. The tool only reads the selected repository/build/evidence files
+and writes a new report file. It does not inspect block devices, invoke the USB
+flasher, boot a guest, or collect a physical result. Its output path must be
+new; put reports under ignored `build/` storage or outside the repository.
+Unignored in-repository paths are refused so repeated updates do not alter the
+source identity being recorded. Each `update` writes another new report
+revision rather than replacing the previous record.
+
+The report records the hardware-profile identifier and document hash, a
+firmware-settings snapshot and hash, Git revision plus tracked/untracked
+working-tree fingerprints, loader/kernel/image sizes and SHA-256 values,
+non-unique boot-medium description, build/diagnostic options, cold/warm boot
+classification, expected actions, required stages, stage observations,
+result-state history, and bounded evidence references. Build artifact hashes
+identify those files independently; they do not by themselves prove that the
+loader and kernel embedded in the image match the separately hashed files.
+That relation remains `NOT TESTED` until an independent image-identity report
+is attached and explicitly recorded. The source fingerprint is the repository
+state at report creation; it does not prove which source tree a prior build
+used. Attach existing build/image identity output for that provenance.
+
+Before each run, select a new report directory and build directory. For
+example, on a machine whose profile is `documentation/development/x250-hardware-profile.md`:
+
+```sh
+RUN=build/physical-tests/x250-cold-01
+BUILD_DIR=build/physical-build/x250-cold-01
+mkdir -p "$RUN/evidence"
+make -j4 BUILD_DIR="$BUILD_DIR" usb-image mgfsck
+```
+
+Prepare a firmware snapshot JSON file under the report directory. Include only
+settings relevant to the test; use `"unknown"` for values not observed. Do not
+include serial numbers, MAC addresses, network identifiers, credentials, or
+other unique personal/device identifiers.
+
+Create it once; noclobber protects an existing snapshot from accidental
+replacement:
+
+```sh
+(
+  set -o noclobber
+  cat > "$RUN/firmware.json" <<'JSON'
+{
+  "source": "operator inspection of firmware setup",
+  "values": {
+    "bios_version": "recorded value",
+    "secure_boot": "recorded value",
+    "boot_mode": "recorded value",
+    "usb_boot_support": "unknown"
+  }
+}
+JSON
+)
+```
+
+Create the manifest before booting. The command below captures build/source
+identity, but leaves every physical stage and the overall result as
+`NOT TESTED`:
+
+```sh
+python3 tools/physical_qualification.py create \
+  --profile-id ThinkPad-X250-20CLS1EY00 \
+  --profile documentation/development/x250-hardware-profile.md \
+  --firmware-snapshot "$RUN/firmware.json" \
+  --loader "$BUILD_DIR/EFI/BOOT/BOOTX64.EFI" \
+  --kernel "$BUILD_DIR/Mangrove/pith.elf" \
+  --image "$BUILD_DIR/Mangrove/MangroveUSB.img" \
+  --medium-kind USB --medium-model 'SanDisk Cruzer Blade' \
+  --medium-capacity 15682560512 --medium-vid-pid 0781:5567 \
+  --boot-classification COLD \
+  --build-option X250_BOOT_TRACE=0 \
+  --expected-action 'Reach Shoot and execute the selected commands' \
+  --required-stage uefi_loader \
+  --required-stage kernel_handoff \
+  --required-stage kernel_initialization \
+  --required-stage device_discovery \
+  --required-stage root_mount \
+  --required-stage shoot_input \
+  --required-stage test_workload \
+  --required-stage shutdown_recovery \
+  --deferred-device 'Fingerprint, Bluetooth, and camera class functions are outside this test' \
+  --output "$RUN/report-00.json"
+```
+
+Use a profile-specific identifier, firmware snapshot, medium model/capacity,
+diagnostic options, expected actions, and required stages for each target. Omit
+the X250-specific trace option for other builds; record the actual options used.
+Choose only stages exercised by the test, and include `shutdown_recovery` as a
+required stage only when that recovery path is part of the test. Deferred or
+unsupported devices can be listed for context; their presence does not fail a
+test unless the test explicitly requires them.
+
+### Prepare and verify removable media
+
+Select the whole removable device yourself, verify its identity, and follow the
+existing [compact USB flashing procedure](usb-flashing.md). Do not use `dd` or
+another writer. To retain the flasher's output as a bounded host-side
+transcript, make the report evidence directory first and capture the command's
+output while keeping the flasher's explicit confirmation:
+
+```sh
+set -o pipefail
+FLASH_LOG=$(mktemp "$RUN/evidence/flash-usb.XXXXXX")
+sudo ./scripts/flash-usb.sh \
+  --image "$BUILD_DIR/Mangrove/MangroveUSB.img" \
+  --device /dev/disk/by-id/REPLACE_WITH_OPERATOR_SELECTED_WHOLE_USB_DEVICE \
+  --mgfsck "$BUILD_DIR/mgfsck" \
+  2>&1 | sed -E \
+    -e 's/^Image: .*/Image: <source image>/' \
+    -e 's/^Destination: .*/Destination: <selected removable USB; unique identifiers redacted>/' \
+  | tee "$FLASH_LOG"
+```
+
+The placeholder is not a device-selection mechanism: replace it only after
+independently selecting and checking the whole removable target. The utility
+requires its device-specific confirmation and validates the write/readback.
+The filter prevents the transcript from retaining the device path, model, or
+serial printed in the safety summary; keep the terminal output visible during
+the operation. It does not alter internal storage. For previously verified
+fallback media, reference its prior verification report and identify the
+fallback medium separately; do not mark the newly built image as present on it
+without evidence.
+
+Record successful host-side media verification in a new report revision. The
+evidence source is `AUTOMATED` because the referenced transcript
+comes from the flasher; the command does not decide whether the physical boot
+will pass:
+
+```sh
+python3 tools/physical_qualification.py update \
+  --report "$RUN/report-00.json" --output "$RUN/report-01.json" \
+  --medium-verification VERIFIED \
+  --evidence-root "$RUN/evidence" \
+  --evidence "transcript=$(basename "$FLASH_LOG")" \
+  --evidence-source AUTOMATED \
+  --evidence-description 'flash-usb.sh write and readback transcript'
+```
+
+If flashing or its verification fails, record `--medium-verification FAILED`
+and retain the failure transcript. Do not proceed to boot on a failed or
+unverified write. Use a distinct output revision, for example:
+
+```sh
+python3 tools/physical_qualification.py update \
+  --report "$RUN/report-00.json" --output "$RUN/report-01-failed-flash.json" \
+  --medium-verification FAILED \
+  --evidence-root "$RUN/evidence" \
+  --evidence "transcript=$(basename "$FLASH_LOG")" \
+  --evidence-source AUTOMATED \
+  --evidence-description 'flash-usb.sh failed write or readback transcript'
+```
+
+Reports whose boot medium is USB cannot reach physical
+`PASS` without an automated flash/readback evidence reference.
+
+### Record physical observations
+
+After each action, copy the preceding report to a new path with `update`.
+Record one stage result and an observation per invocation. Start the overall
+result with `INCOMPLETE`; record only what was actually observed. Include
+`--evidence-root "$RUN/evidence"` on every update or validation after evidence
+has been attached. Example:
+
+```sh
+python3 tools/physical_qualification.py update \
+  --report "$RUN/report-01.json" --output "$RUN/report-02.json" \
+  --evidence-root "$RUN/evidence" \
+  --status INCOMPLETE --stage uefi_loader --stage-status PASS \
+  --observation 'Firmware selected the named USB entry and displayed the Mangrove loader'
+```
+
+Use these stage names to identify the first failure and what followed:
+
+| Stage | Boundary recorded |
+| --- | --- |
+| `uefi_loader` | Firmware selection and loader execution |
+| `kernel_handoff` | Loader-to-Pith transfer |
+| `kernel_initialization` | Pith initialization before device discovery |
+| `device_discovery` | Controller, storage, and other required-device discovery |
+| `root_mount` | Required Mangrove root selection and MGFS mount |
+| `shoot_input` | Shoot startup and required keyboard/input action |
+| `test_workload` | Explicit command or operation and its result |
+| `shutdown_recovery` | Requested shutdown/reboot or return to the recovery system |
+
+If the machine displays useful diagnostics, photograph the full screen or
+write a concise operator note into a file under `$RUN/evidence/`. The current
+kernel does not provide a general persistent physical-boot log; terminal
+output can be replaced during boot. Do not claim that QEMU output, a KVM report,
+or the absence of a panic is a physical observation. Attach existing host
+reports as `AUTOMATED`; attach screen photographs and operator notes as
+`OPERATOR`. The tool records the referenced file's relative path, byte count,
+and SHA-256. Each evidence file is limited to 32 MiB, at most 64 references and
+128 MiB total. It does not copy evidence files or inspect their contents for
+technical correctness, so redact sensitive information before retaining them.
+Keep referenced files inside `$RUN/evidence/`, using fresh destination names
+for any copied reports or notes; the tool will not copy or overwrite them.
+
+If an independent host image-identity report establishes that the loader and
+Pith hashes above match the components embedded in the selected image, attach
+it and record that result. Otherwise leave the field as `NOT TESTED`:
+
+```sh
+python3 tools/physical_qualification.py update \
+  --report "$RUN/report-02.json" --output "$RUN/report-03.json" \
+  --evidence-root "$RUN/evidence" \
+  --embedded-match VERIFIED \
+  --evidence host_report=image-identity.json \
+  --evidence-source AUTOMATED \
+  --evidence-description 'Independent embedded image identity report'
+```
+
+The validator checks that the report is referenced and hashed; it does not
+interpret the host report. Set `VERIFIED` only after reviewing its contents.
+
+Update a stage with its actual observation; use `INCOMPLETE` where it was
+attempted but not established, and `FAIL` where an observed failure occurred.
+First record a failed stage while the overall run is still incomplete:
+
+```sh
+python3 tools/physical_qualification.py update \
+  --report "$RUN/report-05.json" --output "$RUN/report-06.json" \
+  --evidence-root "$RUN/evidence" \
+  --status INCOMPLETE --stage device_discovery --stage-status FAIL \
+  --observation 'No required boot-storage device was discovered'
+```
+
+For a terminal failure, record the failed stage, operator confirmation, and
+operator-supplied evidence in the next revision:
+
+```sh
+python3 tools/physical_qualification.py update \
+  --report "$RUN/report-06.json" --output "$RUN/report-07.json" \
+  --status FAIL --failure-stage device_discovery --confirm-physical \
+  --evidence-root "$RUN/evidence" \
+  --evidence photo=failed-screen.jpg \
+  --evidence-description 'Physical screen at the first failed discovery stage'
+```
+
+For a terminal `PASS`, every required stage must be `PASS` and have an explicit
+operator observation. USB write/readback must be verified when USB is the boot
+source, and an operator must provide at least one evidence reference and
+explicitly set `--confirm-physical`. A terminal result cannot be changed;
+start a new report for a new physical run.
+`NOT TESTED` means there is no physical boot result. `INCOMPLETE` means work
+was attempted without establishing all requested results. A `FAIL` must name
+the matching failed stage. The report validator checks the state transitions,
+stage requirements, local artifact/evidence hashes, and references. It does
+not independently judge the truth of operator observations or the semantics
+of an attached KVM/flasher report.
+
+After all required stages have been recorded, add operator evidence and finish
+a successful run with a new report revision:
+
+```sh
+python3 tools/physical_qualification.py update \
+  --report "$RUN/report-all-required-stages.json" --output "$RUN/report-success.json" \
+  --status PASS --confirm-physical \
+  --evidence-root "$RUN/evidence" \
+  --evidence photo=shoot-workload.jpg \
+  --evidence-description 'Shoot prompt and requested command results on the physical target'
+```
+
+Validate the final revision against the same repository/build files and
+evidence directory:
+
+```sh
+python3 tools/physical_qualification.py validate \
+  --report "$RUN/report-success.json" \
+  --repo . --evidence-root "$RUN/evidence" --require-pass
+```
+
+For an intentionally failed or incomplete run, omit `--require-pass`; a
+structurally valid `FAIL` or `INCOMPLETE` report is not a successful hardware
+qualification. `--metadata-only` skips local source/build/evidence byte
+verification and is suitable only for checking report shape after artifacts
+have been moved. It does not validate the referenced bytes and must not be
+reported as full evidence validation.
+
 ## Before a test
 
 1. Confirm that the machine's existing recovery operating system boots with
