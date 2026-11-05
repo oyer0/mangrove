@@ -130,6 +130,9 @@ DEV_ROOT_IMAGE := $(STATE_DIR)/MangroveDevRoot.img
 LEGACY_DEV_IMAGE := $(MANGROVE_DIR)/Mangrove.img
 FLASH_ROOT_IMAGE := $(MANGROVE_DIR)/MangroveFlash.img
 USB_IMAGE    := $(MANGROVE_DIR)/MangroveUSB.img
+# Optional capacity for isolated disk-image tests. Normal USB flashing uses
+# the compact default and scripts/flash-usb.sh to relocate GPT on the device.
+USB_IMAGE_SECTORS ?= 264225
 SPROUT_DIR   := $(BUILD_DIR)/sprout
 SPROUT_CMD_DIR := $(BUILD_DIR)/sproutcmd
 SESSIOND_DIR := $(BUILD_DIR)/sessiond
@@ -685,7 +688,7 @@ help:
 	@echo "  make run         Build and boot the persistent USB/xHCI development image"
 	@echo "  make fresh       Reset the persistent development image"
 	@echo "  make fresh-run   Reset the development image and boot it"
-	@echo "  make usb         Build $(USB_IMAGE) for hardware"
+	@echo "  make usb         Build compact $(USB_IMAGE); flash with scripts/flash-usb.sh"
 	@echo "  make clean       Remove disposable build artifacts; preserve .mangrove/"
 	@echo "  make test        Run the available host-side test suites"
 	@echo "  make test-guest  MTS standard guest qualification (27 boots; not a quick test)"
@@ -1951,17 +1954,51 @@ test-sync: test-spinlock-context test-ipc-capacity test-ipc-waiters test-preempt
 	python3 tests/kernel/mutex_test.py
 	python3 tests/storage/block_gate_test.py
 
+.PHONY: test-xhci-pci
+test-xhci-pci:
+	@mkdir -p $(HOST_TEST_DIR)
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror \
+		-Ikernel/include/usb -Ikernel/include/pci -Iinclude \
+		tests/storage/xhci_pci_routing_test.c kernel/src/usb/xhci_pci.c \
+		-o $(HOST_TEST_DIR)/mangrove-xhci-pci-routing-test
+	$(HOST_TEST_DIR)/mangrove-xhci-pci-routing-test
+	python3 tests/storage/xhci_legacy_handoff_test.py "$(HOST_CC)"
+
+.PHONY: test-xhci-boot
+test-xhci-boot:
+	python3 tests/storage/xhci_port_admission_test.py "$(HOST_CC)"
+	python3 tests/storage/xhci_boot_ack_test.py "$(HOST_CC)"
+	python3 tests/storage/init_storage_test.py "$(HOST_CC)"
+	python3 tests/storage/init_root_discovery_test.py "$(HOST_CC)"
+	python3 tests/storage/xhci_boot_drain_test.py "$(HOST_CC)"
+	python3 tests/storage/xhci_port_samples_test.py "$(HOST_CC)"
+
 .PHONY: test-storage-authorization
 test-storage-authorization:
 	python3 tests/kernel/storage_authorization_test.py "$(HOST_CC)"
 
-test-storage: test-storage-authorization
+.PHONY: test-usb-image-capacity test-gpt-image
+test-usb-image-capacity:
+	python3 tests/storage/usb_image_capacity_test.py
+
+.PHONY: test-usb-flash
+test-usb-flash: $(MKMGFS) $(BUILD_DIR)/mgfsck
+	python3 tests/storage/flash_usb_test.py --mkmgfs "$(MKMGFS)" --mgfsck "$(BUILD_DIR)/mgfsck"
+	python3 tests/storage/flash_usb_tty_test.py --mkmgfs "$(MKMGFS)" --mgfsck "$(BUILD_DIR)/mgfsck"
+
+GPT_TEST_IMAGE ?= $(USB_IMAGE)
+test-gpt-image:
+	@test -f "$(GPT_TEST_IMAGE)" || { echo "Build a USB image or set GPT_TEST_IMAGE first" >&2; exit 1; }
+	python3 tests/storage/storage_coherency_test.py "$(HOST_CC)" --gpt-image="$(GPT_TEST_IMAGE)"
+
+test-storage: test-storage-authorization test-xhci-pci test-xhci-boot test-usb-image-capacity test-usb-flash
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -Werror=address-of-packed-member \
 		-Ikernel/include -Ikernel/include/usb -Iinclude \
 		tests/storage/xhci_regs_layout_test.c \
 		-o $(HOST_TEST_DIR)/mangrove-xhci-regs-layout-test
 	$(HOST_TEST_DIR)/mangrove-xhci-regs-layout-test
 	python3 tests/storage/xhci_mmio_map_test.py "$(HOST_CC)"
+	python3 tests/storage/xhci_pci_admission_test.py "$(HOST_CC)"
 	python3 tests/storage/ahci_signature_test.py "$(HOST_CC)"
 	python3 tests/storage/storage_coherency_test.py "$(HOST_CC)"
 	python3 tests/filesystems/exfat/storage_format_test.py "$(HOST_CC)"
@@ -2094,8 +2131,7 @@ dev-image fresh-dev-image: override RTC_UTC_TRUST = 1
 flash-image: check-usb-deps binaries $(MKMGFS) $(OVMF_VARS)
 	./scripts/make_image.sh --build-dir "$(BUILD_DIR)" --fresh --root "$(FLASH_ROOT_IMAGE)" --autologin developer
 	@mkdir -p $(MANGROVE_DIR)
-	@rm -f $(USB_IMAGE)
-	@dd if=/dev/zero of=$(USB_IMAGE) bs=1 count=0 seek=135283200 2>/dev/null
+	@python3 tools/create_usb_image_file.py --sectors "$(USB_IMAGE_SECTORS)" "$(USB_IMAGE)"
 ifeq ($(UNAME),Darwin)
 	@sgdisk --zap-all \
 		--new=1:2048:133119 --typecode=1:EF00 --change-name=1:MANGROVE_ESP \
@@ -2112,7 +2148,7 @@ else
 endif
 	@dd if=$(MANGROVE_DIR)/Boot.img of=$(USB_IMAGE) bs=512 seek=2048 conv=notrunc 2>/dev/null
 	@dd if=$(FLASH_ROOT_IMAGE) of=$(USB_IMAGE) bs=512 seek=133120 conv=notrunc 2>/dev/null
-	@echo "Created $(USB_IMAGE)"
+	@echo "Created $(USB_IMAGE) ($(USB_IMAGE_SECTORS) sectors)"
 
 # Specialist compatibility names.
 image: dev-image

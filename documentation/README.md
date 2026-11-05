@@ -93,6 +93,8 @@ procedures. Source code is authoritative for implementation details.
 
 - [Build and image pipeline](development/build-and-images.md): targets,
   generated inputs, image population, and QEMU topology.
+- [Compact USB flashing](development/usb-flashing.md): explicit Linux device
+  admission, confirmation, GPT relocation, and bounded verification.
 - [Linux setup](development/linux.md).
 - [macOS setup](development/macos.md).
 - [Mangrove Test Suite](development/test-suite.md): host and guest profiles,

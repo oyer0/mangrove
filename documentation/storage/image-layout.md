@@ -6,7 +6,7 @@ they are not presentation labels.
 
 ## GPT layout
 
-The current image contains 264,225 512-byte sectors (135,283,200 bytes):
+The default compact image contains 264,225 512-byte sectors (135,283,200 bytes):
 
 | Entry | LBA range | Size | GPT role | Contents |
 | --- | --- | --- | --- | --- |
@@ -20,6 +20,28 @@ tool, while its `MANGROVE_ROOT` name supplies the Mangrove system role.
 
 The ESP contains `/EFI/BOOT/BOOTX64.EFI`. The kernel is not stored on the ESP;
 the loader reads `/boot/pith.elf` from MGFS in `MANGROVE_ROOT`.
+
+### Destination capacity
+
+Normal USB development uses the compact 135,283,200-byte image. The manually
+invoked [Linux USB flashing utility](../development/usb-flashing.md) writes that
+image and relocates its backup GPT array/header to the destination's actual end.
+It updates both headers, usable-space bounds, CRCs and the protective MBR while
+preserving partition entries, identifiers, attributes and contents. Unallocated
+space is left untouched; no full-device image or full-device readback is needed.
+
+A compact image copied with plain `dd` onto a larger disk leaves its backup
+at the image's end. Pith rejects that topology even when both copies are
+individually checksummed: discovery validates the reciprocal header locations
+against reported device capacity, as required by
+[UEFI section 5.3.1](https://uefi.org/specs/UEFI/2.10/05_GUID_Partition_Table_Format.html#guid-partition-table-gpt-disk-layout).
+The kernel does not repair this mismatch or bypass root identity checks.
+
+For isolated disk-image tests, `USB_IMAGE_SECTORS=<count>` can still construct
+a capacity-matched sparse file. The default remains 264225; smaller or invalid
+sizes are rejected. Partition ranges and payload sizes stay fixed. This option
+is unnecessary for the normal flashing utility, which accepts compact images
+only. Sparse files retain their full logical size when read or copied.
 
 ## Root filesystem hierarchy
 

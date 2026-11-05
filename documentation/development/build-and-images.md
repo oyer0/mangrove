@@ -56,9 +56,15 @@ Use the available validation targets above and the guest/runtime network
 commands documented by the current image.
 
 `X250_BOOT_TRACE=1` enables the temporary compact X250 boot overlay and the
-extra firmware storage-discovery report. It is disabled by default. The
-firmware checkpoint halt markers use the separate `BOOT_HANDOFF_CHECKPOINT`
-option; its default `0` does not halt.
+extra firmware storage-discovery report. It retains recent wrapped messages,
+shows up to 40 rows within the actual firmware GOP height, and redraws a
+filtered discovery/failure report after a required bring-up failure. The final
+report includes the GOP dimensions and USB-controller PCI command registers;
+Intel xHCI configuration DWORDs D0/D4/D8/DC are reported read-only to investigate
+companion-controller routing. The loader retains the firmware GOP mode, which
+need not match the panel's native resolution. It is disabled by default. The
+firmware checkpoint halt markers use
+the separate `BOOT_HANDOFF_CHECKPOINT` option; its default `0` does not halt.
 
 `make test-ovmf-discovery` exercises the Arch and Debian OVMF path layouts and
 the explicit source override behavior without using host firmware files.
@@ -118,6 +124,27 @@ repository's `tools/` and `share/` resources remain source inputs.
 the ESP and MGFS root into fixed GPT partition ranges in
 `$(BUILD_DIR)/Mangrove/MangroveUSB.img`. It uses `parted` on Linux and `sgdisk` on
 macOS for GPT creation.
+
+The normal output is a compact 264225-sector image (135,283,200 bytes),
+independent of destination capacity. Use the manually invoked
+[USB flashing utility](usb-flashing.md) to write this image and relocate GPT
+metadata on the USB. Plain `dd` of a compact GPT image onto larger media leaves
+an invalid backup location. Building a full-capacity file for routine flashing
+also makes the write scale unnecessarily with device capacity.
+
+`USB_IMAGE_SECTORS` remains available for isolated image tests:
+
+```sh
+make BUILD_DIR=build/usb-capacity USB_IMAGE_SECTORS=30629376 usb-image
+```
+
+This optional path creates a sparse regular file and never accesses physical
+media. ESP/root ranges stay fixed. See [destination capacity](../storage/image-layout.md#destination-capacity)
+for the GPT validation contract. `make test-usb-image-capacity` checks sizing;
+`make test-usb-flash` exercises real file-backed flashing, simulated Linux
+admission, confirmation, failure handling and scratch cleanup without root.
+`make test-gpt-image GPT_TEST_IMAGE=path/to/image` exercises production block/GPT
+code against actual image metadata and corruption/read-failure controls.
 
 The image population scripts install the loader on the ESP, `/boot/pith.elf`
 and services under `/core`, commands under `/bin`, configuration under
