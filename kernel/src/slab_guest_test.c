@@ -177,7 +177,7 @@ static bool slab_guest_other_cpu_active(volatile u32 *records, u32 cpu)
 
 static bool slab_guest_wait_for_workers(volatile u32 *counter, u32 expected,
                                         volatile u32 *cpu_mask,
-                                        bool require_two_cpus)
+                                        u32 required_cpu_mask)
 {
     u64 started = timer_uptime_ms();
 
@@ -186,7 +186,7 @@ static bool slab_guest_wait_for_workers(volatile u32 *counter, u32 expected,
         u32 mask = cpu_mask
             ? __atomic_load_n(cpu_mask, __ATOMIC_ACQUIRE) : 0U;
         if (completed >= expected &&
-            (!require_two_cpus || (mask & 3U) == 3U ||
+            ((mask & required_cpu_mask) == required_cpu_mask ||
              __atomic_load_n(&slab_guest_worker_failed,
                              __ATOMIC_ACQUIRE)))
             return true;
@@ -250,7 +250,7 @@ static void slab_guest_worker(void *argument)
     u32 worker = (u32)(uintptr_t)argument;
     u32 cpu = cpu_current_index();
     u32 expected;
-    bool require_two_cpus;
+    u32 required_cpu_mask;
     if (worker >= SLAB_GUEST_WORKERS || cpu >= 32U) {
         __atomic_store_n(&slab_guest_worker_failed, 1U, __ATOMIC_RELEASE);
         __atomic_add_fetch(&slab_guest_worker_ready, 1U, __ATOMIC_RELEASE);
@@ -276,12 +276,13 @@ static void slab_guest_worker(void *argument)
     }
     expected = __atomic_load_n(&slab_guest_worker_expected,
                                __ATOMIC_ACQUIRE);
-    require_two_cpus = expected == SLAB_GUEST_WORKERS &&
-        cpu_online_count() >= 2U;
+    u32 online = cpu_online_count();
+    required_cpu_mask = expected == SLAB_GUEST_WORKERS && online >= 2U &&
+        online <= SLAB_GUEST_WORKERS ? (1U << online) - 1U : 0U;
     if (__atomic_load_n(&slab_guest_barrier_failed, __ATOMIC_ACQUIRE) ||
         !slab_guest_wait_for_workers(&slab_guest_worker_ready, expected,
                                      &slab_guest_worker_cpu_mask,
-                                     require_two_cpus)) {
+                                     required_cpu_mask)) {
         __atomic_add_fetch(&slab_guest_worker_done, 1U, __ATOMIC_RELEASE);
         return;
     }
@@ -314,7 +315,8 @@ static void slab_guest_worker(void *argument)
                                __ATOMIC_RELEASE);
             if (!slab_guest_wait_for_workers(
                     &slab_guest_worker_first_allocated, expected,
-                    &slab_guest_allocator_cpu_mask, require_two_cpus))
+                    &slab_guest_allocator_cpu_mask,
+                    required_cpu_mask))
                 break;
         }
     }
@@ -689,9 +691,13 @@ static bool slab_guest_test_concurrency(u32 online_count, bool cpu_cache)
         &slab_guest_worker_first_allocated, __ATOMIC_ACQUIRE);
     u32 cross_frees = __atomic_load_n(&slab_guest_cross_cpu_frees,
                                       __ATOMIC_ACQUIRE);
-    if (online_count >= 2U && queued == created) {
-        passed = passed && (cpu_mask & 3U) == 3U &&
-                 (allocator_cpu_mask & 3U) == 3U;
+    u32 required_cpu_mask = online_count >= 2U &&
+        online_count <= SLAB_GUEST_WORKERS
+            ? (1U << online_count) - 1U : 0U;
+    if (required_cpu_mask && queued == created) {
+        passed = passed && (cpu_mask & required_cpu_mask) == required_cpu_mask &&
+                 (allocator_cpu_mask & required_cpu_mask) ==
+                     required_cpu_mask;
         /* Worker ownership and migration do not guarantee remote frees in
          * this phase. A separate probe below establishes cross-CPU freeing. */
     }
@@ -891,8 +897,9 @@ bool slab_guest_test_run(void)
     if (!irq_reclaim_ok || !refill_ok || !ordinary_heap_ok ||
         !concurrency_ok || !cpu_cache_ok ||
         !reclaim_calls || !reclaim_objects ||
-        (online >= 2U && (!(reclaim_cpu_mask & 1U) ||
-                          !(reclaim_cpu_mask & 2U) || !reclaim_overlap)) ||
+        (online >= 2U && online <= SLAB_GUEST_WORKERS &&
+         ((reclaim_cpu_mask & ((1U << online) - 1U)) !=
+              ((1U << online) - 1U) || !reclaim_overlap)) ||
         !slab_verify() ||
         !slab_guest_all_retired(&retired_slabs) ||
         !slab_get_classifier_stats(&after)) {

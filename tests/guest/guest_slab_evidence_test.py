@@ -11,7 +11,7 @@ from guest_slab_test import check_concurrency_records
 
 def record(cpu_cache, worker_mask='3', allocator_mask='3', allocations=192,
            arrived=4, first_allocations=4, worker_failed=0,
-           terminated=1, rendezvous_timeout=0, passed=1):
+           terminated=1, rendezvous_timeout=0, passed=1, cpus=2):
     return (
         f'SLAB_GUEST_CONCURRENCY pass={passed} cpu_cache={cpu_cache} '
         f'queued=4 created=4 worker_mask={worker_mask} '
@@ -53,11 +53,19 @@ def main():
         record(0, worker_failed=1), record(1))))
     must_reject('phase order', '\n'.join((record(1), record(0))))
 
+    four_cpu = '\n'.join((
+        record(0, worker_mask='f', allocator_mask='f', cpus=4),
+        record(1, worker_mask='f', allocator_mask='f', cpus=4)))
+    assert len(check_concurrency_records(four_cpu, 4)) == 2
+    must_reject('missing CPU 3 in four-CPU guest', '\n'.join((
+        record(0, worker_mask='7', allocator_mask='f', cpus=4),
+        record(1, worker_mask='f', allocator_mask='f', cpus=4))), cpus=4)
+
     one_cpu = '\n'.join((record(0, worker_mask='1', allocator_mask='1'),
                           record(1, worker_mask='1', allocator_mask='1')))
     assert len(check_concurrency_records(one_cpu, 1)) == 2
     must_reject('missing CPU 1 in two-CPU guest', one_cpu, cpus=2)
-    print('Native slab SMP evidence controls: PASS')
+    print('Native slab SMP evidence controls (1/2/4 CPUs): PASS')
 
 
 if __name__ == '__main__':

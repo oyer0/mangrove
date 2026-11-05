@@ -39,9 +39,9 @@ def validate_boot_log(text, cpus, hybrid_routing):
     if not smp or int(smp[-1][1]) < cpus or online != cpus or passed != 1:
         raise ValueError('kernel-range guest did not report successful requested CPU participation')
     expected = (1 << cpus) - 1
-    if ack & expected != expected:
-        raise ValueError('not all online CPUs acknowledged the invalidation')
-    if cpus == 2 and not (other & 2):
+    if ack != expected:
+        raise ValueError('TLB acknowledgement mask differs from online CPUs')
+    if cpus >= 2 and not (other & 2):
         raise ValueError('CPU 1 acknowledged without using a distinct CR3')
     if blocked != 1 or reused != 1:
         raise ValueError('owned frame was not pinned and reused after teardown')
@@ -62,7 +62,7 @@ def main():
     parser.add_argument('--output', type=Path,
                         help='new output directory; retained for review')
     artifacts.add_retention_argument(parser)
-    parser.add_argument('--cpus', type=int, choices=(1, 2), required=True)
+    parser.add_argument('--cpus', type=int, choices=(1, 2, 4), required=True)
     parser.add_argument('--accel', choices=('tcg', 'kvm'), default=guest.default_accel())
     parser.add_argument('--qemu', default='qemu-system-x86_64')
     parser.add_argument('--ovmf-code', type=Path,

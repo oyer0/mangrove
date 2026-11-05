@@ -1555,6 +1555,10 @@ test-slab-guest: test-slab
 		$(if $(SLAB_GUEST_OUTPUT),--output "$(SLAB_GUEST_OUTPUT)-2vcpu") --cpus 2 \
 		--accel "$(SLAB_GUEST_ACCEL)" \
 		--deep-validation "$(SLAB_DEEP_VALIDATION)"
+	python3 tests/guest/guest_slab_test.py --build-dir "$(SLAB_GUEST_BUILD)" \
+		$(if $(SLAB_GUEST_OUTPUT),--output "$(SLAB_GUEST_OUTPUT)-4vcpu") --cpus 4 \
+		--accel "$(SLAB_GUEST_ACCEL)" \
+		--deep-validation "$(SLAB_DEEP_VALIDATION)"
 
 HYBRID_GUEST_BUILD ?= $(abspath $(BUILD_DIR))/hybrid-guest-build
 HYBRID_GUEST_OUTPUT ?=
@@ -1576,12 +1580,20 @@ test-hybrid-guest: test-slab
 		--accel "$(SLAB_GUEST_ACCEL)" \
 		--deep-validation "$(SLAB_DEEP_VALIDATION)" --hybrid-routing \
 		--hybrid-cutoff "$(KERNEL_HYBRID_ALLOCATOR_CUTOFF)"
+	python3 tests/guest/guest_slab_test.py --build-dir "$(HYBRID_GUEST_BUILD)" \
+		$(if $(HYBRID_GUEST_OUTPUT),--output "$(HYBRID_GUEST_OUTPUT)-4vcpu") --cpus 4 \
+		--accel "$(SLAB_GUEST_ACCEL)" \
+		--deep-validation "$(SLAB_DEEP_VALIDATION)" --hybrid-routing \
+		--hybrid-cutoff "$(KERNEL_HYBRID_ALLOCATOR_CUTOFF)"
 
 VMM_RANGE_GUEST_BUILD ?= $(abspath $(BUILD_DIR))/vmm-range-guest-build
 VMM_RANGE_GUEST_OUTPUT ?=
 VMM_RANGE_GUEST_ACCEL ?= $(NATIVE_GUEST_ACCEL)
-.PHONY: test-vmm-range-guest
-test-vmm-range-guest:
+.PHONY: test-vmm-range-evidence test-vmm-range-guest
+test-vmm-range-evidence:
+	python3 tests/guest/guest_vmm_range_evidence_test.py
+
+test-vmm-range-guest: test-vmm-range-evidence
 	$(QEMU_ACCEL_PREFLIGHT) "$(VMM_RANGE_GUEST_ACCEL)"
 	$(MAKE) -B -j4 BUILD_DIR="$(VMM_RANGE_GUEST_BUILD)" \
 		KERNEL_HYBRID_ALLOCATOR="$(KERNEL_HYBRID_ALLOCATOR)" \
@@ -1592,6 +1604,10 @@ test-vmm-range-guest:
 		--hybrid-routing "$(KERNEL_HYBRID_ALLOCATOR)"
 	python3 tests/guest/guest_vmm_range_test.py --build-dir "$(VMM_RANGE_GUEST_BUILD)" \
 		$(if $(VMM_RANGE_GUEST_OUTPUT),--output "$(VMM_RANGE_GUEST_OUTPUT)-2vcpu") --cpus 2 \
+		--accel "$(VMM_RANGE_GUEST_ACCEL)" \
+		--hybrid-routing "$(KERNEL_HYBRID_ALLOCATOR)"
+	python3 tests/guest/guest_vmm_range_test.py --build-dir "$(VMM_RANGE_GUEST_BUILD)" \
+		$(if $(VMM_RANGE_GUEST_OUTPUT),--output "$(VMM_RANGE_GUEST_OUTPUT)-4vcpu") --cpus 4 \
 		--accel "$(VMM_RANGE_GUEST_ACCEL)" \
 		--hybrid-routing "$(KERNEL_HYBRID_ALLOCATOR)"
 

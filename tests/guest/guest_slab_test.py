@@ -82,9 +82,9 @@ def check_concurrency_records(text, cpus):
                 first_allocations != 4 or worker_failed or
                 not terminated or rendezvous_timeout):
             raise ValueError('allocator worker rendezvous or work is incomplete')
-        if cpus >= 2 and ((worker_mask & 3) != 3 or
-                          (allocator_mask & 3) != 3):
-            raise ValueError('two-vCPU workload lacks worker and allocator participation')
+        expected_mask = (1 << cpus) - 1
+        if (worker_mask != expected_mask or allocator_mask != expected_mask):
+            raise ValueError('workload lacks participation from every requested CPU')
         concurrency.append({
             'cpu_cache': bool(cpu_cache), 'queued': queued,
             'created': created, 'worker_cpu_mask': worker_mask,
@@ -139,10 +139,11 @@ def check_boot_log(text, cpus, deep_validation=0, hybrid_routing=False,
     backing_frame, shootdown_ack, other_cr3 = map(
         lambda value: int(value, 16),
         (backing_frame, shootdown_ack, other_cr3))
-    if (reclaim_pass != 1 or reclaim_online < cpus or not backing_frame or
+    expected_cpu_mask = (1 << cpus) - 1
+    if (reclaim_pass != 1 or reclaim_online != cpus or not backing_frame or
             backing_frame % 4096 or (shootdown_ack & ((1 << cpus) - 1)) !=
-            ((1 << cpus) - 1) or
-            (cpus == 2 and not (other_cr3 & (1 << 1)))):
+            expected_cpu_mask or shootdown_ack != expected_cpu_mask or
+            (cpus >= 2 and not (other_cr3 & (1 << 1)))):
         raise ValueError('PMM-backed slab retirement or shootdown evidence is invalid')
     vmm_pass, vmm_online, vmm_ack, vmm_other_cr3, release_blocked, \
         vmm_frame_reused, vmm_slab_active = owned_reclaims[0]
@@ -151,11 +152,11 @@ def check_boot_log(text, cpus, deep_validation=0, hybrid_routing=False,
                                     vmm_frame_reused, vmm_slab_active))
     vmm_ack, vmm_other_cr3 = map(lambda value: int(value, 16),
                                   (vmm_ack, vmm_other_cr3))
-    if (vmm_pass != 1 or vmm_online < cpus or not release_blocked or
+    if (vmm_pass != 1 or vmm_online != cpus or not release_blocked or
             not vmm_frame_reused or
             vmm_slab_active != int(hybrid_routing) or
-            (vmm_ack & ((1 << cpus) - 1)) != ((1 << cpus) - 1) or
-            (cpus == 2 and not (vmm_other_cr3 & (1 << 1)))):
+            vmm_ack != expected_cpu_mask or
+            (cpus >= 2 and not (vmm_other_cr3 & (1 << 1)))):
         raise ValueError('owned-frame VMM shootdown evidence is invalid')
     heap_pass, heap_groups, heap_frames, heap_bytes, heap_frame, heap_free_delta, \
         heap_recommit, heap_online, heap_ack = heap_reclaims[0]
@@ -167,8 +168,8 @@ def check_boot_log(text, cpus, deep_validation=0, hybrid_routing=False,
     if (heap_pass != 1 or heap_groups != 1 or heap_frames != 4 or
             heap_bytes != 4 * 4096 or not heap_frame or
             heap_frame % 4096 or heap_free_delta < heap_bytes or
-            heap_recommit != 1 or heap_online < cpus or
-            (heap_ack & ((1 << cpus) - 1)) != ((1 << cpus) - 1)):
+            heap_recommit != 1 or heap_online != cpus or
+            heap_ack != expected_cpu_mask):
         raise ValueError('indexed-heap reclaim/recommit shootdown evidence is invalid')
     if hybrid_routing:
         if (len(public_records) != 1 or
@@ -185,20 +186,20 @@ def check_boot_log(text, cpus, deep_validation=0, hybrid_routing=False,
             public_overlap = map(int, (public_pass, public_allocations,
                                        public_frees, public_cross,
                                        public_overlap))
-        public_expected_operations = 192 + (1 if cpus == 2 else 0)
+        public_expected_operations = 192 + (1 if cpus >= 2 else 0)
         if (public_pass != 1 or
                 public_allocations != public_expected_operations or
                 public_frees != public_expected_operations or
-                (public_mask & 1) == 0 or
-                (cpus == 2 and ((public_mask & 3) != 3 or
-                                public_cross == 0 or public_overlap == 0))):
+                public_mask != expected_cpu_mask or
+                (cpus >= 2 and
+                 (public_cross == 0 or public_overlap == 0))):
             raise ValueError('concurrent public allocator counts/CPUs invalid')
     elif public_records:
         raise ValueError('indexed-only guest unexpectedly ran hybrid routing test')
     elif public_smp_records:
         raise ValueError('indexed-only guest unexpectedly ran public SMP routing test')
     discovered, smp_online = map(int, smp_records[-1])
-    if discovered < cpus or smp_online < cpus:
+    if discovered < cpus or smp_online != cpus:
         raise ValueError('guest boot log reports fewer online CPUs than requested')
     (classes, refill, retired, ordinary, cpu_cache, leaves, online, cpu_mask, cross,
      classifier_payload, classifier_heap_used_delta) = matches[0]
@@ -221,19 +222,19 @@ def check_boot_log(text, cpus, deep_validation=0, hybrid_routing=False,
         irq_reclaim_objects = map(int, irq_reclaim_records[0])
     if (classes != 20 or refill != 1 or retired == 0 or ordinary != 1 or
             cpu_cache != 1 or
-            leaves < 1 or online < cpus or payload == 0 or delta < payload):
+            leaves < 1 or online != cpus or payload == 0 or delta < payload):
         raise ValueError('guest slab witness is incomplete or inconsistent')
-    if cpus == 2 and ((mask & 3) != 3 or cross == 0):
-        raise ValueError('two-vCPU witness lacks cross-CPU slab activity')
+    if mask != expected_cpu_mask or (cpus >= 2 and cross == 0):
+        raise ValueError('witness lacks all requested CPUs or cross-CPU slab activity')
     if (not reclaim_calls or not reclaim_records_examined or
             not reclaim_objects):
         raise ValueError('bounded reclaim witness reports no useful progress')
     if (irq_reclaim_pass != 1 or irq_reclaim_entry_if != 1 or
             irq_reclaim_result_if != 0 or not irq_reclaim_objects):
         raise ValueError('IRQ-disabled reclaim did not preserve IF or reclaim objects')
-    if cpus == 2 and ((reclaim_cpu_mask & 3) != 3 or
-                      not reclaim_overlap):
-        raise ValueError('two-vCPU reclaim lacked CPU participation/overlap')
+    if reclaim_cpu_mask != expected_cpu_mask or (
+            cpus >= 2 and not reclaim_overlap):
+        raise ValueError('reclaim lacked full CPU participation/overlap')
     return {'classes': classes, 'refill': refill, 'retired_slabs': retired,
             'ordinary_heap_reuse': bool(ordinary), 'classifier_leaves': leaves,
             'cpu_cache_test': bool(cpu_cache),
@@ -847,7 +848,7 @@ def main():
     parser.add_argument('--output', type=Path,
                         help='new output directory; retained for review (default: temporary)')
     artifacts.add_retention_argument(parser)
-    parser.add_argument('--cpus', type=int, choices=(1, 2), required=True)
+    parser.add_argument('--cpus', type=int, choices=(1, 2, 4), required=True)
     parser.add_argument('--accel', choices=('tcg', 'kvm'), default=guest.default_accel())
     parser.add_argument('--qemu', default='qemu-system-x86_64')
     parser.add_argument('--ovmf-code', type=Path,
