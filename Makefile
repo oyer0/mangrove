@@ -3525,6 +3525,38 @@ test-guest-threads:
 		--thread-smoke --cpus 2 --no-nic --repetitions 3 \
 		--accel "$(GUEST_THREADS_ACCEL)" \
 		--ovmf-code "$(OVMF_CODE_SOURCE)" --ovmf-vars "$(OVMF_VARS_SOURCE)"
+	python3 tests/guest/guest_mgfs_test.py --build-dir "$(GUEST_THREADS_BUILD)" \
+		$(if $(GUEST_THREADS_OUTPUT),--output "$(GUEST_THREADS_OUTPUT)-4vcpu") \
+		--thread-smoke --cpus 4 --no-nic --repetitions 1 \
+		--accel "$(GUEST_THREADS_ACCEL)" \
+		--ovmf-code "$(OVMF_CODE_SOURCE)" --ovmf-vars "$(OVMF_VARS_SOURCE)"
+
+SMP_SCHEDULER_GUEST_BUILD ?= $(abspath $(BUILD_DIR))/stage6-scheduler-smp-build
+SMP_SCHEDULER_GUEST_OUTPUT ?= $(abspath $(BUILD_DIR))/stage6-scheduler-smp-$(shell date -u +%Y%m%dT%H%M%SZ)
+SMP_SCHEDULER_GUEST_ACCEL ?= $(NATIVE_GUEST_ACCEL)
+.PHONY: test-scheduler-smp-evidence test-guest-scheduler-smp
+test-scheduler-smp-evidence:
+	python3 tests/guest/guest_scheduler_smp_evidence_test.py
+
+test-guest-scheduler-smp: test-scheduler-smp-evidence
+	$(QEMU_ACCEL_PREFLIGHT) "$(SMP_SCHEDULER_GUEST_ACCEL)"
+	$(MAKE) -B -j4 BUILD_DIR="$(SMP_SCHEDULER_GUEST_BUILD)" \
+		binaries threadtest mkmgfs mgfsck RTC_UTC_TRUST=1
+	python3 tests/guest/guest_scheduler_smp_test.py \
+		--build-dir "$(SMP_SCHEDULER_GUEST_BUILD)" \
+		--output "$(SMP_SCHEDULER_GUEST_OUTPUT)-1vcpu" --cpus 1 \
+		--accel "$(SMP_SCHEDULER_GUEST_ACCEL)" \
+		--ovmf-code "$(OVMF_CODE_SOURCE)" --ovmf-vars "$(OVMF_VARS_SOURCE)"
+	python3 tests/guest/guest_scheduler_smp_test.py \
+		--build-dir "$(SMP_SCHEDULER_GUEST_BUILD)" \
+		--output "$(SMP_SCHEDULER_GUEST_OUTPUT)-2vcpu" --cpus 2 \
+		--accel "$(SMP_SCHEDULER_GUEST_ACCEL)" \
+		--ovmf-code "$(OVMF_CODE_SOURCE)" --ovmf-vars "$(OVMF_VARS_SOURCE)"
+	python3 tests/guest/guest_scheduler_smp_test.py \
+		--build-dir "$(SMP_SCHEDULER_GUEST_BUILD)" \
+		--output "$(SMP_SCHEDULER_GUEST_OUTPUT)-4vcpu" --cpus 4 \
+		--accel "$(SMP_SCHEDULER_GUEST_ACCEL)" \
+		--ovmf-code "$(OVMF_CODE_SOURCE)" --ovmf-vars "$(OVMF_VARS_SOURCE)"
 
 randomtest: $(BUILD_DIR)/randomtest/randomtest.elf
 $(BUILD_DIR)/randomtest/randomtest.o: tests/userspace/random_guest.c $(USER_LIBC)

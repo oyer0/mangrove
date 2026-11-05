@@ -210,6 +210,8 @@ def phase_launch_command(phase, executable):
         return '/bin/randomtest'
     if phase == 'threads':
         return '/bin/threadtest'
+    if phase == 'scheduler-smp':
+        return '/bin/threadtest scheduler-smp'
     if phase == 'ca-store-verify':
         return '/bin/castoretest'
     if phase == 'mgtls':
@@ -240,6 +242,7 @@ def create_disk(folder, build, run, relative_launch=False,
                 random_smoke=False, ca_store_smoke=False,
                 mgtls_smoke=False, mgtls_tls_smoke=False,
                 fetch_https_smoke=False, thread_smoke=False,
+                scheduler_smp_smoke=False, scheduler_smp_cpus=1,
                 kernel_override=None):
     # The disposable image is sparse on common host filesystems, but reserve
     # enough room for a fully allocated image, extracted root partition, and
@@ -274,7 +277,7 @@ def create_disk(folder, build, run, relative_launch=False,
     if random_smoke:
         install(image, 2, 'randomtest',
                 (build / 'randomtest/randomtest.elf').read_bytes())
-    if thread_smoke:
+    if thread_smoke or scheduler_smp_smoke:
         install(image, 2, 'threadtest',
                 (build / 'threadtest/threadtest.elf').read_bytes())
     if ca_store_smoke:
@@ -283,7 +286,7 @@ def create_disk(folder, build, run, relative_launch=False,
     if mgtls_smoke or mgtls_tls_smoke:
         install(image, 2, 'mgtlstest',
                 (build / 'mgtlstest/mgtlstest.elf').read_bytes())
-    if not power_history_smoke and not arguments_smoke and not random_smoke and not thread_smoke and not ca_store_smoke and not mgtls_smoke and not mgtls_tls_smoke and not fetch_https_smoke:
+    if not power_history_smoke and not arguments_smoke and not random_smoke and not thread_smoke and not scheduler_smp_smoke and not ca_store_smoke and not mgtls_smoke and not mgtls_tls_smoke and not fetch_https_smoke:
         install(image, 2, 'fstest', (build / 'fstest/fstest.elf').read_bytes())
     if shoot_v1:
         install(image, 6, 'shoot-v1-script.shoot',
@@ -299,6 +302,10 @@ def create_disk(folder, build, run, relative_launch=False,
         phases = ('random',)
     if thread_smoke:
         phases = ('threads',)
+    if scheduler_smp_smoke:
+        if not 1 <= scheduler_smp_cpus <= 4:
+            raise ValueError('scheduler SMP guest CPU count must be 1..4')
+        phases = ('scheduler-smp',)
     if ca_store_smoke:
         phases = ('ca-store-reboot', 'ca-store-verify')
     if mgtls_smoke:
@@ -361,6 +368,12 @@ def create_disk(folder, build, run, relative_launch=False,
                 '/bin/say protected > /temp/fetch-protected.html\n'
                 '/bin/say PING1 complete\n'
                 '/bin/fetch -q -o /temp/fetch-protected.html example.com\n').encode()
+        elif phase == 'scheduler-smp':
+            script = (
+                f'/bin/threadtest scheduler-smp {scheduler_smp_cpus} '
+                '> /temp/scheduler-smp-command.log\n'
+                f'/bin/say child-exit-0-{phase}-{run} > /temp/{phase}.exit\n'
+                '/bin/shutdown\n').encode()
         elif phase == 'fetch-https':
             script = (
                 network_wait +
@@ -445,8 +458,8 @@ def confirmation_echo(text, answer):
 
 def qemu_cpu_count(args):
     count = getattr(args, 'cpus', 1)
-    if count not in (1, 2):
-        raise ValueError('QEMU vCPU count must be 1 or 2')
+    if count not in (1, 2, 4):
+        raise ValueError('QEMU vCPU count must be 1, 2, or 4')
     return count
 
 
@@ -1874,8 +1887,8 @@ def main():
     parser.add_argument('--ovmf-code', type=Path, default=default_path('code'))
     parser.add_argument('--ovmf-vars', type=Path, default=default_path('vars'))
     parser.add_argument('--timeout', type=int, default=180)
-    parser.add_argument('--cpus', type=int, choices=(1, 2), default=1,
-                        help='QEMU vCPU count (the two-CPU option exercises AP startup)')
+    parser.add_argument('--cpus', type=int, choices=(1, 2, 4), default=1,
+                        help='QEMU vCPU count (two/four CPUs exercise AP startup)')
     parser.add_argument('--no-nic', action='store_true',
                         help='omit QEMU NIC for non-network SMP qualification; kernel unchanged')
     parser.add_argument('--network-receive-smoke', action='store_true',
@@ -1934,9 +1947,10 @@ def main():
             args.ca_store_smoke or args.mgtls_smoke or args.mgtls_tls_smoke or
             args.fetch_https_smoke or args.shoot_v1 or args.power_history_smoke or
             args.network_ping_smoke or args.network_receive_smoke or
-            args.relative_launch or args.negative_control or args.cpus != 2 or
+            args.relative_launch or args.negative_control or
+            args.cpus not in (2, 4) or
             not args.no_nic):
-        parser.error('--thread-smoke is a focused two-CPU, no-NIC workflow')
+        parser.error('--thread-smoke is a focused two- or four-CPU, no-NIC workflow')
     if args.ca_store_smoke and (args.arguments_smoke or args.random_smoke or
             args.shoot_v1 or args.power_history_smoke or args.network_ping_smoke or
             args.network_receive_smoke or args.relative_launch or

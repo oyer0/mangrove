@@ -16,6 +16,10 @@
 #define WORKERS 2U
 #define ITERATIONS 2000U
 #define REPEAT_WORKERS 24U
+#define SCHEDULER_SMP_MAX_CPUS 4U
+#define SCHEDULER_SMP_LOAD_WORKERS (SCHEDULER_SMP_MAX_CPUS + 1U)
+#define SCHEDULER_SMP_MIGRATION_MS 2200U
+#define SCHEDULER_SMP_LOAD_MS 1500U
 #define REQUIRE(condition, stage) do { if (!(condition)) { \
     printf("THREADS1 FAIL %s\n", stage); return 1; } } while (0)
 
@@ -44,13 +48,474 @@ extern u64 threadtest_syscall_with_rsp(uintptr_t selected_rsp,
                                       u64 *out_rflags);
 extern void threadtest_syscall_then_touch_rsp(uintptr_t selected_rsp);
 
+static int save_named_log(const char *path, const char *text);
+
+typedef struct {
+    u32 expected_cpus;
+    u32 online_mask;
+    u32 cpu_mask;
+    u32 samples;
+    u32 transitions;
+    u32 cooperative_yields;
+    u32 failure_code;
+    u32 thread_stable;
+    u32 failed;
+    u64 thread_id;
+    u64 start_ms;
+    u64 end_ms;
+} scheduler_smp_migration_t;
+
+typedef struct {
+    u32 index;
+} scheduler_smp_worker_arg_t;
+
+static scheduler_smp_migration_t scheduler_smp_migration;
+static atomic_uint scheduler_smp_worker_started;
+static atomic_bool scheduler_smp_worker_run;
+static atomic_bool scheduler_smp_worker_abort;
+static atomic_ullong scheduler_smp_work_units;
+static atomic_uint scheduler_smp_multiple_samples;
+static u64 scheduler_smp_worker_iterations[SCHEDULER_SMP_LOAD_WORKERS];
+static u64 scheduler_smp_worker_checksums[SCHEDULER_SMP_LOAD_WORKERS];
+
+static bool scheduler_smp_cpu_snapshot(u32 expected_cpus, u32 *online_mask,
+                                      u64 busy_ticks[SCHEDULER_SMP_MAX_CPUS])
+{
+    mg_cpu_info_t entries[MG_CPU_SNAPSHOT_PAGE_MAX];
+    u32 count = 0;
+    u32 total = 0;
+    mg_cpu_snapshot_request_t request = {
+        .offset = 0U,
+        .result_capacity = MG_CPU_SNAPSHOT_PAGE_MAX,
+        .result = entries,
+        .out_count = &count,
+        .out_total = &total,
+    };
+    u32 mask = 0U;
+
+    if (!online_mask || busy_ticks == NULL ||
+        cpu_snapshot(&request) != MG_OK || total > MG_CPU_SNAPSHOT_PAGE_MAX)
+        return false;
+    for (u32 cpu = 0; cpu < SCHEDULER_SMP_MAX_CPUS; cpu++)
+        busy_ticks[cpu] = 0U;
+    for (u32 index = 0; index < count; index++) {
+        const mg_cpu_info_t *entry = &entries[index];
+        if (!(entry->flags & MG_CPU_FLAG_ONLINE))
+            continue;
+        if (entry->index >= SCHEDULER_SMP_MAX_CPUS)
+            return false;
+        mask |= 1U << entry->index;
+        busy_ticks[entry->index] = entry->busy_ticks;
+    }
+    *online_mask = mask;
+    return mask == ((1U << expected_cpus) - 1U);
+}
+
+static bool scheduler_smp_process_cpu(u64 pid, u32 *running_cpu)
+{
+    mg_process_info_t entries[MG_PROCESS_SNAPSHOT_PAGE_MAX];
+    u32 offset = 0U;
+    u32 count = 0U;
+    u32 total = 0U;
+
+    if (!running_cpu || !pid)
+        return false;
+    do {
+        mg_process_snapshot_request_t request = {
+            .offset = offset,
+            .result_capacity = MG_PROCESS_SNAPSHOT_PAGE_MAX,
+            .result = entries,
+            .out_count = &count,
+            .out_total = &total,
+        };
+        if (process_snapshot(&request) != MG_OK)
+            return false;
+        for (u32 index = 0; index < count; index++) {
+            if (entries[index].pid == pid) {
+                *running_cpu = entries[index].running_cpu;
+                return true;
+            }
+        }
+        offset += count;
+    } while (count && offset < total);
+    return false;
+}
+
+static mg_thread_result_t scheduler_smp_migration_worker(void *argument)
+{
+    scheduler_smp_migration_t *state = argument;
+    mg_thread_id_t first_id = 0U;
+    mg_thread_id_t current_id = 0U;
+    u32 previous_cpu = MG_PROCESS_CPU_NONE;
+    u64 pid = process_current_pid();
+
+    if (!state || !pid || mg_thread_self(&first_id) != MG_OK || !first_id) {
+        if (state) {
+            state->failed = 1U;
+            state->failure_code = 1U;
+        }
+        return 1U;
+    }
+    state->thread_id = first_id;
+    state->thread_stable = 1U;
+    state->start_ms = uptime_ms();
+    for (;;) {
+        u32 cpu = MG_PROCESS_CPU_NONE;
+        if (mg_thread_self(&current_id) != MG_OK) {
+            state->failed = 1U;
+            state->thread_stable = 0U;
+            state->failure_code = 2U;
+            break;
+        }
+        if (current_id != first_id) {
+            state->failed = 1U;
+            state->thread_stable = 0U;
+            state->failure_code = 3U;
+            break;
+        }
+        if (!scheduler_smp_process_cpu(pid, &cpu)) {
+            state->failed = 1U;
+            state->failure_code = 4U;
+            break;
+        }
+        if (cpu == MG_PROCESS_CPU_NONE ||
+            cpu == MG_PROCESS_CPU_MULTIPLE ||
+            cpu >= state->expected_cpus) {
+            state->failed = 1U;
+            state->failure_code = cpu == MG_PROCESS_CPU_NONE ? 5U :
+                cpu == MG_PROCESS_CPU_MULTIPLE ? 6U : 7U;
+            break;
+        }
+        state->cpu_mask |= 1U << cpu;
+        if (previous_cpu != MG_PROCESS_CPU_NONE && previous_cpu != cpu)
+            state->transitions++;
+        previous_cpu = cpu;
+        state->samples++;
+        if ((state->samples & 0x3fU) == 0U &&
+            uptime_ms() - state->start_ms >= SCHEDULER_SMP_MIGRATION_MS)
+            break;
+        __asm__ volatile("pause" ::: "memory");
+        /* Migration is independent from timer preemption. Periodically
+         * relinquish this one-worker process so another online CPU can claim
+         * the same thread from the shared ready queues. */
+        if (state->expected_cpus > 1U &&
+            (state->samples & 0x3fU) == 0U) {
+            if (process_yield() != MG_OK) {
+                state->failed = 1U;
+                state->failure_code = 8U;
+                break;
+            }
+            state->cooperative_yields++;
+        }
+    }
+    state->end_ms = uptime_ms();
+    u32 expected_mask = (1U << state->expected_cpus) - 1U;
+    if (!state->failed && state->expected_cpus == 1U &&
+        state->cpu_mask == 1U && state->transitions == 0U)
+        return 0U;
+    if (!state->failed && state->expected_cpus > 1U &&
+        (state->cpu_mask & expected_mask) &&
+        (state->cpu_mask & (state->cpu_mask - 1U)) &&
+        state->transitions > 0U)
+        return 0U;
+    if (!state->failed)
+        state->failure_code = 9U;
+    return 1U;
+}
+
+static int scheduler_smp_migration_child(u32 expected_cpus)
+{
+    u64 busy[SCHEDULER_SMP_MAX_CPUS];
+    u32 online_mask = 0U;
+    mg_thread_created_t thread;
+    mg_thread_result_t result = 1U;
+    char report[320];
+
+    memset(&scheduler_smp_migration, 0, sizeof(scheduler_smp_migration));
+    scheduler_smp_migration.expected_cpus = expected_cpus;
+    if (!scheduler_smp_cpu_snapshot(expected_cpus, &online_mask, busy))
+        return 20;
+    scheduler_smp_migration.online_mask = online_mask;
+    if (mg_thread_create(&thread, scheduler_smp_migration_worker,
+                         &scheduler_smp_migration) != MG_OK)
+        return 21;
+    mg_result_t joined = mg_thread_join(thread.handle, &result);
+    u32 expected_mask = (1U << expected_cpus) - 1U;
+    bool passed = joined == MG_OK && result == 0U &&
+        !scheduler_smp_migration.failed &&
+        scheduler_smp_migration.online_mask == expected_mask &&
+        (expected_cpus == 1U
+             ? scheduler_smp_migration.cpu_mask == expected_mask
+             : (scheduler_smp_migration.cpu_mask & expected_mask) &&
+               (scheduler_smp_migration.cpu_mask &
+                (scheduler_smp_migration.cpu_mask - 1U))) &&
+        (expected_cpus == 1U ? scheduler_smp_migration.transitions == 0U
+                             : scheduler_smp_migration.transitions > 0U);
+    int length = snprintf(report, sizeof(report),
+        "SCHED_MIGRATION pass=%u cpus=%u online_mask=%x thread=%llu "
+        "samples=%u cpu_mask=%x transitions=%u cooperative_yields=%u "
+        "thread_stable=%u joined=%u failure=%u start_ms=%llu end_ms=%llu\n",
+        passed ? 1U : 0U, expected_cpus, online_mask,
+        (unsigned long long)scheduler_smp_migration.thread_id,
+        scheduler_smp_migration.samples, scheduler_smp_migration.cpu_mask,
+        scheduler_smp_migration.transitions,
+        scheduler_smp_migration.cooperative_yields,
+        scheduler_smp_migration.thread_stable,
+        joined == MG_OK && result == 0U ? 1U : 0U,
+        scheduler_smp_migration.failure_code,
+        (unsigned long long)scheduler_smp_migration.start_ms,
+        (unsigned long long)scheduler_smp_migration.end_ms);
+    if (length <= 0 || (usize)length >= sizeof(report) ||
+        save_named_log("/temp/scheduler-migration.log", report) != 0)
+        return 22;
+    /* Keep the worker stack/TLS ownership alive through join, then permit its
+     * ordinary reaper path to release them before this child exits. */
+    return passed ? 0 : 23;
+}
+
+static mg_thread_result_t scheduler_smp_load_worker(void *raw)
+{
+    scheduler_smp_worker_arg_t *argument = raw;
+    volatile u64 checksum = (u64)argument->index + 1U;
+    u64 iterations = 0U;
+
+    atomic_fetch_add_explicit(&scheduler_smp_worker_started, 1U,
+                              memory_order_release);
+    while (!atomic_load_explicit(&scheduler_smp_worker_run,
+                                 memory_order_acquire) &&
+           !atomic_load_explicit(&scheduler_smp_worker_abort,
+                                 memory_order_acquire))
+        __asm__ volatile("pause" ::: "memory");
+    if (atomic_load_explicit(&scheduler_smp_worker_abort,
+                             memory_order_acquire))
+        return 1U;
+    while (atomic_load_explicit(&scheduler_smp_worker_run,
+                                memory_order_acquire)) {
+        checksum = (checksum * 6364136223846793005ULL) +
+                   (iterations | 1U);
+        iterations++;
+        if ((iterations & 0xfffU) == 0U)
+            atomic_fetch_add_explicit(&scheduler_smp_work_units, 4096U,
+                                      memory_order_relaxed);
+    }
+    scheduler_smp_worker_iterations[argument->index] = iterations;
+    scheduler_smp_worker_checksums[argument->index] = checksum;
+    return iterations ? 0U : 1U;
+}
+
+static int scheduler_smp_preemption_child(u32 expected_cpus)
+{
+    mg_thread_created_t threads[SCHEDULER_SMP_LOAD_WORKERS];
+    scheduler_smp_worker_arg_t arguments[SCHEDULER_SMP_LOAD_WORKERS];
+    u64 before[SCHEDULER_SMP_MAX_CPUS];
+    u64 after[SCHEDULER_SMP_MAX_CPUS];
+    u32 online_mask = 0U;
+    u32 after_mask = 0U;
+    u32 worker_count = expected_cpus + 1U;
+    u32 multiple_samples = 0U;
+    u64 start_ms;
+    u64 end_ms;
+    u32 created = 0U;
+    char busy_deltas[64] = {0};
+    char report[512];
+    usize delta_length = 0U;
+    bool passed = true;
+    u64 work_units;
+    u32 busy_mask = 0U;
+
+    atomic_store_explicit(&scheduler_smp_worker_started, 0U,
+                          memory_order_relaxed);
+    atomic_store_explicit(&scheduler_smp_worker_run, false,
+                          memory_order_relaxed);
+    atomic_store_explicit(&scheduler_smp_worker_abort, false,
+                          memory_order_relaxed);
+    atomic_store_explicit(&scheduler_smp_work_units, 0U,
+                          memory_order_relaxed);
+    atomic_store_explicit(&scheduler_smp_multiple_samples, 0U,
+                          memory_order_relaxed);
+    memset(scheduler_smp_worker_iterations, 0,
+           sizeof(scheduler_smp_worker_iterations));
+    memset(scheduler_smp_worker_checksums, 0,
+           sizeof(scheduler_smp_worker_checksums));
+    if (!scheduler_smp_cpu_snapshot(expected_cpus, &online_mask, before))
+        return 30;
+
+    for (u32 index = 0; index < worker_count; index++) {
+        arguments[index].index = index;
+        if (mg_thread_create(&threads[index], scheduler_smp_load_worker,
+                             &arguments[index]) != MG_OK) {
+            passed = false;
+            break;
+        }
+        created++;
+    }
+    if (created != worker_count) {
+        atomic_store_explicit(&scheduler_smp_worker_abort, true,
+                              memory_order_release);
+        for (u32 index = 0; index < created; index++) {
+            mg_thread_result_t result = 1U;
+            (void)mg_thread_join(threads[index].handle, &result);
+        }
+        return 31;
+    }
+
+    /* The worker entry points do not yield, sleep, or issue syscalls while
+     * waiting here. Since there are more spin-only workers than online CPUs,
+     * seeing every worker arrive requires a local timer to preempt a running
+     * worker and dispatch the remaining ready worker(s). */
+    u64 barrier_budget = 300000000ULL;
+    while (atomic_load_explicit(&scheduler_smp_worker_started,
+                                memory_order_acquire) != worker_count &&
+           barrier_budget--)
+        __asm__ volatile("pause" ::: "memory");
+    if (atomic_load_explicit(&scheduler_smp_worker_started,
+                             memory_order_acquire) != worker_count) {
+        atomic_store_explicit(&scheduler_smp_worker_abort, true,
+                              memory_order_release);
+        for (u32 index = 0; index < worker_count; index++) {
+            mg_thread_result_t result = 1U;
+            (void)mg_thread_join(threads[index].handle, &result);
+        }
+        return 32;
+    }
+
+    start_ms = uptime_ms();
+    atomic_store_explicit(&scheduler_smp_worker_run, true,
+                          memory_order_release);
+    while (uptime_ms() - start_ms < SCHEDULER_SMP_LOAD_MS) {
+        u32 cpu = MG_PROCESS_CPU_NONE;
+        if (scheduler_smp_process_cpu(process_current_pid(), &cpu) &&
+            cpu == MG_PROCESS_CPU_MULTIPLE) {
+            multiple_samples++;
+            atomic_store_explicit(&scheduler_smp_multiple_samples,
+                                  multiple_samples, memory_order_relaxed);
+        }
+        (void)process_sleep_ms(5U);
+    }
+    end_ms = uptime_ms();
+    atomic_store_explicit(&scheduler_smp_worker_run, false,
+                          memory_order_release);
+    for (u32 index = 0; index < worker_count; index++) {
+        mg_thread_result_t result = 1U;
+        if (mg_thread_join(threads[index].handle, &result) != MG_OK ||
+            result != 0U || !scheduler_smp_worker_iterations[index])
+            passed = false;
+    }
+    work_units = atomic_load_explicit(&scheduler_smp_work_units,
+                                      memory_order_relaxed);
+    if (!scheduler_smp_cpu_snapshot(expected_cpus, &after_mask, after))
+        passed = false;
+    for (u32 cpu = 0; cpu < expected_cpus; cpu++) {
+        u64 delta = after[cpu] >= before[cpu] ? after[cpu] - before[cpu] : 0U;
+        if (delta)
+            busy_mask |= 1U << cpu;
+        int written = snprintf(busy_deltas + delta_length,
+                               sizeof(busy_deltas) - delta_length,
+                               "%s%llu", cpu ? "," : "",
+                               (unsigned long long)delta);
+        if (written <= 0 || (usize)written >=
+                                sizeof(busy_deltas) - delta_length) {
+            passed = false;
+            break;
+        }
+        delta_length += (usize)written;
+    }
+    if (expected_cpus > 1U && multiple_samples == 0U)
+        passed = false;
+    if (busy_mask != ((1U << expected_cpus) - 1U) ||
+        after_mask != ((1U << expected_cpus) - 1U) || !work_units)
+        passed = false;
+    int length = snprintf(report, sizeof(report),
+        "SCHED_PREEMPT pass=%u cpus=%u online_mask=%x workers=%u "
+        "started=%u spin_barrier=1 cooperative_yields=0 "
+        "multi_samples=%u busy_mask=%x busy_delta=%s work_units=%llu "
+        "start_ms=%llu end_ms=%llu\n",
+        passed ? 1U : 0U, expected_cpus, online_mask, worker_count,
+        atomic_load_explicit(&scheduler_smp_worker_started,
+                             memory_order_acquire),
+        multiple_samples, busy_mask, busy_deltas,
+        (unsigned long long)work_units, (unsigned long long)start_ms,
+        (unsigned long long)end_ms);
+    if (length <= 0 || (usize)length >= sizeof(report) ||
+        save_named_log("/temp/scheduler-preempt.log", report) != 0)
+        return 33;
+    return passed ? 0 : 34;
+}
+
+static int scheduler_smp_test_main(const char *cpu_text)
+{
+    char *end = NULL;
+    unsigned long parsed = strtoul(cpu_text, &end, 10);
+    char cpu_argument[16];
+    const char *migration_argv[] = {
+        "/bin/threadtest", "scheduler-smp-migrate", cpu_argument
+    };
+    const char *preemption_argv[] = {
+        "/bin/threadtest", "scheduler-smp-preempt", cpu_argument
+    };
+    mg_result_t migration_child = MG_ERR_BAD_ARGUMENT;
+    mg_result_t preemption_child = MG_ERR_BAD_ARGUMENT;
+    mg_handle_t migration_handle = 0U;
+    mg_handle_t preemption_handle = 0U;
+    i32 migration_status = -1;
+    i32 preemption_status = -1;
+    char report[256];
+
+    if (!end || *end || parsed < 1U || parsed > SCHEDULER_SMP_MAX_CPUS)
+        return 40;
+    snprintf(cpu_argument, sizeof(cpu_argument), "%lu", parsed);
+    migration_child = process_spawn_argv(migration_argv, 3U);
+    if (migration_child > 0) {
+        migration_handle = (mg_handle_t)migration_child;
+        preemption_child = process_spawn_argv(preemption_argv, 3U);
+        if (preemption_child > 0) {
+            preemption_handle = (mg_handle_t)preemption_child;
+        } else {
+            (void)process_terminate(migration_handle, 42);
+            (void)process_wait(migration_handle, &migration_status);
+            (void)handle_close(migration_handle);
+        }
+    }
+    mg_result_t migration_wait = migration_handle
+        ? (migration_child > 0 && preemption_child > 0
+           ? process_wait(migration_handle, &migration_status) : MG_OK)
+        : MG_ERR_BAD_ARGUMENT;
+    mg_result_t preemption_wait = preemption_handle
+        ? process_wait(preemption_handle, &preemption_status)
+        : MG_ERR_BAD_ARGUMENT;
+    if (migration_handle && preemption_child > 0)
+        (void)handle_close(migration_handle);
+    if (preemption_handle)
+        (void)handle_close(preemption_handle);
+    bool passed = migration_child > 0 && preemption_child > 0 &&
+        migration_wait == MG_OK && preemption_wait == MG_OK &&
+        migration_status == 0 && preemption_status == 0;
+    int length = snprintf(report, sizeof(report),
+        "SCHED_SMP_RESULT pass=%u cpus=%lu migration_status=%d "
+        "preemption_status=%d concurrent_children=%u\n",
+        passed ? 1U : 0U, parsed, migration_status, preemption_status,
+        migration_child > 0 && preemption_child > 0 ? 1U : 0U);
+    if (length <= 0 || (usize)length >= sizeof(report) ||
+        save_named_log("/temp/scheduler-smp-result.log", report) != 0)
+        return 0;
+    /* Persist failure in the result record and return normally so the guest
+     * script can shut down. The host validator rejects pass=0 or any failed
+     * child status; allowing cleanup is not a test success. */
+    return 0;
+}
+
 #define SYSCALL_PROBE_UNMAPPED_RSP ((uintptr_t)0x0000700000000000ULL)
 
 static int save_log(const char *text)
 {
+    return save_named_log("/temp/thread-evidence.txt", text);
+}
+
+static int save_named_log(const char *path, const char *text)
+{
     mg_handle_t handle = 0;
     usize length = strlen(text);
-    mg_result_t result = file_create_contents("/temp/thread-evidence.txt", text,
+    mg_result_t result = file_create_contents(path, text,
                                                length, &handle);
     if (result < 0) return (int)result;
     return handle_close(handle) == MG_OK ? 0 : 1;
@@ -673,6 +1138,19 @@ static int verify_native_ipc(u64 baseline)
 
 int main(int argc, char **argv)
 {
+    if (argc == 3 && !strcmp(argv[1], "scheduler-smp"))
+        return scheduler_smp_test_main(argv[2]);
+    if (argc == 3 && (!strcmp(argv[1], "scheduler-smp-migrate") ||
+                      !strcmp(argv[1], "scheduler-smp-preempt"))) {
+        char *end = NULL;
+        unsigned long parsed = strtoul(argv[2], &end, 10);
+        if (!end || *end || parsed < 1U ||
+            parsed > SCHEDULER_SMP_MAX_CPUS)
+            return 45;
+        return !strcmp(argv[1], "scheduler-smp-migrate")
+            ? scheduler_smp_migration_child((u32)parsed)
+            : scheduler_smp_preemption_child((u32)parsed);
+    }
     if (argc == 3 && !strcmp(argv[1], "autonomous-target"))
         return autonomous_target(argv[2]);
     if (argc == 3 && (!strcmp(argv[1], "orphan-parent") ||

@@ -232,6 +232,7 @@ with tempfile.TemporaryDirectory(prefix='mangrove-guest-evidence-') as temp:
         else: raise AssertionError('timeout qualified')
     assert guest.qemu_cpu_count(SimpleNamespace()) == 1
     assert guest.qemu_cpu_count(SimpleNamespace(cpus=2)) == 2
+    assert guest.qemu_cpu_count(SimpleNamespace(cpus=4)) == 4
     assert guest.qemu_network_arguments(SimpleNamespace()) == [
         '-netdev', 'user,id=net0',
         '-device', 'e1000,netdev=net0,mac=52:54:00:18:01:01']
@@ -242,6 +243,9 @@ with tempfile.TemporaryDirectory(prefix='mangrove-guest-evidence-') as temp:
     assert guest.parse_smp_boot_log(
         '[SMP] discovered=1 online=1\n', 1) == {
             'discovered_cpus': 1, 'online_cpus': 1}
+    assert guest.parse_smp_boot_log(
+        '[SMP] final discovered=4 online=4\n', 4) == {
+            'discovered_cpus': 4, 'online_cpus': 4}
     for bad_smp_log in ('', '[SMP] final discovered=2 online=1\n',
                         '[SMP] final discovered=1 online=1\n',
                         '[SMP] discovered=1 online=1\n',
