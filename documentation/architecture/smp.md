@@ -239,10 +239,56 @@ syscall, so all workers entering the phase requires timer preemption to
 dispatch the oversubscribed workers. While they perform work, the guest
 requires a process snapshot showing simultaneous execution on multiple CPUs
 and positive scheduler busy-tick deltas on every online CPU. The 1-vCPU
-control rejects a multiple-CPU snapshot. These observations demonstrate the
-selected production scheduler paths in bounded QEMU KVM workloads; they do
-not establish fairness, physical-hardware behavior, or exhaustive race
-freedom.
+control rejects a multiple-CPU snapshot.
+
+With `SCHEDULER_CONTENTION_GUEST_TEST=1`, the same target also runs a bounded
+kernel workload against the production global queues and priority aging. It
+oversubscribes HIGH workers, keeps NORMAL and BACKGROUND workers runnable,
+and checks a timed BACKGROUND wakeup while all online CPUs do useful work.
+The diagnostic build counts acquisitions of the scheduler lock that observed
+contention and the failed observations/CAS attempts before acquisition. This
+observer is limited to that lock and retains IRQ-save and compare-exchange
+ownership semantics; the flag is disabled in normal builds. While the workload
+is active, a schedulable controller periodically calls
+`scheduler_validate_state()`, which checks ready-queue linkage, duplicate
+membership across priority queues, sleeping/ready exclusion, and running CPU
+ownership. The test also requires every worker to start and terminate, the
+final queue state to validate, and all worker objects to be reaped.
+
+The 2026-11-05 KVM matrix completed on 1, 2, and 4 vCPUs. Oversubscribed HIGH
+cohorts of 3, 5, and 9 workers all started and completed. NORMAL first ran at
+4999 ms and BACKGROUND at 5498–5499 ms; their recorded selected priority
+was HIGH after ready-wait aging, while their base priority remained unchanged.
+The timed BACKGROUND worker became ready at 300–301 ms, was observed promoted
+to HIGH at 800–801 ms, and returned from sleep at 749 ms. The controller
+recorded 56 valid queue snapshots in each run. At 1 vCPU there was no
+simultaneous execution or scheduler-lock contention, as expected. At 2 vCPUs
+the workload observed 763,635 overlap samples, 8,931 contended scheduler-lock
+acquisitions, and 151,366 wait iterations. At 4 vCPUs it observed 1,613,980
+overlap samples, 78,035 contended acquisitions, and 1,629,528 wait iterations.
+Timer preemption, context switching, all-CPU busy ticks, worker completion,
+and bounded wakeup progress were positive in every run. The useful-work loop
+counter advanced at approximately 37.2, 75.3, and 150.0 million iterations
+per second for the 1/2/4-vCPU workloads respectively; cohort size scales with
+CPU count, so these are workload observations rather than a scheduler
+benchmark or a per-thread fairness guarantee.
+
+These observations establish bounded progress for the tested priority and
+wakeup scenarios and quantify global-lock contention under this workload.
+They do not promise a maximum latency for arbitrary workloads, prove
+starvation freedom for every execution, or establish physical-hardware
+behavior or exhaustive race freedom. The existing global queue policy remains
+in place; the measurements did not demonstrate a bounded-progress defect that
+would justify a scheduler redesign.
+
+The reports are retained in `build/stage6-task3-qualification-make-final-20261105-*`;
+they record source-file hashes and verify the embedded diagnostic Pith
+(`8ad46586d8970fbc8b3399eff76c0f635686c1bd7ba59452faa0f574b28145ef`) and
+workload ELF. The normal diagnostic-disabled build used Pith
+`d9f6b4f93392927c70f9496becceaa8a9c98f67a751bcc97a0bd341de3c5c384`; its
+1/2/4-vCPU guests independently completed migration/preemption workloads and
+returned to Shoot with zero child status. The normal binary contains no
+`SCHED_CONTENTION` diagnostic string.
 
 The `test-slab-guest`, `test-hybrid-guest`, and `test-vmm-range-guest` targets
 also run with 1, 2, and 4 vCPUs. Guest witnesses require each requested CPU
