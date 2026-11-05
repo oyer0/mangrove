@@ -33,6 +33,8 @@ procedures. Source code is authoritative for implementation details.
   boundaries, and user control.
 - [Boot flow](architecture/boot.md): UEFI root selection, kernel loading, and
   handoff.
+- [USB device support](architecture/usb.md): xHCI enumeration, class binding,
+  and unsupported-device policy.
 - [Memory layout](architecture/memory.md): kernel regions, bootstrap mappings,
   and process address spaces.
 - [Kernel allocator architecture proposal](architecture/kernel-allocator-proposal.md):

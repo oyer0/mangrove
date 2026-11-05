@@ -179,6 +179,8 @@ This diagnostic adds no reads or retries; USB registration can succeed without
 partitions, while the required root role remains unavailable. The flashed disk's
 GPT must satisfy the [destination contract](../storage/image-layout.md#destination-capacity);
 the host flashing utility relocates compact-image metadata before native boot.
+USB class binding and the distinction between an unsupported class and a
+device setup failure are described in the [USB support contract](usb.md).
 
 ### Intel USB port routing
 
