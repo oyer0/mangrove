@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include <syscall.h>
+#include <input_diagnostics.h>
 #include <msr.h>
 #include <cpu.h>
 #include <scheduler.h>
@@ -2550,6 +2551,10 @@ static void syscall_dispatch_inner(syscall_frame_t *frame)
                     if (result == MG_OK)
                         memcpy((void *)(uintptr_t)frame->rdx, &event,
                                sizeof(event));
+#if PS2_INPUT_DIAGNOSTICS
+                    if (result == MG_OK && process_is_session_shell(process))
+                        INPUT_DIAG_INC(shoot_get);
+#endif
                     break;
                 }
                 case MG_TERMINAL_OP_UPDATE_BEGIN:

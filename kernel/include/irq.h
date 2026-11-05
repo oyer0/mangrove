@@ -94,6 +94,7 @@ static inline void irq_gate_reset(irq_gate_t *gate)
 #define IRQ_VECTOR_E1000    0x24U
 #define IRQ_VECTOR_ACPI_SCI 0x25U
 #define IRQ_VECTOR_LAPIC_TIMER 0x26U
+#define IRQ_VECTOR_PS2_AUX    0x27U
 #define IRQ_VECTOR_TLB_SHOOTDOWN 0x30U
 #define IRQ_VECTOR_FIRST    0x20U
 #define IRQ_VECTOR_LAST     IRQ_VECTOR_TLB_SHOOTDOWN

@@ -424,6 +424,7 @@ typedef enum {THREAD_STATE_RUNNING,THREAD_STATE_READY,THREAD_STATE_BLOCKED,THREA
 typedef struct kernel_thread {thread_state_t state;bool mutex_wake_pending,event_wake_pending;pthread_cond_t condition;struct process *process;} kernel_thread_t;
 kernel_thread_t *thread_current(void); bool scheduler_block(void); bool scheduler_sleep(u64);
 bool scheduler_wake_waiter(kernel_thread_t *);
+typedef enum {SCHEDULER_WAKE_FAILED,SCHEDULER_WAKE_DELIVERED,SCHEDULER_WAKE_ALREADY_TERMINATED} scheduler_wake_result_t;
 ''')
     (temp / 'process.h').write_text(r'''#pragma once
 #include <types.h>
@@ -444,7 +445,8 @@ void spin_unlock_irqrestore(spinlock_t *,u64);
     console_path = (ROOT / 'kernel/src/console.c').as_posix()
     keyboard_path = (ROOT / 'kernel/src/drivers/input/keyboard.c').as_posix()
     cfile = temp / 'test.c'
-    cfile.write_text(pre + function('scheduler_wake_waiter') +
+    cfile.write_text(pre + function('scheduler_wake_waiter_result') +
+                     function('scheduler_wake_waiter') +
                      function('scheduler_consume_pending_wake_locked') +
                      function('scheduler_clear_event_wake') +
                      f'\n#include "{console_path}"\n'

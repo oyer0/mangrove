@@ -7,6 +7,7 @@
 #include <mg/utf8.h>
 #include <spinlock.h>
 #include <input_trace.h>
+#include <input_diagnostics.h>
 
 #ifndef NULL
 #define NULL ((void *)0)
@@ -58,12 +59,15 @@ static void console_queue_key_event(u32 keycode, u32 modifiers,
             terminal_key_event_t *queued = &raw_input_queue[index];
 
             if ((queued->flags & TERMINAL_KEY_EVENT_REPEAT) != 0 &&
-                queued->keycode == keycode)
+                queued->keycode == keycode) {
+                INPUT_DIAG_INC(raw_merge);
                 return;
+            }
             index = (index + 1U) % CONSOLE_RAW_QUEUE_SIZE;
         }
     }
     if (raw_input_count == CONSOLE_RAW_QUEUE_SIZE) {
+        INPUT_DIAG_INC(raw_drop);
         return;
     }
     event = &raw_input_queue[raw_input_tail];
@@ -74,6 +78,8 @@ static void console_queue_key_event(u32 keycode, u32 modifiers,
     event->flags = flags & TERMINAL_KEY_EVENT_REPEAT;
     raw_input_tail = (raw_input_tail + 1U) % CONSOLE_RAW_QUEUE_SIZE;
     raw_input_count++;
+    INPUT_DIAG_INC(raw_put);
+    INPUT_DIAG_SET(raw_depth, raw_input_count);
     input_trace_record(INPUT_TRACE_QUEUE, keycode, flags, raw_input_count);
 }
 
@@ -123,6 +129,8 @@ void console_discard_key_repeats(u32 keycode)
     }
     raw_input_tail = write_index;
     raw_input_count = kept;
+    INPUT_DIAG_ADD(raw_cancel, queued - kept);
+    INPUT_DIAG_SET(raw_depth, kept);
     input_trace_record(INPUT_TRACE_CANCEL, keycode, queued - kept, kept);
     spin_unlock_irqrestore(&input_lock, saved_flags);
 }
@@ -277,6 +285,8 @@ static bool console_set_raw_input_mode(bool enabled,
         raw_input_owner = owner;
         raw_input_include_cooked = include_cooked;
         raw_input_enabled = true;
+        INPUT_DIAG_SET(raw_on, 1);
+        INPUT_DIAG_SET(raw_depth, 0);
         input_trace_raw(true);
     } else {
         if (preserve_text) {
@@ -303,6 +313,7 @@ static bool console_set_raw_input_mode(bool enabled,
             }
         }
         raw_input_enabled = false;
+        INPUT_DIAG_SET(raw_on, 0);
         raw_input_include_cooked = false;
         input_trace_raw(false);
         raw_input_owner = NULL;
@@ -314,6 +325,7 @@ static bool console_set_raw_input_mode(bool enabled,
         raw_input_head = 0;
         raw_input_tail = 0;
         raw_input_count = 0;
+        INPUT_DIAG_SET(raw_depth, 0);
     }
     spin_unlock_irqrestore(&input_lock, saved_flags);
     return true;
@@ -370,6 +382,8 @@ i64 console_read_key_event(u32 timeout_ms, terminal_key_event_t *event)
             *event = raw_input_queue[raw_input_head];
             raw_input_head = (raw_input_head + 1U) % CONSOLE_RAW_QUEUE_SIZE;
             raw_input_count--;
+            INPUT_DIAG_INC(raw_get);
+            INPUT_DIAG_SET(raw_depth, raw_input_count);
             input_trace_record(INPUT_TRACE_READ, event->keycode,
                                event->flags, raw_input_count);
             spin_unlock_irqrestore(&input_lock, saved_flags);

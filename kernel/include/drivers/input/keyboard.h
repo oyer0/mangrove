@@ -8,8 +8,8 @@
 typedef u8 keyboard_lock_state_t;
 
 /* A sink receives the logical lock state and must only publish the desired
- * transport state.  It must not block: keyboard reports are handled from the
- * xHCI event worker. */
+ * transport state. It must not block: callers include IRQ1 and the xHCI
+ * event worker. */
 typedef void (*keyboard_led_sink_t)(keyboard_lock_state_t state);
 
 #define KEYBOARD_LOCK_CAPS   (1U << 0)
@@ -20,6 +20,11 @@ void keyboard_init(void);
 void keyboard_update(void);
 keyboard_lock_state_t keyboard_get_lock_state(void);
 void keyboard_register_led_sink(keyboard_led_sink_t sink);
+
+/* Canonical key make/repeat from a native transport. HID usage identities and
+ * modifier bits match the existing terminal ABI. Releases belong to the
+ * transport's held-key state; the terminal ABI has no release event. */
+void keyboard_input_key(u8 key, u8 modifiers, bool repeat);
 
 /* xHCI identifies a keyboard report by the slot and boot-local device
  * instance that produced it.  Keep pressed/repeat state bound to that source:

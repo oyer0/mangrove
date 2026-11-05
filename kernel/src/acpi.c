@@ -31,6 +31,7 @@
 #define FADT_GPE1_LENGTH             93U
 #define FADT_GPE1_BASE               94U
 #define FADT_CENTURY                108U
+#define FADT_IAPC_BOOT_ARCH         109U
 #define FADT_FLAGS                  112U
 #define FADT_RESET_REGISTER         116U
 #define FADT_RESET_VALUE            128U
@@ -930,6 +931,15 @@ static void acpi_parse_fadt(const acpi_sdt_header_t *table)
     fadt_info = (acpi_fadt_info_t){0};
     fadt_info.revision = table->revision;
     fadt_info.length = length;
+
+    /* ACPI 1.0 reserved these bytes. ACPI 2.0+ bit 1 describes the
+     * motherboard's port 60/64 controller, not USB legacy emulation. */
+    if (table->revision >= 2 &&
+        fadt_field_present(length, FADT_IAPC_BOOT_ARCH, 2)) {
+        fadt_info.i8042_known = true;
+        fadt_info.i8042_present =
+            (fadt_u16(bytes, FADT_IAPC_BOOT_ARCH) & (1U << 1)) != 0;
+    }
 
     if (fadt_field_present(length, FADT_FIRMWARE_CONTROL, 4))
         fadt_info.firmware_control = fadt_u32(bytes, FADT_FIRMWARE_CONTROL);

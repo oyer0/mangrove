@@ -99,6 +99,8 @@ typedef struct
     u32 flags;
     u8 rtc_century_register;
     bool rtc_century_available;
+    bool i8042_known;
+    bool i8042_present;
     bool hardware_reduced;
     bool reset_supported;
     bool legacy_pm1_control;

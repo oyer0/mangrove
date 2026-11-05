@@ -164,7 +164,8 @@ with tempfile.TemporaryDirectory(prefix='mangrove-keyboard-smp-') as directory:
                '-Wall', '-Wextra', '-Werror', '-pthread',
                '-fsanitize=address,undefined', '-ffunction-sections',
                '-fdata-sections', '-I', str(temp), '-I', str(ROOT / 'kernel/include'),
-               '-I', str(ROOT / 'include'), '-Wl,--gc-sections',
+               '-I', str(ROOT / 'include'), '-idirafter', str(ROOT / 'libc/include'),
+               '-Wl,--gc-sections',
                str(cfile), '-o', str(binary)]
     subprocess.run(command, check=True)
     subprocess.run([str(binary)], check=True, timeout=30,

@@ -2,7 +2,6 @@
 #include <drivers/input/keyboard.h>
 #include <console.h>
 #include <editor_actions.h>
-#include <io.h>
 #include <spinlock.h>
 #include <stdbool.h>
 #include <timer.h>
@@ -10,15 +9,6 @@
 
 #define KEY_REPEAT_DELAY_MS 400
 #define KEY_REPEAT_RATE_MS  40
-#define PS2_STATUS_PORT 0x64U
-#define PS2_DATA_PORT   0x60U
-#define PS2_STATUS_INPUT_FULL  0x02U
-#define PS2_STATUS_OUTPUT_FULL 0x01U
-#define PS2_SET_LEDS            0xEDU
-#define PS2_ACK                 0xFAU
-#define PS2_RESEND              0xFEU
-#define PS2_MAX_RETRIES         3U
-#define PS2_WAIT_POLLS          100000U
 
 /* USB HID Usage ID for Caps Lock. */
 #define USB_HID_KEY_CAPS_LOCK 0x39U
@@ -29,78 +19,6 @@ static volatile keyboard_lock_state_t keyboard_locks;
 static spinlock_t keyboard_led_lock;
 static bool keyboard_led_lock_ready;
 static keyboard_led_sink_t keyboard_led_sink;
-/* The current input path deliberately disables the 8042 keyboard.  Keep this
- * transport state explicit so a future PS/2 input path can enable the same
- * lock-state/LED interface without changing its public semantics. */
-static bool ps2_keyboard_available;
-
-static bool ps2_wait_input_ready(void)
-{
-    for (u32 poll = 0; poll < PS2_WAIT_POLLS; poll++) {
-        if (!(inb(PS2_STATUS_PORT) & PS2_STATUS_INPUT_FULL))
-            return true;
-    }
-    return false;
-}
-
-static bool ps2_read_response(u8 *response)
-{
-    if (!response) return false;
-    for (u32 poll = 0; poll < PS2_WAIT_POLLS; poll++) {
-        if (inb(PS2_STATUS_PORT) & PS2_STATUS_OUTPUT_FULL) {
-            /* Every response byte is consumed here, including ACK/RESEND,
-             * so command protocol traffic cannot enter normal input. */
-            *response = inb(PS2_DATA_PORT);
-            return true;
-        }
-    }
-    return false;
-}
-
-static void ps2_flush(void)
-{
-    for (u32 poll = 0; poll < PS2_WAIT_POLLS; poll++) {
-        if (!(inb(PS2_STATUS_PORT) & PS2_STATUS_OUTPUT_FULL))
-            break;
-        (void)inb(PS2_DATA_PORT);
-    }
-}
-
-static u8 ps2_led_mask(keyboard_lock_state_t locks)
-{
-    u8 leds = 0;
-
-    if (locks & KEYBOARD_LOCK_SCROLL) leds |= 1U << 0;
-    if (locks & KEYBOARD_LOCK_NUM) leds |= 1U << 1;
-    if (locks & KEYBOARD_LOCK_CAPS) leds |= 1U << 2;
-    return leds;
-}
-
-/* Send the standard PS/2 0xED Set LEDs command.  This helper is intentionally
- * bounded and only enabled when an active PS/2 keyboard path owns the port. */
-static bool ps2_set_leds(keyboard_lock_state_t locks)
-{
-    u8 response;
-    u8 leds = ps2_led_mask(locks);
-
-    if (!ps2_keyboard_available)
-        return false;
-
-    for (u32 attempt = 0; attempt < PS2_MAX_RETRIES; attempt++) {
-        if (!ps2_wait_input_ready()) return false;
-        outb(PS2_DATA_PORT, PS2_SET_LEDS);
-        if (!ps2_read_response(&response)) return false;
-        if (response == PS2_RESEND) continue;
-        if (response != PS2_ACK) return false;
-
-        if (!ps2_wait_input_ready()) return false;
-        outb(PS2_DATA_PORT, leds);
-        if (!ps2_read_response(&response)) return false;
-        if (response == PS2_ACK) return true;
-        if (response != PS2_RESEND) return false;
-    }
-    return false;
-}
 
 static void keyboard_sync_leds(void)
 {
@@ -111,7 +29,6 @@ static void keyboard_sync_leds(void)
     if (!keyboard_led_lock_ready) return;
     flags = spin_lock_irqsave(&keyboard_led_lock);
     locks = __atomic_load_n(&keyboard_locks, __ATOMIC_ACQUIRE);
-    (void)ps2_set_leds(locks);
     sink = keyboard_led_sink;
     if (sink)
         sink(locks);
@@ -162,7 +79,6 @@ void keyboard_register_led_sink(keyboard_led_sink_t sink)
     flags = spin_lock_irqsave(&keyboard_led_lock);
     keyboard_led_sink = sink;
     locks = __atomic_load_n(&keyboard_locks, __ATOMIC_ACQUIRE);
-    (void)ps2_set_leds(locks);
     if (keyboard_led_sink)
         keyboard_led_sink(locks);
     spin_unlock_irqrestore(&keyboard_led_lock, flags);
@@ -170,28 +86,14 @@ void keyboard_register_led_sink(keyboard_led_sink_t sink)
 
 static void usb_keyboard_sources_init(void);
 
-/*
- * Disable PS/2 hardware entirely so only USB handles keyboard input.
- */
+/* Logical input state is initialized early. Physical transports start only
+ * after their bus, clock and interrupt routing are available. */
 void keyboard_init(void)
 {
     spinlock_init(&keyboard_led_lock);
     keyboard_led_lock_ready = true;
     usb_keyboard_sources_init();
     __atomic_store_n(&keyboard_locks, 0, __ATOMIC_RELEASE);
-    ps2_keyboard_available = false;
-
-    /* Wait for the 8042 input buffer to be empty before disabling the legacy
-     * ports.  The USB HID path is the active keyboard source today. */
-    (void)ps2_wait_input_ready();
-    outb(PS2_STATUS_PORT, 0xAD);
-
-    (void)ps2_wait_input_ready();
-    outb(PS2_STATUS_PORT, 0xA7);
-
-    /* Explicitly synchronize the initial logical state when a transport is
-     * available.  It is a no-op for the intentionally disabled PS/2 path. */
-    ps2_flush();
     keyboard_sync_leds();
 }
 
@@ -251,6 +153,10 @@ static void usb_keyboard_sources_init(void)
 }
 
 static char hid_to_ascii(u8 key, bool is_shift) {
+    /* These keypad keys have distinct identities, but invariant text even
+     * with Shift held. Both native PS/2 and USB retain those identities. */
+    if (key == 0x58U) return '\n';
+    if (key == 0x54U) return '/';
     if (key >= 128) return 0;
     return is_shift ? usb_hid_to_ascii_upper[key] : usb_hid_to_ascii_lower[key];
 }
@@ -368,6 +274,40 @@ static bool modifier_shift(u8 modifiers)
 static bool modifier_alt(u8 modifiers)
 {
     return (modifiers & 0x04) || (modifiers & 0x40);
+}
+
+/* Both transports publish through the same console queues and keymap. No
+ * device I/O or waiting is allowed here: PS/2 calls from IRQ1. */
+static bool emit_key_press(u8 key, u8 modifiers, bool repeat)
+{
+    bool control = modifier_control(modifiers);
+    bool shift = modifier_shift(modifiers);
+    bool alt = modifier_alt(modifiers);
+    if (key == 0x06U && control && !shift && !alt && !(modifiers & 0x88U)) {
+        if (!repeat) (void)console_control_c();
+        return false;
+    }
+    if (console_raw_input_active())
+        return emit_raw_key(key, modifiers, shift, repeat);
+    if (emit_editor_action(key_to_editor_action(key, control, shift, alt)))
+        return true;
+    if (control || alt) return false;
+    char c = hid_to_ascii_with_locks(key, shift);
+    if (c) console_input(c);
+    return c != 0;
+}
+
+void keyboard_input_key(u8 key, u8 modifiers, bool repeat)
+{
+    u8 lock = hid_lock_for_key(key);
+    if (lock) {
+        if (!repeat) {
+            keyboard_toggle_lock_state(lock);
+            keyboard_sync_leds();
+        }
+        return;
+    }
+    (void)emit_key_press(key, modifiers, repeat);
 }
 
 static void begin_repeat(usb_keyboard_source_t *source, u8 key,
@@ -493,9 +433,6 @@ void usb_keyboard_remove(u8 slot_id, u64 device_generation)
 void usb_keyboard_handler(u8 slot_id, u64 device_generation,
                           u8 modifier_mask, const u8 *key_codes, u8 count)
 {
-    bool is_control = modifier_control(modifier_mask);
-    bool is_shift = modifier_shift(modifier_mask);
-    bool is_alt = modifier_alt(modifier_mask);
     u8 newly_pressed_key = 0;
     bool sync_leds = false;
     usb_keyboard_source_t *source;
@@ -547,8 +484,6 @@ void usb_keyboard_handler(u8 slot_id, u64 device_generation,
         }
 
         if (is_new && key < 128) {
-            char c;
-
             if (hid_lock_for_key(key) != 0) {
                 /* HID reports retain held keys, so this branch is reached
                  * only for the make transition and never for repeat/release. */
@@ -556,35 +491,8 @@ void usb_keyboard_handler(u8 slot_id, u64 device_generation,
                 sync_leds = true;
                 continue;
             }
-            if (key == 0x06U && is_control && !is_shift && !is_alt &&
-                !(modifier_mask & 0x88U)) {
-                (void)console_control_c();
-                continue;
-            }
-            editor_action_t action = key_to_editor_action(
-                key, is_control, is_shift, is_alt);
-
-            if (console_raw_input_active()) {
-                if (emit_raw_key(key, modifier_mask, is_shift, false))
-                    newly_pressed_key = key;
-                continue;
-            }
-
-            if (emit_editor_action(action)) {
+            if (emit_key_press(key, modifier_mask, false))
                 newly_pressed_key = key;
-                continue;
-            }
-
-            /* Control and application-modified printable keys are not text
-             * in cooked mode. In particular, Ctrl+C/D/L must not leak as
-             * the letters c/d/l to simple byte-oriented readers. */
-            if (is_control || is_alt) continue;
-
-            c = hid_to_ascii_with_locks(key, is_shift);
-            if (c) {
-                console_input(c);
-                newly_pressed_key = key;
-            }
         }
     }
 

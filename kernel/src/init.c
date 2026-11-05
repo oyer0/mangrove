@@ -48,6 +48,7 @@
 #include <mangrove_errors.h>
 #include <identity.h>
 #include <drivers/input/keyboard.h>
+#include <drivers/input/ps2_keyboard.h>
 #include <session.h>
 #include <ipc.h>
 #include <smp.h>
@@ -151,12 +152,19 @@ static init_result_t init_irq_routing(const char **reason)
 
     u8 apic_id = lapic_current_id();
     if (!ioapic_route_gsi(acpi_irq_to_gsi(0), IRQ_VECTOR_PIT, apic_id,
-                          acpi_irq_flags(0)) ||
-        !ioapic_route_gsi(acpi_irq_to_gsi(1), IRQ_VECTOR_PS2, apic_id,
-                          acpi_irq_flags(1))) {
-        *reason = "PIT/PS2 I/O APIC route failed";
+                          acpi_irq_flags(0))) {
+        *reason = "PIT I/O APIC route failed";
         return INIT_RESULT_FAILED;
     }
+
+    /* Optional transport: a USB-only machine must still boot. Initialization
+     * owns command replies while CPU interrupts are off; IRQ1 owns scan bytes
+     * after the controller has enabled scanning and installed its handler. */
+    const char *keyboard_reason;
+    bool keyboard_ready = ps2_keyboard_init(&keyboard_reason);
+    KERNEL_BOOT_DEBUG_LOG("[INPUT] PS/2 %s: %s\n",
+                          keyboard_ready ? "ready" : "unavailable",
+                          keyboard_reason);
 
     const acpi_fadt_info_t *fadt = acpi_fadt_get();
     if (fadt && fadt->sci_interrupt < 256U) {

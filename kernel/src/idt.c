@@ -11,6 +11,7 @@
 #include <kernel_stack.h>
 #include <kprint.h>
 #include <smp.h>
+#include <input_diagnostics.h>
 
 static struct idt_entry idt[256];
 static struct idt_ptr   idt_pointer;
@@ -165,6 +166,8 @@ void irq_handler(struct cpu_registers *regs)
 
     if (lapic_enabled()) {
         lapic_eoi();
+        if (regs->vec_no == IRQ_VECTOR_PS2) INPUT_DIAG_INC(eoi1);
+        if (regs->vec_no == IRQ_VECTOR_PS2_AUX) INPUT_DIAG_INC(eoi12);
     }
 
     /* The IRQ is acknowledged before arranging deferred preemption. */

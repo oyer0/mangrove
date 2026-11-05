@@ -1,5 +1,50 @@
 # Mangrove Test Suite (MTS)
 
+`make test-ps2-keyboard` exercises production i8042 setup, translated scancodes,
+IRQ dispatch, common EOI handling and keyboard delivery against host port-I/O
+fixtures, including missing hardware, bounded ACK/RESEND failures, AUX reply
+demultiplexing, concurrent USB reports and 12,000 rapid make/break cycles with
+interleaved AUX packets. It runs with diagnostic counters both off and on and
+is also a prerequisite of `make test-terminal`.
+The [keyboard transport contract](../architecture/terminal.md) describes the
+supported event model and remaining limitations. Its protocol references are
+the IBM *Personal System/2 Hardware Interface Technical Reference*, May 1988,
+Keyboard and Auxiliary Device Controller / Keyboards sections
+([archived vendor reference](https://ftpmirror.your.org/pub/misc/bitsavers/pdf/ibm/pc/ps2/Personal_System_2_Hardware_Interface_Technical_Reference_May88.pdf)),
+and the [ACPI FADT IA-PC boot architecture flags](https://uefi.org/specs/ACPI/6.5/05_ACPI_Software_Programming_Model.html#ia-pc-boot-architecture-flags).
+
+For native command-delivery qualification, build an isolated compact USB image
+and run:
+
+```sh
+make -j4 BUILD_DIR=build/keyboard-guest usb-image
+python3 tests/guest/guest_keyboard_test.py \
+  --image build/keyboard-guest/Mangrove/MangroveUSB.img --accel kvm
+```
+
+This runner boots copies of that image with PS/2 only, USB only (i8042 disabled),
+and both devices. It injects keystrokes, requires return to Shoot's prompt,
+then checks the exact marker and `help`/`list` output files offline after QEMU
+exits. Twenty further rounds type a varying alphabet/digit payload into
+separate files, each checked byte for byte after QEMU stops; `--rounds` sets
+1–100 rounds. It does not treat an idle prompt or echoed command as success. Firmware
+discovery and `OVMF_CODE_SOURCE`/`OVMF_VARS_SOURCE` overrides follow the normal
+guest runners. `--mode` selects one topology. `--output` must be new and retains
+screenshots, command outputs and reports; successful runs remove their copied
+disk and firmware variables. Omitted output uses an owned disposable workspace.
+KVM results do not establish physical keyboard behavior.
+
+`--inject-aux` additionally pauses emulated CPUs after the initial commands,
+uses QEMU's test I/O interface to place an AUX-tagged byte into the i8042 output
+buffer with command D3, and resumes execution. No host code consumes the byte:
+the test requires the guest's IRQ12 receiver to clear OBF before sustained
+typing resumes. It preserves other controller bits and records the before/after
+status. This catches the former unowned-AUX stall through real emulated
+controller/interrupt delivery. It is skipped for the topology without i8042.
+Only isolated virtual hardware is manipulated; the guest kernel contains no
+fault-injection control. `PS2_INPUT_DIAGNOSTICS=1` enables the live footer
+described in the terminal contract.
+
 Host and guest tests are grouped by subsystem under `tests/`: `kernel/`,
 `memory/`, `network/`, `storage/`, `terminal/`, `userspace/`, and `guest/`.
 Filesystem coverage is split into `filesystems/{mgfs,fat32,exfat,vfs,stress,mfqs}/`;

@@ -49,12 +49,52 @@ then enables the cursor immediately before its first blocking read. Fullscreen
 applications manage visibility through the same terminal API and restore the
 saved normal-screen cursor state when they leave the alternate screen.
 
-The normal input path turns USB keyboard text into UTF-8 bytes in a bounded
+Keyboard input supports USB HID and an optional native i8042 keyboard port.
+Early `keyboard_init()` initializes logical input state without touching either
+i8042 port. After ACPI, the monotonic clock and I/O APIC are ready, and before
+CPU interrupts are enabled, the native driver checks the FADT's i8042 presence
+flag when available. Older firmware without that flag uses a bounded legacy
+probe. An absent controller, failed port test, command/ACK timeout or unavailable
+IRQ route leaves PS/2 unavailable without failing USB-only boot. The exact
+initialization result is retained in the kernel boot log.
+
+The driver disables keyboard scanning during setup, selects keyboard Set 2,
+enables i8042 translation and verifies the controller configuration, then
+enables scanning and IRQ1. Its decoder therefore consumes **translated Set 1**
+bytes, not physical Set 2 bytes. Setup waits use interrupt-independent monotonic
+deadlines (100 ms per wait) and an additional finite polling bound; RESEND is
+limited to three sends per command byte. No controller reset/self-test, AUX
+clock enable/disable or mouse commands are issued. The controller has one
+shared output buffer: initialization retires stale data from both ports and
+skips AUX data while awaiting keyboard/controller replies. AUX bytes are
+never interpreted as ACKs or scancodes.
+
+The shared receiver owns IRQ1 (vector 0x21) and IRQ12 (vector 0x27), routed
+through the ACPI ISA overrides to the same BSP APIC. Both controller receive
+interrupts are enabled only after their handlers/routes are installed. AUX
+clock state and mouse protocol are preserved. Either handler drains already
+available bytes from the shared output buffer, up to 32 per invocation,
+without waiting. AUX data has no native input consumer and is discarded;
+leaving it unconsumed could obstruct later keyboard bytes. There is no native
+touchpad/pointer input support in this path.
+
+Make/break state tracks independent left/right
+modifiers, lock transitions and hardware typematic repeats. E0 navigation,
+Print Screen's fake shifts and Pause's E1 sequence are decoded separately.
+Keyboard parity/timeout errors reset decoder state. The common IRQ dispatcher
+acknowledges each delivered IRQ through the local APIC before preemption;
+both legacy PICs remain masked.
+PS/2 uses hardware typematic, so the USB software repeat timer does not create
+a second repeat stream. PS/2 lock state is logical; its LEDs are cleared during
+setup but runtime PS/2 LED updates are not implemented. USB LED updates continue
+through the existing nonblocking transport sink.
+
+The normal input path turns keyboard text into UTF-8 bytes in a bounded
 console queue. Reads block through the scheduler until input arrives. An
 interactive process may claim the versioned `mg/terminal.h` key-event input
 mode while the normal screen is active; only that process may read those
 events. During an alternate-screen session, only its owner may claim and read
-events. The event includes USB HID key identity, modifier state, text
+events. Both transports use the same HID key identity, modifier state, text
 codepoint, and repeat state, but not a separate key-release event. An event
 reader claimed on the normal screen drains bytes queued before its claim as
 byte-tagged events. Alternate-screen clients retain the event-only queue
@@ -134,8 +174,27 @@ reverse order. LED transport synchronization occurs after releasing the
 keyboard-source lock. A raw client has at most one queued repeat per keycode.
 When a newly pressed key takes over repeat generation on a USB source, a
 pending repeat for the previous key is discarded. Releasing the active key
-also cancels its pending repeats. Initial keypress events are preserved, and
+also cancels its pending repeats. PS/2 decoder state belongs exclusively to
+the BSP's shared i8042 receive handler after initialization; it publishes through the same
+IRQ-safe console queues as USB and has no polling producer. Initial keypress
+events are preserved, and
 already-consumed events cannot be withdrawn.
+
+`PS2_INPUT_DIAGNOSTICS=1` enables a four-row live footer outside the terminal
+ring and cursor area; normal builds have no footer, counters or reserved rows.
+The existing blink worker refreshes it without needing keyboard input and
+without acquiring the console input lock. It reports IRQ1/IRQ12 entry and EOI
+counts, keyboard/AUX bytes, decoded makes/repeats, keyboard errors, protocol
+bytes, full receive budgets, raw queue puts/drops/coalescing/cancellations,
+dequeues/depth and successful key-event returns to the Shoot process. `Shoot`
+counts kernel event delivery, not completed shell commands. Snapshots are
+approximate atomic observations. Live controller status and PIC masks are
+read without consuming data; the observer never reads port 0x60 or issues
+commands. Configuration values show the byte read after keyboard quiesce and
+the requested receive configuration, alongside initial ACPI routes/flags and
+the destination APIC ID. They are not periodic configuration-register reads.
+Status, PIC masks, configuration, flags and last-byte values are hexadecimal;
+counters, milliseconds, GSI numbers and APIC IDs are decimal.
 
 Process console writes check alternate-screen ownership and render their full
 buffer while holding one terminal lock acquisition. A concurrent screen

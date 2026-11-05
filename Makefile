@@ -339,6 +339,11 @@ INPUT_TRACE_DIAGNOSTICS ?= 0
 ifeq ($(INPUT_TRACE_DIAGNOSTICS),1)
 KERNEL_CFLAGS += -DINPUT_TRACE_DIAGNOSTICS=1
 endif
+PS2_INPUT_DIAGNOSTICS ?= 0
+ifneq ($(filter-out 0 1,$(PS2_INPUT_DIAGNOSTICS)),)
+$(error PS2_INPUT_DIAGNOSTICS must be 0 or 1)
+endif
+KERNEL_CFLAGS += -DPS2_INPUT_DIAGNOSTICS=$(PS2_INPUT_DIAGNOSTICS)
 KERNEL_LDFLAGS := -z max-page-size=0x1000 -T kernel/linker.ld -Map=$(KERNEL_MAP)
 
 USER_CFLAGS := -std=gnu17 -ffreestanding -fno-asynchronous-unwind-tables -fno-stack-protector \
@@ -1005,8 +1010,17 @@ test-terminal-api:
 		-o $(HOST_TEST_DIR)/mangrove-terminal-stream-api-test
 	ASAN_OPTIONS=detect_leaks=0 $(HOST_TEST_DIR)/mangrove-terminal-stream-api-test
 
+.PHONY: test-ps2-keyboard
+test-ps2-keyboard:
+	python3 tests/terminal/ps2_keyboard_test.py "$(HOST_CC)"
+	$(HOST_CC) -std=gnu17 -Wall -Wextra -Werror -fno-builtin \
+		-fsanitize=address,undefined -ffunction-sections -fdata-sections \
+		$(HOST_TERMINAL_RENDER_INCLUDES) tests/kernel/acpi_i8042_test.c \
+		-Wl,--gc-sections -o $(HOST_TEST_DIR)/mangrove-acpi-i8042-test
+	ASAN_OPTIONS=detect_leaks=0 $(HOST_TEST_DIR)/mangrove-acpi-i8042-test
+
 .PHONY: test-terminal
-test-terminal: test-terminal-api test-table-literal-output
+test-terminal: test-terminal-api test-table-literal-output test-ps2-keyboard
 	python3 tests/terminal/framebuffer_rect_test.py "$(HOST_CC)"
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
 		-fsanitize=address,undefined -ffunction-sections -fdata-sections \

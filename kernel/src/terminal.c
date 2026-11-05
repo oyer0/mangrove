@@ -14,6 +14,7 @@
 #include <string.h>
 #include <input_trace.h>
 #include <x250_boot_trace.h>
+#include <input_diagnostics.h>
 #if INPUT_TRACE_DIAGNOSTICS
 #include <cpu.h>
 #endif
@@ -446,6 +447,34 @@ static void terminal_overlay_render_locked(void)
         terminal_render_overlay_row_locked(row);
 }
 
+#if PS2_INPUT_DIAGNOSTICS
+/* Reserved diagnostic rows are outside the terminal ring and cursor area.
+ * Rendering runs from the existing blink worker, never from an input IRQ and
+ * never while holding the input queue lock. */
+static void terminal_input_diagnostics_locked(void)
+{
+    static u64 last_update;
+    char lines[INPUT_DIAGNOSTIC_ROWS][INPUT_DIAGNOSTIC_COLUMNS];
+    u64 now = timer_uptime_ms();
+    if (!terminal.cursor_enabled || now - last_update < 250U) return;
+    u32 y = TERMINAL_MARGIN_Y + terminal.visible_rows * terminal_line_height();
+    u32 height = INPUT_DIAGNOSTIC_ROWS * terminal_line_height();
+    if (y > terminal.height || height > terminal.height - y) return;
+    last_update = now;
+    input_diagnostics_lines(lines);
+    framebuffer_fill_rows(y, height, 0);
+    for (u32 row = 0; row < INPUT_DIAGNOSTIC_ROWS; row++) {
+        for (u32 col = 0; col < terminal.visible_cols &&
+                          col < INPUT_DIAGNOSTIC_COLUMNS && lines[row][col]; col++) {
+            draw_codepoint((u8)lines[row][col],
+                TERMINAL_MARGIN_X + col * font_width(),
+                y + row * terminal_line_height(), 0x00FFFF00U, 0);
+        }
+    }
+    framebuffer_flush_rows(y, height);
+}
+#endif
+
 /* Canonical renderer: defines authoritative reference output for any terminal state */
 static void terminal_redraw_locked(void) {
     stats.full_redraw_count++;
@@ -551,6 +580,10 @@ void terminal_init(BOOT_INFO *BootInfo){
     if (!terminal.visible_rows) terminal.visible_rows = 1U;
     if (terminal.visible_rows > TERMINAL_BUFFER_ROWS)
         terminal.visible_rows = TERMINAL_BUFFER_ROWS;
+#if PS2_INPUT_DIAGNOSTICS
+    if (terminal.visible_rows > INPUT_DIAGNOSTIC_ROWS + 4U)
+        terminal.visible_rows -= INPUT_DIAGNOSTIC_ROWS;
+#endif
     x250_boot_trace_event(BootInfo, 29, true,
                           "09.4.2 terminal dimensions ready");
 
@@ -745,6 +778,9 @@ void terminal_cursor_blink_poll(void)
 {
     u64 now;
     u64 saved_flags = spin_lock_irqsave(&terminal_lock);
+#if PS2_INPUT_DIAGNOSTICS
+    terminal_input_diagnostics_locked();
+#endif
 
     if (!terminal.cursor_enabled || terminal.batch_active ||
         presentation_pending ||
