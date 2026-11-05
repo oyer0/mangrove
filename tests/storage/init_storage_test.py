@@ -17,6 +17,12 @@ static void *g_xhc;
 static init_state_t state;
 static unsigned devices;
 static unsigned usb_devices;
+static unsigned waits;
+static init_result_t wait_result;
+static bool publish_device;
+static init_result_t init_await_boot_discovery(bool root_required,const char **reason) {
+ assert(!root_required);(void)reason;waits++;if(publish_device)devices=3;return wait_result;
+}
 init_state_t kernel_init_state(init_id_t id) { assert(id == INIT_XHCI); return state; }
 static unsigned block_device_count(void) { return devices; }
 static unsigned xhci_storage_device_count(void) { return usb_devices; }
@@ -32,6 +38,11 @@ int main(void) {
     state = INIT_INITIALIZING; assert(init_storage(&reason) == INIT_RESULT_UNAVAILABLE);
     state = INIT_FAILED; assert(init_storage(&reason) == INIT_RESULT_UNAVAILABLE);
     state = INIT_READY; devices = 0; assert(init_storage(&reason) == INIT_RESULT_UNAVAILABLE);
+    wait_result=INIT_RESULT_FAILED;
+    assert(init_storage(&reason)==INIT_RESULT_FAILED);
+    wait_result=INIT_RESULT_OK;publish_device=true;devices=0;
+    assert(init_storage(&reason)==INIT_RESULT_OK&&devices==3);
+    publish_device=false;
     g_xhc = NULL; devices = 1; assert(init_storage(&reason) == INIT_RESULT_OK);
     devices = 0; assert(init_storage(&reason) == INIT_RESULT_UNAVAILABLE);
 }

@@ -118,3 +118,110 @@ before control enters PID 1.
 - `boot/src/handoff.s` and `kernel/src/entry.s`
 - `include/bootinfo.h` and `include/address_layout.h`
 - `kernel/src/main.c`
+
+## Native USB root discovery
+
+Pith enables and verifies PCI memory access and bus mastering before initializing
+xHCI. Firmware Block I/O is unavailable after handoff; a USB root therefore
+requires native USB enumeration, a supported mass-storage interface, successful
+BOT inquiry/readiness/capacity commands, block registration, and GPT role
+discovery before root selection. An internal SATA disk can satisfy the
+storage callback while the USB root is absent. Root selection still requires
+exactly one registered `MANGROVE_ROOT` partition with a valid MGFS probe.
+
+The xHCI boot quiescence gate rejects outstanding port work, enumeration
+admission, commands, transfers, and event work. Both READY and FAILED port
+states are terminal for that gate. Before accepting quiescence, the boot caller
+requests a fresh event-worker pass and waits for its acknowledgement after
+event dispatch and port work. This also drains events queued while MSI-X is
+masked, even if the first CCS scan and software work flags were empty. Only
+the worker consumes the Event Ring. A missing acknowledgement or unfinished
+work fails the bounded boot deadline. Controller callback success means the
+current work drained; it does not guarantee that later attachments have arrived
+or that a USB mass-storage disk was found. Bootstrap interrupt acknowledgement
+does not clear PORTSC change flags: the event owner acknowledges those only
+after dispatching their connection state.
+
+Before selecting root, the bootstrap thread grants native xHCI discovery up to
+ten seconds to publish a GPT partition with the exact required root role. It
+returns as soon as that role is present and a fresh owner pass has drained
+outstanding setup. With no registered disk, the storage callback first grants
+up to ten seconds for any block registration before rejecting its required
+dependency. An unrelated disk satisfies storage admission and then root
+discovery must still find the exact required role. Each wait has one fixed
+deadline; an idle pass, an unrelated disk, or an enumeration failure does not
+extend it or constitute root readiness. MGFS probing, duplicate-role rejection,
+and mount validation still run after this fence and retain their exact errors.
+
+The wait parks the bootstrap thread through `scheduler_sleep`, with no block
+I/O or VFS locks held; its readiness predicate reads registration metadata only.
+The event worker continues to own event consumption, port setup, USB transport,
+and GPT publication. That worker cannot call the wait on itself. Requested
+boot passes also reconcile previously unhandled CCS levels, including an attach
+whose CSC has already cleared, without resetting READY/FAILED ports, replacing
+live device slots, or duplicating queued/admitted setup. These bounded passes
+allow boot discovery progress even when a device interrupt is absent. They do
+not replace runtime interrupt routing or retry a failed enumeration.
+
+CCS alone does not permit enumeration. The reset entry accepts a powered USB2
+Polling/disabled link or an enabled U0 link. Inactive, suspended, unpowered,
+resetting, or otherwise unsupported states fail explicitly without speculative
+recovery writes. In particular, PORTSC `0x6c1` means CCS=1, PED=0, PP=1,
+PLS=6 (Inactive), speed ID=1, with no change bits; USB2 awaiting reset maps to
+PLS=7 (Polling), not Inactive. See xHCI section 5.4.8 and table 5-28 in the
+[xHCI specification](https://www.intel.com/content/dam/www/public/us/en/documents/technical-specifications/extensible-host-controler-interface-usb-xhci.pdf).
+The opt-in trace reports per-port raw state, PLS, PP, setup status/reason, USB
+mass-storage count, and root-role inventory after the discovery opportunity,
+distinguishing absent ports, unusable links, failed setup, and unrelated disks.
+USB GPT scanning also reports its exact validation result before block
+publication: `VALID`, `READ_FAILED`, `INVALID`, `ABSENT`, or `UNSUPPORTED`.
+This diagnostic adds no reads or retries; USB registration can succeed without
+partitions, while the required root role remains unavailable. The flashed disk's
+GPT must satisfy the [destination contract](../storage/image-layout.md#destination-capacity);
+the host flashing utility relocates compact-image metadata before native boot.
+
+### Intel USB port routing
+
+On Broadwell/Wildcat Point-LP xHCI (`8086:9cb1`), controller ownership and USB
+pin routing are separate operations. Pith sets the legacy OS Owned semaphore
+even when BIOS Owned is already clear, completes the handoff/reset, then
+configures permitted routes before starting the controller and probing ports.
+
+Intel datasheet [330837-002](https://www.intel.com/content/dam/www/public/us/en/documents/datasheets/core-m-processor-platform-i-o-datasheet.pdf),
+table 1-4 and sections 13.1.33–13.1.36, define the policy. PCI D0 selects xHCI
+for USB2 pins; D4 authorizes which selectors software may change. D8 enables
+SuperSpeed visibility; DC authorizes which enables software may change. The
+implemented fields cover eight switchable USB2 ports and four SuperSpeed ports.
+The driver ORs only firmware-authorized bits in those fields into the existing
+selectors, enabling SuperSpeed visibility before transferring USB2 pins. It
+preserves all other bits and never writes either permission register. Already
+configured routes cause no writes. Inaccessible configuration or a failed
+write readback prevents controller start; no retry or forced permission change
+is performed. Other controller IDs receive no configuration accesses through
+this routing helper.
+
+Firmware-denied ports retain their existing owner. Pith has no native EHCI
+driver, so an EHCI-only device cannot supply the native root filesystem.
+`X250_BOOT_TRACE=1` reports permitted masks and before/after selectors alongside
+normal discovery results. A successful routing readback does not prove device
+enumeration, mass-storage readiness, or a mounted root filesystem.
+
+### Port visibility diagnostics
+
+The opt-in X250 trace records timestamped, read-only port samples after reset,
+after Intel routing, after controller start, after boot event draining, and
+before the final required bring-up failure report. The final sample uses the
+existing failure-presentation interval; it adds no wait, port reset, power
+write, enumeration retry, or filesystem retry. The report includes USBCMD and
+USBSTS, CCS and PP bitmaps, Supported Protocol port-number ranges, CAPLENGTH,
+and the first PORTSC physical address. Raw per-port values are shown as
+`route/start/final`, including disconnected ports, for up to 32 register sets.
+Normal enumeration still scans all advertised ports.
+
+PORTSC numbering follows xHCI section 5.4.8: operational base plus
+`0x400 + 0x10 * (port - 1)`. Supported Protocol ranges identify which numbered
+register sets describe USB2/USB3; they do not relocate the registers. Intel
+330837-002 sections 13.2.2.10 and 13.2.2.12 specify PP as read-only one on this
+controller. A routing readback alone does not establish electrical attachment;
+the samples distinguish unpowered/inaccessible registers, immediate versus
+later attachment, and controller halt/error state.

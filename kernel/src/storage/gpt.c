@@ -9,6 +9,7 @@
 #include <vfs.h>
 #include <storage/format.h>
 #include <spinlock.h>
+#include <x250_boot_trace.h>
 
 #define GPT_SECTOR_BYTES          512U
 #define GPT_HEADER_BYTES          92U
@@ -623,6 +624,14 @@ static bool gpt_scan_device_guarded(block_device_t *device)
     int result;
 
     result = gpt_load(device, &table);
+#if X250_BOOT_TRACE
+    if (device && device->type == BLOCK_DEVICE_USB)
+        x250_boot_trace_result(47U, result == VFS_OK, "USB GPT validation",
+            false, true, result, result == VFS_OK ? "VALID" :
+                result == VFS_ERR_IO ? "READ_FAILED" :
+                result == VFS_ERR_BAD_FORMAT ? "INVALID" :
+                result == VFS_ERR_NOT_FOUND ? "ABSENT" : "UNSUPPORTED", NULL);
+#endif
     if (result != VFS_OK) return false;
     if (device->registered && !block_device_is_live(device)) return false;
     u64 parent_id = device->registered ? device->id : ~(u64)0;

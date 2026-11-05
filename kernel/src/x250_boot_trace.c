@@ -8,6 +8,7 @@
 #include <stddef.h>
 
 #define TRACE_HISTORY_LINES 40U
+#define TRACE_HISTORY_CAPACITY 80U
 #define TRACE_TEXT_CAPACITY 192U
 #define TRACE_MESSAGE_CAPACITY 1024U
 #define TRACE_PANIC_ROWS 9U
@@ -52,9 +53,10 @@ typedef struct {
 extern const u8 _binary_kernel_assets_font_psf_start[];
 extern const u8 _binary_kernel_assets_font_psf_end[];
 
-static char trace_lines[TRACE_HISTORY_LINES][TRACE_TEXT_CAPACITY];
-static char trace_line_states[TRACE_HISTORY_LINES];
+static char trace_lines[TRACE_HISTORY_CAPACITY][TRACE_TEXT_CAPACITY];
+static char trace_line_states[TRACE_HISTORY_CAPACITY];
 static u32 trace_line_count;
+static u32 trace_line_start;
 static volatile u32 *trace_framebuffer;
 static u32 trace_width;
 static u32 trace_height;
@@ -340,9 +342,19 @@ static void trace_put_pixel(u32 x, u32 y, u32 color)
     trace_framebuffer[(u64)y * trace_stride + x] = color;
 }
 
+/* GOP may remain at 640x480 even on a larger LCD. */
+static u32 trace_visible_rows(void)
+{
+    u32 overhead = TRACE_PANEL_PADDING_Y * 2U + TRACE_PANEL_MARGIN_Y * 2U;
+    if (trace_height <= overhead)
+        return 0;
+    u32 rows = (trace_height - overhead) / TRACE_DIAG_LINE_HEIGHT;
+    return rows < TRACE_HISTORY_LINES ? rows : TRACE_HISTORY_LINES;
+}
+
 static void trace_fill_panel(void)
 {
-    u32 panel_height = TRACE_HISTORY_LINES * TRACE_DIAG_LINE_HEIGHT +
+    u32 panel_height = trace_visible_rows() * TRACE_DIAG_LINE_HEIGHT +
                        TRACE_PANEL_PADDING_Y * 2U;
     u32 start_x = TRACE_PANEL_MARGIN_X;
     u32 end_x;
@@ -468,7 +480,7 @@ static void trace_draw_character(u8 character, u32 x, u32 y, u32 color)
 static void trace_render(void)
 {
     u32 visible_lines;
-    u32 panel_height = TRACE_HISTORY_LINES * TRACE_DIAG_LINE_HEIGHT +
+    u32 panel_height = trace_visible_rows() * TRACE_DIAG_LINE_HEIGHT +
                        TRACE_PANEL_PADDING_Y * 2U;
     u32 start_y;
     u32 first_line;
@@ -483,14 +495,16 @@ static void trace_render(void)
         trace_width <= TRACE_TEXT_MARGIN_X * 2U)
         return;
 
-    visible_lines = trace_line_count < TRACE_HISTORY_LINES
-        ? trace_line_count : TRACE_HISTORY_LINES;
-    first_line = TRACE_HISTORY_LINES - visible_lines;
+    visible_lines = trace_line_count < trace_visible_rows()
+        ? trace_line_count : trace_visible_rows();
+    first_line = trace_visible_rows() - visible_lines;
     start_y = trace_height - panel_height - TRACE_PANEL_MARGIN_Y +
               TRACE_PANEL_PADDING_Y + first_line * TRACE_DIAG_LINE_HEIGHT;
 
+    u32 first_visible = trace_line_count - visible_lines;
     for (u32 line_index = 0; line_index < visible_lines; line_index++) {
-        u32 row = line_index;
+        u32 row = (trace_line_start + first_visible + line_index) %
+                  TRACE_HISTORY_CAPACITY;
         const char *line = trace_lines[row];
         u32 y = start_y + line_index * TRACE_DIAG_LINE_HEIGHT;
         u32 color = trace_line_states[row] == 'P' ? TRACE_COLOR_PASS :
@@ -681,9 +695,9 @@ static void trace_store_wrapped(const char *message, char state)
     if (!columns)
         columns = 1U;
 
-    while (message[message_offset] &&
-           trace_line_count < TRACE_HISTORY_LINES) {
-        char *line = trace_lines[trace_line_count];
+    while (message[message_offset]) {
+        u32 slot;
+        char *line;
         bool continuation = message_offset != 0U;
         u32 indent = continuation && columns > 2U ? 2U : 0U;
         u32 available = columns - indent;
@@ -702,13 +716,22 @@ static void trace_store_wrapped(const char *message, char state)
         if (!length)
             length = available;
 
+        if (trace_line_count < TRACE_HISTORY_CAPACITY) {
+            slot = (trace_line_start + trace_line_count) %
+                   TRACE_HISTORY_CAPACITY;
+            trace_line_count++;
+        } else {
+            slot = trace_line_start;
+            trace_line_start = (trace_line_start + 1U) %
+                               TRACE_HISTORY_CAPACITY;
+        }
+        line = trace_lines[slot];
         for (u32 index = 0; index < indent; index++)
             line[index] = ' ';
         for (u32 index = 0; index < length; index++)
             line[indent + index] = message[message_offset + index];
         line[indent + length] = '\0';
-        trace_line_states[trace_line_count] = state;
-        trace_line_count++;
+        trace_line_states[slot] = state;
 
         next_offset = message_offset + length;
         while (message[next_offset] == ' ')
@@ -772,8 +795,46 @@ void x250_boot_trace_begin(void)
     if (trace_active)
         return;
     trace_line_count = 0;
+    trace_line_start = 0;
     trace_failure_hold_used = false;
     trace_active = true;
+}
+
+void x250_boot_trace_refresh(void)
+{
+    /* Drop callback chatter from the final view. Keep discovery rows and
+       failures (including their wrapped continuations) in original order. */
+    if (trace_active) {
+        static char saved[TRACE_HISTORY_CAPACITY][TRACE_TEXT_CAPACITY];
+        static char states[TRACE_HISTORY_CAPACITY];
+        u32 count = 0;
+        bool selected = false;
+        for (u32 i = 0; i < trace_line_count; i++) {
+            u32 slot = (trace_line_start + i) % TRACE_HISTORY_CAPACITY;
+            const char *line = trace_lines[slot];
+            if (line[0] != ' ')
+                selected = (line[0] == '4' && line[1] >= '2' &&
+                            line[1] <= '7') || trace_line_states[slot] == 'F';
+            if (selected) {
+                __builtin_memcpy(saved[count], line, TRACE_TEXT_CAPACITY);
+                states[count++] = trace_line_states[slot];
+            }
+        }
+        __builtin_memcpy(trace_lines, saved, count * TRACE_TEXT_CAPACITY);
+        __builtin_memcpy(trace_line_states, states, count);
+        trace_line_start = 0;
+        trace_line_count = count;
+        char message[TRACE_MESSAGE_CAPACITY];
+        u32 position = 0;
+        trace_append_prefix(message, &position, 47U, 'I');
+        trace_append_text(message, &position, "USB ROOT REPORT fb=");
+        trace_append_u32(message, &position, trace_width);
+        trace_append_text(message, &position, "x");
+        trace_append_u32(message, &position, trace_height);
+        message[position] = '\0';
+        trace_store_wrapped(message, 'I');
+    }
+    trace_render_if_active();
 }
 
 void x250_boot_trace_event(BOOT_INFO *boot_info, u32 checkpoint,
@@ -874,6 +935,147 @@ void x250_boot_trace_xhci_summary(u32 ports, u32 connected,
     trace_render();
 }
 
+void x250_boot_trace_ports_stage(const char *stage, u64 ms, u32 command,
+                                  u32 status, u32 connected, u32 powered)
+{
+    if (!trace_active) return;
+    char message[TRACE_MESSAGE_CAPACITY];
+    u32 position = 0;
+    trace_append_prefix(message, &position, 47U, 'I');
+    trace_append_text(message, &position, stage);
+    trace_append_text(message, &position, " t=");
+    trace_append_u64(message, &position, ms);
+    trace_append_text(message, &position, " C=");
+    trace_append_hex(message, &position, command, 8U);
+    trace_append_text(message, &position, " S=");
+    trace_append_hex(message, &position, status, 8U);
+    trace_append_text(message, &position, " CCS=");
+    trace_append_hex(message, &position, connected, 8U);
+    trace_append_text(message, &position, " PP=");
+    trace_append_hex(message, &position, powered, 8U);
+    message[position] = '\0';
+    trace_store_wrapped(message, 'I');
+    trace_render();
+}
+
+void x250_boot_trace_protocol(u32 major, u32 minor, u32 first,
+                               u32 count, u32 slot_type)
+{
+    if (!trace_active) return;
+    char message[TRACE_MESSAGE_CAPACITY];
+    u32 position = 0;
+    trace_append_prefix(message, &position, 47U, 'I');
+    trace_append_text(message, &position, "USB");
+    trace_append_u32(message, &position, major);
+    trace_append_text(message, &position, ".");
+    trace_append_hex(message, &position, minor, 2U);
+    trace_append_text(message, &position, " ports first=");
+    trace_append_u32(message, &position, first);
+    trace_append_text(message, &position, " count=");
+    trace_append_u32(message, &position, count);
+    trace_append_text(message, &position, " slot-type=");
+    trace_append_u32(message, &position, slot_type);
+    message[position] = '\0';
+    trace_store_wrapped(message, 'I');
+    trace_render();
+}
+
+void x250_boot_trace_ports_raw(u32 caplength, u64 first_physical,
+                                const u32 *routed, const u32 *started,
+                                const u32 *final, u32 count)
+{
+    if (!trace_active) return;
+    char message[TRACE_MESSAGE_CAPACITY];
+    u32 position = 0;
+    trace_append_prefix(message, &position, 47U, 'I');
+    trace_append_text(message, &position, "caplen=");
+    trace_append_hex(message, &position, caplength, 2U);
+    trace_append_text(message, &position, " PORTSC1_PA=");
+    trace_append_hex(message, &position, first_physical, 16U);
+    trace_append_text(message, &position, " raw=route/start/final");
+    message[position] = '\0';
+    trace_store_wrapped(message, 'I');
+    for (u32 first = 0; first < count; first += 2U) {
+        position = 0;
+        trace_append_prefix(message, &position, 47U, 'I');
+        for (u32 port = first; port < count && port < first + 2U; port++) {
+            if (port != first) trace_append_text(message, &position, " ");
+            trace_append_u32(message, &position, port + 1U);
+            trace_append_text(message, &position, ":");
+            trace_append_hex(message, &position, routed[port], 8U);
+            trace_append_text(message, &position, "/");
+            trace_append_hex(message, &position, started[port], 8U);
+            trace_append_text(message, &position, "/");
+            trace_append_hex(message, &position, final[port], 8U);
+        }
+        message[position] = '\0';
+        trace_store_wrapped(message, 'I');
+    }
+    trace_render();
+}
+
+void x250_boot_trace_routing(bool passed, u32 usb2_mask, u32 usb2_before,
+                              u32 usb2_after, u32 usb3_mask,
+                              u32 usb3_before, u32 usb3_after)
+{
+    if (!trace_active) return;
+    char message[TRACE_MESSAGE_CAPACITY];
+    u32 position = 0;
+    trace_append_prefix(message, &position, 47U, passed ? 'P' : 'F');
+    trace_append_text(message, &position, "Intel routing USB2=");
+    trace_append_hex(message, &position, usb2_before, 8U);
+    trace_append_text(message, &position, ">");
+    trace_append_hex(message, &position, usb2_after, 8U);
+    trace_append_text(message, &position, " allow=");
+    trace_append_hex(message, &position, usb2_mask, 8U);
+    trace_append_text(message, &position, " USB3=");
+    trace_append_hex(message, &position, usb3_before, 8U);
+    trace_append_text(message, &position, ">");
+    trace_append_hex(message, &position, usb3_after, 8U);
+    trace_append_text(message, &position, " allow=");
+    trace_append_hex(message, &position, usb3_mask, 8U);
+    message[position] = '\0';
+    trace_store_wrapped(message, passed ? 'P' : 'F');
+    trace_render();
+}
+
+void x250_boot_trace_pci(u32 bus, u32 device, u32 function,
+                          u32 vendor, u32 product, u32 interface, u32 command,
+                          u32 d0, u32 d4, u32 d8, u32 dc)
+{
+    if (!trace_active) return;
+    char message[TRACE_MESSAGE_CAPACITY];
+    u32 position = 0;
+    trace_append_prefix(message, &position, 47U, 'I');
+    trace_append_text(message, &position, "PCI USB ");
+    trace_append_hex(message, &position, bus, 2U);
+    trace_append_text(message, &position, ":");
+    trace_append_hex(message, &position, device, 2U);
+    trace_append_text(message, &position, ".");
+    trace_append_u32(message, &position, function);
+    trace_append_text(message, &position, " id=");
+    trace_append_hex(message, &position, vendor, 4U);
+    trace_append_text(message, &position, ":");
+    trace_append_hex(message, &position, product, 4U);
+    trace_append_text(message, &position, " pi=");
+    trace_append_hex(message, &position, interface, 2U);
+    trace_append_text(message, &position, " cmd=");
+    trace_append_hex(message, &position, command, 4U);
+    if (vendor == 0x8086U && interface == 0x30U) {
+        trace_append_text(message, &position, " cfgD0/D4/D8/DC=");
+        trace_append_hex(message, &position, d0, 8U);
+        trace_append_text(message, &position, "/");
+        trace_append_hex(message, &position, d4, 8U);
+        trace_append_text(message, &position, "/");
+        trace_append_hex(message, &position, d8, 8U);
+        trace_append_text(message, &position, "/");
+        trace_append_hex(message, &position, dc, 8U);
+    }
+    message[position] = '\0';
+    trace_store_wrapped(message, 'I');
+    trace_render();
+}
+
 void x250_boot_trace_xhci_port(u32 port, u32 portsc, const char *state,
                                bool result_available, int result,
                                const char *reason)
@@ -893,6 +1095,10 @@ void x250_boot_trace_xhci_port(u32 port, u32 portsc, const char *state,
     trace_append_u32(message, &position, (portsc & 1U) != 0U);
     trace_append_text(message, &position, " PED=");
     trace_append_u32(message, &position, (portsc & 2U) != 0U);
+    trace_append_text(message, &position, " PLS=");
+    trace_append_u32(message, &position, (portsc >> 5) & 0x0fU);
+    trace_append_text(message, &position, " PP=");
+    trace_append_u32(message, &position, (portsc >> 9) & 1U);
     trace_append_text(message, &position, " speed=");
     trace_append_u32(message, &position, (portsc >> 10) & 0x0fU);
     trace_append_text(message, &position, " state=");

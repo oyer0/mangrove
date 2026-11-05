@@ -106,7 +106,7 @@ static bool scheduler_yield(void){
 }
 static bool scheduler_mutex_wake(kernel_thread_t*t){(void)t;return true;}
 '''
-names = ('xhci_sync_waiter_released','xhci_accepts_enumeration','xhci_slot_accepts_io','xhci_quarantine_slot','xhci_quarantine_controller',
+names = ('xhci_boot_enumeration_quiescent','xhci_sync_waiter_released','xhci_accepts_enumeration','xhci_slot_accepts_io','xhci_quarantine_slot','xhci_quarantine_controller',
          'xhci_dma_may_release','xhci_dma_defer_release','xhci_arm_command_wait',
          'xhci_cancel_command_wait','xhci_take_command_completion','xhci_route_command_completion',
          'xhci_arm_transfer_operation','xhci_arm_transfer_wait','xhci_transfer_wait_generation',
@@ -137,7 +137,22 @@ static xhci_controller_t *init(void){memset(&g_xhc_instance,0,sizeof(g_xhc_insta
  publish_on_yield=delayed_command=force_expired=cancel_on_yield=false;
  delayed_code=XHCI_COMP_SUCCESS;return x;}
 static void arm(xhci_controller_t*x){assert(xhci_arm_transfer_wait(x,1,1,0x1000,0x1000,0x1000));}
-int main(void){xhci_trb_t e={0};xhci_controller_t*x=init();arm(x);
+int main(void){xhci_trb_t e={0};xhci_controller_t*x=init();
+ x->max_ports=2;
+ assert(xhci_boot_enumeration_quiescent(x));
+ x->ports[1].state=XHCI_PORT_FAILED;
+ assert(xhci_boot_enumeration_quiescent(x)); /* finished, not successful */
+ x->ports[1].state=XHCI_PORT_ENUMERATING;
+ assert(!xhci_boot_enumeration_quiescent(x));
+ x->ports[1].state=XHCI_PORT_READY;
+ x->pending_port_changes[0]=2;assert(!xhci_boot_enumeration_quiescent(x));
+ x->pending_port_changes[0]=0;x->event_work_pending=true;
+ assert(!xhci_boot_enumeration_quiescent(x));x->event_work_pending=false;
+ x->enumeration_reserved=true;assert(!xhci_boot_enumeration_quiescent(x));
+ x->enumeration_reserved=false;x->command_waiting=true;
+ assert(!xhci_boot_enumeration_quiescent(x));x->command_waiting=false;
+ x->transfer_waiting=true;assert(!xhci_boot_enumeration_quiescent(x));
+ x=init();arm(x);
  assert(xhci_map_completion_code(XHCI_COMP_NO_SLOTS_ERR)==XHCI_ERR_NO_MEMORY);
  assert(xhci_map_completion_code(XHCI_COMP_RESOURCE_ERR)==XHCI_ERR_NO_MEMORY);
  x->devices[1].state=XHCI_DEVICE_READY;

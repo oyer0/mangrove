@@ -219,6 +219,10 @@ struct xhci_controller {
     u32 admission_generation;
     bool enumeration_reserved;
     volatile bool boot_enumeration_active;
+    /* Boot caller requests a fresh pass; only the event owner acknowledges
+       after dispatch and port setup. IRQ masking cannot imply an empty ring. */
+    volatile u32 boot_event_drain_requested;
+    volatile u32 boot_event_drain_completed;
     volatile bool deferred_worker_stop;
     bool last_setup_retry_safe;
     volatile bool event_work_pending;
@@ -534,8 +538,6 @@ void xhci_trace_boot_discovery(xhci_controller_t *xhc)
         if (port->state == XHCI_PORT_FAILED)
             failed++;
     }
-    x250_boot_trace_xhci_summary(xhc->max_ports, connected, enumerated,
-                                failed, xhci_storage_device_count());
     for (u32 port_id = 1; port_id <= xhc->max_ports; port_id++) {
         xhci_port_record_t *port = &xhc->ports[port_id];
         volatile u32 *portsc = xhci_get_portsc_ptr(xhc, (u8)port_id);
@@ -549,6 +551,10 @@ void xhci_trace_boot_discovery(xhci_controller_t *xhc)
                                   port->result_valid, port->last_result,
                                   port->last_reason);
     }
+    /* Keep the aggregate controller result after per-port rows so it remains
+     * visible when the bounded overlay is showing its most recent history. */
+    x250_boot_trace_xhci_summary(xhc->max_ports, connected, enumerated,
+                                failed, xhci_storage_device_count());
 }
 #endif
 
@@ -558,6 +564,41 @@ void xhci_trace_boot_discovery(xhci_controller_t *xhc)
 #define XHCI_LEGACY_PRESERVE_BITS    ((0x7U << 1) | (0xFFU << 5) | (0x7U << 17))
 #define XHCI_LEGACY_SMI_EVENTS       (0x7U << 29)
 #define XHCI_MAX_EXT_CAPS            50U
+
+#if X250_BOOT_TRACE
+/* Read-only samples. Bound output to the first 32 register sets; the X250
+   has 15. Normal controller discovery still visits every advertised port. */
+typedef struct {
+    u64 ms;
+    u32 command;
+    u32 status;
+    u32 connected;
+    u32 powered;
+    u32 raw[32];
+    bool valid;
+} xhci_boot_ports_sample_t;
+static xhci_boot_ports_sample_t boot_ports_samples[5];
+
+void xhci_trace_capture_ports(xhci_controller_t *xhc, u32 stage)
+{
+    if (!xhc || !xhc->op_regs || stage >= 5U)
+        return;
+    xhci_boot_ports_sample_t *sample = &boot_ports_samples[stage];
+    *sample = (xhci_boot_ports_sample_t){0};
+    sample->ms = timer_uptime_ms();
+    sample->command = xhc->op_regs->usbcmd;
+    sample->status = xhc->op_regs->usbsts;
+    for (u32 port = 1; port <= xhc->max_ports && port <= 32U; port++) {
+        volatile u32 *address = xhci_get_portsc_ptr(xhc, (u8)port);
+        if (!address) continue;
+        u32 value = *address;
+        sample->raw[port - 1U] = value;
+        if (value & XHCI_PORTSC_CCS) sample->connected |= 1U << (port - 1U);
+        if (value & XHCI_PORTSC_PP) sample->powered |= 1U << (port - 1U);
+    }
+    sample->valid = true;
+}
+#endif
 
 static volatile u32 *xhci_extended_capability(xhci_controller_t *xhc,
                                                u32 offset, u32 size)
@@ -614,10 +655,12 @@ static bool xhci_legacy_handoff(xhci_controller_t *xhc)
             bool forced = false;
             u32 initial = value;
 
+            /* Request exclusive ownership even when firmware has already
+               cleared BIOS Owned. Otherwise both semaphores remain zero and
+               firmware is still allowed to reclaim the controller. */
+            *cap = value | XHCI_LEGACY_OS_OWNED;
+            value = *cap;
             if (value & XHCI_LEGACY_BIOS_OWNED) {
-                *cap = value | XHCI_LEGACY_OS_OWNED;
-                value = *cap;
-
                 for (u32 waited = 0;
                      (value & XHCI_LEGACY_BIOS_OWNED) && waited < 1000;
                      waited++) {
@@ -660,6 +703,54 @@ static bool xhci_legacy_handoff(xhci_controller_t *xhc)
 
     return offset == 0U;
 }
+
+#if X250_BOOT_TRACE
+void xhci_trace_report_ports(xhci_controller_t *xhc)
+{
+    static const char *names[5] = {"reset", "routed", "started", "drained", "final"};
+    if (!xhc || !xhc->op_regs) return;
+    xhci_trace_capture_ports(xhc, 4U);
+    for (u32 stage = 0; stage < 5U; stage++) {
+        const xhci_boot_ports_sample_t *s = &boot_ports_samples[stage];
+        if (s->valid)
+            x250_boot_trace_ports_stage(names[stage], s->ms, s->command,
+                                        s->status, s->connected, s->powered);
+    }
+
+    /* Supported Protocol ranges describe port numbers; they do not move the
+       PORTSC register array. Keep this diagnostic scan separate from handoff. */
+    u32 offset = XHCI_HCCPARAMS1_XECP(xhc->cap_regs->hccparams1) << 2;
+    for (u32 visited = 0; offset && visited < XHCI_MAX_EXT_CAPS; visited++) {
+        volatile u32 *cap = xhci_extended_capability(xhc, offset, 4U);
+        if (!cap) break;
+        u32 header = cap[0];
+        if ((header & 0xffU) == 2U) {
+            cap = xhci_extended_capability(xhc, offset, 16U);
+            if (!cap) break;
+            u32 ports = cap[2];
+            x250_boot_trace_protocol(header >> 24, (header >> 16) & 0xffU,
+                ports & 0xffU, (ports >> 8) & 0xffU, cap[3] & 0x1fU);
+        }
+        u32 next = (header >> 8) & 0xffU;
+        if (!next || !xhci_ext_cap_next_offset(offset, next, &offset)) break;
+    }
+    u32 count = xhc->max_ports < 32U ? xhc->max_ports : 32U;
+    x250_boot_trace_ports_raw(xhc->cap_regs->caplength,
+        xhc->mmio_phys_base + (uintptr_t)xhc->op_regs - xhc->mmio_base + 0x400U,
+        boot_ports_samples[1].raw, boot_ports_samples[2].raw,
+        boot_ports_samples[4].raw, count);
+
+    u32 enumerated = 0, failed = 0, connected = 0;
+    for (u32 port = 1; port <= xhc->max_ports; port++) {
+        volatile u32 *address = xhci_get_portsc_ptr(xhc, (u8)port);
+        if (address && (*address & XHCI_PORTSC_CCS)) connected++;
+        if (xhc->ports[port].device_enumerated) enumerated++;
+        if (xhc->ports[port].state == XHCI_PORT_FAILED) failed++;
+    }
+    x250_boot_trace_xhci_summary(xhc->max_ports, connected, enumerated,
+                                failed, xhci_storage_device_count());
+}
+#endif
 
 void xhci_queue_port_change(xhci_controller_t *xhc, u8 port_id,
                             const char *source)
@@ -1351,6 +1442,30 @@ static void xhci_process_keyboard_leds(xhci_controller_t *xhc)
                      __ATOMIC_RELEASE);
 }
 
+/* Only a requested boot pass reconciles connection levels. A change event
+ * may have been coalesced or acknowledged before dispatch; CCS is still
+ * authoritative. Never restart READY/FAILED ports or supersede queued work. */
+static void xhci_reconcile_boot_ports(xhci_controller_t *xhc)
+{
+    for (u32 port = 1; port <= xhc->max_ports && port < 256U; port++) {
+        xhci_port_state_t state = xhc->ports[port].state;
+        if (state != XHCI_PORT_DISCONNECTED &&
+            state != XHCI_PORT_CONNECTED_OBSERVED)
+            continue;
+        if ((__atomic_load_n(&xhc->pending_port_changes[port / 32U],
+                              __ATOMIC_ACQUIRE) & (1U << (port % 32U))) ||
+            (xhc->port_admission_state && xhc->admission_port == port) ||
+            xhci_device_slot_for_port(xhc, (u8)port))
+            continue;
+        volatile u32 *address = xhci_get_portsc_ptr(xhc, (u8)port);
+        if (address && (*address & XHCI_PORTSC_CCS)) {
+            xhci_set_port_state(xhc, (u8)port, XHCI_PORT_CONNECTED_OBSERVED,
+                                *address, "boot-connection-level");
+            xhci_queue_port_change(xhc, (u8)port, "boot-connection-level");
+        }
+    }
+}
+
 static void xhci_deferred_worker_entry(void *argument)
 {
     xhci_controller_t *xhc = (xhci_controller_t *)argument;
@@ -1359,13 +1474,20 @@ static void xhci_deferred_worker_entry(void *argument)
     while (!__atomic_load_n(&xhc->deferred_worker_stop, __ATOMIC_ACQUIRE)) {
         /* The service thread is the sole Event Ring consumer. */
         __atomic_store_n(&xhc->event_work_pending, false, __ATOMIC_RELEASE);
+        u32 boot_request = __atomic_load_n(&xhc->boot_event_drain_requested,
+                                           __ATOMIC_ACQUIRE);
         input_trace_record(INPUT_TRACE_USB_WORK, 0, 0, 0);
         xhci_process_events(xhc);
+        if (boot_request != __atomic_load_n(&xhc->boot_event_drain_completed,
+                                            __ATOMIC_ACQUIRE))
+            xhci_reconcile_boot_ports(xhc);
         xhci_process_pending_teardowns(xhc);
 
         /* Deliver completions before attempting nonblocking FIFO admission. */
         xhci_process_port_work(xhc);
         xhci_process_keyboard_leds(xhc);
+        __atomic_store_n(&xhc->boot_event_drain_completed, boot_request,
+                          __ATOMIC_RELEASE);
 
         /* Close the wakeup race: no IRQ can set the pending bit between this
            check and scheduler_block().  The original IF state is restored
@@ -1815,6 +1937,8 @@ xhci_controller_t* xhci_init(uintptr_t mmio_base, u64 mmio_phys_base,
                    max_scratchpads, xhc->csz);
 
 
+    xhci_trace_capture_ports(xhc, 0U);
+
     /* 6. Program Max Device Slots */
     xhc->op_regs->config = xhc->max_slots & XHCI_CONFIG_MAX_SLOTS_EN_MASK;
 
@@ -1912,20 +2036,9 @@ void xhci_acknowledge_boot_interrupts(xhci_controller_t *xhc)
     if (!ir0)
         return;
 
-    /* Boot probing owns enumeration.  This helper only acknowledges
-       controller/port change state; the service thread owns Event Ring
-       dequeue and dispatch. */
-    for (u8 port = 1; port <= xhc->max_ports; port++) {
-        volatile u32 *portsc = xhci_get_portsc_ptr(xhc, port);
-        if (!portsc)
-            continue;
-        u32 value = *portsc;
-        u32 changes = value & XHCI_PORTSC_RW1C_MASK;
-        if (changes) {
-            value &= ~XHCI_PORTSC_RW1CS_MASK;
-            *portsc = value | changes;
-        }
-    }
+    /* The event owner acknowledges PORTSC changes when it dispatches them.
+       Clearing CSC here can discard an attach arriving after the boot pass
+       and before MSI-X unmask: its queued event would then see CSC=0. */
 
     u32 status = xhc->op_regs->usbsts;
     u32 iman = ir0->iman;
@@ -3088,19 +3201,57 @@ bool xhci_boot_enumeration_quiescent(xhci_controller_t *xhc)
     return true;
 }
 
-bool xhci_wait_for_boot_quiescence(xhci_controller_t *xhc)
+static bool xhci_boot_drain_until(xhci_controller_t *xhc, u64 deadline)
 {
-    u64 deadline;
-
-    if (!xhc)
+    if (!xhc || xhc->quarantined || xhc->deferred_worker_stop ||
+        xhci_is_service_owner(xhc))
         return false;
-    deadline = timer_uptime_ms() + XHCI_BOOT_QUIESCENCE_TIMEOUT_MS;
-    while (!xhci_boot_enumeration_quiescent(xhc)) {
-        if (timer_uptime_ms() >= deadline) {
+    /* A one-shot CCS scan can precede the attach event. MSI-X remains masked
+       at this point, so even a populated Event Ring need not have set the
+       software work bit. Require the sole consumer to dispatch a fresh pass
+       before accepting software quiescence; never consume events here. */
+    u32 request = __atomic_add_fetch(&xhc->boot_event_drain_requested, 1U,
+                                     __ATOMIC_ACQ_REL);
+    xhci_mark_event_work_pending(xhc);
+    if (!xhci_start_deferred_worker(xhc))
+        return false;
+    while (__atomic_load_n(&xhc->boot_event_drain_completed,
+                           __ATOMIC_ACQUIRE) != request ||
+           !xhci_boot_enumeration_quiescent(xhc)) {
+        if (xhc->quarantined || xhc->deferred_worker_stop ||
+            timer_uptime_ms() >= deadline) {
             return false;
         }
         (void)xhci_start_deferred_worker(xhc);
-        timer_sleep(1);
+        if (!scheduler_sleep(1))
+            return false;
     }
     return true;
+}
+
+bool xhci_wait_for_boot_quiescence(xhci_controller_t *xhc)
+{
+    return xhci_boot_drain_until(xhc,
+        timer_uptime_ms() + XHCI_BOOT_QUIESCENCE_TIMEOUT_MS);
+}
+
+xhci_status_t xhci_wait_for_boot_discovery(xhci_controller_t *xhc,
+                                          bool (*ready)(void *), void *context)
+{
+    if (!xhc || !ready)
+        return XHCI_ERR_INVALID_PARAM;
+    u64 deadline = timer_uptime_ms() + XHCI_BOOT_QUIESCENCE_TIMEOUT_MS;
+    for (;;) {
+        if (!xhci_boot_drain_until(xhc, deadline))
+            return timer_uptime_ms() >= deadline ? XHCI_ERR_TIMEOUT :
+                                                   XHCI_ERR_CONTROLLER_BAD;
+        if (ready(context))
+            return XHCI_SUCCESS;
+        if (timer_uptime_ms() >= deadline)
+            return XHCI_ERR_TIMEOUT;
+        /* Yield while waiting for a device, not a fixed settling interval.
+           Each pass services events and newly observed CCS through the owner. */
+        if (!scheduler_sleep(1))
+            return XHCI_ERR_CONTROLLER_BAD;
+    }
 }

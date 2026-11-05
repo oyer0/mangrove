@@ -154,6 +154,20 @@ static xhci_status_t xhci_reset_port(xhci_controller_t *xhc, u8 port_id,
     bool reset_asserted_logged = false;
     const char *failure_reason = "reset-timeout";
 
+    /* CCS alone is not an enumeration permit. USB2 attach maps to Polling;
+       an already enabled USB2/USB3 link is U0. Inactive/Compliance and other
+       ambiguous states need a classified recovery path, not a blind reset. */
+    if ((status & XHCI_PORTSC_CCS) &&
+        !xhci_port_link_enumerable(status)) {
+        failure_reason = !(status & XHCI_PORTSC_PP) ?
+            "connected-port-not-powered" : "connected-link-not-enumerable";
+        xhci_set_port_state(xhc, port_id, XHCI_PORT_FAILED, status,
+                            failure_reason);
+        xhci_set_port_result(xhc, port_id, XHCI_ERR_NOT_SUPPORTED,
+                             failure_reason);
+        return XHCI_ERR_NOT_SUPPORTED;
+    }
+
     xhci_diag_timeline_at("reset-start", (uintptr_t)portsc_ptr, status);
     xhci_port_reset_log(port_id, state, status, NULL);
     xhci_set_port_state(xhc, port_id, state, status, "reset-start");
@@ -361,7 +375,9 @@ void xhci_handle_port_status_change(xhci_controller_t *xhc, xhci_trb_t *event) {
     if (!(status & XHCI_PORTSC_CCS))
         xhci_set_port_state(xhc, port_id, XHCI_PORT_DISCONNECTED,
                             status, "port-status-change-disconnected");
-    else if (!setup_in_progress)
+    else if (!setup_in_progress &&
+             ((status & XHCI_PORTSC_CSC) ||
+              current_state == XHCI_PORT_DISCONNECTED))
         xhci_set_port_state(xhc, port_id, XHCI_PORT_CONNECTED_OBSERVED,
                             status, "port-status-change-event");
 

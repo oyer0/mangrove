@@ -3,7 +3,9 @@
 """Production block cache/registry, GPT and management range admission.
 Pthread parking/IRQs, VFS policy, device media and failures are controlled.
 --baseline reproduces the failed initialization and stale child read at the
-pinned original commit; neither mode accesses a real storage device.
+pinned original commit. These fixtures never access a physical storage device.
+--gpt-image=PATH exercises actual image metadata, simulated device capacities,
+late parent publication, and GPT/I/O negative controls instead of mutations.
 """
 from pathlib import Path
 import ast
@@ -14,6 +16,10 @@ import tempfile
 
 root = Path(__file__).resolve().parents[2]
 baseline = '--baseline' in sys.argv
+image_fixture = next((s.split('=', 1)[1] for s in sys.argv[1:]
+                      if s.startswith('--gpt-image=')), None)
+if baseline and image_fixture:
+    raise SystemExit('--baseline cannot be combined with --gpt-image')
 compiler = next((s for s in sys.argv[1:] if not s.startswith('--')), 'cc')
 ref = '3c16cf3cac8ddca5a32caba691be704f8cc8b0b8'
 def read(path):
@@ -71,10 +77,32 @@ model = '#define MG_EVENT_CLASS_DEVICE' + model
 fmt = read('kernel/src/storage/format.c')
 management = ''.join(function(fmt,n) for n in ('storage_mutation_begin','storage_mutation_end','storage_mutation_busy'))
 if not baseline: management += function(fmt,'storage_management_range_preflight')
-source = pre + types + headers + model + function(read('kernel/src/scheduler.c'),'scheduler_mutex_wake') + mutex + block + gpt + management
-source += (root/'tests/storage/storage_coherency_test.c').read_text()
+trace_model = ''
+if image_fixture:
+    trace_model = r'''
+#define X250_BOOT_TRACE 1
+static int last_gpt_result;
+static unsigned gpt_result_calls;
+static void x250_boot_trace_result(u32 checkpoint, bool passed, const char *description,
+    bool required, bool available, int result, const char *state, const char *reason)
+{
+    assert(checkpoint == 47U && !required && available && !reason);
+    assert(strcmp(description, "USB GPT validation") == 0);
+    assert(passed == (result == VFS_OK));
+    if (result == VFS_ERR_IO) assert(strcmp(state, "READ_FAILED") == 0);
+    if (result == VFS_ERR_BAD_FORMAT) assert(strcmp(state, "INVALID") == 0);
+    if (result == VFS_OK) assert(strcmp(state, "VALID") == 0);
+    if (result == VFS_ERR_NOT_FOUND) assert(strcmp(state, "ABSENT") == 0);
+    if (result == VFS_ERR_UNSUPPORTED) assert(strcmp(state, "UNSUPPORTED") == 0);
+    last_gpt_result = result; gpt_result_calls++;
+}
+'''
+source = pre + types + headers + model + trace_model + function(read('kernel/src/scheduler.c'),'scheduler_mutex_wake') + mutex + block + gpt + management
+source += (root/('tests/storage/gpt_image_test.c' if image_fixture else
+                 'tests/storage/storage_coherency_test.c')).read_text()
 with tempfile.TemporaryDirectory(prefix='mangrove-coherency-') as d:
     c = Path(d)/'test.c'; c.write_text(source); exe = Path(d)/'test'
     subprocess.run([compiler, '-O1','-std=c11','-Wall','-Wextra','-Werror','-pthread',
         '-fsanitize=address,undefined', *(['-DCOHERENCY_BASELINE'] if baseline else []), str(c), '-o', str(exe)],check=True)
-    subprocess.run([str(exe)],check=True,timeout=60)
+    subprocess.run([str(exe), *([image_fixture] if image_fixture else [])],
+                   check=True,timeout=60)

@@ -37,6 +37,7 @@
 #include <vfs.h>
 #include <vmm.h>
 #include <xhci.h>
+#include <xhci_pci.h>
 #include <xhci_storage.h>
 #include <xhci_regs.h>
 #include <net/dns.h>
@@ -300,16 +301,114 @@ static init_result_t init_cpu_irqs_enabled(const char **reason)
     return INIT_RESULT_OK;
 }
 
+#if X250_BOOT_TRACE
+static u16 xhci_pci_entry_command;
+static xhci_pci_routing_t boot_usb_routing;
+static bool boot_usb_routing_ok;
+
+static void init_trace_usb_pci(void)
+{
+    if (boot_usb_routing.supported)
+        x250_boot_trace_routing(boot_usb_routing_ok,
+            boot_usb_routing.usb2_mask, boot_usb_routing.usb2_before,
+            boot_usb_routing.usb2_after, boot_usb_routing.usb3_mask,
+            boot_usb_routing.usb3_before, boot_usb_routing.usb3_after);
+    x250_boot_trace_result(47U, true, "xHCI PCI command at entry",
+                           false, true, xhci_pci_entry_command,
+                           "OBSERVED", NULL);
+    /* Read-only inventory: distinguish a companion controller owning
+       USB2 ports from an xHCI reset/enumeration/MSC failure. */
+    for (u32 i = 0; i < pci_get_device_count(); i++) {
+        const pci_device_t *p = pci_get_device(i);
+        if (!p || p->class_code != 0x0c || p->subclass != 0x03)
+            continue;
+        bool intel_xhc = p->vendor_id == 0x8086 && p->prog_if == 0x30;
+        x250_boot_trace_pci(p->bus, p->device, p->function,
+            p->vendor_id, p->device_id, p->prog_if,
+            pci_read_config16(p, 4),
+            intel_xhc ? pci_read_config32(p, 0xd0) : 0,
+            intel_xhc ? pci_read_config32(p, 0xd4) : 0,
+            intel_xhc ? pci_read_config32(p, 0xd8) : 0,
+            intel_xhc ? pci_read_config32(p, 0xdc) : 0);
+    }
+}
+#endif
+
+/* Metadata-only predicate: do not probe/mount MGFS while USB setup owns the
+   transfer stream. The original root callback performs all identity, duplicate
+   role and filesystem checks after the discovery fence. */
+static bool init_root_role_registered(void *context)
+{
+    (void)context;
+    for (u32 i = 0; i < block_device_count(); i++) {
+        block_device_t *device = block_get_device(i);
+        gpt_partition_info_t info;
+        if (device && gpt_get_partition_info(device, &info) &&
+            strcmp(info.name, GPT_MANGROVE_ROOT_NAME) == 0)
+            return true;
+    }
+    return false;
+}
+
+static bool init_block_registered(void *context)
+{
+    (void)context;
+    return block_device_count() != 0U;
+}
+
+static init_result_t init_await_boot_discovery(bool root_required,
+                                              const char **reason)
+{
+    if (!g_xhc || kernel_init_state(INIT_XHCI) != INIT_READY)
+        return INIT_RESULT_OK;
+    x250_boot_trace_stage(47U, false, root_required ?
+        "await native root discovery" : "await native block discovery");
+    xhci_status_t status = xhci_wait_for_boot_discovery(
+        g_xhc, root_required ? init_root_role_registered :
+                              init_block_registered, NULL);
+    xhci_trace_boot_discovery(g_xhc);
+    x250_boot_trace_result(47U, status == XHCI_SUCCESS,
+        root_required ? "native root discovery" : "native block discovery",
+        true, true, (int)status,
+        status == XHCI_SUCCESS ? "READY" :
+            status == XHCI_ERR_TIMEOUT ? "DEADLINE" : "FAILED",
+        status == XHCI_SUCCESS ? NULL : root_required ?
+            "required root device not published" : "no block device published");
+    if (status != XHCI_SUCCESS) {
+        *reason = status == XHCI_ERR_TIMEOUT ?
+            (root_required ?
+                "Mangrove root volume not found (USB discovery deadline)" :
+                "no persistent block device (USB discovery deadline)") :
+            (root_required ? "native USB root discovery failed" :
+                             "native USB storage discovery failed");
+        return status == XHCI_ERR_TIMEOUT && !root_required ?
+            INIT_RESULT_UNAVAILABLE : INIT_RESULT_FAILED;
+    }
+    return INIT_RESULT_OK;
+}
+
 static init_result_t init_storage(const char **reason)
 {
     u32 block_devices = block_device_count();
     bool xhci_ready = kernel_init_state(INIT_XHCI) == INIT_READY;
+    init_result_t discovery = INIT_RESULT_OK;
 
+    /* Grant an empty registry a bounded publication opportunity. Any disk
+       satisfies storage admission; root applies its own exact role check. */
+    if (!block_devices && g_xhc && xhci_ready) {
+        discovery = init_await_boot_discovery(false, reason);
+        block_devices = block_device_count();
+    }
     x250_boot_trace_storage_inventory(
         block_devices, xhci_storage_device_count(), xhci_ready);
+#if X250_BOOT_TRACE
+    init_trace_usb_pci();
+#endif
+    if (discovery != INIT_RESULT_OK)
+        return discovery;
 
-    /* init_xhci already confirmed boot discovery before resuming keyboard
-     * work. Runtime transfers need not be idle at this later admission point. */
+    /* Controller admission is distinct from root-role publication. Runtime
+     * keyboard transfers need not be idle at this storage admission point. */
     if (g_xhc && !xhci_ready) {
         *reason = "xHCI boot discovery did not complete";
         return INIT_RESULT_UNAVAILABLE;
@@ -353,6 +452,14 @@ static init_result_t init_xhci(const char **reason)
         return INIT_RESULT_UNAVAILABLE;
     }
 
+#if X250_BOOT_TRACE
+    xhci_pci_entry_command = pci_read_config16(xhci_pdev, 4);
+#endif
+    if (!pci_enable_memory_busmaster(xhci_pdev)) {
+        *reason = "xHCI PCI memory/bus-master enable failed";
+        return INIT_RESULT_FAILED;
+    }
+
     uintptr_t xhci_mmio_base =
         (uintptr_t)vmm_map_mmio(xhci_mmio_phys, xhci_mmio_size);
     if (!xhci_mmio_base) {
@@ -376,6 +483,24 @@ static init_result_t init_xhci(const char **reason)
         *reason = "xHCI controller initialization failed";
         return INIT_RESULT_FAILED;
     }
+
+    /* The generic legacy handshake claims the controller, not the chipset
+       pin mux. Apply only a documented, firmware-authorized routing policy
+       after that handoff/reset, before starting native port discovery. */
+    xhci_pci_routing_t routing;
+    bool routing_ok = xhci_pci_route_ports(xhci_pdev, &routing);
+#if X250_BOOT_TRACE
+    boot_usb_routing = routing;
+    boot_usb_routing_ok = routing_ok;
+#endif
+    if (!routing_ok) {
+        xhci_shutdown(g_xhc);
+        irq_unregister_vector(IRQ_VECTOR_XHCI);
+        g_xhc = NULL;
+        *reason = "xHCI chipset port routing readback failed";
+        return INIT_RESULT_FAILED;
+    }
+    xhci_trace_capture_ports(g_xhc, 1U);
 
     bool msix_prepared = false;
     pci_msix_info_t msix_info = {0};
@@ -418,11 +543,13 @@ static init_result_t init_xhci(const char **reason)
         return INIT_RESULT_FAILED;
     }
 
+    xhci_trace_capture_ports(g_xhc, 2U);
     xhci_probe_ports(g_xhc);
     if (!xhci_wait_for_boot_quiescence(g_xhc)) {
         *reason = "xHCI boot enumeration did not quiesce";
         return INIT_RESULT_FAILED;
     }
+    xhci_trace_capture_ports(g_xhc, 3U);
     xhci_trace_boot_discovery(g_xhc);
     xhci_acknowledge_boot_interrupts(g_xhc);
     xhci_complete_boot_enumeration(g_xhc);
@@ -575,6 +702,7 @@ static init_result_t init_rootfs(const char **reason)
         *reason = "filesystem drivers unavailable";
         return INIT_RESULT_FAILED;
     }
+    init_result_t discovery = init_await_boot_discovery(true, reason);
 
 #if X250_BOOT_TRACE
     {
@@ -631,6 +759,9 @@ static init_result_t init_rootfs(const char **reason)
                                        partition_devices, root_candidates);
     }
 #endif
+
+    if (discovery != INIT_RESULT_OK)
+        return discovery;
 
     /* The GPT partition name is a persistent installation role marker.  It
        is deliberately required so an unrelated MGFS volume cannot become /. */
@@ -1144,6 +1275,10 @@ bool kernel_bringup(void)
         if (!failure_reason && init_graph_error)
             failure_reason = "initialization dependency graph cycle";
     }
+    /* The existing first-failure presentation pause has already elapsed.
+       Sample again without adding a delay or retrying enumeration/mounts. */
+    if (!bringup_ok)
+        xhci_trace_report_ports(g_xhc);
     x250_boot_trace_result(21U, bringup_ok, "required kernel bring-up", true,
                            true, bringup_ok ? 0 : 1,
                            bringup_ok ? "READY" : "FAILED", failure_reason);

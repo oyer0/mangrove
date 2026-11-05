@@ -190,6 +190,11 @@ bool xhci_start_deferred_worker(xhci_controller_t *xhc);
 bool xhci_is_service_owner(xhci_controller_t *xhc);
 bool xhci_boot_enumeration_quiescent(xhci_controller_t *xhc);
 bool xhci_wait_for_boot_quiescence(xhci_controller_t *xhc);
+/* Boot-only, no filesystem/block I/O locks held. Await a required device
+ * publication while the normal event owner services late connections. The
+ * readiness predicate must inspect metadata only, never issue device I/O. */
+xhci_status_t xhci_wait_for_boot_discovery(xhci_controller_t *xhc,
+                                          bool (*ready)(void *), void *context);
 bool xhci_setup_retry_allowed(xhci_controller_t *xhc);
 xhci_controller_state_t xhci_get_controller_state(xhci_controller_t *xhc);
 xhci_port_state_t xhci_get_port_state(xhci_controller_t *xhc, u8 port_id);
@@ -200,9 +205,13 @@ void xhci_set_port_state(xhci_controller_t *xhc, u8 port_id,
 void xhci_set_port_result(xhci_controller_t *xhc, u8 port_id,
                           xhci_status_t result, const char *reason);
 void xhci_trace_boot_discovery(xhci_controller_t *xhc);
+void xhci_trace_capture_ports(xhci_controller_t *xhc, u32 stage);
+void xhci_trace_report_ports(xhci_controller_t *xhc);
 #else
 #define xhci_set_port_result(...) ((void)0)
 #define xhci_trace_boot_discovery(...) ((void)0)
+#define xhci_trace_capture_ports(...) ((void)0)
+#define xhci_trace_report_ports(...) ((void)0)
 #endif
 
 /*

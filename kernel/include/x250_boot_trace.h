@@ -13,6 +13,20 @@ struct cpu_registers;
 
 #if X250_BOOT_TRACE
 void x250_boot_trace_begin(void);
+void x250_boot_trace_refresh(void);
+void x250_boot_trace_ports_stage(const char *stage, u64 ms, u32 command,
+                                  u32 status, u32 connected, u32 powered);
+void x250_boot_trace_ports_raw(u32 caplength, u64 first_physical,
+                                const u32 *routed, const u32 *started,
+                                const u32 *final, u32 count);
+void x250_boot_trace_protocol(u32 major, u32 minor, u32 first,
+                               u32 count, u32 slot_type);
+void x250_boot_trace_routing(bool passed, u32 usb2_mask, u32 usb2_before,
+                              u32 usb2_after, u32 usb3_mask,
+                              u32 usb3_before, u32 usb3_after);
+void x250_boot_trace_pci(u32 bus, u32 device, u32 function,
+                          u32 vendor, u32 product, u32 interface, u32 command,
+                          u32 d0, u32 d4, u32 d8, u32 dc);
 void x250_boot_trace_event(BOOT_INFO *boot_info, u32 checkpoint,
                            bool passed, const char *description);
 void x250_boot_trace_stage(u32 checkpoint, bool passed,
@@ -57,6 +71,9 @@ void x250_boot_trace_panic(const char *message,
                            u64 cr2, u64 cr3);
 #else
 #define x250_boot_trace_begin(...) ((void)0)
+#define x250_boot_trace_refresh(...) ((void)0)
+#define x250_boot_trace_routing(...) ((void)0)
+#define x250_boot_trace_pci(...) ((void)0)
 #define x250_boot_trace_event(...) ((void)0)
 #define x250_boot_trace_result(...) ((void)0)
 #define x250_boot_trace_storage_inventory(...) ((void)0)

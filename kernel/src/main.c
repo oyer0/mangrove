@@ -1180,6 +1180,10 @@ void kmain_high(BOOT_INFO *source_boot_info)
         return;
     if (!kernel_bringup()) {
         kprint("[FAIL] Required kernel bring-up phase failed\n");
+        /* Console rendering can repaint the shared framebuffer over the
+         * temporary diagnostic layer. Leave the final report as the last
+         * framebuffer writer before halting this failed boot. */
+        x250_boot_trace_refresh();
         for (;;) __asm__ volatile("cli; hlt");
     }
 #ifdef TIMEKEEPING_QMP_TEST

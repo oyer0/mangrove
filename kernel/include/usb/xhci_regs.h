@@ -171,6 +171,19 @@ typedef struct {
 /* PED is RW1CS on USB2 ports: writing back a read value of 1 disables the port. */
 #define XHCI_PORTSC_RW1CS_MASK (XHCI_PORTSC_PED | XHCI_PORTSC_RW1C_MASK)
 
+/* xHCI 5.4.8 and table 5-28: connected USB2 awaiting reset is Polling;
+ * enabled links are U0. This does not authorize recovery from other states. */
+static inline bool xhci_port_link_enumerable(u32 status)
+{
+    if ((status & (XHCI_PORTSC_CCS | XHCI_PORTSC_PP)) !=
+            (XHCI_PORTSC_CCS | XHCI_PORTSC_PP) ||
+        (status & (XHCI_PORTSC_PR | XHCI_PORTSC_WPR)))
+        return false;
+    u32 link = (status & XHCI_PORTSC_PLS_MASK) >> 5;
+    return (link == 7U && !(status & XHCI_PORTSC_PED)) ||
+           (link == 0U && (status & XHCI_PORTSC_PED));
+}
+
 
 /* ==============================================================================
  * xHCI Interrupter Register Set (Part of Runtime Registers)
