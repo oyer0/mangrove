@@ -2012,6 +2012,10 @@ test-usb-flash: $(MKMGFS) $(BUILD_DIR)/mgfsck
 	python3 tests/storage/flash_usb_test.py --mkmgfs "$(MKMGFS)" --mgfsck "$(BUILD_DIR)/mgfsck"
 	python3 tests/storage/flash_usb_tty_test.py --mkmgfs "$(MKMGFS)" --mgfsck "$(BUILD_DIR)/mgfsck"
 
+.PHONY: test-physical-qualification
+test-physical-qualification:
+	python3 tests/development/physical_qualification_test.py
+
 GPT_TEST_IMAGE ?= $(USB_IMAGE)
 test-gpt-image:
 	@test -f "$(GPT_TEST_IMAGE)" || { echo "Build a USB image or set GPT_TEST_IMAGE first" >&2; exit 1; }
