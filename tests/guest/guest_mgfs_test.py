@@ -243,6 +243,7 @@ def create_disk(folder, build, run, relative_launch=False,
                 mgtls_smoke=False, mgtls_tls_smoke=False,
                 fetch_https_smoke=False, thread_smoke=False,
                 scheduler_smp_smoke=False, scheduler_smp_cpus=1,
+                device_smp_mode=None, device_smp_cpus=0,
                 kernel_override=None):
     # The disposable image is sparse on common host filesystems, but reserve
     # enough room for a fully allocated image, extracted root partition, and
@@ -271,6 +272,8 @@ def create_disk(folder, build, run, relative_launch=False,
     if mgtls_tls_smoke:
         install_qemu_network_config(image)
     if fetch_https_smoke:
+        install_qemu_network_config(image)
+    if device_smp_mode == 'network':
         install_qemu_network_config(image)
     if arguments_smoke:
         install(image, 2, 'argvtest', (build / 'argvtest/argvtest.elf').read_bytes())
@@ -306,6 +309,10 @@ def create_disk(folder, build, run, relative_launch=False,
         if not 1 <= scheduler_smp_cpus <= 4:
             raise ValueError('scheduler SMP guest CPU count must be 1..4')
         phases = ('scheduler-smp',)
+    if device_smp_mode:
+        if device_smp_mode not in ('storage', 'network') or device_smp_cpus not in (2, 4):
+            raise ValueError('device SMP guest requires storage/network and two/four CPUs')
+        phases = ('device-smp',)
     if ca_store_smoke:
         phases = ('ca-store-reboot', 'ca-store-verify')
     if mgtls_smoke:
@@ -373,6 +380,18 @@ def create_disk(folder, build, run, relative_launch=False,
                 f'/bin/threadtest scheduler-smp {scheduler_smp_cpus} '
                 '> /temp/scheduler-smp-command.log\n'
                 f'/bin/say child-exit-0-{phase}-{run} > /temp/{phase}.exit\n'
+                '/bin/shutdown\n').encode()
+        elif phase == 'device-smp':
+            network_snapshot = ('/bin/netinfo interfaces > '
+                                '/temp/device-smp-interfaces.log\n'
+                                if device_smp_mode == 'network' else '')
+            script = (
+                f'/bin/fstest device-smp {device_smp_mode} '
+                f'{device_smp_cpus} {run} > '
+                f'/temp/device-smp-{device_smp_mode}.log\n' +
+                network_snapshot +
+                f'/bin/say child-exit-0-device-smp-{run} '
+                '> /temp/device-smp.exit\n'
                 '/bin/shutdown\n').encode()
         elif phase == 'fetch-https':
             script = (

@@ -261,6 +261,7 @@ int fstest_stdio_phase(const char *run, const char *target);
 int fstest_time_phase(bool network_smoke);
 int fstest_network_phase(void);
 int fstest_math_phase(void);
+int fstest_device_smp_phase(const char *mode, u32 cpus, const char *run);
 
 static bool valid_run(const char *run)
 {
@@ -304,6 +305,13 @@ int main(int argc, char **argv)
     else if (argc == 3 && !strcmp(argv[1], "time") &&
         !strcmp(argv[2], "--network"))
         status = fstest_time_phase(true);
+    else if (argc == 5 && !strcmp(argv[1], "device-smp")) {
+        char *end = NULL;
+        unsigned long cpus = strtoul(argv[3], &end, 10);
+        if (!end || *end || cpus < 2U || cpus > 4U ||
+            !valid_run(argv[4])) return 2;
+        status = fstest_device_smp_phase(argv[2], (u32)cpus, argv[4]);
+    }
     else if (argc == 2 && !strcmp(argv[1], "math"))
         status = fstest_math_phase();
     else if (argc >= 2 && !strncmp(argv[1], "volume-safe-", 12)) {

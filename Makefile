@@ -2954,11 +2954,15 @@ $(BUILD_DIR)/FsTest/time.o: userspace/fstest/time.c $(USER_LIBC)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
+$(BUILD_DIR)/FsTest/device_smp.o: userspace/fstest/device_smp.c $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
 $(BUILD_DIR)/FsTest/math.o: userspace/fstest/math.c $(USER_LIBM) $(USER_LIBC)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -frounding-math -c $< -o $@
 
-FSTEST_VOLUME_OBJS := $(BUILD_DIR)/FsTest/stress.o $(BUILD_DIR)/FsTest/safe.o $(BUILD_DIR)/FsTest/volume.o $(BUILD_DIR)/FsTest/stdio.o $(BUILD_DIR)/FsTest/time.o $(BUILD_DIR)/FsTest/math.o $(BUILD_DIR)/userspace/volume_client.o $(BUILD_DIR)/userspace/storage_snapshot.o
+FSTEST_VOLUME_OBJS := $(BUILD_DIR)/FsTest/stress.o $(BUILD_DIR)/FsTest/safe.o $(BUILD_DIR)/FsTest/volume.o $(BUILD_DIR)/FsTest/stdio.o $(BUILD_DIR)/FsTest/time.o $(BUILD_DIR)/FsTest/device_smp.o $(BUILD_DIR)/FsTest/math.o $(BUILD_DIR)/userspace/volume_client.o $(BUILD_DIR)/userspace/storage_snapshot.o
 
 $(FSTEST): $(BUILD_DIR)/FsTest/fstest.o $(FSTEST_VOLUME_OBJS) $(USER_CRT) $(USER_LIBM) $(USER_LIBC) $(USER_LIBGCC) $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
@@ -3572,6 +3576,38 @@ test-guest-scheduler-smp: test-scheduler-smp-evidence
 		--build-dir "$(SMP_SCHEDULER_GUEST_BUILD)" \
 		--output "$(SMP_SCHEDULER_GUEST_OUTPUT)-4vcpu" --cpus 4 \
 		--accel "$(SMP_SCHEDULER_GUEST_ACCEL)" \
+		--ovmf-code "$(OVMF_CODE_SOURCE)" --ovmf-vars "$(OVMF_VARS_SOURCE)"
+
+SMP_DEVICE_GUEST_BUILD ?= $(abspath $(BUILD_DIR))/stage6-device-smp-build
+SMP_DEVICE_GUEST_OUTPUT ?= $(abspath $(BUILD_DIR))/stage6-device-smp-$(shell date -u +%Y%m%dT%H%M%SZ)
+SMP_DEVICE_GUEST_ACCEL ?= $(NATIVE_GUEST_ACCEL)
+.PHONY: test-device-smp-evidence test-guest-device-smp
+test-device-smp-evidence:
+	python3 tests/guest/guest_device_smp_evidence_test.py
+
+test-guest-device-smp: test-device-smp-evidence
+	$(QEMU_ACCEL_PREFLIGHT) "$(SMP_DEVICE_GUEST_ACCEL)"
+	$(MAKE) -B -j4 BUILD_DIR="$(SMP_DEVICE_GUEST_BUILD)" \
+		binaries mkmgfs mgfsck RTC_UTC_TRUST=1
+	python3 tests/guest/guest_device_smp_test.py \
+		--build-dir "$(SMP_DEVICE_GUEST_BUILD)" --mode storage --cpus 2 \
+		--output "$(SMP_DEVICE_GUEST_OUTPUT)-storage-2vcpu" \
+		--accel "$(SMP_DEVICE_GUEST_ACCEL)" \
+		--ovmf-code "$(OVMF_CODE_SOURCE)" --ovmf-vars "$(OVMF_VARS_SOURCE)"
+	python3 tests/guest/guest_device_smp_test.py \
+		--build-dir "$(SMP_DEVICE_GUEST_BUILD)" --mode storage --cpus 4 \
+		--output "$(SMP_DEVICE_GUEST_OUTPUT)-storage-4vcpu" \
+		--accel "$(SMP_DEVICE_GUEST_ACCEL)" \
+		--ovmf-code "$(OVMF_CODE_SOURCE)" --ovmf-vars "$(OVMF_VARS_SOURCE)"
+	python3 tests/guest/guest_device_smp_test.py \
+		--build-dir "$(SMP_DEVICE_GUEST_BUILD)" --mode network --cpus 2 \
+		--output "$(SMP_DEVICE_GUEST_OUTPUT)-network-2vcpu" \
+		--accel "$(SMP_DEVICE_GUEST_ACCEL)" \
+		--ovmf-code "$(OVMF_CODE_SOURCE)" --ovmf-vars "$(OVMF_VARS_SOURCE)"
+	python3 tests/guest/guest_device_smp_test.py \
+		--build-dir "$(SMP_DEVICE_GUEST_BUILD)" --mode network --cpus 4 \
+		--output "$(SMP_DEVICE_GUEST_OUTPUT)-network-4vcpu" \
+		--accel "$(SMP_DEVICE_GUEST_ACCEL)" \
 		--ovmf-code "$(OVMF_CODE_SOURCE)" --ovmf-vars "$(OVMF_VARS_SOURCE)"
 
 randomtest: $(BUILD_DIR)/randomtest/randomtest.elf
