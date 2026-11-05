@@ -34,6 +34,10 @@ static u64 scheduler_tick_count;
 static kernel_thread_t *sleeping_threads;
 static scheduler_stats_t scheduler_stats;
 static spinlock_t scheduler_lock;
+#if defined(SCHEDULER_CONTENTION_GUEST_TEST)
+static volatile u64 scheduler_lock_contended_acquisitions;
+static volatile u64 scheduler_lock_wait_iterations;
+#endif
 
 #define THREAD_CPU_NONE (~(u32)0)
 
@@ -631,9 +635,46 @@ void scheduler_get_stats(scheduler_stats_t *stats)
         for (u32 priority = 0; priority < 3U; priority++)
             stats->dispatches[priority] =
                 scheduler_stats.dispatches[priority];
+#if defined(SCHEDULER_CONTENTION_GUEST_TEST)
+        stats->lock_contended_acquisitions = __atomic_load_n(
+            &scheduler_lock_contended_acquisitions, __ATOMIC_RELAXED);
+        stats->lock_wait_iterations = __atomic_load_n(
+            &scheduler_lock_wait_iterations, __ATOMIC_RELAXED);
+#endif
         spin_unlock_irqrestore(&scheduler_lock, flags);
     }
 }
+
+#if defined(SCHEDULER_CONTENTION_GUEST_TEST)
+void scheduler_contention_counters_reset(void)
+{
+    __atomic_store_n(&scheduler_lock_contended_acquisitions, 0U,
+                     __ATOMIC_RELAXED);
+    __atomic_store_n(&scheduler_lock_wait_iterations, 0U,
+                     __ATOMIC_RELAXED);
+}
+
+bool scheduler_contention_thread_snapshot(const kernel_thread_t *thread,
+    thread_state_t *state, thread_priority_t *base_priority,
+    thread_priority_t *effective_priority, thread_priority_t *last_selected,
+    u64 *ready_wait_ticks, bool *wakeup_boosted, bool *sleeping)
+{
+    u64 flags;
+
+    if (!thread)
+        return false;
+    flags = spin_lock_irqsave(&scheduler_lock);
+    if (state) *state = thread->state;
+    if (base_priority) *base_priority = thread->base_priority;
+    if (effective_priority) *effective_priority = thread->effective_priority;
+    if (last_selected) *last_selected = thread->last_selected_priority;
+    if (ready_wait_ticks) *ready_wait_ticks = thread->ready_wait_ticks;
+    if (wakeup_boosted) *wakeup_boosted = thread->wakeup_boosted;
+    if (sleeping) *sleeping = thread->sleeping;
+    spin_unlock_irqrestore(&scheduler_lock, flags);
+    return true;
+}
+#endif
 
 void scheduler_dump(void)
 {
@@ -937,6 +978,11 @@ bool scheduler_init(void)
         return false;
 
     spinlock_init(&scheduler_lock);
+#if defined(SCHEDULER_CONTENTION_GUEST_TEST)
+    spinlock_observe_irqsave_contention(&scheduler_lock,
+        &scheduler_lock_contended_acquisitions,
+        &scheduler_lock_wait_iterations);
+#endif
     memset(ready_queues, 0, sizeof(ready_queues));
     next_thread_id = 2;
     scheduler_tick_count = 0;

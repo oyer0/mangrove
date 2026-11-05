@@ -41,6 +41,18 @@ void spin_unlock(spinlock_t *lock);
 u64 spin_lock_irqsave(spinlock_t *lock);
 void spin_unlock_irqrestore(spinlock_t *lock, u64 flags);
 
+#if defined(SCHEDULER_CONTENTION_GUEST_TEST)
+/* Diagnostic build only: acquire with normal IRQ-save semantics while
+ * recording whether this acquisition had to wait and how many failed
+ * observations/CAS attempts occurred. */
+void spinlock_observe_irqsave_contention(spinlock_t *lock,
+                                         volatile u64 *contended_acquisitions,
+                                         volatile u64 *wait_iterations);
+u64 spin_lock_irqsave_observe(spinlock_t *lock,
+                              volatile u64 *contended_acquisitions,
+                              volatile u64 *wait_iterations);
+#endif
+
 /* Returns UINT32_MAX when the executing CPU-local record is unavailable.
  * Callers that may block must treat both nonzero and unknown as unsafe. */
 u32 spinlock_depth_current(void);

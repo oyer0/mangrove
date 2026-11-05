@@ -69,6 +69,9 @@
 extern void kernel_debug_scheduler_tests(void);
 extern void kernel_debug_runtime_tests(void);
 #endif
+#if defined(SCHEDULER_CONTENTION_GUEST_TEST)
+extern bool kernel_scheduler_contention_guest_test(void);
+#endif
 
 static xhci_controller_t *g_xhc;
 static volatile u32 g_xhci_irq_entries;
@@ -908,6 +911,12 @@ static init_result_t init_smp(const char **reason)
         *reason = "application processors unavailable";
         return INIT_RESULT_UNAVAILABLE;
     }
+#if defined(SCHEDULER_CONTENTION_GUEST_TEST)
+    if (!kernel_scheduler_contention_guest_test()) {
+        *reason = "scheduler contention/fairness guest test failed";
+        return INIT_RESULT_FAILED;
+    }
+#endif
     kernel_stack_usage_report();
 #if defined(KERNEL_STACK_OVERFLOW_GUEST_TEST)
     kprint("[STACK-TEST] deliberate guarded thread-stack overflow\n");

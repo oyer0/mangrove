@@ -34,6 +34,94 @@ RESULT = re.compile(
     r'^SCHED_SMP_RESULT pass=(\d+) cpus=(\d+) migration_status=(-?\d+) '
     r'preemption_status=(-?\d+) concurrent_children=(\d+)$', re.M)
 SMP = re.compile(r'^\[SMP\] (?:final )?discovered=(\d+) online=(\d+)$', re.M)
+CONTENTION = re.compile(
+    r'^SCHED_CONTENTION pass=(\d+) cpus=(\d+) online_mask=([0-9a-fA-F]+) '
+    r'workers=(\d+) started=(\d+) completed=(\d+) normal_seen=(\d+) '
+    r'background_seen=(\d+) wake_seen=(\d+) normal_priority=(\d+) '
+    r'background_priority=(\d+) wake_priority=(\d+) '
+    r'normal_latency_ms=(\d+) background_latency_ms=(\d+) '
+    r'wake_latency_ms=(\d+) wake_ready_ms=(\d+) wake_high_ms=(\d+) '
+    r'busy_mask=([0-9a-fA-F]+) '
+    r'busy_delta=(\d+),(\d+),(\d+),(\d+) '
+    r'cpu_mask=([0-9a-fA-F]+) overlap_samples=(\d+) useful_work=(\d+) '
+    r'lock_contended=(\d+) lock_wait_iterations=(\d+) wakeups=(\d+) '
+    r'timer_preemptions=(\d+) context_switches=(\d+) high_dispatches=(\d+) '
+    r'normal_dispatches=(\d+) elapsed_ms=(\d+) timeout=(\d+) '
+    r'queue_validation_samples=(\d+) queue_valid=(\d+) drained=(\d+)$', re.M)
+
+
+def validate_contention_evidence(text, cpus):
+    rows = CONTENTION.findall(text)
+    if len(rows) != 1:
+        raise ValueError('scheduler contention witness is missing or duplicated')
+    values = rows[0]
+    (passed, observed_cpus, online_text, workers, started, completed,
+     normal_seen, background_seen, wake_seen, normal_priority,
+     background_priority, wake_priority, normal_latency, background_latency,
+     wake_latency, wake_ready, wake_high, busy_mask_text, busy0, busy1, busy2,
+     busy3, cpu_mask_text,
+     overlap, useful_work, contended, wait_iterations, wakeups, preemptions,
+     switches, high_dispatches, _normal_dispatches, elapsed, timeout,
+     queue_validation_samples, queue_valid, drained) = values
+    numeric = list(map(int, (passed, observed_cpus, workers, started,
+        completed, normal_seen, background_seen, wake_seen, normal_priority,
+        background_priority, wake_priority, normal_latency,
+        background_latency, wake_latency, wake_ready, wake_high, busy0, busy1,
+        busy2, busy3,
+        overlap, useful_work, contended, wait_iterations, wakeups, preemptions,
+        switches, high_dispatches, elapsed, timeout, queue_valid, drained)))
+    queue_validation_samples = int(queue_validation_samples)
+    (passed, observed_cpus, workers, started, completed, normal_seen,
+     background_seen, wake_seen, normal_priority, background_priority,
+     wake_priority, normal_latency, background_latency, wake_latency,
+     wake_ready, wake_high, busy0, busy1, busy2, busy3, overlap, useful_work,
+     contended, wait_iterations,
+     wakeups, preemptions, switches, high_dispatches, elapsed, timeout,
+     queue_valid, drained) = numeric
+    expected_mask = (1 << cpus) - 1
+    busy = (busy0, busy1, busy2, busy3)
+    if (passed != 1 or observed_cpus != cpus or
+            int(online_text, 16) != expected_mask or
+            workers != 2 * cpus + 1 or started != workers or
+            completed != workers or not normal_seen or not background_seen or
+            not wake_seen or normal_priority != 0 or background_priority != 0 or
+            wake_priority != 0 or normal_latency < 4500 or
+            background_latency < 5400 or not 450 <= wake_latency <= 2500 or
+            not 100 <= wake_ready <= 500 or
+            not 650 <= wake_high <= 1500 or
+            int(busy_mask_text, 16) != expected_mask or
+            any(busy[index] <= 0 for index in range(cpus)) or
+            any(busy[index] != 0 for index in range(cpus, 4)) or
+            int(cpu_mask_text, 16) != expected_mask or useful_work <= 0 or
+            wakeups < 1 or preemptions < 1 or switches < 1 or
+            high_dispatches < workers + 2 or elapsed < 5200 or
+            elapsed > 20000 or timeout != 0 or queue_valid != 1 or
+            queue_validation_samples < 20 or drained != 1 or
+            wait_iterations < contended):
+        raise ValueError('scheduler fairness, wakeup, lifecycle or CPU evidence is incomplete')
+    if cpus == 1:
+        if overlap != 0 or contended != 0:
+            raise ValueError('one-vCPU scheduler control reports SMP overlap/contention')
+    elif overlap <= 0 or contended <= 0:
+        raise ValueError('multicore scheduler load lacks overlap or lock contention')
+    return {
+        'online_cpu_mask': expected_mask,
+        'oversubscribed_high_workers': workers,
+        'high_workers_started_and_completed': completed,
+        'normal_first_run_after_ms': normal_latency,
+        'background_first_run_after_ms': background_latency,
+        'wakeup_latency_ms': wake_latency,
+        'wake_ready_after_ms': wake_ready,
+        'wake_high_priority_after_ms': wake_high,
+        'busy_tick_deltas': list(busy[:cpus]),
+        'simultaneous_work_samples': overlap,
+        'scheduler_lock_contended_acquisitions': contended,
+        'scheduler_lock_wait_iterations': wait_iterations,
+        'queue_validation_samples': queue_validation_samples,
+        'wakeups': wakeups, 'timer_preemptions': preemptions,
+        'context_switches': switches, 'useful_work': useful_work,
+        'elapsed_ms': elapsed,
+    }
 
 
 def validate_native_evidence(migration_text, preempt_text, result_text, cpus):
@@ -156,6 +244,9 @@ def run(args, workspace):
     if online != args.cpus or discovered < args.cpus:
         raise ValueError(f'guest online CPU set is {online}/{discovered}, '
                          f'expected exactly {args.cpus}')
+    contention = None
+    if args.require_contention:
+        contention = validate_contention_evidence(boot_log, args.cpus)
 
     threadtest_record = guest.find(image, '/bin/threadtest')[1]
     threadtest = guest.payload(image, threadtest_record)
@@ -197,6 +288,7 @@ def run(args, workspace):
         'smp_boot': {'discovered': discovered, 'online': online,
                      'online_indices': list(range(online))},
         'witness': native, 'guest_runtime': runtime_summary,
+        'contention_witness': contention,
         'independent_mgfs_check': 'PASS before and after guest execution',
         'embedded_identity': {
             'threadtest_sha256': source_hash(args.build_dir /
@@ -211,7 +303,9 @@ def run(args, workspace):
         'source_hashes': {
             path: source_hash(ROOT / path) for path in (
                 'kernel/src/scheduler.c', 'kernel/src/smp.c',
-                'kernel/src/vmm.c',
+                'kernel/src/vmm.c', 'kernel/src/spinlock.c',
+                'kernel/src/main.c', 'kernel/src/init.c',
+                'kernel/include/scheduler.h', 'kernel/include/spinlock.h',
                 'tests/userspace/thread_lifecycle_guest.c',
                 'tests/guest/guest_scheduler_smp_test.py',
             )
@@ -223,6 +317,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--build-dir', type=Path, required=True)
     parser.add_argument('--cpus', type=int, choices=(1, 2, 4), required=True)
+    parser.add_argument('--require-contention', action='store_true',
+                        help='require the opt-in kernel contention/fairness witness')
     parser.add_argument('--output', type=Path,
                         help='new output directory; retained for review')
     artifacts.add_retention_argument(parser)
@@ -252,7 +348,9 @@ def main():
         'build_dir': str(args.build_dir),
     }
     source_paths = ('kernel/src/scheduler.c', 'kernel/src/smp.c',
-                    'kernel/src/vmm.c',
+                    'kernel/src/vmm.c', 'kernel/src/spinlock.c',
+                    'kernel/src/main.c', 'kernel/src/init.c',
+                    'kernel/include/scheduler.h', 'kernel/include/spinlock.h',
                     'tests/userspace/thread_lifecycle_guest.c',
                     'tests/guest/guest_scheduler_smp_test.py')
     report['source_revision'] = subprocess.run(

@@ -4,6 +4,21 @@
 #include <cpu.h>
 #include <panic.h>
 
+#if defined(SCHEDULER_CONTENTION_GUEST_TEST)
+static spinlock_t *contention_observed_lock;
+static volatile u64 *contention_observed_acquisitions;
+static volatile u64 *contention_observed_wait_iterations;
+
+void spinlock_observe_irqsave_contention(spinlock_t *lock,
+                                         volatile u64 *acquisitions,
+                                         volatile u64 *wait_iterations)
+{
+    contention_observed_lock = lock;
+    contention_observed_acquisitions = acquisitions;
+    contention_observed_wait_iterations = wait_iterations;
+}
+#endif
+
 static void spinlock_depth_enter(void)
 {
     cpu_local_t *cpu = cpu_current();
@@ -86,11 +101,53 @@ static void spin_irq_restore(u64 flags)
 
 u64 spin_lock_irqsave(spinlock_t *lock)
 {
+#if defined(SCHEDULER_CONTENTION_GUEST_TEST)
+    if (lock == contention_observed_lock && lock)
+        return spin_lock_irqsave_observe(lock,
+            contention_observed_acquisitions,
+            contention_observed_wait_iterations);
+#endif
     u64 flags = spin_irq_save();
 
     spin_lock(lock);
     return flags;
 }
+
+#if defined(SCHEDULER_CONTENTION_GUEST_TEST)
+u64 spin_lock_irqsave_observe(spinlock_t *lock,
+                              volatile u64 *contended_acquisitions,
+                              volatile u64 *wait_iterations)
+{
+    u64 flags = spin_irq_save();
+    u64 iterations = 0;
+    bool contended = false;
+
+    for (;;) {
+        while (__atomic_load_n(&lock->value, __ATOMIC_RELAXED) != 0U) {
+            contended = true;
+            if (iterations != ~(u64)0)
+                iterations++;
+            cpu_relax();
+        }
+
+        if (spin_try_lock(lock))
+            break;
+
+        contended = true;
+        if (iterations != ~(u64)0)
+            iterations++;
+        cpu_relax();
+    }
+
+    if (contended) {
+        if (contended_acquisitions)
+            __atomic_add_fetch(contended_acquisitions, 1U, __ATOMIC_RELAXED);
+        if (wait_iterations)
+            __atomic_add_fetch(wait_iterations, iterations, __ATOMIC_RELAXED);
+    }
+    return flags;
+}
+#endif
 
 bool spin_try_lock_irqsave(spinlock_t *lock, u64 *flags_out)
 {

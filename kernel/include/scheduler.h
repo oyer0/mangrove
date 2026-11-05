@@ -82,6 +82,10 @@ typedef struct {
     u64 peak_runnable_threads;
     u64 idle_runtime_ticks;
     u64 dispatches[3];
+#if defined(SCHEDULER_CONTENTION_GUEST_TEST)
+    u64 lock_contended_acquisitions;
+    u64 lock_wait_iterations;
+#endif
 } scheduler_stats_t;
 
 struct cpu_registers;
@@ -252,6 +256,13 @@ void scheduler_syscall_leave(void);
 bool scheduler_validate_state(void);
 u32 scheduler_ready_count(thread_priority_t priority);
 void scheduler_get_stats(scheduler_stats_t *stats);
+#if defined(SCHEDULER_CONTENTION_GUEST_TEST)
+void scheduler_contention_counters_reset(void);
+bool scheduler_contention_thread_snapshot(const kernel_thread_t *thread,
+    thread_state_t *state, thread_priority_t *base_priority,
+    thread_priority_t *effective_priority, thread_priority_t *last_selected,
+    u64 *ready_wait_ticks, bool *wakeup_boosted, bool *sleeping);
+#endif
 void scheduler_dump(void);
 /* Prepare an AP-owned idle context before that AP is started. */
 bool scheduler_prepare_idle_cpu(struct cpu_local *cpu,

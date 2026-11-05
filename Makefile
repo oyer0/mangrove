@@ -362,6 +362,14 @@ ifneq ($(DEBUG_BOOT_TESTS),)
 KERNEL_CFLAGS += -DPITH_DEBUG_BOOT_TESTS
 endif
 
+SCHEDULER_CONTENTION_GUEST_TEST ?= 0
+ifneq ($(filter-out 0 1,$(SCHEDULER_CONTENTION_GUEST_TEST)),)
+$(error SCHEDULER_CONTENTION_GUEST_TEST must be 0 or 1)
+endif
+ifeq ($(SCHEDULER_CONTENTION_GUEST_TEST),1)
+KERNEL_CFLAGS += -DSCHEDULER_CONTENTION_GUEST_TEST=1
+endif
+
 # Low-level kernel bring-up details are excluded from normal production boot.
 # Use KERNEL_BOOT_DEBUG=1 when auditing the initialization path.
 ifeq ($(KERNEL_BOOT_DEBUG),1)
@@ -3557,24 +3565,29 @@ SMP_SCHEDULER_GUEST_ACCEL ?= $(NATIVE_GUEST_ACCEL)
 .PHONY: test-scheduler-smp-evidence test-guest-scheduler-smp
 test-scheduler-smp-evidence:
 	python3 tests/guest/guest_scheduler_smp_evidence_test.py
+	python3 tests/guest/guest_scheduler_contention_evidence_test.py
 
 test-guest-scheduler-smp: test-scheduler-smp-evidence
 	$(QEMU_ACCEL_PREFLIGHT) "$(SMP_SCHEDULER_GUEST_ACCEL)"
 	$(MAKE) -B -j4 BUILD_DIR="$(SMP_SCHEDULER_GUEST_BUILD)" \
+		SCHEDULER_CONTENTION_GUEST_TEST=1 \
 		binaries threadtest mkmgfs mgfsck RTC_UTC_TRUST=1
 	python3 tests/guest/guest_scheduler_smp_test.py \
 		--build-dir "$(SMP_SCHEDULER_GUEST_BUILD)" \
 		--output "$(SMP_SCHEDULER_GUEST_OUTPUT)-1vcpu" --cpus 1 \
+		--require-contention \
 		--accel "$(SMP_SCHEDULER_GUEST_ACCEL)" \
 		--ovmf-code "$(OVMF_CODE_SOURCE)" --ovmf-vars "$(OVMF_VARS_SOURCE)"
 	python3 tests/guest/guest_scheduler_smp_test.py \
 		--build-dir "$(SMP_SCHEDULER_GUEST_BUILD)" \
 		--output "$(SMP_SCHEDULER_GUEST_OUTPUT)-2vcpu" --cpus 2 \
+		--require-contention \
 		--accel "$(SMP_SCHEDULER_GUEST_ACCEL)" \
 		--ovmf-code "$(OVMF_CODE_SOURCE)" --ovmf-vars "$(OVMF_VARS_SOURCE)"
 	python3 tests/guest/guest_scheduler_smp_test.py \
 		--build-dir "$(SMP_SCHEDULER_GUEST_BUILD)" \
 		--output "$(SMP_SCHEDULER_GUEST_OUTPUT)-4vcpu" --cpus 4 \
+		--require-contention \
 		--accel "$(SMP_SCHEDULER_GUEST_ACCEL)" \
 		--ovmf-code "$(OVMF_CODE_SOURCE)" --ovmf-vars "$(OVMF_VARS_SOURCE)"
 

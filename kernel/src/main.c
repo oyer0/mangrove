@@ -652,6 +652,600 @@ static void scheduler_stress_test(void)
     }
 }
 
+#if defined(SCHEDULER_CONTENTION_GUEST_TEST)
+#define SCHEDULER_CONTENTION_MAX_CPUS 4U
+#define SCHEDULER_CONTENTION_MAX_HIGH_WORKERS \
+    (2U * SCHEDULER_CONTENTION_MAX_CPUS + 1U)
+#define SCHEDULER_CONTENTION_MAX_WORKERS \
+    (SCHEDULER_CONTENTION_MAX_HIGH_WORKERS + 4U)
+#define SCHEDULER_CONTENTION_TIMEOUT_MS 16000U
+
+typedef enum {
+    SCHEDULER_CONTENTION_HIGH = 0,
+    SCHEDULER_CONTENTION_NORMAL,
+    SCHEDULER_CONTENTION_BACKGROUND,
+    SCHEDULER_CONTENTION_WAKE_BACKGROUND,
+    SCHEDULER_CONTENTION_CONTROLLER,
+} scheduler_contention_kind_t;
+
+typedef struct {
+    kernel_thread_t *thread;
+    scheduler_contention_kind_t kind;
+    volatile u64 work_units;
+    u64 first_run_ms;
+    u64 sleep_start_ms;
+    u64 wake_latency_ms;
+    u64 wake_ready_after_ms;
+    u64 wake_high_after_ms;
+    thread_priority_t selected_priority;
+    thread_priority_t base_priority;
+    thread_priority_t effective_priority;
+    volatile bool started;
+    volatile bool completed;
+    volatile bool sleep_succeeded;
+    volatile bool wake_ready_seen;
+    volatile bool wake_high_seen;
+    volatile u32 queue_validation_samples;
+    volatile bool queue_validation_failed;
+} scheduler_contention_worker_t;
+
+static scheduler_contention_worker_t scheduler_contention_high[
+    SCHEDULER_CONTENTION_MAX_HIGH_WORKERS];
+static scheduler_contention_worker_t scheduler_contention_normal;
+static scheduler_contention_worker_t scheduler_contention_background;
+static scheduler_contention_worker_t scheduler_contention_wake_background;
+static scheduler_contention_worker_t scheduler_contention_controller;
+static volatile bool scheduler_contention_stop;
+static volatile bool scheduler_contention_timeout;
+static volatile u64 scheduler_contention_start_ms;
+static volatile u32 scheduler_contention_high_worker_count;
+static volatile u32 scheduler_contention_high_started;
+static volatile u32 scheduler_contention_high_completed;
+static volatile bool scheduler_contention_normal_seen;
+static volatile bool scheduler_contention_background_seen;
+static volatile bool scheduler_contention_wake_seen;
+static volatile u64 scheduler_contention_cpu_mask;
+static volatile u64 scheduler_contention_active_cpus;
+static volatile u64 scheduler_contention_overlap_samples;
+static volatile u64 scheduler_contention_useful_work;
+
+static void scheduler_contention_window(scheduler_contention_worker_t *worker)
+{
+    u64 flags;
+    u64 bit;
+    u32 cpu;
+
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
+    cpu = cpu_current_index();
+    if (cpu >= 64U) {
+        __atomic_store_n(&scheduler_test_failed, true, __ATOMIC_RELAXED);
+        __asm__ volatile("pushq %0; popfq" :: "r"(flags) : "memory");
+        return;
+    }
+    bit = 1ULL << cpu;
+    __atomic_or_fetch(&scheduler_contention_cpu_mask, bit, __ATOMIC_RELAXED);
+    __atomic_or_fetch(&scheduler_contention_active_cpus, bit,
+                      __ATOMIC_RELAXED);
+    {
+        u64 active = __atomic_load_n(&scheduler_contention_active_cpus,
+                                     __ATOMIC_RELAXED);
+        if (active & (active - 1U)) {
+        __atomic_add_fetch(&scheduler_contention_overlap_samples, 1U,
+                           __ATOMIC_RELAXED);
+        }
+    }
+
+    /* Keep a short non-preemptible useful-work window so the active CPU mask
+     * is a simultaneous execution witness, not a historical participation
+     * union. Scheduling and timer preemption happen outside this window. */
+    for (u32 i = 0; i < 512U; i++) {
+        worker->work_units += (u64)(i + 1U);
+        __asm__ volatile("pause" ::: "memory");
+    }
+    __atomic_add_fetch(&scheduler_contention_useful_work, 512U,
+                       __ATOMIC_RELAXED);
+    __atomic_and_fetch(&scheduler_contention_active_cpus, ~bit,
+                       __ATOMIC_RELAXED);
+    __asm__ volatile("pushq %0; popfq" :: "r"(flags) : "memory");
+}
+
+static void scheduler_contention_high_entry(void *argument)
+{
+    scheduler_contention_worker_t *worker = argument;
+    u32 windows = 0;
+
+    if (!worker || thread_current() != worker->thread) {
+        __atomic_store_n(&scheduler_test_failed, true, __ATOMIC_RELAXED);
+        return;
+    }
+    worker->first_run_ms = timer_uptime_ms();
+    __atomic_store_n(&worker->started, true, __ATOMIC_RELEASE);
+    __atomic_add_fetch(&scheduler_contention_high_started, 1U,
+                       __ATOMIC_ACQ_REL);
+    while (__atomic_load_n(&scheduler_contention_high_started,
+                           __ATOMIC_ACQUIRE) <
+               __atomic_load_n(&scheduler_contention_high_worker_count,
+                               __ATOMIC_ACQUIRE) &&
+           !__atomic_load_n(&scheduler_contention_stop, __ATOMIC_ACQUIRE)) {
+        scheduler_contention_window(worker);
+        /* The workload is deliberately oversubscribed at every CPU count.
+         * Cooperate while forming the start cohort so a single CPU, or a
+         * smaller worker set than the cohort, cannot spin ahead of workers
+         * that have not yet received their first dispatch. Timer preemption
+         * is measured separately by the native SMP workload. */
+        (void)scheduler_yield();
+    }
+
+    while (!__atomic_load_n(&scheduler_contention_stop, __ATOMIC_ACQUIRE)) {
+        scheduler_contention_window(worker);
+        if ((++windows & 3U) == 0U)
+            (void)scheduler_yield();
+    }
+    __atomic_add_fetch(&scheduler_contention_high_completed, 1U,
+                       __ATOMIC_RELEASE);
+    __atomic_store_n(&worker->completed, true, __ATOMIC_RELEASE);
+}
+
+static void scheduler_contention_low_entry(void *argument)
+{
+    scheduler_contention_worker_t *worker = argument;
+    bool background;
+
+    if (!worker || thread_current() != worker->thread) {
+        __atomic_store_n(&scheduler_test_failed, true, __ATOMIC_RELAXED);
+        return;
+    }
+    background = worker->kind == SCHEDULER_CONTENTION_BACKGROUND;
+    worker->first_run_ms = timer_uptime_ms();
+    worker->selected_priority = worker->thread->last_selected_priority;
+    worker->base_priority = worker->thread->base_priority;
+    worker->effective_priority = worker->thread->effective_priority;
+    worker->work_units = 1U;
+    __atomic_store_n(&worker->started, true, __ATOMIC_RELEASE);
+    if (background)
+        __atomic_store_n(&scheduler_contention_background_seen, true,
+                         __ATOMIC_RELEASE);
+    else
+        __atomic_store_n(&scheduler_contention_normal_seen, true,
+                         __ATOMIC_RELEASE);
+    __atomic_store_n(&worker->completed, true, __ATOMIC_RELEASE);
+}
+
+static void scheduler_contention_wake_entry(void *argument)
+{
+    scheduler_contention_worker_t *worker = argument;
+
+    if (!worker || thread_current() != worker->thread) {
+        __atomic_store_n(&scheduler_test_failed, true, __ATOMIC_RELAXED);
+        return;
+    }
+    worker->sleep_start_ms = timer_uptime_ms();
+    __atomic_store_n(&worker->started, true, __ATOMIC_RELEASE);
+    worker->sleep_succeeded = scheduler_sleep(250U);
+    worker->wake_latency_ms = timer_uptime_ms() - worker->sleep_start_ms;
+    worker->first_run_ms = timer_uptime_ms();
+    worker->selected_priority = worker->thread->last_selected_priority;
+    worker->base_priority = worker->thread->base_priority;
+    worker->effective_priority = worker->thread->effective_priority;
+    worker->work_units = worker->sleep_succeeded ? 1U : 0U;
+    __atomic_store_n(&worker->completed, true, __ATOMIC_RELEASE);
+    __atomic_store_n(&scheduler_contention_wake_seen,
+                     worker->sleep_succeeded, __ATOMIC_RELEASE);
+}
+
+static void scheduler_contention_controller_entry(void *argument)
+{
+    scheduler_contention_worker_t *worker = argument;
+
+    if (!worker || thread_current() != worker->thread) {
+        __atomic_store_n(&scheduler_test_failed, true, __ATOMIC_RELAXED);
+        __atomic_store_n(&scheduler_contention_stop, true, __ATOMIC_RELEASE);
+        return;
+    }
+    __atomic_store_n(&worker->started, true, __ATOMIC_RELEASE);
+    for (;;) {
+        thread_state_t wake_state;
+        thread_priority_t wake_effective;
+        thread_priority_t wake_selected;
+        u64 now_ms = timer_uptime_ms();
+        if (scheduler_contention_thread_snapshot(
+                scheduler_contention_wake_background.thread, &wake_state,
+                NULL, &wake_effective, &wake_selected, NULL, NULL, NULL)) {
+            scheduler_contention_worker_t *wake =
+                &scheduler_contention_wake_background;
+            if (!wake->wake_ready_seen && wake_state != THREAD_STATE_BLOCKED) {
+                wake->wake_ready_after_ms = now_ms >=
+                    scheduler_contention_start_ms ? now_ms -
+                    scheduler_contention_start_ms : 0U;
+                __atomic_store_n(&wake->wake_ready_seen, true,
+                                 __ATOMIC_RELEASE);
+            }
+            if (!wake->wake_high_seen &&
+                (wake_effective == THREAD_PRIORITY_HIGH ||
+                 wake_selected == THREAD_PRIORITY_HIGH)) {
+                wake->wake_high_after_ms = now_ms >=
+                    scheduler_contention_start_ms ? now_ms -
+                    scheduler_contention_start_ms : 0U;
+                __atomic_store_n(&wake->wake_high_seen, true,
+                                 __ATOMIC_RELEASE);
+            }
+        }
+        if (!scheduler_validate_state()) {
+            worker->queue_validation_failed = true;
+            __atomic_store_n(&scheduler_test_failed, true, __ATOMIC_RELAXED);
+            break;
+        }
+        __atomic_add_fetch(&worker->queue_validation_samples, 1U,
+                           __ATOMIC_RELAXED);
+        bool done =
+            __atomic_load_n(&scheduler_contention_high_started,
+                            __ATOMIC_ACQUIRE) ==
+                __atomic_load_n(&scheduler_contention_high_worker_count,
+                                __ATOMIC_ACQUIRE) &&
+            __atomic_load_n(&scheduler_contention_normal_seen,
+                            __ATOMIC_ACQUIRE) &&
+            __atomic_load_n(&scheduler_contention_background_seen,
+                            __ATOMIC_ACQUIRE) &&
+            __atomic_load_n(&scheduler_contention_wake_seen,
+                            __ATOMIC_ACQUIRE);
+        if (done)
+            break;
+        if (now_ms - scheduler_contention_start_ms >=
+            SCHEDULER_CONTENTION_TIMEOUT_MS) {
+            __atomic_store_n(&scheduler_contention_timeout, true,
+                             __ATOMIC_RELEASE);
+            break;
+        }
+        if (!scheduler_sleep(100U)) {
+            __atomic_store_n(&scheduler_test_failed, true,
+                             __ATOMIC_RELAXED);
+            __atomic_store_n(&scheduler_contention_timeout, true,
+                             __ATOMIC_RELEASE);
+            break;
+        }
+    }
+
+    __atomic_store_n(&scheduler_contention_stop, true, __ATOMIC_RELEASE);
+    if (!__atomic_load_n(&scheduler_contention_wake_seen, __ATOMIC_ACQUIRE))
+        (void)scheduler_wake_waiter(
+            scheduler_contention_wake_background.thread);
+    __atomic_store_n(&worker->completed, true, __ATOMIC_RELEASE);
+}
+
+static bool scheduler_contention_prepare_worker(
+    scheduler_contention_worker_t *worker, const char *name,
+    thread_entry_t entry, scheduler_contention_kind_t kind,
+    thread_priority_t priority)
+{
+    memset(worker, 0, sizeof(*worker));
+    worker->kind = kind;
+    worker->thread = thread_create_suspended_with_priority(
+        name, entry, worker, priority);
+    return worker->thread != NULL;
+}
+
+static bool scheduler_contention_worker_stopped(
+    scheduler_contention_worker_t *worker)
+{
+    return worker && worker->thread &&
+        scheduler_thread_exit_complete(worker->thread);
+}
+
+bool kernel_scheduler_contention_guest_test(void)
+{
+    scheduler_contention_worker_t *all[SCHEDULER_CONTENTION_MAX_WORKERS];
+    scheduler_stats_t before;
+    scheduler_stats_t after;
+    u64 busy_before[SCHEDULER_CONTENTION_MAX_CPUS] = {0};
+    u64 busy_after[SCHEDULER_CONTENTION_MAX_CPUS] = {0};
+    u64 busy_delta[SCHEDULER_CONTENTION_MAX_CPUS] = {0};
+    u64 start_ms;
+    u64 end_ms;
+    u64 cleanup_deadline;
+    u64 expected_mask;
+    u64 observed_mask;
+    u64 busy_mask = 0;
+    u64 overlap_samples;
+    u32 cpus = cpu_online_count();
+    u32 high_count;
+    u32 all_count = 0;
+    bool created = true;
+    bool timeout = false;
+    bool drained = true;
+    bool validated;
+    bool passed;
+
+    if (cpus == 0U || cpus > SCHEDULER_CONTENTION_MAX_CPUS) {
+        kprint("SCHED_CONTENTION pass=0 cpus=%u reason=unsupported-online-cpu-count\n",
+               cpus);
+        return false;
+    }
+    high_count = 2U * cpus + 1U;
+    scheduler_contention_high_worker_count = high_count;
+    expected_mask = (1ULL << cpus) - 1ULL;
+    scheduler_contention_stop = false;
+    scheduler_contention_timeout = false;
+    scheduler_contention_start_ms = 0;
+    scheduler_contention_high_started = 0;
+    scheduler_contention_high_completed = 0;
+    scheduler_contention_normal_seen = false;
+    scheduler_contention_background_seen = false;
+    scheduler_contention_wake_seen = false;
+    scheduler_contention_cpu_mask = 0;
+    scheduler_contention_active_cpus = 0;
+    scheduler_contention_overlap_samples = 0;
+    scheduler_contention_useful_work = 0;
+    scheduler_test_failed = false;
+
+    created = scheduler_contention_prepare_worker(
+        &scheduler_contention_wake_background, "sched-wake-background",
+        scheduler_contention_wake_entry,
+        SCHEDULER_CONTENTION_WAKE_BACKGROUND, THREAD_PRIORITY_BACKGROUND);
+    all[all_count++] = &scheduler_contention_wake_background;
+    for (u32 i = 0; created && i < high_count; i++) {
+        created = scheduler_contention_prepare_worker(
+            &scheduler_contention_high[i], "sched-high",
+            scheduler_contention_high_entry, SCHEDULER_CONTENTION_HIGH,
+            THREAD_PRIORITY_HIGH);
+        all[all_count++] = &scheduler_contention_high[i];
+    }
+    if (created) {
+        created = scheduler_contention_prepare_worker(
+            &scheduler_contention_normal, "sched-fair-normal",
+            scheduler_contention_low_entry, SCHEDULER_CONTENTION_NORMAL,
+            THREAD_PRIORITY_NORMAL);
+        all[all_count++] = &scheduler_contention_normal;
+    }
+    if (created) {
+        created = scheduler_contention_prepare_worker(
+            &scheduler_contention_background, "sched-fair-background",
+            scheduler_contention_low_entry,
+            SCHEDULER_CONTENTION_BACKGROUND, THREAD_PRIORITY_BACKGROUND);
+        all[all_count++] = &scheduler_contention_background;
+    }
+    if (created) {
+        created = scheduler_contention_prepare_worker(
+            &scheduler_contention_controller, "sched-contention-control",
+            scheduler_contention_controller_entry,
+            SCHEDULER_CONTENTION_CONTROLLER, THREAD_PRIORITY_HIGH);
+        all[all_count++] = &scheduler_contention_controller;
+    }
+    if (!created) {
+        for (u32 i = 0; i < all_count; i++)
+            if (all[i]->thread) (void)thread_destroy(all[i]->thread);
+        kprint("SCHED_CONTENTION pass=0 cpus=%u reason=thread-creation-failed\n",
+               cpus);
+        return false;
+    }
+
+    if (!scheduler_enqueue(scheduler_contention_wake_background.thread) ||
+        !scheduler_reschedule()) {
+        created = false;
+    }
+    start_ms = timer_uptime_ms();
+    while (created && scheduler_thread_state_snapshot(
+               scheduler_contention_wake_background.thread) !=
+               THREAD_STATE_BLOCKED && timer_uptime_ms() - start_ms < 1000U) {
+        (void)scheduler_yield();
+    }
+    if (scheduler_thread_state_snapshot(
+            scheduler_contention_wake_background.thread) !=
+        THREAD_STATE_BLOCKED) {
+        created = false;
+    }
+    if (!created) {
+        scheduler_contention_stop = true;
+        (void)scheduler_wake_waiter(
+            scheduler_contention_wake_background.thread);
+        for (u32 i = 0; i < all_count; i++) {
+            if (all[i]->thread && !all[i]->started)
+                (void)scheduler_terminate_thread(all[i]->thread);
+            if (all[i]->thread &&
+                scheduler_thread_exit_complete(all[i]->thread))
+                (void)thread_destroy(all[i]->thread);
+        }
+        kprint("SCHED_CONTENTION pass=0 cpus=%u reason=wake-worker-did-not-block\n",
+               cpus);
+        return false;
+    }
+    scheduler_get_stats(&before);
+    scheduler_contention_counters_reset();
+    for (u32 i = 0; i < cpus; i++) {
+        cpu_local_t *cpu = cpu_by_index(i);
+        if (!cpu || !cpu->online) {
+            created = false;
+            continue;
+        }
+        busy_before[i] = __atomic_load_n(&cpu->scheduler_busy_ticks,
+                                         __ATOMIC_RELAXED);
+    }
+    start_ms = timer_uptime_ms();
+    scheduler_contention_start_ms = start_ms;
+    for (u32 i = 0; created && i < high_count; i++)
+        created = scheduler_enqueue(scheduler_contention_high[i].thread);
+    if (created)
+        created = scheduler_enqueue(scheduler_contention_normal.thread) &&
+                  scheduler_enqueue(scheduler_contention_background.thread);
+    if (created)
+        created = scheduler_enqueue(scheduler_contention_controller.thread);
+    if (!created) {
+        __atomic_store_n(&scheduler_contention_stop, true,
+                         __ATOMIC_RELEASE);
+        (void)scheduler_wake_waiter(
+            scheduler_contention_wake_background.thread);
+    }
+
+    /* The boot callback runs on the special BSP bootstrap context, which is
+     * resumed only after the runnable queue drains. A same-priority control
+     * worker owns the deadline and stop transition so oversubscribed workers
+     * cannot starve the callback that launched them. */
+    while (created &&
+           !__atomic_load_n(&scheduler_contention_controller.completed,
+                            __ATOMIC_ACQUIRE)) {
+        (void)scheduler_yield();
+    }
+    timeout = !created || __atomic_load_n(&scheduler_contention_timeout,
+                                          __ATOMIC_ACQUIRE);
+    for (u32 i = 0; i < all_count; i++) {
+        if (all[i]->thread && !all[i]->started &&
+            scheduler_thread_state_snapshot(all[i]->thread) ==
+                THREAD_STATE_READY)
+            (void)scheduler_terminate_thread(all[i]->thread);
+    }
+    cleanup_deadline = timer_uptime_ms() + 4000U;
+    while (timer_uptime_ms() < cleanup_deadline) {
+        bool all_stopped = true;
+        for (u32 i = 0; i < all_count; i++) {
+            if (!scheduler_contention_worker_stopped(all[i])) {
+                all_stopped = false;
+                break;
+            }
+        }
+        if (all_stopped)
+            break;
+        (void)scheduler_yield();
+    }
+    for (u32 i = 0; i < all_count; i++) {
+        if (!scheduler_contention_worker_stopped(all[i])) {
+            drained = false;
+            continue;
+        }
+        if (!thread_destroy(all[i]->thread))
+            drained = false;
+        all[i]->thread = NULL;
+    }
+    end_ms = timer_uptime_ms();
+    scheduler_get_stats(&after);
+    observed_mask = __atomic_load_n(&scheduler_contention_cpu_mask,
+                                    __ATOMIC_RELAXED);
+    overlap_samples = __atomic_load_n(
+        &scheduler_contention_overlap_samples, __ATOMIC_RELAXED);
+    for (u32 i = 0; i < cpus; i++) {
+        cpu_local_t *cpu = cpu_by_index(i);
+        if (!cpu) continue;
+        busy_after[i] = __atomic_load_n(&cpu->scheduler_busy_ticks,
+                                        __ATOMIC_RELAXED);
+        busy_delta[i] = busy_after[i] - busy_before[i];
+        if (busy_delta[i]) busy_mask |= 1ULL << i;
+    }
+    validated = scheduler_validate_state();
+    passed = created && !timeout && drained && validated &&
+        !__atomic_load_n(&scheduler_test_failed, __ATOMIC_RELAXED) &&
+        __atomic_load_n(&scheduler_contention_high_completed,
+                        __ATOMIC_ACQUIRE) == high_count &&
+        __atomic_load_n(&scheduler_contention_normal_seen,
+                        __ATOMIC_ACQUIRE) &&
+        __atomic_load_n(&scheduler_contention_background_seen,
+                        __ATOMIC_ACQUIRE) &&
+        __atomic_load_n(&scheduler_contention_wake_seen,
+                        __ATOMIC_ACQUIRE) &&
+        scheduler_contention_normal.selected_priority == THREAD_PRIORITY_HIGH &&
+        scheduler_contention_background.selected_priority ==
+            THREAD_PRIORITY_HIGH &&
+        scheduler_contention_wake_background.sleep_succeeded &&
+        scheduler_contention_wake_background.selected_priority ==
+            THREAD_PRIORITY_HIGH &&
+        scheduler_contention_normal.base_priority == THREAD_PRIORITY_NORMAL &&
+        scheduler_contention_normal.effective_priority ==
+            THREAD_PRIORITY_NORMAL &&
+        scheduler_contention_background.base_priority ==
+            THREAD_PRIORITY_BACKGROUND &&
+        scheduler_contention_background.effective_priority ==
+            THREAD_PRIORITY_BACKGROUND &&
+        scheduler_contention_wake_background.base_priority ==
+            THREAD_PRIORITY_BACKGROUND &&
+        scheduler_contention_wake_background.effective_priority ==
+            THREAD_PRIORITY_BACKGROUND &&
+        __atomic_load_n(&scheduler_contention_wake_background.wake_ready_seen,
+                        __ATOMIC_ACQUIRE) &&
+        scheduler_contention_wake_background.wake_ready_after_ms >= 100U &&
+        scheduler_contention_wake_background.wake_ready_after_ms <= 500U &&
+        __atomic_load_n(&scheduler_contention_wake_background.wake_high_seen,
+                        __ATOMIC_ACQUIRE) &&
+        scheduler_contention_controller.queue_validation_samples >= 20U &&
+        !scheduler_contention_controller.queue_validation_failed &&
+        scheduler_contention_wake_background.wake_high_after_ms >= 650U &&
+        scheduler_contention_wake_background.wake_high_after_ms <= 1500U &&
+        scheduler_contention_normal.first_run_ms >= start_ms + 4500U &&
+        scheduler_contention_background.first_run_ms >= start_ms + 5400U &&
+        scheduler_contention_wake_background.wake_latency_ms >= 450U &&
+        scheduler_contention_wake_background.wake_latency_ms <= 2500U &&
+        observed_mask == expected_mask && busy_mask == expected_mask &&
+        (cpus == 1U ? overlap_samples == 0U : overlap_samples > 0U) &&
+        __atomic_load_n(&scheduler_contention_useful_work,
+                        __ATOMIC_RELAXED) > 0U &&
+        after.dispatches[THREAD_PRIORITY_HIGH] >
+            before.dispatches[THREAD_PRIORITY_HIGH] &&
+        after.dispatches[THREAD_PRIORITY_HIGH] -
+            before.dispatches[THREAD_PRIORITY_HIGH] >= high_count + 2U &&
+        after.wakeups > before.wakeups &&
+        after.timer_preemptions > before.timer_preemptions &&
+        after.context_switches > before.context_switches &&
+        (cpus == 1U ? after.lock_contended_acquisitions == 0U :
+                      after.lock_contended_acquisitions > 0U) &&
+        after.lock_wait_iterations >= after.lock_contended_acquisitions;
+
+    kprint("SCHED_CONTENTION pass=%u cpus=%u online_mask=%llx workers=%u "
+           "started=%u completed=%u normal_seen=%u background_seen=%u "
+           "wake_seen=%u normal_priority=%u background_priority=%u "
+           "wake_priority=%u normal_latency_ms=%llu background_latency_ms=%llu "
+           "wake_latency_ms=%llu wake_ready_ms=%llu wake_high_ms=%llu "
+           "busy_mask=%llx busy_delta=%llu,%llu,%llu,%llu cpu_mask=%llx "
+           "overlap_samples=%llu useful_work=%llu lock_contended=%llu "
+           "lock_wait_iterations=%llu wakeups=%llu timer_preemptions=%llu "
+           "context_switches=%llu high_dispatches=%llu normal_dispatches=%llu "
+           "elapsed_ms=%llu timeout=%u queue_validation_samples=%u "
+           "queue_valid=%u drained=%u\n",
+           passed ? 1U : 0U, cpus, expected_mask, high_count,
+           __atomic_load_n(&scheduler_contention_high_started,
+                           __ATOMIC_RELAXED),
+           __atomic_load_n(&scheduler_contention_high_completed,
+                           __ATOMIC_RELAXED),
+           __atomic_load_n(&scheduler_contention_normal_seen,
+                           __ATOMIC_RELAXED) ? 1U : 0U,
+           __atomic_load_n(&scheduler_contention_background_seen,
+                           __ATOMIC_RELAXED) ? 1U : 0U,
+           __atomic_load_n(&scheduler_contention_wake_seen,
+                           __ATOMIC_RELAXED) ? 1U : 0U,
+           (u32)scheduler_contention_normal.selected_priority,
+           (u32)scheduler_contention_background.selected_priority,
+           (u32)scheduler_contention_wake_background.selected_priority,
+           (unsigned long long)(scheduler_contention_normal.first_run_ms -
+                                start_ms),
+           (unsigned long long)(scheduler_contention_background.first_run_ms -
+                                start_ms),
+           (unsigned long long)
+               scheduler_contention_wake_background.wake_latency_ms,
+           (unsigned long long)
+               scheduler_contention_wake_background.wake_ready_after_ms,
+           (unsigned long long)
+               scheduler_contention_wake_background.wake_high_after_ms,
+           busy_mask,
+           (unsigned long long)busy_delta[0],
+           (unsigned long long)busy_delta[1],
+           (unsigned long long)busy_delta[2],
+           (unsigned long long)busy_delta[3], observed_mask,
+           (unsigned long long)overlap_samples,
+           (unsigned long long)__atomic_load_n(
+               &scheduler_contention_useful_work, __ATOMIC_RELAXED),
+           (unsigned long long)after.lock_contended_acquisitions,
+           (unsigned long long)after.lock_wait_iterations,
+           (unsigned long long)(after.wakeups - before.wakeups),
+           (unsigned long long)(after.timer_preemptions -
+                                before.timer_preemptions),
+           (unsigned long long)(after.context_switches -
+                                before.context_switches),
+           (unsigned long long)(after.dispatches[THREAD_PRIORITY_HIGH] -
+                                before.dispatches[THREAD_PRIORITY_HIGH]),
+           (unsigned long long)(after.dispatches[THREAD_PRIORITY_NORMAL] -
+                                before.dispatches[THREAD_PRIORITY_NORMAL]),
+           (unsigned long long)(end_ms - start_ms), timeout ? 1U : 0U,
+           scheduler_contention_controller.queue_validation_samples,
+           validated ? 1U : 0U, drained ? 1U : 0U);
+    return passed;
+}
+#endif
+
 #ifdef PITH_DEBUG_BOOT_TESTS
 void kernel_debug_scheduler_tests(void)
 {
