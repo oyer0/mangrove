@@ -781,10 +781,21 @@ static bool mgfs_allocate_data_block_from(mgfs_fs_t *fs, u64 minimum,
     u8 block[MGFS_BLOCK_BYTES];
     u64 first = minimum > fs->layout.data_start ?
         minimum - fs->layout.data_start : 0;
-    for (u64 index = first; index < fs->layout.data_blocks; index++) {
-        u64 bitmap_block = index / MGFS_BITMAP_BITS_PER_BLOCK;
-        u64 bit = index % MGFS_BITMAP_BITS_PER_BLOCK;
-        u64 byte_offset = MGFS_BITMAP_HEADER_BYTES + bit / 8ULL;
+    u64 first_bitmap_block = first / MGFS_BITMAP_BITS_PER_BLOCK;
+
+    for (u64 bitmap_block = first_bitmap_block;
+         bitmap_block < fs->layout.allocation_bitmap_blocks;
+         bitmap_block++) {
+        u64 bitmap_start = bitmap_block * MGFS_BITMAP_BITS_PER_BLOCK;
+        u64 scan_start = first > bitmap_start ? first - bitmap_start : 0;
+        u64 remaining;
+        u64 scan_end;
+
+        if (bitmap_start >= fs->layout.data_blocks)
+            break;
+        remaining = fs->layout.data_blocks - bitmap_start;
+        scan_end = remaining < MGFS_BITMAP_BITS_PER_BLOCK
+            ? remaining : MGFS_BITMAP_BITS_PER_BLOCK;
         if (!mgfs_read_block(fs->dev, fs->device_id,
                              fs->layout.allocation_bitmap_start + bitmap_block,
                              block) ||
@@ -792,14 +803,20 @@ static bool mgfs_allocate_data_block_from(mgfs_fs_t *fs, u64 minimum,
                                            bitmap_block)) {
             return false;
         }
-        if ((block[byte_offset] & (1U << (bit % 8ULL))) == 0U) {
-            if (!mgfs_update_bitmap_bit(fs, fs->layout.allocation_bitmap_start,
-                                        fs->layout.allocation_bitmap_blocks,
-                                        fs->layout.data_blocks, index, true, false)) {
-                return false;
+
+        for (u64 bit = scan_start; bit < scan_end; bit++) {
+            u64 byte_offset = MGFS_BITMAP_HEADER_BYTES + bit / 8ULL;
+            if ((block[byte_offset] & (1U << (bit % 8ULL))) == 0U) {
+                u64 index = bitmap_start + bit;
+                if (!mgfs_update_bitmap_bit(
+                        fs, fs->layout.allocation_bitmap_start,
+                        fs->layout.allocation_bitmap_blocks,
+                        fs->layout.data_blocks, index, true, false)) {
+                    return false;
+                }
+                *out_block = fs->layout.data_start + index;
+                return true;
             }
-            *out_block = fs->layout.data_start + index;
-            return true;
         }
     }
     mgfs_set_error("MGFS data area is full");

@@ -84,7 +84,8 @@ struct ordinary_tx {vfs_node_t *prepared_node;};
 static int mgfs_node_ops;
 static const char *error="no error";
 static u8 disk[16][4096],bitmap[4096];
-static unsigned allocs,live,fail_alloc,reads,writes,fail_read,fail_write;
+static unsigned allocs,live,fail_alloc,reads,writes,fail_read,fail_write,validations;
+static bool fail_metadata_validation;
 static bool torn,append_fail,append_uncertain,published,registered,append_real;
 static void mgfs_set_error(const char *s){error=s;}
 static const char *mgfs_last_error(void){return error;}
@@ -95,7 +96,7 @@ static void mgfs_store_le64(u8 *p,u64 n){memcpy(p,&n,8);}
 static bool mgfs_recompute_checksum(u8 *p,u32 o,usize n){(void)p;(void)o;(void)n;return true;}
 static bool mgfs_read_block(void *d,u64 id,u64 n,u8 *p){(void)d;(void)id;assert(n<16);if(++reads==fail_read)return false;memcpy(p,disk[n],4096);return true;}
 static bool mgfs_write_block(void *d,u64 id,u64 n,const u8 *p){(void)d;(void)id;assert(n<16);if(++writes==fail_write){if(torn)memcpy(disk[n],p,200);return false;}memcpy(disk[n],p,4096);return true;}
-static bool mgfs_validate_metadata_header(const u8 *p,u64 type,u64 n){(void)p;(void)type;(void)n;return true;}
+static bool mgfs_validate_metadata_header(const u8 *p,u64 type,u64 n){(void)p;(void)type;(void)n;validations++;return !fail_metadata_validation;}
 static bool mgfs_record_slot_allocated(const mgfs_fs_t *fs,u64 n){assert(n<fs->layout.record_count);return (fs->record_bitmap[24+n/8]&(1U<<(n%8)))!=0;}
 static bool mgfs_valid_utf8_name(const u8 *p,u64 n){(void)p;return n>0&&n<=255;}
 static bool vfs_current_uid(u32 *uid){*uid=9;return true;}
@@ -157,7 +158,7 @@ static vfs_node_t dir;
 static void finish(void){kfree(fs.record_ids);assert(!live);}
 static void seed(void){
  assert(!live);memset(&fs,0,sizeof(fs));memset(disk,0,sizeof(disk));memset(bitmap,0,sizeof(bitmap));
- reads=writes=allocs=fail_read=fail_write=fail_alloc=0;torn=append_fail=append_uncertain=published=registered=append_real=false;
+ reads=writes=allocs=fail_read=fail_write=fail_alloc=validations=0;fail_metadata_validation=false;torn=append_fail=append_uncertain=published=registered=append_real=false;
  fs.layout=(layout_t){16,1,1,2,1,4,12,3,1};fs.next_record_id=2;fs.record_bitmap=bitmap;
  fs.record_id_capacity=16;fs.record_ids=kmalloc(16*sizeof(*fs.record_ids));memset(fs.record_ids,0,16*sizeof(*fs.record_ids));
  assert(mgfs_insert_record_id(&fs,1,0));bitmap[24]=disk[1][24]=1;
@@ -165,6 +166,37 @@ static void seed(void){
  super.private_data=&fs;dir=(vfs_node_t){.type=2,.fs_data=(void*)1,.super=&super};error="no error";
 }
 static unsigned occupied(void){unsigned n=0;for(unsigned i=0;i<16;i++)n+=mgfs_record_slot_allocated(&fs,i);return n;}
+static void bitmap_scan(void){
+ seed();fs.layout.data_start=100;fs.layout.data_blocks=4000;
+ fs.layout.allocation_bitmap_start=3;fs.layout.allocation_bitmap_blocks=1;
+ for(u64 bit=0;bit<3000;bit++)disk[3][MGFS_BITMAP_HEADER_BYTES+bit/8]|=(u8)(1U<<(bit%8));
+ reads=writes=validations=0;u64 allocated=0;
+ assert(mgfs_allocate_data_block_from(&fs,fs.layout.data_start,&allocated));
+ assert(allocated==fs.layout.data_start+3000);
+ if(reads!=2||validations!=2||writes!=1)fprintf(stderr,"bitmap scan counts read=%u validate=%u write=%u\n",reads,validations,writes);
+ assert(reads==2&&validations==2&&writes==1);
+ assert((disk[3][MGFS_BITMAP_HEADER_BYTES+3000/8]&(1U<<(3000%8)))!=0);
+ finish();
+
+ seed();fs.layout.data_start=200;
+ fs.layout.data_blocks=MGFS_BITMAP_BITS_PER_BLOCK+8;
+ fs.layout.allocation_bitmap_start=3;fs.layout.allocation_bitmap_blocks=2;
+ memset(disk[3]+MGFS_BITMAP_HEADER_BYTES,0xff,
+        MGFS_BLOCK_BYTES-MGFS_BITMAP_HEADER_BYTES);
+ disk[4][MGFS_BITMAP_HEADER_BYTES]=7U; /* First three bits of block two used. */
+ reads=writes=validations=0;allocated=0;
+ assert(mgfs_allocate_data_block_from(&fs,fs.layout.data_start,&allocated));
+ assert(allocated==fs.layout.data_start+MGFS_BITMAP_BITS_PER_BLOCK+3);
+ assert(reads==3&&validations==3&&writes==1);
+ finish();
+
+ seed();fs.layout.data_blocks=4000;fs.layout.allocation_bitmap_start=3;
+ fs.layout.allocation_bitmap_blocks=1;fail_metadata_validation=true;
+ reads=writes=validations=0;
+ assert(!mgfs_allocate_data_block_from(&fs,fs.layout.data_start,&allocated));
+ assert(reads==1&&validations==1&&writes==0);
+ finish();
+}
 static void churn(void){
  seed();unsigned allocation_count=allocs;u64 slot;
  for(u64 id=2;id<40002;id++){
@@ -244,6 +276,7 @@ static void real_append(void){
 }
 int main(int argc,char **argv){(void)mgfs_reserve_record_index;(void)mgfs_free_record_slot;(void)mgfs_release_record;assert(argc==2);
  if(!strcmp(argv[1],"exhaustion")){seed();for(u64 id=2;id<1000;id++){bitmap[24]|=2;disk[1][24]|=2;assert(mgfs_insert_record_id(&fs,id,1));assert(mgfs_release_record(&fs,1,id));}finish();}
+ if(!strcmp(argv[1],"all")||!strcmp(argv[1],"bitmap-scan")){bitmap_scan();puts("MGFS bitmap allocation: bounded per-bitmap-block validation, cross-block search, allocation update and invalid-metadata rejection passed");}
  if(!strcmp(argv[1],"all")||!strcmp(argv[1],"index"))churn();
  if(!strcmp(argv[1],"all")||!strcmp(argv[1],"cleanup"))cleanup();
  if(!strcmp(argv[1],"all")){real_append();release_churn();}
