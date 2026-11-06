@@ -41,7 +41,9 @@ can be supplied unambiguously. This does not add flags to those commands.
 These commands run inside Shoot and are not standalone `/bin` programs:
 `jump` changes the working directory, `help` lists built-in commands,
 `history` displays or manages the current session's history, `reload` reloads
-Shoot configuration, and `exit` or `logout` leaves the current login session.
+Shoot configuration, and `exit` ends the current Shoot process. When `exit`
+runs in the login shell, logind performs session cleanup; a nested Shoot
+returns to its parent.
 See the [history contract](../shell/history.md) for history options and
 persistence.
 

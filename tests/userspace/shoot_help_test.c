@@ -118,22 +118,15 @@ int main(void)
     assert(strstr(output, "help") != NULL);
     assert(strstr(output, "history") != NULL);
     assert(strstr(output, "exit") != NULL);
-    assert(strstr(output, "logout") != NULL);
+    assert(strstr(output, "logout") == NULL);
     assert(strstr(output, "change Shoot's current directory") != NULL);
     assert(strstr(output, "/bin") == NULL);
 
     reset();
     command.name = "logout";
     command.argument_count = 0U;
-    assert(execute_builtin(NULL, &command));
-    assert(handler_calls == 1U);
-    assert(find_builtin("logout") != NULL);
-
-    reset();
-    command.argument_count = 1U;
-    command.arguments[0] = "7";
     assert(!execute_builtin(NULL, &command));
-    assert(handler_calls == 0U && strstr(output, "Usage: logout") != NULL);
+    assert(handler_calls == 0U && find_builtin("logout") == NULL);
 
     reset();
     command.name = "help";

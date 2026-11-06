@@ -23,11 +23,8 @@ static const shell_command_info_t shell_builtins[] = {
      "An uncertain write blocks append until a successful -w.", 0, 2,
      SHELL_COMPLETION_NONE, execute_history},
     {"exit", "exit [STATUS]", "leave Shoot",
-     "Exits the current Shoot session with an optional status.",
+     "Exits this Shoot process with an optional status.",
      0, 1, SHELL_COMPLETION_NONE, execute_exit},
-    {"logout", "logout", "end the current login session",
-     "Leaves the current login session and returns to the login prompt.",
-     0, 0, SHELL_COMPLETION_NONE, execute_exit},
 };
 
 usize shell_builtin_count(void)

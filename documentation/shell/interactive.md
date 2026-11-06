@@ -65,14 +65,15 @@ and sleep operations are interruptible, while CPU-only work must reach an
 interruptible operation. See the
 [process interruption contract](../architecture/processes-and-syscalls.md#foreground-interruption).
 
-`exit` leaves the current login session; `logout` is its no-status spelling.
-Ctrl+D at an empty prompt has the same end-of-input effect. Ctrl+D on a
-nonempty command still deletes the scalar under the cursor. When a session
-ends, logind retires its remaining processes and clears the terminal before
-showing the next `Username:` prompt. The reset clears the terminal's retained
-cell ring as well as its visible framebuffer, so output from the previous
-session is not available through the console after logout. An unexpected
-shell exit is recorded by the logging service and follows the same reset path.
+`exit` ends the current Shoot process. If it is the login shell, logind retires
+the remaining session processes and clears the terminal before showing the
+next `Username:` prompt; a nested Shoot exits to its parent process. Ctrl+D at
+an empty prompt has the same end-of-input effect. Ctrl+D on a nonempty command
+still deletes the scalar under the cursor. Session reset clears the terminal's
+retained cell ring as well as its visible framebuffer, so output from the
+previous session is not available through the console after logout. An
+unexpected login-shell exit is recorded by the logging service and follows
+the same reset path.
 
 Shoot's word model groups consecutive ASCII letters, digits, and underscore
 with any valid non-ASCII Unicode scalar. ASCII punctuation, spaces, and tabs

@@ -14,13 +14,13 @@ from types import SimpleNamespace
 from unittest.mock import patch
 sys.dont_write_bytecode = True
 import guest_mgfs_test as guest
-import guest_logout_test as logout
+import guest_logout_test as session_exit
 
 run='0123456789abcdef'
 assert guest.screen_geometry(1366, 768) == (16, 18, 41, 168)
 assert guest.screen_geometry(1920, 1080) == (16, 18, 58, 237)
-assert logout.scroll_fill_limit(1280, 800) == 45
-assert logout.scroll_fill_limit(1920, 1080) == 60
+assert session_exit.scroll_fill_limit(1280, 800) == 45
+assert session_exit.scroll_fill_limit(1920, 1080) == 60
 for height in (40, 900):
     width = 36
     assert guest.screen_geometry(width, height)[0] == 16

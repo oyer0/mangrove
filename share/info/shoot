@@ -122,8 +122,7 @@ COMMANDS
     help — List Shoot's built-in commands.
     history — Display or manage command history.
     reload — Reload Shoot's configuration.
-    exit — End the current login session.
-    logout — End the current login session.
+    exit [STATUS] — Exit the current Shoot process with an optional status.
 
 EXAMPLES
 

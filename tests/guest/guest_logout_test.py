@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Native login/logout screen-reset qualification on disposable QEMU media."""
+"""Native login-session reset qualification on disposable QEMU media."""
 import argparse
 import hashlib
 import json
@@ -162,9 +162,9 @@ def boot_logout(folder, disk, args):
             # session scrolls old text out of the physical viewport while it
             # remains in the terminal's retained cell ring.
             login()
-            run_say('logoutmarker')
+            run_say('priorsessionmarker')
             before = capture('session-output-before-scroll')
-            if 'logoutmarker' not in before:
+            if 'priorsessionmarker' not in before:
                 raise AssertionError('session marker was not rendered')
             _header, dimensions, _maximum, _pixels = current_ppm.read_bytes().split(
                 b'\n', 3)
@@ -173,10 +173,10 @@ def boot_logout(folder, disk, args):
             last_visible_fill = None
             for index in range(1, scroll_fill_limit(
                     framebuffer_width, framebuffer_height) + 1):
-                token = f'logoutfill{index:02d}'
+                token = f'priorsessionfill{index:02d}'
                 run_say(token)
                 visible = capture()
-                if 'logoutmarker' not in visible:
+                if 'priorsessionmarker' not in visible:
                     last_visible_fill = token
                     save_capture('session-output-after-scroll', visible)
                     break
@@ -184,12 +184,12 @@ def boot_logout(folder, disk, args):
                 raise AssertionError('guest output did not scroll marker off screen')
 
             # Positive control: the existing session can reach the marker in
-            # retained output before logout. This also synchronizes the guest
+            # retained output before session exit. This also synchronizes the guest
             # key-event path rather than assuming sendkey has been consumed.
             qmp_key(qmp, 'alt-pgup')
-            wait_for(lambda text: 'logoutmarker' in text,
+            wait_for(lambda text: 'priorsessionmarker' in text,
                      'Alt+PageUp to reveal retained session output',
-                     'scrollback-before-logout')
+                     'scrollback-before-session-exit')
             qmp_key(qmp, 'alt-pgdn')
             wait_for(lambda text: text.rstrip().endswith('developer ~:'),
                      'Alt+PageDown to restore live Shoot output')
@@ -208,7 +208,7 @@ def boot_logout(folder, disk, args):
                      'Page Up to recover the just-cleared live page',
                      'scrollback-after-clear')
             qmp_key(qmp, 'alt-pgup')
-            wait_for(lambda text: 'logoutmarker' in text,
+            wait_for(lambda text: 'priorsessionmarker' in text,
                      'older history remains available after clear')
             qmp_key(qmp, 'alt-pgdn')
             wait_for(lambda text: text.rstrip().endswith('developer ~:'),
@@ -235,7 +235,8 @@ def boot_logout(folder, disk, args):
                      'cancel preserved partial input')
 
             send_line('exit', 'exit')
-            expect_clean_login('login-after-exit', ('logoutmarker', 'logoutfill'))
+            expect_clean_login('login-after-exit',
+                               ('priorsessionmarker', 'priorsessionfill'))
 
             login()
             # If the old session's ring leaked, enough new output to make a
@@ -250,14 +251,14 @@ def boot_logout(folder, disk, args):
             oldest = wait_for(lambda text: 'NAME' in text,
                               'scrollback to reach the new session history',
                               'scrollback-after-login')
-            if 'logoutmarker' in oldest or 'logoutfill' in oldest:
+            if 'priorsessionmarker' in oldest or 'priorsessionfill' in oldest:
                 raise AssertionError(
                     'previous session output remains reachable in scrollback')
             qmp_key(qmp, 'alt-pgdn')
             wait_for(lambda text: text.rstrip().endswith('developer ~:'),
                      'return live after session-isolation check')
-            send_line('logout', 'logout')
-            expect_clean_login('login-after-logout')
+            send_line('exit', 'exit')
+            expect_clean_login('login-after-repeated-exit')
 
             login()
             qmp_key(qmp, 'ctrl-d')
@@ -274,9 +275,9 @@ def boot_logout(folder, disk, args):
                 raise RuntimeError(f'QEMU exited with status {process.returncode}')
             return {
                 'status': 'PASS', 'vcpus': args.cpus,
-                'normal_session_exit': True, 'logout_builtin': True,
+                'normal_session_exit': True, 'repeated_session_exit': True,
                 'empty_ctrl_d': True, 'nonzero_shell_exit': True,
-                'scroll_before_logout': True,
+                'scroll_before_session_exit': True,
                 'scrollback_reaches_prior_session_output': True,
                 'clear_preserves_live_and_older_history': True,
                 'ctrl_l_preserves_visible_input_page': True,
