@@ -68,6 +68,7 @@ def reed_cursor_column(path,expected):
     width,height=map(int,dimensions.split())
     if width*height>4096*2160 or len(pixels)!=width*height*3:
         raise ValueError('screendump bounds')
+    glyph_height,line_height,_,_=guest.screen_geometry(width,height)
     matching=[index for index,row in enumerate(guest.screen_text(path).splitlines())
               if row==expected]
     if len(matching)!=1:return None
@@ -75,8 +76,8 @@ def reed_cursor_column(path,expected):
     backgrounds=[]
     for column in range(len(expected)):
         colors=[]
-        for dy in range(16):
-            start=((10+row*18+dy)*width+10+column*8)*3
+        for dy in range(glyph_height):
+            start=((10+row*line_height+dy)*width+10+column*8)*3
             for dx in range(8):
                 offset=start+dx*3
                 colors.append(pixels[offset:offset+3])

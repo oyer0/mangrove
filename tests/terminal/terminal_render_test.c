@@ -7,6 +7,7 @@
 #include <string.h>
 #include <spinlock.h>
 #include <timer.h>
+#include <terminal_kernel.h>
 
 #ifndef TERMINAL_RENDER_SOURCE
 #define TERMINAL_RENDER_SOURCE "../../kernel/src/terminal.c"
@@ -252,6 +253,8 @@ static mg_result_t replace_after_clearing_prompt(mg_line_editor_t *editor,
 
 static u32 mock_width;
 static u32 mock_height;
+static u32 mock_font_width = 8U;
+static u32 mock_font_height = 16U;
 static u32 *pixel_backbuffer;
 static u32 *pixel_display;
 static u32 drawn_codepoint;
@@ -318,8 +321,8 @@ void *kmalloc(usize size) { return malloc(size); }
 void kfree(void *pointer) { free(pointer); }
 
 u64 timer_uptime_ms(void) { return ++mock_time; }
-u32 font_width(void) { return 8U; }
-u32 font_height(void) { return 16U; }
+u32 font_width(void) { return mock_font_width; }
+u32 font_height(void) { return mock_font_height; }
 u32 framebuffer_pitch(void) { return mock_width; }
 void framebuffer_fill_rows(u32 start, u32 count, u32 color)
 {
@@ -458,7 +461,8 @@ void draw_codepoint(u32 codepoint, u32 x, u32 y, u32 foreground,
                 glyph_ink(codepoint, dx, dy) ? foreground : background;
 }
 
-static void initialize(u32 width, u32 height)
+static void initialize_with_font(u32 width, u32 height, u32 glyph_width,
+                                 u32 glyph_height)
 {
     BOOT_INFO boot = {0};
 
@@ -469,6 +473,8 @@ static void initialize(u32 width, u32 height)
     assert(pixel_backbuffer && pixel_display);
     mock_width = width;
     mock_height = height;
+    mock_font_width = glyph_width;
+    mock_font_height = glyph_height;
     boot.FramebufferWidth = width;
     boot.FramebufferHeight = height;
     boot.PixelsPerScanLine = width;
@@ -488,8 +494,14 @@ static void initialize(u32 width, u32 height)
     drawn_foreground = drawn_background = 0;
 }
 
+static void initialize(u32 width, u32 height)
+{
+    initialize_with_font(width, height, 8U, 16U);
+}
+
 static void assert_pixels_match_cells(void);
 static void assert_cursor_at(u32 row, u32 column);
+static terminal_cell_t *screen_cell(u32 row, u32 column);
 
 static void test_startup_cursor_hidden_until_input(void)
 {
@@ -510,6 +522,44 @@ static void test_startup_cursor_hidden_until_input(void)
     assert(terminal_set_cursor_visible(false));
     assert(!terminal.cursor_enabled);
     assert(!terminal.cursor_visible);
+}
+
+static void test_kernel_diagnostics_use_owned_console_ring(void)
+{
+    static const char diagnostic[] = "37 [PASS] xHCI\n";
+    u8 saved_foreground;
+    u8 saved_background;
+    u32 flushes_before;
+
+    initialize(640U, 240U);
+    saved_foreground = terminal.fg_color;
+    saved_background = terminal.bg_color;
+    flushes_before = flush_calls;
+    assert(terminal_kernel_output_begin());
+    assert(terminal_write_kernel_styled(diagnostic,
+        sizeof(diagnostic) - 1U, TERMINAL_COLOR_GREEN,
+        TERMINAL_COLOR_BLACK));
+    assert(flush_calls == flushes_before);
+    assert(screen_cell(0U, 0U)->codepoint == '3');
+    assert(screen_cell(0U, 0U)->fg_color == TERMINAL_COLOR_GREEN);
+    assert(screen_cell(0U, 0U)->bg_color == TERMINAL_COLOR_BLACK);
+    assert(phys_to_screen_row(terminal.cursor_phys_row) == 1U);
+    assert(terminal.cursor_col == 0U);
+    assert(terminal.fg_color == saved_foreground);
+    assert(terminal.bg_color == saved_background);
+    terminal_kernel_output_end();
+    assert(flush_calls > flushes_before);
+    assert_pixels_match_cells();
+
+    assert(terminal_alternate_enter_process(7U));
+    assert(!terminal_kernel_output_begin());
+    assert(!terminal_write_kernel_styled(diagnostic,
+        sizeof(diagnostic) - 1U, TERMINAL_COLOR_GREEN,
+        TERMINAL_COLOR_BLACK));
+    assert(screen_cell(0U, 0U)->codepoint == ' ');
+    assert(terminal_alternate_leave_process(7U));
+    assert(screen_cell(0U, 0U)->codepoint == '3');
+    assert_pixels_match_cells();
 }
 
 static void test_terminal_clear_erases_retained_session_rows(void)
@@ -1273,6 +1323,26 @@ static void test_dimensions_fit_owned_ring(void)
     assert(terminal.visible_cols == 1U);
     assert(terminal.visible_rows == 1U);
     assert(terminal.top_row_idx == 0U);
+
+    initialize_with_font(1366U, 768U, 8U, 8U);
+    assert(terminal.visible_cols == 168U);
+    assert(terminal.visible_rows == 74U);
+    char compact_line[170];
+    memset(compact_line, 'a', 169U);
+    compact_line[169] = '\0';
+    terminal_write_bytes(compact_line, 169U);
+    assert(screen_cell(0U, 167U)->codepoint == 'a');
+    assert(screen_cell(1U, 0U)->codepoint == 'a');
+
+    initialize_with_font(1920U, 1080U, 8U, 16U);
+    assert(terminal.visible_cols == 237U);
+    assert(terminal.visible_rows == 58U);
+    char full_line[239];
+    memset(full_line, 'b', 238U);
+    full_line[238] = '\0';
+    terminal_write_bytes(full_line, 238U);
+    assert(screen_cell(0U, 236U)->codepoint == 'b');
+    assert(screen_cell(1U, 0U)->codepoint == 'b');
 }
 
 static void test_ring_wrap_and_scrolling(void)
@@ -2457,6 +2527,8 @@ int main(int argument_count, char **arguments)
         test_dimensions_fit_owned_ring();
     if (run_all || !strcmp(arguments[1], "startup-cursor"))
         test_startup_cursor_hidden_until_input();
+    if (run_all || !strcmp(arguments[1], "kernel-diagnostics"))
+        test_kernel_diagnostics_use_owned_console_ring();
     if (run_all || !strcmp(arguments[1], "clear-history"))
         test_terminal_clear_erases_retained_session_rows();
     if (run_all || !strcmp(arguments[1], "scrollback-navigation"))

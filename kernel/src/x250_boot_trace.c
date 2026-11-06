@@ -2,34 +2,25 @@
 #include <x250_boot_trace.h>
 
 #if X250_BOOT_TRACE
+#include <font.h>
 #include <framebuffer.h>
 #include <idt.h>
 #include <io.h>
 #include <stddef.h>
+#include <terminal.h>
+#include <terminal_kernel.h>
 #include <usb/xhci_storage_trace.h>
 
-#define TRACE_HISTORY_LINES 40U
 #define TRACE_HISTORY_CAPACITY X250_BOOT_TRACE_HISTORY_CAPACITY
 #define TRACE_TEXT_CAPACITY X250_BOOT_TRACE_TEXT_CAPACITY
 #define TRACE_MESSAGE_CAPACITY 1024U
 #define TRACE_PANIC_ROWS 9U
 #define TRACE_GLYPH_WIDTH 8U
 #define TRACE_GLYPH_HEIGHT 16U
-#define TRACE_DIAG_GLYPH_WIDTH 7U
-#define TRACE_DIAG_GLYPH_HEIGHT 12U
-#define TRACE_DIAG_CELL_WIDTH 8U
-#define TRACE_DIAG_LINE_HEIGHT 14U
-#define TRACE_PANEL_MARGIN_X 12U
-#define TRACE_PANEL_MARGIN_Y 12U
-#define TRACE_TEXT_MARGIN_X 20U
-#define TRACE_PANEL_PADDING_Y 8U
-#define TRACE_COLOR_BACKGROUND 0x00000000U
-#define TRACE_COLOR_ENTER 0x00ffff00U
-#define TRACE_COLOR_PASS 0x0000ff00U
-#define TRACE_COLOR_FAIL 0x00ff4040U
 #define TRACE_COLOR_TEXT 0x00ffffffU
 #define TRACE_COLOR_PANIC_BACKGROUND 0x00400000U
 #define TRACE_COLOR_PANIC_TITLE 0x00ffff00U
+#define TRACE_FALLBACK_COLUMNS 80U
 #define TRACE_TSC_SPIN_LIMIT 1000000000ULL
 #define TRACE_FALLBACK_SPIN_LIMIT 100000000ULL
 #define TRACE_PM_TIMER_SPIN_LIMIT 10000000ULL
@@ -68,6 +59,9 @@ static bool trace_glyphs_ready;
 static bool trace_use_framebuffer_api;
 static bool trace_initialized;
 static bool trace_active;
+static bool trace_console_ready;
+static bool trace_report_presented;
+static u32 trace_console_columns;
 static bool trace_failure_hold_used;
 static bool trace_pm_timer_checked;
 static u16 trace_pm_timer_port;
@@ -348,100 +342,6 @@ static void trace_put_pixel(u32 x, u32 y, u32 color)
     trace_framebuffer[(u64)y * trace_stride + x] = color;
 }
 
-/* GOP may remain at 640x480 even on a larger LCD. */
-static u32 trace_visible_rows(void)
-{
-    u32 overhead = TRACE_PANEL_PADDING_Y * 2U + TRACE_PANEL_MARGIN_Y * 2U;
-    if (trace_height <= overhead)
-        return 0;
-    u32 rows = (trace_height - overhead) / TRACE_DIAG_LINE_HEIGHT;
-    return rows < TRACE_HISTORY_LINES ? rows : TRACE_HISTORY_LINES;
-}
-
-static void trace_fill_panel(void)
-{
-    u32 panel_height = trace_visible_rows() * TRACE_DIAG_LINE_HEIGHT +
-                       TRACE_PANEL_PADDING_Y * 2U;
-    u32 start_x = TRACE_PANEL_MARGIN_X;
-    u32 end_x;
-    u32 end_y;
-    u32 start_y;
-
-    if (!trace_framebuffer || trace_width <= start_x * 2U ||
-        trace_height < panel_height + TRACE_PANEL_MARGIN_Y ||
-        trace_stride < trace_width)
-        return;
-
-    end_x = trace_width - TRACE_PANEL_MARGIN_X;
-    start_y = trace_height - panel_height - TRACE_PANEL_MARGIN_Y;
-    end_y = trace_height - TRACE_PANEL_MARGIN_Y;
-    for (u32 y = start_y; y < end_y; y++) {
-        for (u32 x = start_x; x < end_x; x++)
-            trace_put_pixel(x, y, TRACE_COLOR_BACKGROUND);
-    }
-}
-
-static void trace_draw_diagnostic_character(u8 character, u32 x, u32 y,
-                                            u32 color)
-{
-    const u8 *font = _binary_kernel_assets_font_psf_start;
-    usize font_size = (usize)(_binary_kernel_assets_font_psf_end - font);
-    u32 header_size;
-    u32 glyph_count;
-    u32 bytes_per_glyph;
-    u32 glyph_width;
-    u32 glyph_height;
-    u32 glyph;
-    usize glyph_offset;
-
-    if (character < 32U || character > 126U)
-        character = '?';
-    glyph = trace_glyphs[character - 32U];
-    header_size = trace_read_u32(font + 8U);
-    glyph_count = trace_read_u32(font + 16U);
-    bytes_per_glyph = trace_read_u32(font + 20U);
-    glyph_height = trace_read_u32(font + 24U);
-    glyph_width = trace_read_u32(font + 28U);
-    if (glyph >= glyph_count || glyph_width == 0 || glyph_height == 0 ||
-        glyph_width > TRACE_GLYPH_WIDTH || glyph_height > TRACE_GLYPH_HEIGHT ||
-        bytes_per_glyph < glyph_height)
-        return;
-    glyph_offset = header_size + (usize)glyph * bytes_per_glyph;
-    if (glyph_offset > font_size ||
-        bytes_per_glyph > font_size - glyph_offset)
-        return;
-
-    const u8 *bitmap = font + glyph_offset;
-    for (u32 py = 0; py < TRACE_DIAG_GLYPH_HEIGHT; py++) {
-        u32 source_y_start = py * glyph_height / TRACE_DIAG_GLYPH_HEIGHT;
-        u32 source_y_end = (py + 1U) * glyph_height /
-                           TRACE_DIAG_GLYPH_HEIGHT;
-        for (u32 px = 0; px < TRACE_DIAG_GLYPH_WIDTH; px++) {
-            u32 source_x_start = px * glyph_width /
-                                 TRACE_DIAG_GLYPH_WIDTH;
-            u32 source_x_end = (px + 1U) * glyph_width /
-                               TRACE_DIAG_GLYPH_WIDTH;
-            bool set = false;
-
-            for (u32 source_y = source_y_start;
-                 source_y < source_y_end; source_y++) {
-                u8 bits = bitmap[source_y];
-                for (u32 source_x = source_x_start;
-                     source_x < source_x_end; source_x++) {
-                    if (bits & (0x80U >> source_x)) {
-                        set = true;
-                        break;
-                    }
-                }
-                if (set)
-                    break;
-            }
-            if (set)
-                trace_put_pixel(x + px, y + py, color);
-        }
-    }
-}
-
 static void trace_draw_character(u8 character, u32 x, u32 y, u32 color)
 {
     const u8 *font = _binary_kernel_assets_font_psf_start;
@@ -481,55 +381,6 @@ static void trace_draw_character(u8 character, u32 x, u32 y, u32 color)
                 trace_put_pixel(x + px, y + py, color);
         }
     }
-}
-
-static void trace_render(void)
-{
-    u32 visible_lines;
-    u32 panel_height = trace_visible_rows() * TRACE_DIAG_LINE_HEIGHT +
-                       TRACE_PANEL_PADDING_Y * 2U;
-    u32 start_y;
-    u32 first_line;
-
-    if (!trace_glyphs_ready) {
-        trace_init_glyphs();
-        trace_glyphs_ready = true;
-    }
-    trace_fill_panel();
-    if (!trace_framebuffer || trace_height < panel_height +
-                               TRACE_PANEL_MARGIN_Y ||
-        trace_width <= TRACE_TEXT_MARGIN_X * 2U)
-        return;
-
-    visible_lines = trace_line_count < trace_visible_rows()
-        ? trace_line_count : trace_visible_rows();
-    first_line = trace_visible_rows() - visible_lines;
-    start_y = trace_height - panel_height - TRACE_PANEL_MARGIN_Y +
-              TRACE_PANEL_PADDING_Y + first_line * TRACE_DIAG_LINE_HEIGHT;
-
-    u32 first_visible = trace_line_count - visible_lines;
-    for (u32 line_index = 0; line_index < visible_lines; line_index++) {
-        u32 row = (trace_line_start + first_visible + line_index) %
-                  TRACE_HISTORY_CAPACITY;
-        const char *line = trace_lines[row];
-        u32 y = start_y + line_index * TRACE_DIAG_LINE_HEIGHT;
-        u32 color = trace_line_states[row] == 'P' ? TRACE_COLOR_PASS :
-                    trace_line_states[row] == 'F' ? TRACE_COLOR_FAIL :
-                                                     TRACE_COLOR_ENTER;
-        for (u32 column = 0; column < TRACE_TEXT_CAPACITY - 1U &&
-                             line[column] != '\0'; column++) {
-            trace_draw_diagnostic_character(
-                (u8)line[column], TRACE_TEXT_MARGIN_X +
-                column * TRACE_DIAG_CELL_WIDTH, y, color);
-        }
-    }
-
-    if (trace_use_framebuffer_api)
-        framebuffer_flush_rect(TRACE_PANEL_MARGIN_X,
-                               trace_height - panel_height -
-                                   TRACE_PANEL_MARGIN_Y,
-                               trace_width - TRACE_PANEL_MARGIN_X * 2U,
-                               panel_height);
 }
 
 static void trace_panic_draw_text(const char *text, u32 row, u32 color)
@@ -644,6 +495,12 @@ static void trace_append_hex(char *line, u32 *position, u32 value,
     }
 }
 
+static void trace_append_hex64(char *line, u32 *position, u64 value)
+{
+    trace_append_hex(line, position, (u32)(value >> 32), 8U);
+    trace_append_hex(line, position, (u32)value, 8U);
+}
+
 static void trace_append_i32(char *line, u32 *position, int value)
 {
     u32 magnitude;
@@ -690,14 +547,12 @@ static void trace_append_prefix(char *line, u32 *position,
 static void trace_store_wrapped(const char *message, char state)
 {
     u32 columns = TRACE_TEXT_CAPACITY - 1U;
-    u32 x_margin = TRACE_TEXT_MARGIN_X * 2U;
     u32 message_offset = 0;
 
-    if (trace_width > x_margin) {
-        u32 available = (trace_width - x_margin) / TRACE_DIAG_CELL_WIDTH;
-        if (available && available < columns)
-            columns = available;
-    }
+    if (trace_console_columns && trace_console_columns < columns)
+        columns = trace_console_columns;
+    else if (!trace_console_columns && TRACE_FALLBACK_COLUMNS < columns)
+        columns = TRACE_FALLBACK_COLUMNS;
     if (!columns)
         columns = 1U;
 
@@ -791,12 +646,6 @@ static void trace_append_result(u32 checkpoint, bool passed,
     trace_store_wrapped(message, passed ? 'P' : 'F');
 }
 
-static void trace_render_if_active(void)
-{
-    if (trace_active)
-        trace_render();
-}
-
 void x250_boot_trace_begin(void)
 {
     if (trace_active)
@@ -805,7 +654,94 @@ void x250_boot_trace_begin(void)
     trace_line_start = 0;
     trace_dropped_lines = 0;
     trace_failure_hold_used = false;
+    trace_report_presented = false;
     trace_active = true;
+}
+
+void x250_boot_trace_console_ready(void)
+{
+    u32 rows;
+    u32 columns;
+
+    terminal_get_dimensions(&rows, &columns);
+    (void)rows;
+    trace_console_columns = columns;
+    trace_console_ready = columns != 0U;
+}
+
+void x250_boot_trace_gop_modes(void)
+{
+    const BOOT_INFO *boot_info = trace_boot_info;
+    char message[TRACE_MESSAGE_CAPACITY];
+    u32 position;
+
+    if (!trace_active || !boot_info)
+        return;
+
+    position = 0U;
+    trace_append_prefix(message, &position, 47U, 'I');
+    trace_append_text(message, &position, "GOP initial=");
+    trace_append_u32(message, &position, boot_info->GopInitialMode);
+    trace_append_text(message, &position, " request=");
+    trace_append_u32(message, &position, boot_info->GopRequestedMode);
+    trace_append_text(message, &position, " set=0x");
+    trace_append_hex64(message, &position, boot_info->GopSetModeStatus);
+    trace_append_text(message, &position, " restore=0x");
+    trace_append_hex64(message, &position, boot_info->GopRestoreModeStatus);
+    trace_append_text(message, &position, " actual=");
+    trace_append_u32(message, &position, boot_info->GopCurrentMode);
+    trace_append_text(message, &position, " ");
+    trace_append_u32(message, &position, boot_info->FramebufferWidth);
+    trace_append_text(message, &position, "x");
+    trace_append_u32(message, &position, boot_info->FramebufferHeight);
+    trace_append_text(message, &position, " fmt=");
+    trace_append_u32(message, &position, boot_info->GopActivePixelFormat);
+    trace_append_text(message, &position, " pitch=");
+    trace_append_u32(message, &position, boot_info->PixelsPerScanLine);
+    trace_append_text(message, &position, " modes=");
+    trace_append_u32(message, &position, boot_info->GopModeCount);
+    trace_append_text(message, &position, "/");
+    trace_append_u32(message, &position, boot_info->GopMaxMode);
+    trace_append_text(message, &position, " complete=");
+    trace_append_u32(message, &position,
+                     boot_info->GopModeInventoryComplete);
+    message[position] = '\0';
+    trace_store_wrapped(message, 'I');
+
+    u32 count = boot_info->GopModeCount;
+    if (count > BOOT_GOP_MODE_LIMIT)
+        count = BOOT_GOP_MODE_LIMIT;
+    for (u32 index = 0; index < count; index++) {
+        const BOOT_GOP_MODE_INFO *mode = &boot_info->GopModes[index];
+
+        position = 0U;
+        trace_append_prefix(message, &position, 48U, 'I');
+        trace_append_text(message, &position, "GOP mode=");
+        trace_append_u32(message, &position, mode->Number);
+        trace_append_text(message, &position, " query=0x");
+        trace_append_hex64(message, &position, mode->QueryStatus);
+        if (mode->QueryStatus == 0U) {
+            trace_append_text(message, &position, " ");
+            trace_append_u32(message, &position,
+                             mode->HorizontalResolution);
+            trace_append_text(message, &position, "x");
+            trace_append_u32(message, &position,
+                             mode->VerticalResolution);
+            trace_append_text(message, &position, " format=");
+            trace_append_u32(message, &position, mode->PixelFormat);
+            trace_append_text(message, &position, " pitch=");
+            trace_append_u32(message, &position, mode->PixelsPerScanLine);
+        }
+        trace_append_text(message, &position, " valid=");
+        trace_append_u32(message, &position, mode->Valid);
+        trace_append_text(message, &position, " validate=0x");
+        trace_append_hex64(message, &position,
+                           mode->ValidationStatus);
+        trace_append_text(message, &position, " free=0x");
+        trace_append_hex64(message, &position, mode->FreeStatus);
+        message[position] = '\0';
+        trace_store_wrapped(message, 'I');
+    }
 }
 
 void x250_boot_trace_measurements_begin(void)
@@ -895,41 +831,82 @@ usize x250_boot_trace_export(char *buffer, usize capacity, u32 *line_count,
 
 void x250_boot_trace_refresh(void)
 {
-    /* Drop callback chatter from the final view. Keep discovery rows and
-       failures (including their wrapped continuations) in original order. */
-    if (trace_active) {
-        static char saved[TRACE_HISTORY_CAPACITY][TRACE_TEXT_CAPACITY];
-        static char states[TRACE_HISTORY_CAPACITY];
-        u32 count = 0;
-        bool selected = false;
-        for (u32 i = 0; i < trace_line_count; i++) {
-            u32 slot = (trace_line_start + i) % TRACE_HISTORY_CAPACITY;
-            const char *line = trace_lines[slot];
-            if (line[0] != ' ')
-                selected = ((line[0] == '2' && line[1] == '1') ||
-                            (line[0] == '4' && line[1] >= '2' &&
-                             line[1] <= '7') ||
-                            trace_line_states[slot] == 'F');
-            if (selected) {
-                __builtin_memcpy(saved[count], line, TRACE_TEXT_CAPACITY);
-                states[count++] = trace_line_states[slot];
-            }
+    bool selected = false;
+    u32 count;
+    u32 start;
+    u32 rows;
+    u32 columns;
+
+    if (!trace_active || !trace_console_ready || trace_report_presented)
+        return;
+
+    if (!terminal_kernel_output_begin())
+        return;
+
+    /* Trace producers only record events. Present the bounded final report at
+     * a safe boot-thread checkpoint through the normal terminal cell ring. */
+    count = trace_line_count;
+    start = trace_line_start;
+    for (u32 index = 0; index < count; index++) {
+        u32 slot = (start + index) % TRACE_HISTORY_CAPACITY;
+        const char *line = trace_lines[slot];
+        char output[TRACE_TEXT_CAPACITY + 1U];
+        u32 length = 0;
+        terminal_color_t foreground;
+
+        if (line[0] != ' ')
+            selected = ((line[0] == '2' && line[1] == '1') ||
+                        (line[0] == '4' && line[1] >= '2' &&
+                         line[1] <= '7') ||
+                        trace_line_states[slot] == 'F');
+        if (!selected)
+            continue;
+
+        while (length < TRACE_TEXT_CAPACITY - 1U && line[length]) {
+            output[length] = line[length];
+            length++;
         }
-        __builtin_memcpy(trace_lines, saved, count * TRACE_TEXT_CAPACITY);
-        __builtin_memcpy(trace_line_states, states, count);
-        trace_line_start = 0;
-        trace_line_count = count;
-        char message[TRACE_MESSAGE_CAPACITY];
-        u32 position = 0;
-        trace_append_prefix(message, &position, 47U, 'I');
-        trace_append_text(message, &position, "USB ROOT REPORT fb=");
-        trace_append_u32(message, &position, trace_width);
-        trace_append_text(message, &position, "x");
-        trace_append_u32(message, &position, trace_height);
-        message[position] = '\0';
-        trace_store_wrapped(message, 'I');
+        output[length++] = '\n';
+        output[length] = '\0';
+        switch (trace_line_states[slot]) {
+        case 'P': foreground = TERMINAL_COLOR_GREEN; break;
+        case 'F': foreground = TERMINAL_COLOR_BRIGHT_RED; break;
+        case 'I': foreground = TERMINAL_COLOR_CYAN; break;
+        default: foreground = TERMINAL_COLOR_YELLOW; break;
+        }
+        if (!terminal_write_kernel_styled(output, length, foreground,
+                                           TERMINAL_COLOR_BLACK)) {
+            terminal_kernel_output_end();
+            return;
+        }
     }
-    trace_render_if_active();
+
+    terminal_get_dimensions(&rows, &columns);
+    {
+        char summary[128];
+        u32 position = 0;
+        trace_append_text(summary, &position, "47 [INFO] console fb=");
+        trace_append_u32(summary, &position, trace_width);
+        trace_append_text(summary, &position, "x");
+        trace_append_u32(summary, &position, trace_height);
+        trace_append_text(summary, &position, " grid=");
+        trace_append_u32(summary, &position, rows);
+        trace_append_text(summary, &position, "x");
+        trace_append_u32(summary, &position, columns);
+        trace_append_text(summary, &position, " cell=");
+        trace_append_u32(summary, &position, font_width());
+        trace_append_text(summary, &position, "x");
+        trace_append_u32(summary, &position, font_height());
+        summary[position++] = '\n';
+        summary[position] = '\0';
+        if (!terminal_write_kernel_styled(summary, position,
+                TERMINAL_COLOR_CYAN, TERMINAL_COLOR_BLACK)) {
+            terminal_kernel_output_end();
+            return;
+        }
+    }
+    terminal_kernel_output_end();
+    trace_report_presented = true;
 }
 
 void x250_boot_trace_event(BOOT_INFO *boot_info, u32 checkpoint,
@@ -953,7 +930,6 @@ void x250_boot_trace_event(BOOT_INFO *boot_info, u32 checkpoint,
         return;
 
     trace_append(checkpoint, passed, description);
-    trace_render();
 }
 
 void x250_boot_trace_stage(u32 checkpoint, bool passed,
@@ -993,7 +969,6 @@ void x250_boot_trace_timing(u64 uptime_ms, const char *event, u32 port,
     }
     message[position] = '\0';
     trace_store_wrapped(message, 'I');
-    trace_render();
 }
 
 void x250_boot_trace_timing_value(u64 uptime_ms, const char *event,
@@ -1028,7 +1003,6 @@ void x250_boot_trace_timing_value(u64 uptime_ms, const char *event,
     }
     message[position] = '\0';
     trace_store_wrapped(message, 'I');
-    trace_render();
 }
 
 void x250_boot_trace_storage_io(
@@ -1105,7 +1079,6 @@ void x250_boot_trace_storage_io(
     trace_append_u64(message, &position, io->bot_csw_ms);
     message[position] = '\0';
     trace_store_wrapped(message, 'I');
-    trace_render();
 }
 
 void x250_boot_trace_result(u32 checkpoint, bool passed,
@@ -1118,7 +1091,6 @@ void x250_boot_trace_result(u32 checkpoint, bool passed,
 
     trace_append_result(checkpoint, passed, description, required,
                         status_available, status, state, reason);
-    trace_render();
     if (!passed && required && !trace_failure_hold_used &&
         !trace_text_equal(state, "SKIPPED")) {
         trace_failure_hold_used = true;
@@ -1146,7 +1118,6 @@ void x250_boot_trace_storage_inventory(u32 block_devices,
                       xhci_ready ? "READY" : "NOT-READY");
     message[position] = '\0';
     trace_store_wrapped(message, passed ? 'P' : 'F');
-    trace_render();
 }
 
 void x250_boot_trace_xhci_summary(u32 ports, u32 connected,
@@ -1171,7 +1142,6 @@ void x250_boot_trace_xhci_summary(u32 ports, u32 connected,
     trace_append_u32(message, &position, usb_mass_storage);
     message[position] = '\0';
     trace_store_wrapped(message, 'I');
-    trace_render();
 }
 
 void x250_boot_trace_ports_stage(const char *stage, u64 ms, u32 command,
@@ -1194,7 +1164,6 @@ void x250_boot_trace_ports_stage(const char *stage, u64 ms, u32 command,
     trace_append_hex(message, &position, powered, 8U);
     message[position] = '\0';
     trace_store_wrapped(message, 'I');
-    trace_render();
 }
 
 void x250_boot_trace_protocol(u32 major, u32 minor, u32 first,
@@ -1216,7 +1185,6 @@ void x250_boot_trace_protocol(u32 major, u32 minor, u32 first,
     trace_append_u32(message, &position, slot_type);
     message[position] = '\0';
     trace_store_wrapped(message, 'I');
-    trace_render();
 }
 
 void x250_boot_trace_ports_raw(u32 caplength, u64 first_physical,
@@ -1250,7 +1218,6 @@ void x250_boot_trace_ports_raw(u32 caplength, u64 first_physical,
         message[position] = '\0';
         trace_store_wrapped(message, 'I');
     }
-    trace_render();
 }
 
 void x250_boot_trace_routing(bool passed, u32 usb2_mask, u32 usb2_before,
@@ -1275,7 +1242,6 @@ void x250_boot_trace_routing(bool passed, u32 usb2_mask, u32 usb2_before,
     trace_append_hex(message, &position, usb3_mask, 8U);
     message[position] = '\0';
     trace_store_wrapped(message, passed ? 'P' : 'F');
-    trace_render();
 }
 
 void x250_boot_trace_pci(u32 bus, u32 device, u32 function,
@@ -1312,7 +1278,6 @@ void x250_boot_trace_pci(u32 bus, u32 device, u32 function,
     }
     message[position] = '\0';
     trace_store_wrapped(message, 'I');
-    trace_render();
 }
 
 void x250_boot_trace_xhci_port(u32 port, u32 portsc, const char *state,
@@ -1352,7 +1317,6 @@ void x250_boot_trace_xhci_port(u32 port, u32 portsc, const char *state,
     }
     message[position] = '\0';
     trace_store_wrapped(message, failed ? 'F' : 'I');
-    trace_render();
 }
 
 void x250_boot_trace_usb_device(u32 port, u32 slot, u32 speed,
@@ -1398,7 +1362,6 @@ void x250_boot_trace_usb_device(u32 port, u32 slot, u32 speed,
     }
     message[position] = '\0';
     trace_store_wrapped(message, probe_result != 0 ? 'F' : 'I');
-    trace_render();
 }
 
 void x250_boot_trace_msc_probe(u32 port, u32 slot, const char *stage,
@@ -1452,7 +1415,6 @@ void x250_boot_trace_msc_probe(u32 port, u32 slot, const char *stage,
     }
     message[position] = '\0';
     trace_store_wrapped(message, passed ? 'P' : 'F');
-    trace_render();
 }
 
 void x250_boot_trace_root_inventory(u32 block_devices, u32 whole_disks,
@@ -1475,7 +1437,6 @@ void x250_boot_trace_root_inventory(u32 block_devices, u32 whole_disks,
     trace_append_u32(message, &position, root_candidates);
     message[position] = '\0';
     trace_store_wrapped(message, 'I');
-    trace_render();
 }
 
 void x250_boot_trace_block_device(u32 index, const char *type,
@@ -1522,7 +1483,6 @@ void x250_boot_trace_block_device(u32 index, const char *type,
     }
     message[position] = '\0';
     trace_store_wrapped(message, 'I');
-    trace_render();
 }
 
 void x250_boot_trace_rebind(void *framebuffer, u32 width, u32 height,
@@ -1532,7 +1492,6 @@ void x250_boot_trace_rebind(void *framebuffer, u32 width, u32 height,
     trace_width = width;
     trace_height = height;
     trace_stride = stride;
-    trace_render_if_active();
 }
 
 void x250_boot_trace_use_framebuffer_api(void)

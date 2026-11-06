@@ -57,11 +57,12 @@ commands documented by the current image.
 
 ### Opt-in boot diagnostics
 
-`X250_BOOT_TRACE=1` enables the opt-in compact hardware boot overlay and the
-extra firmware storage-discovery report. It retains recent wrapped messages,
-shows up to 40 rows within the actual firmware GOP height, and redraws a
-filtered discovery/failure report after a required bring-up failure. The final
-report includes the GOP dimensions and USB-controller PCI command registers;
+`X250_BOOT_TRACE=1` enables the opt-in bounded hardware boot trace and the
+extra firmware storage-discovery report. It retains recent wrapped messages
+and appends the selected discovery/failure report to the normal terminal cell
+ring, using its Unscii font, colors, scrolling, and scrollback. The report is
+written in one terminal presentation batch after a required bring-up failure
+or before PID 1 launch. It includes GOP dimensions and USB-controller PCI command registers;
 Intel xHCI configuration DWORDs D0/D4/D8/DC are reported read-only to investigate
 companion-controller routing. For boot-log latency investigation it also reports
 whether a prior log existed and its size, plus USB block-request and BOT command
@@ -77,8 +78,10 @@ writing. Categories can be nested, so their
 totals must not be added together. USB callback and BOT timings exclude time
 spent before entering those measured callbacks, including any block-gate or
 VFS wait. These measurements are observational and do not change the storage
-path. The loader retains the firmware GOP mode, which need not match the
-panel's native resolution.
+path. The trace also records initial, requested, and actual GOP modes,
+SetMode/restore status, and a bounded mode inventory. Normal builds perform
+the validated mode selection described in [boot flow](../architecture/boot.md)
+but omit this extra inventory and report.
 
 On a successful trace-enabled boot, Pith saves the captured kernel log and
 trace to `/sys/logs/boot.log`. Before saving, it moves the preceding
@@ -96,10 +99,9 @@ If the trace ring overflowed, a write failed, or boot stopped before a valid
 footer was written, extraction reports `INCOMPLETE`. A failure before MGFS is
 mounted cannot be persisted by this mechanism. These records are written only
 by trace-enabled builds; normal builds keep the existing boot-log behavior and
-produce no overlay or diagnostic footer.
+produce no boot-trace output or diagnostic footer.
 
-The trace retains at most 128 wrapped lines while the on-screen overlay shows
-at most 40. An exported trace is marked incomplete if the ring overflowed or
+The trace retains at most 128 wrapped lines. An exported trace is marked incomplete if the ring overflowed or
 the export buffer could not hold every retained line. The host extractor
 reports a valid save footer independently from trace completeness: a completed
 payload can contain an incomplete trace. Footer version 1 remains readable but
@@ -251,8 +253,12 @@ installation may assign new 64-bit IDs even after the ID watermark exceeds
 table capacity. Free-slot availability and exhaustion of the 64-bit identity
 space remain separate checks; neither permits reuse of an old identity.
 
-The embedded kernel font is generated from the repository's UNSCII source by
-`tools/convert_unscii_hex.py`. The exFAT recommended up-case data is generated
+The kernel embeds native Unscii 8x16 PSF2 glyphs generated from the
+repository's source bitmap by `tools/convert_unscii_hex.py`. The native 8x8
+source is checked by converter tests but is not embedded in Pith. The system
+console does not scale glyphs or select a different variant based on
+framebuffer dimensions. The exFAT recommended
+up-case data is generated
 by `tools/generate_exfat_upcase.py`; its source and provenance are documented
 in [the exFAT provenance note](../filesystem/exfat/upcase-provenance.md).
 

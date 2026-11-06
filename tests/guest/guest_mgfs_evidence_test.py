@@ -4,6 +4,8 @@
 import io
 import json
 import os
+import struct
+import zlib
 from datetime import datetime, timezone
 from pathlib import Path
 import sys
@@ -12,8 +14,37 @@ from types import SimpleNamespace
 from unittest.mock import patch
 sys.dont_write_bytecode = True
 import guest_mgfs_test as guest
+import guest_logout_test as logout
 
 run='0123456789abcdef'
+assert guest.screen_geometry(1366, 768) == (16, 18, 41, 168)
+assert guest.screen_geometry(1920, 1080) == (16, 18, 58, 237)
+assert logout.scroll_fill_limit(1280, 800) == 45
+assert logout.scroll_fill_limit(1920, 1080) == 60
+for height in (40, 900):
+    width = 36
+    assert guest.screen_geometry(width, height)[0] == 16
+    font_path = guest.ROOT / 'kernel/assets/font/unscii-16.hex'
+    mappings = {line.split(':', 1)[0]: bytes.fromhex(
+                    line.split(':', 1)[1])
+                for line in font_path.read_text().splitlines()
+                if ':' in line}
+    pixels = bytearray(width * height * 3)
+    # M has more than half its cell pixels set. A tests a distinct, sparse
+    # shape. Different foreground colors confirm decoding ignores severity.
+    for cell, code, color in ((0, '0004D', b'\xff\xff\xff'),
+                              (1, '00041', b'\x00\xff\x80')):
+        for y, bits in enumerate(mappings[code]):
+            for x in range(8):
+                if bits & (0x80 >> x):
+                    offset = ((10 + y) * width + 10 + cell * 8 + x) * 3
+                    pixels[offset:offset + 3] = color
+    with tempfile.TemporaryDirectory() as temporary:
+        capture = Path(temporary) / 'screen.ppm'
+        capture.write_bytes(
+            f'P6\n{width} {height}\n255\n'.encode() + pixels)
+        assert guest.screen_text(capture).splitlines()[0] == 'MA'
+print('Shoot screenshot decoding follows the production 8x16 Unscii geometry')
 assert guest.phase_launch_command('mgtls', '/bin/fstest') == '/bin/mgtlstest'
 assert guest.phase_launch_command('random', '/bin/fstest') == '/bin/randomtest'
 assert guest.phase_launch_command('arguments', '/bin/fstest') == '/bin/argvtest'
@@ -246,6 +277,35 @@ with tempfile.TemporaryDirectory(prefix='mangrove-guest-evidence-') as temp:
     assert guest.parse_smp_boot_log(
         '[SMP] final discovered=4 online=4\n', 4) == {
             'discovered_cpus': 4, 'online_cpus': 4}
+    smp_snapshot = b'[SMP] final discovered=2 online=2\n'
+    diagnostic_payload = smp_snapshot + guest.boot_diagnostics.TRACE_HEADER
+    footer_offset = ((len(diagnostic_payload) +
+                      guest.boot_diagnostics.FOOTER_BYTES + 4095) // 4096 *
+                     4096 - guest.boot_diagnostics.FOOTER_BYTES)
+    padded_payload = diagnostic_payload.ljust(footer_offset, b'\0')
+
+    def diagnostic_log(flags=0, corrupt_payload=False):
+        footer = bytearray(guest.boot_diagnostics.FOOTER_BYTES)
+        footer[:8] = guest.boot_diagnostics.FOOTER_MAGIC
+        struct.pack_into('<IIII', footer, 8,
+                         guest.boot_diagnostics.FOOTER_VERSION,
+                         guest.boot_diagnostics.FOOTER_BYTES, 1, flags)
+        struct.pack_into('<QQ', footer, 24, len(smp_snapshot), 0)
+        struct.pack_into('<I', footer, 68, zlib.crc32(padded_payload))
+        struct.pack_into('<I', footer, 72, zlib.crc32(footer))
+        payload = bytearray(padded_payload)
+        if corrupt_payload:
+            payload[0] ^= 1
+        return bytes(payload + footer)
+
+    assert guest.parse_smp_boot_log(
+        guest.smp_boot_log_snapshot(diagnostic_log()), 2) == {
+            'discovered_cpus': 2, 'online_cpus': 2}
+    for bad_capture in (diagnostic_log(flags=1),
+                        diagnostic_log(corrupt_payload=True)):
+        try: guest.smp_boot_log_snapshot(bad_capture)
+        except ValueError: pass
+        else: raise AssertionError('incomplete diagnostic SMP evidence accepted')
     for bad_smp_log in ('', '[SMP] final discovered=2 online=1\n',
                         '[SMP] final discovered=1 online=1\n',
                         '[SMP] discovered=1 online=1\n',

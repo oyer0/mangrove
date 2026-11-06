@@ -1,8 +1,8 @@
 # Console and terminal behavior
 
 Mangrove currently provides one framebuffer-backed system console. The kernel
-maintains a text-cell ring and renders it with the embedded PSF2 font asset.
-Screen dimensions derive from the UEFI framebuffer and font metrics; the
+maintains a text-cell ring and renders it with the embedded PSF2 Unscii bitmap
+asset. Screen dimensions derive from the UEFI framebuffer and selected font metrics; the
 visible text grid is bounded to 256 columns and 512 rows, matching the
 two 512-row cell stores. A framebuffer too small for the text margins still
 uses a one-cell logical grid, and a taller framebuffer clips the visible grid
@@ -48,6 +48,28 @@ cooked input helper flushes the prompt, ends any open console transaction, and
 then enables the cursor immediately before its first blocking read. Fullscreen
 applications manage visibility through the same terminal API and restore the
 saved normal-screen cursor state when they leave the alternate screen.
+
+The system console uses native Unscii 8x16 PSF2 glyphs. The native 8x8 Unscii
+source is retained for converter tests but is not embedded in Pith. Both
+variants are eight pixels wide, so 8x8 would add rows without increasing
+columns. Physical X250 visual qualification retained 8x16 metrics and used
+the loader-selected 1366x768 GOP mode. With the 10-pixel horizontal
+and vertical margins and two-pixel row spacing, that mode provides a
+168-column by 41-row grid. A 1920x1080 mode provides 237 columns by 58 rows.
+The grid follows the actual active GOP dimensions and scan-line pitch reported
+in `BOOT_INFO`; the hardware-independent mode-selection policy is described
+in [boot flow](boot.md). Shoot, Reed, kernel output, and other terminal
+clients query the same grid and render through this console. Glyphs are never
+scaled to change the cell size.
+
+Opt-in boot tracing records events independently of framebuffer presentation.
+Once the terminal and console are ready, the bounded final report is appended
+to the ordinary console ring with status colors in one presentation batch.
+Those lines therefore share the normal font metrics, wrapping, scrolling, and
+scrollback. Trace recording and persistent MGFS diagnostics do not own a second
+display position. Before the normal console is available, events remain
+bounded in memory; the fixed panic summary retains a direct framebuffer path
+because panic handling cannot safely depend on terminal locks or workers.
 
 Keyboard input supports USB HID and an optional native i8042 keyboard port.
 Early `keyboard_init()` initializes logical input state without touching either
@@ -218,13 +240,14 @@ behavior are described in the [Shoot](../shell/README.md) and
 The output decoder uses Mangrove's strict UTF-8 codec and presents malformed
 prefixes as U+FFFD. An incomplete multibyte sequence is retained until later
 output supplies more bytes; there is no per-write decoder reset or end-of-input
-signal. The embedded regular UNSCII-16 subset is an 8x16 PSF2 font with 2,997
-Unicode mappings, including printable ASCII, selected accented Latin,
-combining marks, box drawing, and block elements. The renderer uses one cell
-per code point; a mapped combining mark is drawn as its own glyph and is not
-composed over a preceding character. It does not implement grapheme clusters,
-East Asian wide cells, shaping, or bidirectional layout. The bundled font has
-no U+FFFD or CJK U+4E00 glyph, so an unmapped CJK scalar uses the `?` fallback.
+signal. The embedded regular Unscii 8x16 PSF2 asset has 2,997 Unicode
+mappings; the retained native Unscii 8x8 source has 3,190. Both include printable ASCII,
+selected accented Latin, combining marks, box drawing, and block elements. The
+renderer uses one cell per code point; a mapped combining mark is drawn as its
+own glyph and is not composed over a preceding character. It does not implement
+grapheme clusters, East Asian wide cells, shaping, or bidirectional layout.
+The bundled font has neither U+FFFD nor CJK U+4E00, so an unmapped CJK scalar
+uses the `?` fallback.
 
 The console recognizes carriage return (column zero), backspace (move left by
 one cell when possible, without erasing), and line feed (column zero on the

@@ -180,6 +180,7 @@ WHERE_DIR    := $(BUILD_DIR)/where
 FONT_SOURCE  := kernel/assets/font/unscii-16.hex
 FONT_CONVERTER := tools/convert_unscii_hex.py
 FONT_ASSET   := kernel/assets/font.psf
+FONT_TEST_ASSET_8 := $(BUILD_DIR)/tests/terminal/font-8.psf
 FSTEST_DIR   := $(BUILD_DIR)/fstest
 CASTORETEST_DIR := $(BUILD_DIR)/castoretest
 MGTLS_TEST_DIR := $(BUILD_DIR)/mgtlstest
@@ -1126,10 +1127,14 @@ test-say:
 	ASAN_OPTIONS=detect_leaks=0 $(HOST_TEST_DIR)/mangrove-say-test
 
 .PHONY: test-font
-test-font: $(FONT_ASSET) $(BUILD_DIR)/tests/terminal/font_asset_blob.o
+test-font: $(FONT_ASSET) $(FONT_TEST_ASSET_8) $(BUILD_DIR)/tests/terminal/font_asset_blob.o
 	python3 tests/terminal/font_asset_test.py \
 		--source "$(FONT_SOURCE)" --asset "$(FONT_ASSET)" \
-		--converter "$(FONT_CONVERTER)"
+		--converter "$(FONT_CONVERTER)" --height 16
+	python3 tests/terminal/font_asset_test.py \
+		--source "kernel/assets/font/unscii-8.hex" \
+		--asset "$(FONT_TEST_ASSET_8)" \
+		--converter "$(FONT_CONVERTER)" --height 8
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
 		-fsanitize=address,undefined -I. -Ikernel/include -Iinclude \
 		-idirafter libc/include tests/terminal/font_render_test.c \
@@ -1137,9 +1142,10 @@ test-font: $(FONT_ASSET) $(BUILD_DIR)/tests/terminal/font_asset_blob.o
 		$(BUILD_DIR)/tests/terminal/font_asset_blob.o \
 		-o $(HOST_TEST_DIR)/mangrove-font-render-test
 	ASAN_OPTIONS=detect_leaks=0 $(HOST_TEST_DIR)/mangrove-font-render-test
-	@echo production UNSCII-16 font tests passed
+	@echo production UNSCII native-size font tests passed
 
-$(BUILD_DIR)/tests/terminal/font_asset_blob.o: tests/terminal/font_asset_blob.S $(FONT_ASSET)
+$(BUILD_DIR)/tests/terminal/font_asset_blob.o: tests/terminal/font_asset_blob.S \
+		$(FONT_ASSET)
 	@mkdir -p $(dir $@)
 	$(HOST_CC) -c $< -o $@
 
@@ -3304,7 +3310,11 @@ $(BUILD_DIR)/kernel/%.o: kernel/src/%.s
 font: $(FONT_ASSET)
 
 $(FONT_ASSET): $(FONT_SOURCE) $(FONT_CONVERTER)
-	python3 $(FONT_CONVERTER) --source $(FONT_SOURCE) --output $@
+	python3 $(FONT_CONVERTER) --source $(FONT_SOURCE) --output $@ --height 16
+
+$(FONT_TEST_ASSET_8): kernel/assets/font/unscii-8.hex $(FONT_CONVERTER)
+	@mkdir -p $(dir $@)
+	python3 $(FONT_CONVERTER) --source $< --output $@ --height 8
 
 $(BUILD_DIR)/kernel/font_blob.o: $(FONT_ASSET)
 	@mkdir -p $(dir $@)

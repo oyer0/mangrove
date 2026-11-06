@@ -41,6 +41,8 @@ struct xhci_storage_trace_snapshot;
 #define X250_BOOT_TRACE_EXPORT_CAPACITY \
     (X250_BOOT_TRACE_HISTORY_CAPACITY * X250_BOOT_TRACE_TEXT_CAPACITY)
 void x250_boot_trace_begin(void);
+void x250_boot_trace_console_ready(void);
+void x250_boot_trace_gop_modes(void);
 void x250_boot_trace_refresh(void);
 usize x250_boot_trace_export(char *buffer, usize capacity, u32 *line_count,
                              bool *complete);
@@ -117,6 +119,8 @@ void x250_boot_trace_panic(const char *message,
                            u64 cr2, u64 cr3);
 #else
 #define x250_boot_trace_begin(...) ((void)0)
+#define x250_boot_trace_console_ready(...) ((void)0)
+#define x250_boot_trace_gop_modes(...) ((void)0)
 #define x250_boot_trace_refresh(...) ((void)0)
 #define x250_boot_trace_export(...) 0U
 #define x250_boot_trace_measurements_begin(...) ((void)0)

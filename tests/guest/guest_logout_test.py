@@ -24,6 +24,12 @@ def screen_has(text, value):
     return value in text
 
 
+def scroll_fill_limit(width, height):
+    """Bound marker scrolling using the active production terminal rows."""
+    visible_rows = mgfs.screen_geometry(width, height)[2]
+    return visible_rows + 2
+
+
 def qmp_key(qmp, key):
     qmp.call('human-monitor-command', {
         'command-line': 'sendkey ' + key + ' 35'})
@@ -160,8 +166,13 @@ def boot_logout(folder, disk, args):
             before = capture('session-output-before-scroll')
             if 'logoutmarker' not in before:
                 raise AssertionError('session marker was not rendered')
+            _header, dimensions, _maximum, _pixels = current_ppm.read_bytes().split(
+                b'\n', 3)
+            framebuffer_width, framebuffer_height = map(
+                int, dimensions.split())
             last_visible_fill = None
-            for index in range(1, 30):
+            for index in range(1, scroll_fill_limit(
+                    framebuffer_width, framebuffer_height) + 1):
                 token = f'logoutfill{index:02d}'
                 run_say(token)
                 visible = capture()

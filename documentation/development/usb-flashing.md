@@ -6,9 +6,9 @@ Build the normal compact image and host MGFS checker without privileges:
 make -j4 usb-image mgfsck
 ```
 
-An isolated X250 diagnostic build can use
+An isolated build with opt-in boot diagnostics can use
 `BUILD_DIR=build/x250-compact X250_BOOT_TRACE=1` on that command. Normal builds
-leave the overlay disabled. Omit `USB_IMAGE_SECTORS` for routine flashing.
+leave the boot trace disabled. Omit `USB_IMAGE_SECTORS` for routine flashing.
 
 Choose the whole removable USB device explicitly, preferably its stable
 `/dev/disk/by-id/` name without a partition suffix. Unmount its partitions

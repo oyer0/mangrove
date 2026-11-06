@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Check the generated production UNSCII-16 PSF2 asset against its source."""
+"""Check a generated native-size production Unscii PSF2 asset."""
 import argparse
 from pathlib import Path
 import struct
@@ -15,14 +15,14 @@ REQUIRED = set(range(0x20, 0x7f)) | {
 }
 
 
-def source_entries(path):
+def source_entries(path, height):
     entries = {}
     for line_number, raw_line in enumerate(path.read_text("ascii").splitlines(), 1):
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
         codepoint_text, bitmap_text = line.split(":", 1)
-        if len(bitmap_text) != 32:
+        if len(bitmap_text) != height * 2:
             continue
         codepoint = int(codepoint_text, 16)
         if codepoint in entries:
@@ -32,18 +32,19 @@ def source_entries(path):
     return entries
 
 
-def decode_asset(data):
+def decode_asset(data, height, expected_glyph_count):
     if len(data) < 32:
         raise AssertionError("PSF2 asset is shorter than its header")
     (magic, version, header_size, flags, glyph_count, bytes_per_glyph,
-     height, width) = struct.unpack_from("<4s7I", data)
+     actual_height, width) = struct.unpack_from("<4s7I", data)
     assert magic == MAGIC, "incorrect PSF2 magic"
     assert version == 0, f"unsupported PSF2 version {version}"
     assert header_size == 32, f"unexpected PSF2 header size {header_size}"
     assert flags == 1, f"expected one Unicode table, got flags {flags:#x}"
-    assert (width, height, bytes_per_glyph) == (8, 16, 16), \
-        f"unexpected glyph geometry: {width}x{height}, {bytes_per_glyph} bytes"
-    assert glyph_count == 2997, f"unexpected source glyph count {glyph_count}"
+    assert (width, actual_height, bytes_per_glyph) == (8, height, height), \
+        f"unexpected glyph geometry: {width}x{actual_height}, {bytes_per_glyph} bytes"
+    assert glyph_count == expected_glyph_count, \
+        f"unexpected source glyph count {glyph_count}"
 
     glyph_start = header_size
     glyph_end = glyph_start + glyph_count * bytes_per_glyph
@@ -108,17 +109,18 @@ def main():
     parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--asset", type=Path, required=True)
     parser.add_argument("--converter", type=Path, required=True)
+    parser.add_argument("--height", type=int, choices=(8, 16), default=16)
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[2]
-    source = source_entries(root / args.source)
+    source = source_entries(root / args.source, args.height)
     actual = (root / args.asset).read_bytes()
-    mappings = decode_asset(actual)
+    mappings = decode_asset(actual, args.height, len(source))
 
     with tempfile.TemporaryDirectory(prefix="mangrove-font-asset-") as directory:
         regenerated = Path(directory) / "font.psf"
         subprocess.run([
             sys.executable, str(args.converter), "--source", str(args.source),
-            "--output", str(regenerated),
+            "--output", str(regenerated), "--height", str(args.height),
         ], cwd=root, check=True)
         assert regenerated.read_bytes() == actual, \
             "checked-in PSF2 asset differs from converter output"
@@ -127,7 +129,8 @@ def main():
     for codepoint, bitmap in source.items():
         assert mappings[codepoint] == bitmap, \
             f"PSF2 glyph data differs from source for U+{codepoint:04X}"
-    print(f"UNSCII-16 asset: 8x16, {len(mappings)} unique mappings; converter and source match")
+    print(f"UNSCII-{args.height} asset: 8x{args.height}, "
+          f"{len(mappings)} unique mappings; converter and source match")
 
 
 if __name__ == "__main__":

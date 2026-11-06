@@ -38,26 +38,29 @@ static void render_and_compare(u32 codepoint, const char *expected_hex,
                                bool should_lookup)
 {
     u8 expected_rows[16];
+    u32 expected_height = font_height();
+    usize expected_bytes = (usize)expected_height;
     u32 glyph_index = 0U;
     bool found;
     const u32 origin_x = 7U;
     const u32 origin_y = 3U;
 
-    assert(expected_hex && strlen(expected_hex) == sizeof(expected_rows) * 2U);
-    for (u32 row = 0U; row < sizeof(expected_rows); row++)
+    assert(expected_height <= sizeof(expected_rows));
+    assert(expected_hex && strlen(expected_hex) == expected_bytes * 2U);
+    for (u32 row = 0U; row < expected_bytes; row++)
         expected_rows[row] = (u8)((hex_digit(expected_hex[row * 2U]) << 4U) |
                                   hex_digit(expected_hex[row * 2U + 1U]));
 
     found = font_lookup_codepoint(codepoint, &glyph_index);
     assert(found == should_lookup);
-    if (found) assert(glyph_index < 2997U);
+    if (found) assert(glyph_index < 4096U);
 
     for (usize i = 0U; i < sizeof(pixels) / sizeof(pixels[0]); i++)
         pixels[i] = TEST_PIXEL_SENTINEL;
     draw_codepoint(codepoint, origin_x, origin_y, TEST_FOREGROUND,
                    TEST_BACKGROUND);
 
-    for (u32 row = 0U; row < 16U; row++) {
+    for (u32 row = 0U; row < expected_height; row++) {
         for (u32 column = 0U; column < 8U; column++) {
             bool ink = (expected_rows[row] & (u8)(0x80U >> column)) != 0U;
             u32 expected = ink ? TEST_FOREGROUND : TEST_BACKGROUND;
@@ -67,7 +70,7 @@ static void render_and_compare(u32 codepoint, const char *expected_hex,
     }
     assert(pixels[origin_y * TEST_WIDTH + origin_x - 1U] ==
            TEST_PIXEL_SENTINEL);
-    assert(pixels[(origin_y + 16U) * TEST_WIDTH + origin_x] ==
+    assert(pixels[(origin_y + expected_height) * TEST_WIDTH + origin_x] ==
            TEST_PIXEL_SENTINEL);
 }
 
@@ -108,6 +111,8 @@ static void test_loader_rejects_bad_header(void)
 
     expect_header_field_rejected(4U, 1U); /* Only PSF2 version 0 is supported. */
     expect_header_field_rejected(8U, (u32)(asset_size + 1U));
+    expect_header_field_rejected(20U, 1U); /* row bytes must cover height */
+    expect_header_field_rejected(28U, 9U); /* current rasterizer is 8 pixels */
 
     font_init(NULL);
     assert(font_lookup_codepoint('A', &glyph_index));
@@ -116,6 +121,7 @@ static void test_loader_rejects_bad_header(void)
 int main(void)
 {
     u32 glyph_index;
+    BOOT_INFO boot = {0};
 
     test_loader_rejects_bad_header();
     assert(font_width() == 8U && font_height() == 16U);
@@ -149,6 +155,22 @@ int main(void)
 
     assert(!font_lookup_codepoint(0xd800U, &glyph_index));
     assert(!font_lookup_codepoint(0x110000U, &glyph_index));
+
+    /* The initial physical visual candidate keeps native 8x16 Unscii at the
+     * X250 panel geometry; GOP selection, not font substitution, provides the
+     * panel's useful resolution. */
+    boot.FramebufferWidth = 1366U;
+    boot.FramebufferHeight = 768U;
+    font_init(&boot);
+    assert(font_width() == 8U && font_height() == 16U);
+    render_and_compare(0x0041U, "0000183c6666667e6666666666000000", true);
+
+    /* A larger framebuffer retains the native 8x16 Unscii bitmap. */
+    boot.FramebufferWidth = 1920U;
+    boot.FramebufferHeight = 1080U;
+    font_init(&boot);
+    assert(font_width() == 8U && font_height() == 16U);
+    render_and_compare(0x0041U, "0000183c6666667e6666666666000000", true);
     puts("production UNSCII PSF2 loader and rasterizer: mappings, glyph rows, pixels and fallback passed");
     return 0;
 }

@@ -1,10 +1,16 @@
-UNSCII-16
-=========
+UNSCII bitmap sources
+=====================
 
-Mangrove uses the regular 8x16 UNSCII font by viznut.
+Mangrove embeds the regular Unscii 8x16 bitmap by viznut. The native 8x8
+source is retained for converter validation; it is not embedded in Pith.
+It is from the official Unscii repository at commit
+257b4dfeb50651510fe8b9cf4f151a148a4490e4
+(https://github.com/viznut/unscii).
 
 License:
 Public Domain / CC0
 
-kernel/assets/font.psf is generated from unscii-16.hex using
-tools/convert_unscii_hex.py.
+The source bitmaps are retained in `font/unscii-16.hex` and
+`font/unscii-8.hex`. `kernel/assets/font.psf` is generated from the 8x16
+source by `tools/convert_unscii_hex.py`. The converter keeps native bitmaps
+and does not resize glyphs.

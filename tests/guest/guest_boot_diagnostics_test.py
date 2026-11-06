@@ -57,7 +57,7 @@ def boot_once(args, workspace, disk, variables, run):
     command = [
         args.qemu, "-machine", "q35", "-accel", args.accel,
         "-cpu", "host" if args.accel == "kvm" else "max",
-        "-smp", "2", "-m", "512M", "-display", "none", "-vga", "none",
+        "-smp", str(args.cpus), "-m", "512M", "-display", "none", "-vga", "none",
         "-device", "VGA,xres=1024,yres=768", "-serial", f"file:{serial}",
         "-qmp", "stdio",
         "-drive", f"if=pflash,format=raw,readonly=on,file={args.ovmf_code}",
@@ -106,7 +106,8 @@ def boot_once(args, workspace, disk, variables, run):
             if qmp:
                 qmp.close()
             artifacts.terminate_and_reap(process)
-    return {"boot": run, "status": "PASS", "shoot_command":
+    return {"boot": run, "status": "INCOMPLETE", "shoot_command_status":
+            "INCOMPLETE", "shoot_command_attempted":
             f"say boot-{run} > /temp/diagnostic-boot-{run}",
             "serial_log": str(serial.relative_to(workspace)),
             "screenshot": str((work / f"boot-{run}.ppm").relative_to(workspace))}
@@ -142,6 +143,8 @@ def main():
     parser.add_argument("--ovmf-code", type=Path, default=default_path("code"))
     parser.add_argument("--ovmf-vars", type=Path, default=default_path("vars"))
     parser.add_argument("--timeout", type=int, default=120)
+    parser.add_argument("--cpus", type=int, choices=(1, 2), default=2,
+                        help="guest vCPU count for the two-boot persistence run")
     parser.add_argument("--interaction-settle", type=int, default=10,
                         help="bounded seconds before injecting the Shoot command")
     args = parser.parse_args()
@@ -172,7 +175,7 @@ def main():
     disk = workspace.path / "MangroveUSB.img"
     variables = workspace.path / "OVMF_VARS.fd"
     report = {
-        "status": "INCOMPLETE", "accel": args.accel, "vcpus": 2,
+        "status": "INCOMPLETE", "accel": args.accel, "vcpus": args.cpus,
         "source_revision": source_hash,
         "source_identity": source_identity,
         "build_dir": str(build),
@@ -200,6 +203,17 @@ def main():
             if current.get("status") != "COMPLETE":
                 raise RuntimeError(
                     f"boot {run} log is not complete: {current.get('reason')}")
+            root_partition = extracted["root_partition"]
+            with disk.open("rb") as source:
+                source.seek(root_partition["first_lba"] * 512)
+                root_image = source.read(root_partition["bytes"])
+            if len(root_image) != root_partition["bytes"]:
+                raise RuntimeError(
+                    f"short post-stop root read after boot {run}")
+            verify_shoot_command(
+                root_image, f"diagnostic-boot-{run}", f"boot-{run}\n".encode())
+            record["shoot_command_status"] = "PASS"
+            record["status"] = "PASS"
             if run == 1:
                 report["first_run_log_sha256"] = current["sha256"]
                 report["first_run_extraction"] = str(
@@ -235,8 +249,11 @@ def main():
         for text in (current, previous):
             if ("boot log file prepared" not in text or
                     "payload-write-ms=" not in text or
-                    "BOT commands=" not in text):
-                raise RuntimeError("extracted trace lacks persisted completion timings")
+                    "BOT commands=" not in text or
+                    "GOP initial=" not in text or
+                    "GOP mode=" not in text):
+                raise RuntimeError(
+                    "extracted trace lacks persisted completion timings or GOP mode inventory")
         report["extraction"] = {
             "status": "PASS", "root_mgfsck": "PASS",
             "current_log": logs["boot.log"],

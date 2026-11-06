@@ -15,6 +15,8 @@
 #include <input_trace.h>
 #include <x250_boot_trace.h>
 #include <input_diagnostics.h>
+#include <terminal_layout.h>
+#include <terminal_kernel.h>
 #if INPUT_TRACE_DIAGNOSTICS
 #include <cpu.h>
 #endif
@@ -22,10 +24,6 @@
 #ifndef NULL
 #define NULL ((void*)0)
 #endif
-
-#define TERMINAL_MARGIN_X 10
-#define TERMINAL_MARGIN_Y 10
-#define TERMINAL_LINE_SPACING 2
 
 #define TERMINAL_BUFFER_ROWS 512
 #define TERMINAL_MAX_COLS    256
@@ -564,19 +562,14 @@ void terminal_init(BOOT_INFO *BootInfo){
 
     u32 glyph_w = font_width();
     if (!glyph_w) glyph_w = 1U;
-    u32 content_width = terminal.width > (TERMINAL_MARGIN_X * 2) ?
-                        terminal.width - (TERMINAL_MARGIN_X * 2) : 0U;
-    terminal.visible_cols = content_width / glyph_w;
+    terminal.visible_cols = terminal_layout_columns(terminal.width, glyph_w);
     if (terminal.visible_cols > TERMINAL_MAX_COLS) {
         terminal.visible_cols = TERMINAL_MAX_COLS;
     }
     if (!terminal.visible_cols) terminal.visible_cols = 1U;
 
-    u32 line_h = terminal_line_height();
-    if (!line_h) line_h = 1U;
-    u32 content_height = terminal.height > (TERMINAL_MARGIN_Y * 2) ?
-                         terminal.height - (TERMINAL_MARGIN_Y * 2) : 0U;
-    terminal.visible_rows = content_height / line_h;
+    terminal.visible_rows = terminal_layout_rows(terminal.height,
+                                                  font_height());
     if (!terminal.visible_rows) terminal.visible_rows = 1U;
     if (terminal.visible_rows > TERMINAL_BUFFER_ROWS)
         terminal.visible_rows = TERMINAL_BUFFER_ROWS;
@@ -1119,6 +1112,59 @@ void terminal_write_bytes(const char *buffer, u64 length)
     for (u64 i = 0; i < length; i++)
         terminal_putc_locked(buffer[i]);
     terminal_end_batch_locked(true);
+    spin_unlock_irqrestore(&terminal_lock, saved_flags);
+}
+
+bool terminal_write_kernel_styled(const char *text, u64 length,
+                                  terminal_color_t foreground,
+                                  terminal_color_t background)
+{
+    u64 saved_flags;
+
+    if (!text || !length || !terminal_lock_ready ||
+        !terminal_color_valid((u32)foreground) ||
+        !terminal_color_valid((u32)background))
+        return false;
+
+    saved_flags = spin_lock_irqsave(&terminal_lock);
+    /* Diagnostics are a boot-time console client. Never let a late trace
+     * repaint an application's owned alternate screen. */
+    if (terminal.alternate_active) {
+        spin_unlock_irqrestore(&terminal_lock, saved_flags);
+        return false;
+    }
+
+    terminal_overlay_clear_locked(true);
+    terminal_begin_batch_locked();
+    for (u64 index = 0; index < length; index++)
+        terminal_putc_with_colors_locked(text[index], (u8)foreground,
+                                         (u8)background);
+    terminal_end_batch_locked(false);
+    spin_unlock_irqrestore(&terminal_lock, saved_flags);
+    return true;
+}
+
+bool terminal_kernel_output_begin(void)
+{
+    u64 saved_flags;
+
+    if (!terminal_lock_ready)
+        return false;
+    saved_flags = spin_lock_irqsave(&terminal_lock);
+    if (terminal.alternate_active) {
+        spin_unlock_irqrestore(&terminal_lock, saved_flags);
+        return false;
+    }
+    terminal_overlay_clear_locked(true);
+    terminal_begin_batch_locked();
+    spin_unlock_irqrestore(&terminal_lock, saved_flags);
+    return true;
+}
+
+void terminal_kernel_output_end(void)
+{
+    u64 saved_flags = spin_lock_irqsave(&terminal_lock);
+    terminal_end_batch_locked(false);
     spin_unlock_irqrestore(&terminal_lock, saved_flags);
 }
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Exercise production init callback result propagation into X250 tracing."""
+"""Exercise production init callback result propagation into boot tracing."""
 from pathlib import Path
 import os
 import re
@@ -50,6 +50,7 @@ typedef struct {
 static init_descriptor_t descriptors[INIT_COUNT];
 static bool init_graph_error;
 static u32 begin_calls;
+static u32 gop_inventory_calls;
 static u32 enter_calls;
 static u32 result_calls;
 static bool last_passed;
@@ -63,6 +64,7 @@ static init_result_t callback_result;
 static const char *callback_reason;
 
 static void x250_boot_trace_begin(void) { begin_calls++; }
+static void x250_boot_trace_gop_modes(void) { gop_inventory_calls++; }
 static void x250_boot_trace_stage(u32 checkpoint, bool passed,
                                  const char *description)
 {
@@ -100,6 +102,7 @@ static init_result_t callback_ok(const char **reason)
 static void reset_trace(void)
 {
     begin_calls = enter_calls = result_calls = 0;
+    gop_inventory_calls = 0;
     last_passed = last_required = last_status_available = false;
     last_status = 0;
     last_name[0] = last_state[0] = last_reason[0] = '\0';
@@ -121,7 +124,8 @@ int main(void)
     callback_result = INIT_RESULT_FAILED;
     callback_reason = "controller initialization failed";
     assert(!init_start_node(INIT_XHCI));
-    assert(begin_calls == 1U && enter_calls == 1U && result_calls == 1U);
+    assert(begin_calls == 1U && gop_inventory_calls == 1U &&
+           enter_calls == 1U && result_calls == 1U);
     assert(!last_passed && !last_required && last_status_available);
     assert(last_status == INIT_RESULT_FAILED);
     assert(strcmp(last_name, "xHCI") == 0);
@@ -135,7 +139,8 @@ int main(void)
     callback_result = INIT_RESULT_UNAVAILABLE;
     callback_reason = "no supported Ethernet controller";
     assert(!init_start_node(INIT_NETWORK_DEVICE));
-    assert(begin_calls == 0U && result_calls == 1U);
+    assert(begin_calls == 0U && gop_inventory_calls == 0U &&
+           result_calls == 1U);
     assert(!last_passed && !last_required);
     assert(last_status == INIT_RESULT_UNAVAILABLE);
     assert(strcmp(last_state, "UNAVAILABLE") == 0);

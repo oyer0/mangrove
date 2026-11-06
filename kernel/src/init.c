@@ -1604,8 +1604,10 @@ static bool init_start_node(init_id_t id)
         }
     }
 
-    if (id == INIT_XHCI)
+    if (id == INIT_XHCI) {
         x250_boot_trace_begin();
+        x250_boot_trace_gop_modes();
+    }
     x250_boot_trace_stage(37, false, node->status.name);
     node->status.result = node->start(&reason);
     node->status.reason = reason;

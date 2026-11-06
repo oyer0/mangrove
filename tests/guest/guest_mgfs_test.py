@@ -30,6 +30,7 @@ from qmp_client import QMP, QMPError
 sys.path.insert(0, str(ROOT / 'tools'))
 import image_payloads as manifest
 import update_mgfs as image_tool
+import extract_boot_diagnostics as boot_diagnostics
 import ca_store
 from populate_mgfs import directory_entry, checksum, SYSTEM_PERMISSIONS
 sys.path.insert(0, str(ROOT / 'tests/userspace'))
@@ -443,31 +444,56 @@ def create_disk(folder, build, run, relative_launch=False,
     return disk
 
 
+def screen_geometry(width, height):
+    """Return the production 8x16 Unscii grid for a GOP size."""
+    content_width = max(0, width - 20)
+    content_height = max(0, height - 20)
+    columns = min(256, content_width // 8) or 1
+    rows = min(512, content_height // 18) or 1
+    return 16, 18, rows, columns
+
+
 def screen_text(path):
-    """Exact ASCII glyph recognition for the existing 8x16 console, not OCR."""
+    """Decode exact ASCII glyphs using the production 8x16 Unscii font."""
     header, dimensions, maximum, pixels = path.read_bytes().split(b'\n', 3)
     if header != b'P6' or maximum != b'255': raise ValueError('unsupported screendump')
     width, height = map(int, dimensions.split())
     if width * height > 4096 * 2160 or len(pixels) != width * height * 3:
         raise ValueError('screendump bounds')
+    glyph_height, line_height, visible_rows, columns = screen_geometry(
+        width, height)
     glyphs = {}
-    for line in (ROOT / 'kernel/assets/font/unscii-16.hex').read_text().splitlines():
+    font = ROOT / 'kernel/assets/font/unscii-16.hex'
+    for line in font.read_text().splitlines():
         if ':' not in line: continue
         code, bits = line.split(':')
-        if 32 <= int(code, 16) < 127 and len(bits) == 32:
+        if 32 <= int(code, 16) < 127 and len(bits) == glyph_height * 2:
             glyphs[bytes.fromhex(bits)] = chr(int(code, 16))
-    rows = []
-    for y in range(10, height - 16, 18):
+    text_rows = []
+    for row_index in range(visible_rows):
+        y = 10 + row_index * line_height
         row = ''
-        for x in range(10, width - 8, 8):
+        for column in range(columns):
+            x = 10 + column * 8
+            if x + 8 > width or y + glyph_height > height:
+                break
             colors = [pixels[((y + dy) * width + x + dx) * 3:((y + dy) * width + x + dx) * 3 + 3]
-                      for dy in range(16) for dx in range(8)]
-            background = Counter(colors).most_common(1)[0][0]
-            bits = bytes(sum((color != background) << (7 - dx)
-                             for dx, color in enumerate(colors[dy * 8:dy * 8 + 8])) for dy in range(16))
-            row += glyphs.get(bits, '?')
-        rows.append(row.rstrip())
-    return '\n'.join(rows)
+                      for dy in range(glyph_height) for dx in range(8)]
+            # Dense glyphs such as Unscii's uppercase M can cover more than
+            # half a cell. Try each observed color as the background instead
+            # of assuming the majority color is always the background.
+            decoded = None
+            for background, _count in Counter(colors).most_common():
+                bits = bytes(sum((color != background) << (7 - dx)
+                                 for dx, color in enumerate(
+                                     colors[dy * 8:dy * 8 + 8]))
+                             for dy in range(glyph_height))
+                decoded = glyphs.get(bits)
+                if decoded is not None:
+                    break
+            row += decoded if decoded is not None else '?'
+        text_rows.append(row.rstrip())
+    return '\n'.join(text_rows)
 
 
 def confirmation_echo(text, answer):
@@ -514,12 +540,27 @@ def parse_smp_boot_log(text, requested_cpus):
     return {'discovered_cpus': discovered, 'online_cpus': online}
 
 
+def smp_boot_log_snapshot(raw):
+    """Return the text snapshot from a plain or captured diagnostic log."""
+    if len(raw) >= boot_diagnostics.FOOTER_BYTES_V1 and any(
+            raw[-size:-size + 8] == boot_diagnostics.FOOTER_MAGIC
+            for size in (boot_diagnostics.FOOTER_BYTES,
+                         boot_diagnostics.FOOTER_BYTES_V1)):
+        captured = boot_diagnostics.decode_footer(raw)
+        if captured['status'] != 'COMPLETE':
+            raise ValueError('diagnostic boot log is incomplete: ' +
+                             str(captured['reason']))
+        raw = captured['snapshot']
+    return raw.decode('ascii')
+
+
 def inspect_smp_boot(disk, requested_cpus):
     with disk.open('rb') as source:
         source.seek(ROOT_OFFSET)
         image = source.read(PART_BYTES)
     _, boot_log = find(image, '/sys/logs/boot.log')
-    return parse_smp_boot_log(payload(image, boot_log).decode('ascii'),
+    return parse_smp_boot_log(smp_boot_log_snapshot(
+                                  payload(image, boot_log)),
                               requested_cpus)
 
 
@@ -1202,6 +1243,7 @@ def inspect_shoot_v1(folder, disk, build, run):
     if len(pixels) != width * height * 3:
         raise ValueError('native ESC-control framebuffer pixel length mismatch')
     rows = framebuffer_text.splitlines()
+    glyph_height, line_height, _, _ = screen_geometry(width, height)
     for marker, expected_rgb in (
             ('ESC INTERACTIVE PASS', bytes((0x32, 0xc7, 0x6d))),
             ('ESC STYLE PASS', bytes((0xff, 0xd1, 0x66)))):
@@ -1211,10 +1253,10 @@ def inspect_shoot_v1(folder, disk, build, run):
                           if marker in row)
         start_column = rows[marker_row].index(marker)
         colored_pixel = False
-        for cell_y in range(16):
+        for cell_y in range(glyph_height):
             for cell_x in range(len(marker) * 8):
                 x = 10 + start_column * 8 + cell_x
-                y = 10 + marker_row * 18 + cell_y
+                y = 10 + marker_row * line_height + cell_y
                 if x < width and y < height:
                     at = (y * width + x) * 3
                     if pixels[at:at + 3] == expected_rgb:

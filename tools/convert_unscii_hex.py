@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Convert the upstream regular UNSCII-16 HEX font to PSF2.
+"""Convert an upstream regular UNSCII bitmap HEX font to PSF2.
 
-The upstream HEX file contains a mixture of 8x8, 8x16, and 16x16 entries.
-Mangrove's console is an 8x16 monospace terminal, so this deliberately keeps
-the upstream 8x16 entries and emits them without changing their bitmaps.
+The HEX source contains fixed-size bitmap entries. Select the native 8x8 or
+8x16 cells without resizing glyphs.
 """
 
 from __future__ import annotations
@@ -18,8 +17,7 @@ MAGIC = b"\x72\xb5\x4a\x86"
 PSF2_HEADER_SIZE = 32
 PSF2_UNICODE_TABLE = 0x1
 GLYPH_WIDTH = 8
-GLYPH_HEIGHT = 16
-GLYPH_BYTES = 16
+SUPPORTED_HEIGHTS = (8, 16)
 MAX_SOURCE_BYTES = 512 * 1024
 MAX_GLYPHS = 4096
 
@@ -34,7 +32,10 @@ def parse_codepoint(token: str, path: Path, line_number: int) -> int:
     return value
 
 
-def parse_source(path: Path) -> list[tuple[int, bytes]]:
+def parse_source(path: Path, glyph_height: int) -> list[tuple[int, bytes]]:
+    if glyph_height not in SUPPORTED_HEIGHTS:
+        raise ValueError("supported glyph heights are 8 and 16")
+    glyph_bytes = glyph_height
     raw = path.read_bytes()
     if len(raw) > MAX_SOURCE_BYTES:
         raise ValueError("UNSCII source exceeds bounded input size")
@@ -48,24 +49,27 @@ def parse_source(path: Path) -> list[tuple[int, bytes]]:
         if ":" not in line:
             raise ValueError(f"{path}:{line_number}: expected codepoint:bitmap")
         codepoint_token, bitmap = line.split(":", 1)
-        # The regular source includes other cell sizes.  Keep only the exact
-        # 8x16 entries that fit Mangrove's existing terminal geometry.
-        if len(bitmap) != GLYPH_BYTES * 2:
+        # Unscii source files can contain other native dimensions. Keep only
+        # this variant's exact 8-pixel-wide rows; never scale the bitmaps.
+        if len(bitmap) != glyph_bytes * 2:
             continue
         codepoint = parse_codepoint(codepoint_token, path, line_number)
         try:
             glyph = bytes.fromhex(bitmap)
         except ValueError as error:
             raise ValueError(f"{path}:{line_number}: invalid bitmap") from error
-        if len(glyph) != GLYPH_BYTES:
-            raise ValueError(f"{path}:{line_number}: invalid 8x16 bitmap")
+        if len(glyph) != glyph_bytes:
+            raise ValueError(
+                f"{path}:{line_number}: invalid 8x{glyph_height} bitmap")
         if codepoint in seen:
-            raise ValueError(f"{path}:{line_number}: duplicate 8x16 code point")
+            raise ValueError(
+                f"{path}:{line_number}: duplicate 8x{glyph_height} code point")
         seen.add(codepoint)
         entries.append((codepoint, glyph))
 
     if not entries or len(entries) > MAX_GLYPHS:
-        raise ValueError(f"8x16 glyph count is outside 1..{MAX_GLYPHS}")
+        raise ValueError(
+            f"8x{glyph_height} glyph count is outside 1..{MAX_GLYPHS}")
     required = list(range(0x20, 0x7F)) + [0x2500, 0x2502, 0x2514, 0x251C]
     missing = [f"U+{value:04X}" for value in required if value not in seen]
     if missing:
@@ -73,8 +77,9 @@ def parse_source(path: Path) -> list[tuple[int, bytes]]:
     return entries
 
 
-def build(source: Path, output: Path) -> None:
-    entries = parse_source(source)
+def build(source: Path, output: Path, glyph_height: int = 16) -> None:
+    entries = parse_source(source, glyph_height)
+    glyph_bytes = glyph_height
     header = struct.pack(
         "<4s7I",
         MAGIC,
@@ -82,8 +87,8 @@ def build(source: Path, output: Path) -> None:
         PSF2_HEADER_SIZE,
         PSF2_UNICODE_TABLE,
         len(entries),
-        GLYPH_BYTES,
-        GLYPH_HEIGHT,
+        glyph_bytes,
+        glyph_height,
         GLYPH_WIDTH,
     )
     glyph_data = b"".join(bitmap for _, bitmap in entries)
@@ -106,8 +111,12 @@ def main() -> int:
         type=Path,
         default=Path("kernel/assets/font.psf"),
     )
+    parser.add_argument(
+        "--height", type=int, choices=SUPPORTED_HEIGHTS, default=16,
+        help="native glyph height (8 or 16; default: 16)",
+    )
     args = parser.parse_args()
-    build(args.source, args.output)
+    build(args.source, args.output, args.height)
     return 0
 
 

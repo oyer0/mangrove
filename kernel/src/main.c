@@ -1417,6 +1417,7 @@ static bool early_bootstrap(BOOT_INFO *source_boot_info)
     x250_boot_trace_event(BootInfo, 33, false,
                           "09.5 initialize console");
     console_init();
+    x250_boot_trace_console_ready();
     x250_boot_trace_event(BootInfo, 33, true,
                           "09.5 console initialized");
     x250_boot_trace_event(BootInfo, 9, true,
@@ -1727,6 +1728,7 @@ static void start_pid1(void)
     x250_boot_trace_event(&kernel_boot_info, 23, false,
                           "enter PID 1 userspace");
     __asm__ volatile("sti" ::: "memory");
+    x250_boot_trace_refresh();
     process_user_context_enter();
 
     for (;;)
@@ -1774,9 +1776,8 @@ void kmain_high(BOOT_INFO *source_boot_info)
         return;
     if (!kernel_bringup()) {
         kprint("[FAIL] Required kernel bring-up phase failed\n");
-        /* Console rendering can repaint the shared framebuffer over the
-         * temporary diagnostic layer. Leave the final report as the last
-         * framebuffer writer before halting this failed boot. */
+        /* Present the retained diagnostic report through the same terminal
+         * ring as ordinary kernel output before stopping this failed boot. */
         x250_boot_trace_refresh();
         for (;;) __asm__ volatile("cli; hlt");
     }
@@ -1785,10 +1786,7 @@ void kmain_high(BOOT_INFO *source_boot_info)
 #endif
     x250_boot_trace_event(&kernel_boot_info, 22, false,
                           "prepare PID 1 and transfer to Shoot");
-#if X250_BOOT_TRACE
     x250_boot_trace_timing(timer_uptime_ms(), "Shoot launch begin", 0,
                            false, 0, NULL);
-    x250_boot_trace_refresh();
-#endif
     start_pid1();
 }

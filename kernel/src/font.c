@@ -131,6 +131,7 @@ void font_init(BOOT_INFO *BootInfo)
     u64 glyph_bytes;
     usize map_offset;
 
+    /* Keep the established native 8x16 Unscii system-console metrics. */
     (void)BootInfo;
     font_asset_start = (const u8 *)_binary_kernel_assets_font_psf_start;
     font_asset_size = (usize)((const u8 *)_binary_kernel_assets_font_psf_end -
@@ -163,8 +164,13 @@ void font_init(BOOT_INFO *BootInfo)
     if (glyph_bytes > (u64)(font_asset_size - font_header->headerfile))
         return;
 
-    glyph_buffer =
-        (u8 *)_binary_kernel_assets_font_psf_start + font_header->headerfile;
+    /* The renderer stores one byte per bitmap row and supports this native
+     * 8-pixel-wide Unscii asset without a separate rasterization path. */
+    if (font_header->width > 8U ||
+        font_header->bytesperglyph < font_header->height)
+        return;
+
+    glyph_buffer = font_asset_start + font_header->headerfile;
     glyph_buffer_size = (usize)glyph_bytes;
     font_ready = true;
 
