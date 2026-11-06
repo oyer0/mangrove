@@ -59,6 +59,34 @@ Before leaving boot services, the loader collects:
 - a 16-page physical handoff stack;
 - the physical address of the bootstrap PML4.
 
+Before handoff, the loader queries up to 64 GOP modes and admits only
+descriptors with version 0, the framebuffer renderer's supported
+Blue-Green-Red-Reserved pixel layout, nonzero visible dimensions, a scan-line
+pitch at least as wide as the visible image, and a checked framebuffer extent
+no larger than 256 MiB. It selects the usable mode with the largest visible
+pixel area; ties prefer greater width, then height, then the lower mode number.
+This is independent of machine model, panel name, and mode index. On the
+operator-inventoried X250 mode set, it selects 1366×768 with pitch 1376 over
+the inherited 640×480 mode.
+
+The loader calls `SetMode` only when the selected mode differs from the
+current mode. It then re-reads the GOP active-mode record and validates the
+actual framebuffer base, size, dimensions, format, and pitch before publishing
+geometry in `BOOT_INFO`. If the requested switch fails or produces invalid
+active properties, a previously validated active mode is retained or
+restored. When firmware offers no valid current or selectable framebuffer,
+the loader reports the failure and stops before kernel handoff. The handoff
+contains the actual active mode's properties, including padded pitch; it does
+not report a requested mode as selected unless the active GOP record supports
+it.
+
+`X250_BOOT_TRACE=1` additionally records the initial, requested, and actual
+mode numbers, SetMode/restore statuses, and up to 32 mode descriptors for the
+persistent diagnostic report. Its list is marked incomplete when the trace
+bound is exceeded or a query/free fails. Mode selection and its safety checks
+are part of normal boot behavior; only the extra inventory and reporting are
+diagnostic-only.
+
 All persistent loader allocations are complete before the final memory-map
 snapshot. If `ExitBootServices` requires a refreshed map, the loader publishes
 the map that accompanied the successful call.

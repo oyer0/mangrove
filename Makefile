@@ -938,6 +938,22 @@ test-guest-boot-diagnostics:
 		--image "$(BUILD_DIR)/Mangrove/MangroveUSB.img" \
 		--build-dir "$(BUILD_DIR)" --accel "$(BOOT_DIAG_ACCEL)"
 
+.PHONY: test-gop-modes
+test-gop-modes:
+	@mkdir -p $(HOST_TEST_DIR)
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -Wno-unused-variable \
+		-fsanitize=address,undefined \
+		-DMANGROVE_HOST_TEST -DX250_BOOT_TRACE=1 -Iboot/include -Iinclude \
+		tests/boot/gop_modes_test.c boot/src/gop_modes.c \
+		-o $(HOST_TEST_DIR)/mangrove-gop-modes-trace-test
+	ASAN_OPTIONS=detect_leaks=0 $(HOST_TEST_DIR)/mangrove-gop-modes-trace-test
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -Wno-unused-variable \
+		-fsanitize=address,undefined \
+		-DMANGROVE_HOST_TEST -DX250_BOOT_TRACE=0 -Iboot/include -Iinclude \
+		tests/boot/gop_modes_test.c boot/src/gop_modes.c \
+		-o $(HOST_TEST_DIR)/mangrove-gop-modes-normal-test
+	ASAN_OPTIONS=detect_leaks=0 $(HOST_TEST_DIR)/mangrove-gop-modes-normal-test
+
 test-x250-boot-trace:
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -Wno-unused-function \
 		-ffunction-sections \

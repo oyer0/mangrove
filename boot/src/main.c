@@ -7,6 +7,17 @@
 #include <handoff.h>
 #include <bootstrap.h>
 #include <boot_checkpoint.h>
+#include <gop_modes.h>
+
+#if X250_BOOT_TRACE
+static void boot_zero_info(BOOT_INFO *info)
+{
+    volatile u8 *bytes = (volatile u8 *)info;
+
+    for (usize index = 0; index < sizeof(*info); index++)
+        bytes[index] = 0U;
+}
+#endif
 
 static const EFI_GUID ACPI20_TABLE_GUID =
 {
@@ -252,15 +263,19 @@ EFI_STATUS EFIAPI efi_main(
 
     BOOT_INFO BootInfo;
 
+#if X250_BOOT_TRACE
+    boot_zero_info(&BootInfo);
+#else
+    __builtin_memset(&BootInfo, 0, sizeof(BootInfo));
+#endif
     BootInfo.Size = sizeof(BOOT_INFO);
     BootInfo.KernelPhysicalBase = KernelPhysicalBase;
 
-    BootInfo.FramebufferBase = (void *)Gop->Mode->FrameBufferBase;
-    BootInfo.FramebufferPhysicalBase = (u64)Gop->Mode->FrameBufferBase;
-    BootInfo.FramebufferSize = (usize)Gop->Mode->FrameBufferSize;
-    BootInfo.FramebufferWidth = (u32)Gop->Mode->Info->HorizontalResolution;
-    BootInfo.FramebufferHeight = (u32)Gop->Mode->Info->VerticalResolution;
-    BootInfo.PixelsPerScanLine = (u32)Gop->Mode->Info->PixelsPerScanLine;
+    Status = boot_gop_select_mode(SystemTable, Gop, &BootInfo);
+    if (Status != EFI_SUCCESS) {
+        console_write(L"No validated GOP framebuffer mode is available.\r\n");
+        return Status;
+    }
     
     BootInfo.Rsdp = Rsdp;
 

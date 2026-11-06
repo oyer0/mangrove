@@ -3,6 +3,26 @@
 
 #include <types.h>
 
+#ifndef X250_BOOT_TRACE
+#define X250_BOOT_TRACE 0
+#endif
+
+#if X250_BOOT_TRACE
+#define BOOT_GOP_MODE_LIMIT 32U
+
+typedef struct {
+    u32 Number;
+    u32 HorizontalResolution;
+    u32 VerticalResolution;
+    u32 PixelFormat;
+    u32 PixelsPerScanLine;
+    u32 Valid;
+    u64 QueryStatus;
+    u64 ValidationStatus;
+    u64 FreeStatus;
+} BOOT_GOP_MODE_INFO;
+#endif
+
 typedef struct
 {
     u32 Type;
@@ -46,6 +66,23 @@ typedef struct
 
     /* Physical address corresponding to KERNEL_PHYS_BASE in the linked ELF. */
     u64 KernelPhysicalBase;
+
+#if X250_BOOT_TRACE
+    /* GOP selection details are bounded and included only in trace builds. */
+    u32 GopInitialMode;
+    u32 GopCurrentMode;
+    u32 GopRequestedMode;
+    u32 GopSetModeAttempted;
+    u32 GopFallbackUsed;
+    u32 GopMaxMode;
+    u32 GopModeCount;
+    u32 GopModeInventoryComplete;
+    u32 GopActivePixelFormat;
+    u64 GopSetModeStatus;
+    u64 GopRestoreModeStatus;
+    u64 GopSelectionStatus;
+    BOOT_GOP_MODE_INFO GopModes[BOOT_GOP_MODE_LIMIT];
+#endif
 
 } BOOT_INFO;
 
