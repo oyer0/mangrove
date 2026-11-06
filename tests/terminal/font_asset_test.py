@@ -9,20 +9,21 @@ import sys
 import tempfile
 
 MAGIC = b"\x72\xb5\x4a\x86"
+GLYPH_HEIGHT = 16
 REQUIRED = set(range(0x20, 0x7f)) | {
     0x00e9, 0x010d, 0x015f, 0x0301, 0x030c, 0x0327,
     0x2500, 0x2502, 0x250c, 0x2518, 0x2588, 0x2591,
 }
 
 
-def source_entries(path, height):
+def source_entries(path):
     entries = {}
     for line_number, raw_line in enumerate(path.read_text("ascii").splitlines(), 1):
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
         codepoint_text, bitmap_text = line.split(":", 1)
-        if len(bitmap_text) != height * 2:
+        if len(bitmap_text) != GLYPH_HEIGHT * 2:
             continue
         codepoint = int(codepoint_text, 16)
         if codepoint in entries:
@@ -32,7 +33,7 @@ def source_entries(path, height):
     return entries
 
 
-def decode_asset(data, height, expected_glyph_count):
+def decode_asset(data, expected_glyph_count):
     if len(data) < 32:
         raise AssertionError("PSF2 asset is shorter than its header")
     (magic, version, header_size, flags, glyph_count, bytes_per_glyph,
@@ -41,7 +42,8 @@ def decode_asset(data, height, expected_glyph_count):
     assert version == 0, f"unsupported PSF2 version {version}"
     assert header_size == 32, f"unexpected PSF2 header size {header_size}"
     assert flags == 1, f"expected one Unicode table, got flags {flags:#x}"
-    assert (width, actual_height, bytes_per_glyph) == (8, height, height), \
+    assert (width, actual_height, bytes_per_glyph) == \
+        (8, GLYPH_HEIGHT, GLYPH_HEIGHT), \
         f"unexpected glyph geometry: {width}x{actual_height}, {bytes_per_glyph} bytes"
     assert glyph_count == expected_glyph_count, \
         f"unexpected source glyph count {glyph_count}"
@@ -109,18 +111,17 @@ def main():
     parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--asset", type=Path, required=True)
     parser.add_argument("--converter", type=Path, required=True)
-    parser.add_argument("--height", type=int, choices=(8, 16), default=16)
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[2]
-    source = source_entries(root / args.source, args.height)
+    source = source_entries(root / args.source)
     actual = (root / args.asset).read_bytes()
-    mappings = decode_asset(actual, args.height, len(source))
+    mappings = decode_asset(actual, len(source))
 
     with tempfile.TemporaryDirectory(prefix="mangrove-font-asset-") as directory:
         regenerated = Path(directory) / "font.psf"
         subprocess.run([
             sys.executable, str(args.converter), "--source", str(args.source),
-            "--output", str(regenerated), "--height", str(args.height),
+            "--output", str(regenerated),
         ], cwd=root, check=True)
         assert regenerated.read_bytes() == actual, \
             "checked-in PSF2 asset differs from converter output"
@@ -129,8 +130,8 @@ def main():
     for codepoint, bitmap in source.items():
         assert mappings[codepoint] == bitmap, \
             f"PSF2 glyph data differs from source for U+{codepoint:04X}"
-    print(f"UNSCII-{args.height} asset: 8x{args.height}, "
-          f"{len(mappings)} unique mappings; converter and source match")
+    print(f"Unscii 8x16 asset: {len(mappings)} unique mappings; "
+          "converter and source match")
 
 
 if __name__ == "__main__":

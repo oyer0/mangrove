@@ -49,12 +49,9 @@ then enables the cursor immediately before its first blocking read. Fullscreen
 applications manage visibility through the same terminal API and restore the
 saved normal-screen cursor state when they leave the alternate screen.
 
-The system console uses native Unscii 8x16 PSF2 glyphs. The native 8x8 Unscii
-source is retained for converter tests but is not embedded in Pith. Both
-variants are eight pixels wide, so 8x8 would add rows without increasing
-columns. Physical X250 visual qualification retained 8x16 metrics and used
-the loader-selected 1366x768 GOP mode. With the 10-pixel horizontal
-and vertical margins and two-pixel row spacing, that mode provides a
+The system console uses native Unscii 8x16 PSF2 glyphs. Physical X250 visual
+qualification used the loader-selected 1366x768 GOP mode. With the 10-pixel
+horizontal and vertical margins and two-pixel row spacing, that mode provides a
 168-column by 41-row grid. A 1920x1080 mode provides 237 columns by 58 rows.
 The grid follows the actual active GOP dimensions and scan-line pitch reported
 in `BOOT_INFO`; the hardware-independent mode-selection policy is described
@@ -241,8 +238,8 @@ The output decoder uses Mangrove's strict UTF-8 codec and presents malformed
 prefixes as U+FFFD. An incomplete multibyte sequence is retained until later
 output supplies more bytes; there is no per-write decoder reset or end-of-input
 signal. The embedded regular Unscii 8x16 PSF2 asset has 2,997 Unicode
-mappings; the retained native Unscii 8x8 source has 3,190. Both include printable ASCII,
-selected accented Latin, combining marks, box drawing, and block elements. The
+mappings. It includes printable ASCII, selected accented Latin, combining
+marks, box drawing, and block elements. The
 renderer uses one cell per code point; a mapped combining mark is drawn as its
 own glyph and is not composed over a preceding character. It does not implement
 grapheme clusters, East Asian wide cells, shaping, or bidirectional layout.
