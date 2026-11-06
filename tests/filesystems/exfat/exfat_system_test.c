@@ -121,10 +121,32 @@ static void release_image(void)
     if (fs.upcase != exfat_default_upcase) kfree(fs.upcase);
     fs.upcase = NULL; cleanup();
 }
-static void enumerate(vfs_node_t *directory, unsigned count, unsigned oversized)
+static bool is_wide_fixture_name(const char *name)
+{
+    if (strlen(name) != 256U) return false;
+    for (unsigned i = 0; i < 128U; i++)
+        if ((u8)name[2U * i] != 0xc3U || (u8)name[2U * i + 1U] != 0xa9U)
+            return false;
+    return name[256] == '\0';
+}
+static void check_wide_enumeration_entry(const char *name, u32 index,
+                                         unsigned expected_wide,
+                                         u32 expected_wide_index,
+                                         unsigned *wide_entries)
+{
+    if (strlen(name) > 255U) {
+        assert(expected_wide == 1U && !*wide_entries &&
+               index == expected_wide_index && is_wide_fixture_name(name));
+        (*wide_entries)++;
+    } else if (expected_wide && index == expected_wide_index + 1U) {
+        assert(*wide_entries == 1U && !strcmp(name, "later.txt"));
+    }
+}
+static void enumerate(vfs_node_t *directory, unsigned count, unsigned oversized,
+                      unsigned expected_wide, u32 expected_wide_index)
 {
     vfs_dirent_t out, saved; memset(&out, 0xa5, sizeof(out)); saved = out;
-    unsigned entries = 0U, errors = 0U;
+    unsigned entries = 0U, errors = 0U, wide_entries = 0U;
     for (u32 index = 0; ; index++) {
         int result = vfs_readdir_checked(directory, index, &out);
         if (!result) break;
@@ -134,25 +156,38 @@ static void enumerate(vfs_node_t *directory, unsigned count, unsigned oversized)
         assert(result == 1);
         vfs_node_t *node = vfs_finddir(directory, out.name);
         assert(node && out.inode == node->inode && out.type == node->type);
+        check_wide_enumeration_entry(out.name, index, expected_wide,
+                                     expected_wide_index,
+                                     &wide_entries);
         entries++; saved = out;
     }
-    assert(entries == count && errors == oversized);
+    assert(entries == count && errors == oversized &&
+           wide_entries == expected_wide);
     assert(vfs_super_operation_lock(&super));
     void *cursor; assert(directory->ops->readdir_open(directory, &cursor));
-    entries = errors = 0; memset(&out, 0xa5, sizeof(out)); saved = out;
+    entries = errors = wide_entries = 0U;
+    memset(&out, 0xa5, sizeof(out)); saved = out;
+    u32 index = 0U;
     int result;
     while ((result = directory->ops->readdir_next_checked(cursor, &out)) != 0) {
         if (result == VFS_ERR_NAME_TOO_LONG) {
-            assert(!memcmp(&out, &saved, sizeof(out))); errors++;
-        } else { assert(result == 1); entries++; saved = out; }
+            assert(!memcmp(&out, &saved, sizeof(out))); errors++; index++;
+            continue;
+        }
+        assert(result == 1);
+        check_wide_enumeration_entry(out.name, index, expected_wide,
+                                     expected_wide_index,
+                                     &wide_entries);
+        entries++; saved = out; index++;
     }
     directory->ops->readdir_close(cursor); vfs_super_operation_unlock(&super);
-    assert(entries == count && errors == oversized);
+    assert(entries == count && errors == oversized &&
+           wide_entries == expected_wide);
 }
 static void visibility(const char *path, const char *output)
 {
     load_image(path); usize baseline = live_requested; clock_t start = clock();
-    enumerate(&root, 17U, 1U);
+    enumerate(&root, 18U, 0U, 1U, 16U);
     for (unsigned directory = 0; directory < 2U; directory++)
         for (unsigned combination = 0; combination < 8U; combination++) {
             char name[64], pathname[96];
@@ -166,7 +201,7 @@ static void visibility(const char *path, const char *output)
                 ((combination & 4U) ? EXFAT_ATTR_ARCHIVE : 0U);
             assert(((exfat_node_t *)node->fs_data)->attributes == expected);
             if (directory) {
-                enumerate(node, 1U, 0U);
+                enumerate(node, 1U, 0U, 0U, 0U);
                 strncat(pathname, "/R\xc3\xa9sum\xc3\xa9.txt", sizeof(pathname)-strlen(pathname)-1U);
                 assert(vfs_lookup(pathname, &node) == VFS_OK);
             }
@@ -223,6 +258,7 @@ static void visibility(const char *path, const char *output)
     assert(vfs_finddir(&root, "moved.txt") == unicode && !vfs_finddir(&root, "Syst\xc3\xa8me.txt"));
     assert(vfs_unlink(&root, "moved.txt") == VFS_OK && !((exfat_node_t *)unicode->fs_data)->alive);
     assert(vfs_finddir(&root, "later.txt") == later && exfat_ownership_preflight_locked(later) == VFS_OK);
+    enumerate(&root, 17U, 0U, 1U, 15U);
     printf("SYSTEM namespace/VFS lifecycle: peak=%zu reads=%u writes=%u flushes=%u cpu_ms=%.3f\n",
         (size_t)(peak_requested-baseline), reads, writes, flushes,
         1000.0*(double)(clock()-start)/CLOCKS_PER_SEC);
@@ -279,7 +315,7 @@ static void adverse(const char *path)
 }
 static void readback(const char *path)
 {
-    load_image(path); enumerate(&root, 16U, 1U);
+    load_image(path); enumerate(&root, 17U, 0U, 1U, 15U);
     vfs_node_t *node;
     assert(vfs_lookup("/Syst\xc3\xa8me.txt", &node) == VFS_ERR_NOT_FOUND);
     assert(vfs_lookup("/moved.txt", &node) == VFS_ERR_NOT_FOUND);
