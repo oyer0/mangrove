@@ -55,6 +55,9 @@
 #include <smp.h>
 #include <string.h>
 #include <x250_boot_trace.h>
+#if X250_BOOT_TRACE
+#include <boot_log_diagnostics.h>
+#endif
 #if defined(KERNEL_HYBRID_ALLOCATOR) || defined(SLAB_CORE_GUEST_TEST)
 #include <slab.h>
 #endif
@@ -364,6 +367,12 @@ static init_result_t init_await_boot_discovery(bool root_required,
 {
     if (!g_xhc || kernel_init_state(INIT_XHCI) != INIT_READY)
         return INIT_RESULT_OK;
+#if X250_BOOT_TRACE
+    u64 discovery_started_ms = timer_uptime_ms();
+    x250_boot_trace_timing(discovery_started_ms,
+        root_required ? "root discovery begin" : "block discovery begin",
+        0, false, 0, NULL);
+#endif
     x250_boot_trace_stage(47U, false, root_required ?
         "await native root discovery" : "await native block discovery");
     xhci_status_t status = xhci_wait_for_boot_discovery(
@@ -377,6 +386,14 @@ static init_result_t init_await_boot_discovery(bool root_required,
             status == XHCI_ERR_TIMEOUT ? "DEADLINE" : "FAILED",
         status == XHCI_SUCCESS ? NULL : root_required ?
             "required root device not published" : "no block device published");
+#if X250_BOOT_TRACE
+    u64 discovery_finished_ms = timer_uptime_ms();
+    x250_boot_trace_timing(discovery_finished_ms,
+        root_required ? "root discovery end" : "block discovery end",
+        0, true, discovery_finished_ms - discovery_started_ms,
+        status == XHCI_SUCCESS ? "READY" :
+            status == XHCI_ERR_TIMEOUT ? "DEADLINE" : "FAILED");
+#endif
     if (status != XHCI_SUCCESS) {
         *reason = status == XHCI_ERR_TIMEOUT ?
             (root_required ?
@@ -438,6 +455,20 @@ static init_result_t init_xhci(const char **reason)
     phys_addr_t xhci_mmio_phys = 0;
     const usize xhci_mmio_size = XHCI_MMIO_BASE_APERTURE_SIZE;
     u8 xhci_irq = 11;
+#if X250_BOOT_TRACE
+    u64 xhci_started_ms = timer_uptime_ms();
+    mg_monotonic_info_t monotonic_info;
+    timer_monotonic_info(&monotonic_info);
+    const char *clocksource =
+        monotonic_info.source == MG_CLOCKSOURCE_HPET ? "HPET" :
+        monotonic_info.source == MG_CLOCKSOURCE_ACPI_PM_TIMER ?
+            "ACPI_PM_TIMER" : "PIT";
+    x250_boot_trace_timing_value(
+        xhci_started_ms, "monotonic clock", "period_fs",
+        timer_monotonic_period_fs(), false, 0, clocksource);
+    x250_boot_trace_timing(xhci_started_ms, "xHCI enter", 0, false, 0,
+                           NULL);
+#endif
 
     for (u32 i = 0; i < pci_get_device_count(); i++) {
         const pci_device_t *pdev = pci_get_device(i);
@@ -486,6 +517,12 @@ static init_result_t init_xhci(const char **reason)
         *reason = "xHCI controller initialization failed";
         return INIT_RESULT_FAILED;
     }
+#if X250_BOOT_TRACE
+    u64 controller_ready_ms = timer_uptime_ms();
+    x250_boot_trace_timing(controller_ready_ms, "xHCI controller ready", 0,
+                           true, controller_ready_ms - xhci_started_ms,
+                           NULL);
+#endif
 
     /* The generic legacy handshake claims the controller, not the chipset
        pin mux. Apply only a documented, firmware-authorized routing policy
@@ -545,13 +582,47 @@ static init_result_t init_xhci(const char **reason)
         *reason = "xHCI start failed";
         return INIT_RESULT_FAILED;
     }
+#if X250_BOOT_TRACE
+    u64 controller_started_ms = timer_uptime_ms();
+    x250_boot_trace_timing(controller_started_ms, "xHCI controller started",
+                           0, true, controller_started_ms - controller_ready_ms,
+                           NULL);
+#endif
 
     xhci_trace_capture_ports(g_xhc, 2U);
+#if X250_BOOT_TRACE
+    u64 port_scan_started_ms = timer_uptime_ms();
+    x250_boot_trace_timing(port_scan_started_ms, "xHCI port scan begin", 0,
+                           false, 0, NULL);
+#endif
     xhci_probe_ports(g_xhc);
+#if X250_BOOT_TRACE
+    u64 port_scan_finished_ms = timer_uptime_ms();
+    x250_boot_trace_timing(port_scan_finished_ms, "xHCI port scan end", 0,
+                           true, port_scan_finished_ms - port_scan_started_ms,
+                           NULL);
+    u64 quiescence_started_ms = timer_uptime_ms();
+    x250_boot_trace_timing(quiescence_started_ms,
+                           "xHCI quiescence begin", 0, false, 0, NULL);
+#endif
     if (!xhci_wait_for_boot_quiescence(g_xhc)) {
+#if X250_BOOT_TRACE
+        u64 quiescence_failed_ms = timer_uptime_ms();
+        x250_boot_trace_timing(quiescence_failed_ms,
+                               "xHCI quiescence end", 0, true,
+                               quiescence_failed_ms - quiescence_started_ms,
+                               "FAILED");
+#endif
         *reason = "xHCI boot enumeration did not quiesce";
         return INIT_RESULT_FAILED;
     }
+#if X250_BOOT_TRACE
+    u64 quiescence_finished_ms = timer_uptime_ms();
+    x250_boot_trace_timing(quiescence_finished_ms,
+                           "xHCI quiescence end", 0, true,
+                           quiescence_finished_ms - quiescence_started_ms,
+                           "READY");
+#endif
     xhci_trace_capture_ports(g_xhc, 3U);
     xhci_trace_boot_discovery(g_xhc);
     xhci_acknowledge_boot_interrupts(g_xhc);
@@ -568,6 +639,11 @@ static init_result_t init_xhci(const char **reason)
     xhci_register_keyboard_callback(g_xhc, usb_keyboard_handler);
     keyboard_register_led_sink(init_keyboard_led_sink);
     xhci_resume_keyboard(g_xhc);
+#if X250_BOOT_TRACE
+    u64 xhci_finished_ms = timer_uptime_ms();
+    x250_boot_trace_timing(xhci_finished_ms, "xHCI ready", 0, true,
+                           xhci_finished_ms - xhci_started_ms, NULL);
+#endif
     return INIT_RESULT_OK;
 }
 
@@ -700,6 +776,11 @@ static init_result_t init_rootfs(const char **reason)
     gpt_partition_info_t boot_info = {0};
     vfs_node_t *root_node;
     vfs_node_t *boot_node;
+#if X250_BOOT_TRACE
+    u64 rootfs_started_ms = timer_uptime_ms();
+    x250_boot_trace_timing(rootfs_started_ms, "root filesystem enter", 0,
+                           false, 0, NULL);
+#endif
 
     if (!mgfs || !mgfs->probe || !fat32 || !fat32->probe) {
         *reason = "filesystem drivers unavailable";
@@ -777,7 +858,20 @@ static init_result_t init_rootfs(const char **reason)
             *reason = "multiple Mangrove root volumes";
             return INIT_RESULT_FAILED;
         }
-        if (!mgfs->probe(device)) {
+#if X250_BOOT_TRACE
+        u64 mgfs_probe_started_ms = timer_uptime_ms();
+        x250_boot_trace_timing(mgfs_probe_started_ms, "MGFS probe begin", 0,
+                               false, 0, NULL);
+#endif
+        bool mgfs_valid = mgfs->probe(device);
+#if X250_BOOT_TRACE
+        u64 mgfs_probe_finished_ms = timer_uptime_ms();
+        x250_boot_trace_timing(mgfs_probe_finished_ms, "MGFS probe end", 0,
+                               true,
+                               mgfs_probe_finished_ms - mgfs_probe_started_ms,
+                               mgfs_valid ? "VALID" : "INVALID");
+#endif
+        if (!mgfs_valid) {
             *reason = "Mangrove root volume is not MGFS";
             return INIT_RESULT_FAILED;
         }
@@ -788,16 +882,31 @@ static init_result_t init_rootfs(const char **reason)
         *reason = "Mangrove root volume not found";
         return INIT_RESULT_FAILED;
     }
+#if X250_BOOT_TRACE
+    u64 mount_started_ms = timer_uptime_ms();
+    x250_boot_trace_timing(mount_started_ms, "MGFS mount begin", 0,
+                           false, 0, NULL);
+#endif
     if (vfs_mount_root("mgfs", root_device) != VFS_OK) {
         *reason = "persistent root filesystem mount failed";
         return INIT_RESULT_FAILED;
     }
+#if X250_BOOT_TRACE
+    u64 mount_finished_ms = timer_uptime_ms();
+    x250_boot_trace_timing(mount_finished_ms, "MGFS mount end", 0, true,
+                           mount_finished_ms - mount_started_ms, "READY");
+#endif
 
     root_node = vfs_get_root_node();
     if (!root_node) {
         *reason = "root filesystem did not publish a root node";
         return INIT_RESULT_FAILED;
     }
+#if X250_BOOT_TRACE
+    u64 rootfs_ready_ms = timer_uptime_ms();
+    x250_boot_trace_timing(rootfs_ready_ms, "root filesystem ready", 0,
+                           true, rootfs_ready_ms - rootfs_started_ms, NULL);
+#endif
 
     /* Only the explicitly associated Mangrove ESP on the root disk may own
        /boot.  Other ESPs remain ordinary additional volumes. */
@@ -1069,61 +1178,345 @@ static void init_report_optional_network_status(void)
                            status->reason);
 }
 
-#define KERNEL_BOOT_LOG_WRITE_CHUNK 4096U
+#if X250_BOOT_TRACE
+static void init_trace_boot_log_storage_end(
+    const char *phase, x250_boot_trace_measurement_snapshot_t *measurements)
+{
+    xhci_storage_trace_snapshot_t io;
+    x250_boot_trace_measurement_snapshot_t discarded_measurements;
+
+    x250_boot_trace_measurements_end(measurements ? measurements :
+                                                   &discarded_measurements);
+    xhci_storage_trace_end(&io);
+    x250_boot_trace_storage_io(timer_uptime_ms(), phase, &io);
+}
+
+#define INIT_BOOT_LOG_MGFS_BLOCK_BYTES 4096U
+
+static bool init_prepare_boot_log_file(vfs_node_t *logs,
+                                       vfs_node_t **out_file,
+                                       u64 *out_previous_bytes,
+                                       bool *out_previous_present)
+{
+    vfs_node_t *current = NULL;
+    vfs_node_t *previous = NULL;
+    int current_status;
+    int previous_status;
+
+    if (!logs || !out_file || !out_previous_bytes ||
+        !out_previous_present)
+        return false;
+    *out_file = NULL;
+    *out_previous_bytes = 0;
+    *out_previous_present = false;
+
+    current_status = vfs_lookup("/sys/logs/boot.log", &current);
+    previous_status = vfs_lookup("/sys/logs/boot.previous.log", &previous);
+    if ((current_status != VFS_OK && current_status != VFS_ERR_NOT_FOUND) ||
+        (previous_status != VFS_OK &&
+         previous_status != VFS_ERR_NOT_FOUND))
+        return false;
+    if (current_status == VFS_OK &&
+        (!current || current->type != VFS_TYPE_FILE))
+        return false;
+    if (previous_status == VFS_OK &&
+        (!previous || previous->type != VFS_TYPE_FILE))
+        return false;
+
+    if (current_status == VFS_OK) {
+        *out_previous_bytes = current->size;
+        *out_previous_present = true;
+        if (previous_status == VFS_OK &&
+            vfs_unlink(logs, "boot.previous.log") != VFS_OK)
+            return false;
+        if (vfs_rename(logs, "boot.log", logs,
+                       "boot.previous.log") != VFS_OK)
+            return false;
+    }
+
+    return vfs_create(logs, "boot.log", out_file) == VFS_OK &&
+           *out_file && (*out_file)->type == VFS_TYPE_FILE;
+}
+
+static bool init_write_boot_log_diagnostic(vfs_node_t *boot_file,
+                                           u64 snapshot_size,
+                                           u64 preparation_ms,
+                                           u64 save_started_ms,
+        const x250_boot_trace_measurement_snapshot_t *preparation_measurements)
+{
+    const usize trace_header_bytes =
+        sizeof(BOOT_LOG_DIAGNOSTIC_TRACE_HEADER) - 1U;
+    const usize trace_capacity = X250_BOOT_TRACE_EXPORT_CAPACITY;
+    const u64 footer_bytes = BOOT_LOG_DIAGNOSTIC_FOOTER_BYTES;
+    usize allocation_bytes;
+    char *buffer;
+    usize snapshot_bytes;
+    usize trace_bytes;
+    u64 payload_bytes;
+    u64 required_bytes;
+    u64 file_bytes;
+    u64 footer_offset;
+    u64 write_started_ms;
+    u64 write_finished_ms;
+    u64 finalize_started_ms;
+    u64 finalize_finished_ms;
+    u32 trace_lines = 0;
+    bool trace_complete = false;
+    bool saved;
+    xhci_storage_trace_snapshot_t io;
+    boot_log_diagnostic_footer_t footer;
+    u8 encoded_footer[BOOT_LOG_DIAGNOSTIC_FOOTER_BYTES];
+
+    if (!boot_file || snapshot_size > (u64)-1 - trace_header_bytes ||
+        snapshot_size + trace_header_bytes > (u64)-1 - trace_capacity ||
+        snapshot_size + trace_header_bytes + trace_capacity >
+            (u64)-1 - footer_bytes -
+                     (INIT_BOOT_LOG_MGFS_BLOCK_BYTES - 1U))
+        return false;
+
+    allocation_bytes = (usize)(snapshot_size + trace_header_bytes +
+        trace_capacity + footer_bytes + INIT_BOOT_LOG_MGFS_BLOCK_BYTES - 1U);
+    buffer = kmalloc(allocation_bytes);
+    if (!buffer)
+        return false;
+
+    snapshot_bytes = kprint_boot_log_read(0, buffer, (usize)snapshot_size);
+    if (snapshot_bytes != snapshot_size) {
+        kfree(buffer);
+        return false;
+    }
+    __builtin_memcpy(buffer + snapshot_bytes,
+                     BOOT_LOG_DIAGNOSTIC_TRACE_HEADER,
+                     trace_header_bytes);
+    trace_bytes = x250_boot_trace_export(
+        buffer + snapshot_bytes + trace_header_bytes, trace_capacity,
+        &trace_lines, &trace_complete);
+    payload_bytes = snapshot_bytes + trace_header_bytes + trace_bytes;
+    if (payload_bytes > (u64)-1 - footer_bytes -
+                              (INIT_BOOT_LOG_MGFS_BLOCK_BYTES - 1U)) {
+        kfree(buffer);
+        return false;
+    }
+    required_bytes = payload_bytes + footer_bytes;
+    file_bytes = ((required_bytes + INIT_BOOT_LOG_MGFS_BLOCK_BYTES - 1U) /
+                  INIT_BOOT_LOG_MGFS_BLOCK_BYTES) *
+                 INIT_BOOT_LOG_MGFS_BLOCK_BYTES;
+    footer_offset = file_bytes - footer_bytes;
+    if (file_bytes > allocation_bytes) {
+        kfree(buffer);
+        return false;
+    }
+    for (u64 index = payload_bytes; index < file_bytes; index++)
+        buffer[index] = 0;
+
+    __builtin_memset(&footer, 0, sizeof(footer));
+    footer.state = BOOT_LOG_DIAGNOSTIC_STATE_INCOMPLETE;
+    footer.flags = trace_complete ? 0U :
+                   BOOT_LOG_DIAGNOSTIC_FLAG_TRACE_INCOMPLETE;
+    footer.trace_lines = trace_lines;
+    footer.snapshot_bytes = snapshot_bytes;
+    footer.trace_bytes = trace_bytes;
+    footer.preparation_ms = preparation_ms;
+    if (preparation_measurements)
+        footer.preparation_measurements = *preparation_measurements;
+    boot_log_diagnostic_footer_encode(encoded_footer, &footer,
+                                      (const u8 *)buffer,
+                                      (usize)footer_offset);
+    __builtin_memcpy(buffer + footer_offset, encoded_footer, footer_bytes);
+
+    xhci_storage_trace_begin();
+    x250_boot_trace_measurements_begin();
+    write_started_ms = timer_uptime_ms();
+    if (vfs_write(boot_file, 0, file_bytes, buffer) != file_bytes) {
+        x250_boot_trace_measurements_end(NULL);
+        xhci_storage_trace_end(&io);
+        x250_boot_trace_storage_io(timer_uptime_ms(),
+                                   "boot log payload write failed", &io);
+        kfree(buffer);
+        return false;
+    }
+    write_finished_ms = timer_uptime_ms();
+    x250_boot_trace_measurements_end(&footer.payload_measurements);
+    xhci_storage_trace_end(&io);
+    x250_boot_trace_storage_io(write_finished_ms, "boot log payload write",
+                               &io);
+    x250_boot_trace_timing_value(
+        write_finished_ms, "boot log payload write complete", "bytes",
+        snapshot_bytes + trace_bytes, true,
+        write_finished_ms - write_started_ms, "WRITTEN");
+
+    footer.state = BOOT_LOG_DIAGNOSTIC_STATE_COMPLETE;
+    footer.payload_write_ms = write_finished_ms - write_started_ms;
+    footer.elapsed_before_finalize_ms = timer_uptime_ms() - save_started_ms;
+    footer.storage = io;
+    boot_log_diagnostic_footer_encode(encoded_footer, &footer,
+                                      (const u8 *)buffer,
+                                      (usize)footer_offset);
+
+    finalize_started_ms = timer_uptime_ms();
+    saved = vfs_write(boot_file, footer_offset, footer_bytes,
+                      encoded_footer) == footer_bytes;
+    finalize_finished_ms = timer_uptime_ms();
+    x250_boot_trace_timing(
+        finalize_finished_ms, "boot log evidence finalize", 0, true,
+        finalize_finished_ms - finalize_started_ms,
+        saved ? "COMPLETE" : "INCOMPLETE");
+    kfree(buffer);
+    return saved;
+}
+#endif
+
+static bool init_write_boot_log_snapshot(vfs_node_t *boot_file)
+{
+    usize size = kprint_boot_log_size();
+    char *buffer = NULL;
+    usize read = 0;
+    bool saved = false;
+#if X250_BOOT_TRACE
+    xhci_storage_trace_begin();
+    u64 write_started_ms = timer_uptime_ms();
+#endif
+
+    /* A single MGFS write is one mutation and one confirmed device flush.
+     * Split writes multiply the same persistence boundary and made removable
+     * USB media pay for it once per 4 KiB chunk. Keep the bounded snapshot on
+     * the heap rather than growing the boot stack. */
+    if (size == 0U) {
+        saved = true;
+    } else {
+        buffer = kmalloc(size);
+        if (buffer) {
+            read = kprint_boot_log_read(0, buffer, size);
+            if (read == size && vfs_write(boot_file, 0, read, buffer) == read)
+                saved = true;
+            kfree(buffer);
+        }
+    }
+
+#if X250_BOOT_TRACE
+    u64 write_finished_ms = timer_uptime_ms();
+    init_trace_boot_log_storage_end("boot log write", NULL);
+    x250_boot_trace_timing_value(
+        write_finished_ms, "boot log data write", "bytes", size, true,
+        write_finished_ms - write_started_ms, saved ? "SAVED" : "FAILED");
+#endif
+    return saved;
+}
 
 static bool init_persist_boot_log(void)
 {
     vfs_node_t *root = vfs_get_root_node();
     vfs_node_t *sys = NULL;
     vfs_node_t *logs = NULL;
+#if !X250_BOOT_TRACE
     vfs_node_t *existing = NULL;
+#endif
     vfs_node_t *boot_file = NULL;
-    char buffer[KERNEL_BOOT_LOG_WRITE_CHUNK];
-    usize size;
+#if X250_BOOT_TRACE
+    u64 previous_log_bytes = 0;
+    bool previous_log_present = false;
+    bool created_sys = false;
+    bool created_logs = false;
+    x250_boot_trace_measurement_snapshot_t preparation_measurements;
+    u64 file_setup_started_ms = timer_uptime_ms();
+    u64 save_started_ms = file_setup_started_ms;
+    xhci_storage_trace_begin();
+    x250_boot_trace_measurements_begin();
+#endif
 
     /* Stop capture before touching VFS so the snapshot cannot change while
      * it is being copied into the new file.  This runs in normal kernel
      * context, after root filesystem selection, never from an IRQ path. */
     kprint_boot_log_stop();
 
-    if (!root || root->type != VFS_TYPE_DIRECTORY)
+    if (!root || root->type != VFS_TYPE_DIRECTORY) {
+#if X250_BOOT_TRACE
+        init_trace_boot_log_storage_end("boot log prepare failed", NULL);
+#endif
         return false;
+    }
 
     if (vfs_lookup("/sys", &sys) != VFS_OK) {
-        if (vfs_mkdir(root, "sys", &sys) != VFS_OK)
+        if (vfs_mkdir(root, "sys", &sys) != VFS_OK) {
+#if X250_BOOT_TRACE
+            init_trace_boot_log_storage_end("boot log prepare failed", NULL);
+#endif
             return false;
+        }
+#if X250_BOOT_TRACE
+        created_sys = true;
+#endif
     }
-    if (!sys || sys->type != VFS_TYPE_DIRECTORY)
+    if (!sys || sys->type != VFS_TYPE_DIRECTORY) {
+#if X250_BOOT_TRACE
+        init_trace_boot_log_storage_end("boot log prepare failed", NULL);
+#endif
         return false;
+    }
 
     if (vfs_lookup("/sys/logs", &logs) != VFS_OK) {
-        if (vfs_mkdir(sys, "logs", &logs) != VFS_OK)
+        if (vfs_mkdir(sys, "logs", &logs) != VFS_OK) {
+#if X250_BOOT_TRACE
+            init_trace_boot_log_storage_end("boot log prepare failed", NULL);
+#endif
             return false;
+        }
+#if X250_BOOT_TRACE
+        created_logs = true;
+#endif
     }
-    if (!logs || logs->type != VFS_TYPE_DIRECTORY)
+    if (!logs || logs->type != VFS_TYPE_DIRECTORY) {
+#if X250_BOOT_TRACE
+        init_trace_boot_log_storage_end("boot log prepare failed", NULL);
+#endif
         return false;
+    }
 
+#if X250_BOOT_TRACE
+    if (!init_prepare_boot_log_file(logs, &boot_file,
+                                    &previous_log_bytes,
+                                    &previous_log_present)) {
+        init_trace_boot_log_storage_end("boot log prepare failed", NULL);
+        return false;
+    }
+#else
     if (vfs_lookup("/sys/logs/boot.log", &existing) == VFS_OK) {
-        if (!existing || existing->type != VFS_TYPE_FILE ||
-            vfs_unlink(logs, "boot.log") != VFS_OK)
+        if (!existing || existing->type != VFS_TYPE_FILE) {
             return false;
+        }
+        if (vfs_unlink(logs, "boot.log") != VFS_OK) {
+            return false;
+        }
     }
 
     if (vfs_create(logs, "boot.log", &boot_file) != VFS_OK ||
-        !boot_file || boot_file->type != VFS_TYPE_FILE)
+        !boot_file || boot_file->type != VFS_TYPE_FILE) {
         return false;
-
-    size = kprint_boot_log_size();
-    for (usize offset = 0; offset < size;) {
-        usize remaining = size - offset;
-        usize chunk = remaining < sizeof(buffer) ? remaining : sizeof(buffer);
-        usize read = kprint_boot_log_read(offset, buffer, chunk);
-        if (read != chunk || vfs_write(boot_file, offset, read, buffer) != read)
-            return false;
-        offset += read;
     }
+#endif
 
-    return true;
+#if X250_BOOT_TRACE
+    u64 file_setup_finished_ms = timer_uptime_ms();
+    init_trace_boot_log_storage_end("boot log preparation",
+                                    &preparation_measurements);
+    const char *path_state = previous_log_present ? "replaced" :
+        created_sys && created_logs ? "new-sys+logs" :
+        created_logs ? "new-logs" : "new-file";
+    x250_boot_trace_timing_value(file_setup_finished_ms,
+        "boot log prep path", "old_bytes", previous_log_bytes,
+        false, 0, path_state);
+    x250_boot_trace_timing(
+        file_setup_finished_ms, "boot log file prepared", 0, true,
+        file_setup_finished_ms - file_setup_started_ms, "READY");
+#endif
+#if X250_BOOT_TRACE
+    return init_write_boot_log_diagnostic(
+        boot_file, kprint_boot_log_size(),
+        file_setup_finished_ms - file_setup_started_ms, save_started_ms,
+        &preparation_measurements);
+#else
+    return init_write_boot_log_snapshot(boot_file);
+#endif
 }
 
 static bool init_id_valid(init_id_t id)
@@ -1261,16 +1654,6 @@ bool kernel_bringup(void)
 
     init_report_optional_network_status();
 
-    boot_log_saved = init_persist_boot_log();
-    if (!boot_log_saved)
-        kprint("[WARN] Kernel boot log could not be saved\n");
-
-    x250_boot_trace_result(41U, boot_log_saved, "kernel boot log", false,
-                           true, boot_log_saved ? 0 : 1,
-                           boot_log_saved ? "SAVED" : "UNAVAILABLE",
-                           boot_log_saved ? NULL :
-                               "boot.log persistence failed");
-
     bringup_ok = required_ok && !init_graph_error;
     if (!bringup_ok) {
         for (init_id_t id = 0; id < INIT_COUNT; id++) {
@@ -1284,13 +1667,35 @@ bool kernel_bringup(void)
         if (!failure_reason && init_graph_error)
             failure_reason = "initialization dependency graph cycle";
     }
+    x250_boot_trace_result(21U, bringup_ok, "required kernel bring-up", true,
+                           true, bringup_ok ? 0 : 1,
+                           bringup_ok ? "READY" : "FAILED", failure_reason);
+
+#if X250_BOOT_TRACE
+    u64 boot_log_started_ms = timer_uptime_ms();
+    x250_boot_trace_timing(boot_log_started_ms, "boot log save begin", 0,
+                           false, 0, NULL);
+#endif
+    boot_log_saved = init_persist_boot_log();
+#if X250_BOOT_TRACE
+    u64 boot_log_finished_ms = timer_uptime_ms();
+    x250_boot_trace_timing(boot_log_finished_ms, "boot log save end", 0,
+                           true, boot_log_finished_ms - boot_log_started_ms,
+                           boot_log_saved ? "SAVED" : "UNAVAILABLE");
+#endif
+    if (!boot_log_saved)
+        kprint("[WARN] Kernel boot log could not be saved\n");
+
+    x250_boot_trace_result(41U, boot_log_saved, "kernel boot log", false,
+                           true, boot_log_saved ? 0 : 1,
+                           boot_log_saved ? "SAVED" : "UNAVAILABLE",
+                           boot_log_saved ? NULL :
+                               "boot.log persistence failed");
+
     /* The existing first-failure presentation pause has already elapsed.
        Sample again without adding a delay or retrying enumeration/mounts. */
     if (!bringup_ok)
         xhci_trace_report_ports(g_xhc);
-    x250_boot_trace_result(21U, bringup_ok, "required kernel bring-up", true,
-                           true, bringup_ok ? 0 : 1,
-                           bringup_ok ? "READY" : "FAILED", failure_reason);
 
     return bringup_ok;
 }

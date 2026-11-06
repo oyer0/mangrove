@@ -6,10 +6,11 @@
 #include <idt.h>
 #include <io.h>
 #include <stddef.h>
+#include <usb/xhci_storage_trace.h>
 
 #define TRACE_HISTORY_LINES 40U
-#define TRACE_HISTORY_CAPACITY 80U
-#define TRACE_TEXT_CAPACITY 192U
+#define TRACE_HISTORY_CAPACITY X250_BOOT_TRACE_HISTORY_CAPACITY
+#define TRACE_TEXT_CAPACITY X250_BOOT_TRACE_TEXT_CAPACITY
 #define TRACE_MESSAGE_CAPACITY 1024U
 #define TRACE_PANIC_ROWS 9U
 #define TRACE_GLYPH_WIDTH 8U
@@ -57,6 +58,7 @@ static char trace_lines[TRACE_HISTORY_CAPACITY][TRACE_TEXT_CAPACITY];
 static char trace_line_states[TRACE_HISTORY_CAPACITY];
 static u32 trace_line_count;
 static u32 trace_line_start;
+static u64 trace_dropped_lines;
 static volatile u32 *trace_framebuffer;
 static u32 trace_width;
 static u32 trace_height;
@@ -71,6 +73,10 @@ static bool trace_pm_timer_checked;
 static u16 trace_pm_timer_port;
 static u32 trace_pm_timer_mask;
 static BOOT_INFO *trace_boot_info;
+static volatile u32 trace_measurements_active;
+static volatile u64 trace_measurement_counts[X250_BOOT_TRACE_MEASURE_COUNT];
+static volatile u64 trace_measurement_elapsed_ms[X250_BOOT_TRACE_MEASURE_COUNT];
+static volatile u64 trace_measurement_maximum_ms[X250_BOOT_TRACE_MEASURE_COUNT];
 
 static u32 trace_read_u32(const u8 *bytes)
 {
@@ -724,6 +730,7 @@ static void trace_store_wrapped(const char *message, char state)
             slot = trace_line_start;
             trace_line_start = (trace_line_start + 1U) %
                                TRACE_HISTORY_CAPACITY;
+            trace_dropped_lines++;
         }
         line = trace_lines[slot];
         for (u32 index = 0; index < indent; index++)
@@ -796,8 +803,94 @@ void x250_boot_trace_begin(void)
         return;
     trace_line_count = 0;
     trace_line_start = 0;
+    trace_dropped_lines = 0;
     trace_failure_hold_used = false;
     trace_active = true;
+}
+
+void x250_boot_trace_measurements_begin(void)
+{
+    __atomic_store_n(&trace_measurements_active, 0U, __ATOMIC_RELEASE);
+    for (u32 index = 0; index < X250_BOOT_TRACE_MEASURE_COUNT; index++) {
+        __atomic_store_n(&trace_measurement_counts[index], 0ULL,
+                         __ATOMIC_RELAXED);
+        __atomic_store_n(&trace_measurement_elapsed_ms[index], 0ULL,
+                         __ATOMIC_RELAXED);
+        __atomic_store_n(&trace_measurement_maximum_ms[index], 0ULL,
+                         __ATOMIC_RELAXED);
+    }
+    __atomic_store_n(&trace_measurements_active, 1U, __ATOMIC_RELEASE);
+}
+
+void x250_boot_trace_measurement_note(
+    x250_boot_trace_measurement_kind_t kind, u64 elapsed_ms)
+{
+    if ((u32)kind >= X250_BOOT_TRACE_MEASURE_COUNT ||
+        !__atomic_load_n(&trace_measurements_active, __ATOMIC_ACQUIRE))
+        return;
+    __atomic_fetch_add(&trace_measurement_counts[kind], 1ULL,
+                       __ATOMIC_RELAXED);
+    __atomic_fetch_add(&trace_measurement_elapsed_ms[kind], elapsed_ms,
+                       __ATOMIC_RELAXED);
+    xhci_storage_trace_atomic_max(&trace_measurement_maximum_ms[kind],
+                                  elapsed_ms);
+}
+
+void x250_boot_trace_measurements_end(
+    x250_boot_trace_measurement_snapshot_t *snapshot)
+{
+    __atomic_store_n(&trace_measurements_active, 0U, __ATOMIC_RELEASE);
+    if (!snapshot)
+        return;
+    for (u32 index = 0; index < X250_BOOT_TRACE_MEASURE_COUNT; index++) {
+        snapshot->kinds[index].count = __atomic_load_n(
+            &trace_measurement_counts[index], __ATOMIC_ACQUIRE);
+        snapshot->kinds[index].elapsed_ms = __atomic_load_n(
+            &trace_measurement_elapsed_ms[index], __ATOMIC_ACQUIRE);
+        snapshot->kinds[index].maximum_ms = __atomic_load_n(
+            &trace_measurement_maximum_ms[index], __ATOMIC_ACQUIRE);
+    }
+}
+
+usize x250_boot_trace_export(char *buffer, usize capacity, u32 *line_count,
+                             bool *complete)
+{
+    usize used = 0;
+    u32 copied = 0;
+    bool full = trace_active && trace_dropped_lines == 0U;
+
+    if (line_count)
+        *line_count = 0;
+    if (!buffer && capacity)
+        full = false;
+
+    if (buffer) {
+        for (u32 index = 0; index < trace_line_count; index++) {
+            u32 slot = (trace_line_start + index) % TRACE_HISTORY_CAPACITY;
+            usize length = 0;
+
+            while (length < TRACE_TEXT_CAPACITY &&
+                   trace_lines[slot][length])
+                length++;
+            if (length == TRACE_TEXT_CAPACITY ||
+                length + 1U > capacity - used) {
+                full = false;
+                break;
+            }
+            __builtin_memcpy(buffer + used, trace_lines[slot], length);
+            used += length;
+            buffer[used++] = '\n';
+            copied++;
+        }
+    } else if (trace_line_count) {
+        full = false;
+    }
+
+    if (line_count)
+        *line_count = copied;
+    if (complete)
+        *complete = full && copied == trace_line_count;
+    return used;
 }
 
 void x250_boot_trace_refresh(void)
@@ -813,8 +906,10 @@ void x250_boot_trace_refresh(void)
             u32 slot = (trace_line_start + i) % TRACE_HISTORY_CAPACITY;
             const char *line = trace_lines[slot];
             if (line[0] != ' ')
-                selected = (line[0] == '4' && line[1] >= '2' &&
-                            line[1] <= '7') || trace_line_states[slot] == 'F';
+                selected = ((line[0] == '2' && line[1] == '1') ||
+                            (line[0] == '4' && line[1] >= '2' &&
+                             line[1] <= '7') ||
+                            trace_line_states[slot] == 'F');
             if (selected) {
                 __builtin_memcpy(saved[count], line, TRACE_TEXT_CAPACITY);
                 states[count++] = trace_line_states[slot];
@@ -867,6 +962,150 @@ void x250_boot_trace_stage(u32 checkpoint, bool passed,
     if (trace_boot_info)
         x250_boot_trace_event(trace_boot_info, checkpoint, passed,
                               description);
+}
+
+void x250_boot_trace_timing(u64 uptime_ms, const char *event, u32 port,
+                            bool duration_valid, u64 duration_ms,
+                            const char *state)
+{
+    char message[TRACE_MESSAGE_CAPACITY];
+    u32 position = 0;
+
+    if (!trace_active)
+        return;
+    trace_append_prefix(message, &position, 47U, 'I');
+    trace_append_text(message, &position, "up=");
+    trace_append_u64(message, &position, uptime_ms);
+    trace_append_text(message, &position, "ms ");
+    trace_append_text(message, &position, event ? event : "event");
+    if (port) {
+        trace_append_text(message, &position, " p=");
+        trace_append_u32(message, &position, port);
+    }
+    if (duration_valid) {
+        trace_append_text(message, &position, " dt=");
+        trace_append_u64(message, &position, duration_ms);
+        trace_append_text(message, &position, "ms");
+    }
+    if (state) {
+        trace_append_text(message, &position, " state=");
+        trace_append_text(message, &position, state);
+    }
+    message[position] = '\0';
+    trace_store_wrapped(message, 'I');
+    trace_render();
+}
+
+void x250_boot_trace_timing_value(u64 uptime_ms, const char *event,
+                                  const char *value_name, u64 value,
+                                  bool duration_valid, u64 duration_ms,
+                                  const char *state)
+{
+    char message[TRACE_MESSAGE_CAPACITY];
+    u32 position = 0;
+
+    if (!trace_active)
+        return;
+    trace_append_prefix(message, &position, 47U, 'I');
+    trace_append_text(message, &position, "up=");
+    trace_append_u64(message, &position, uptime_ms);
+    trace_append_text(message, &position, "ms ");
+    trace_append_text(message, &position, event ? event : "event");
+    if (value_name) {
+        trace_append_text(message, &position, " ");
+        trace_append_text(message, &position, value_name);
+        trace_append_text(message, &position, "=");
+        trace_append_u64(message, &position, value);
+    }
+    if (duration_valid) {
+        trace_append_text(message, &position, " dt=");
+        trace_append_u64(message, &position, duration_ms);
+        trace_append_text(message, &position, "ms");
+    }
+    if (state) {
+        trace_append_text(message, &position, " state=");
+        trace_append_text(message, &position, state);
+    }
+    message[position] = '\0';
+    trace_store_wrapped(message, 'I');
+    trace_render();
+}
+
+void x250_boot_trace_storage_io(
+    u64 uptime_ms, const char *phase,
+    const struct xhci_storage_trace_snapshot *io)
+{
+    char message[TRACE_MESSAGE_CAPACITY];
+    u32 position = 0;
+
+    if (!trace_active || !io)
+        return;
+    trace_append_prefix(message, &position, 47U, 'I');
+    trace_append_text(message, &position, "up=");
+    trace_append_u64(message, &position, uptime_ms);
+    trace_append_text(message, &position, "ms ");
+    trace_append_text(message, &position, phase ? phase : "storage");
+    trace_append_text(message, &position, " USBblk r=");
+    trace_append_u64(message, &position, io->block_read_requests);
+    trace_append_text(message, &position, "/");
+    trace_append_u64(message, &position, io->block_read_sectors);
+    trace_append_text(message, &position, "s w=");
+    trace_append_u64(message, &position, io->block_write_requests);
+    trace_append_text(message, &position, "/");
+    trace_append_u64(message, &position, io->block_write_sectors);
+    trace_append_text(message, &position, "s sizeR=");
+    trace_append_u64(message, &position, io->block_read_min_sectors);
+    trace_append_text(message, &position, "-");
+    trace_append_u64(message, &position, io->block_read_max_sectors);
+    trace_append_text(message, &position, " sizeW=");
+    trace_append_u64(message, &position, io->block_write_min_sectors);
+    trace_append_text(message, &position, "-");
+    trace_append_u64(message, &position, io->block_write_max_sectors);
+    trace_append_text(message, &position, " BOT=");
+    trace_append_u64(message, &position, io->bot_commands);
+    trace_append_text(message, &position, " R10=");
+    trace_append_u64(message, &position, io->bot_read10);
+    trace_append_text(message, &position, " W10=");
+    trace_append_u64(message, &position, io->bot_write10);
+    trace_append_text(message, &position, " other=");
+    trace_append_u64(message, &position, io->bot_other);
+    trace_append_text(message, &position, " iofail=");
+    trace_append_u64(message, &position, io->block_read_failures);
+    trace_append_text(message, &position, "/");
+    trace_append_u64(message, &position, io->block_write_failures);
+    trace_append_text(message, &position, " BOTfail=");
+    trace_append_u64(message, &position, io->bot_failed);
+    message[position] = '\0';
+    trace_store_wrapped(message, 'I');
+
+    position = 0;
+    trace_append_prefix(message, &position, 47U, 'I');
+    trace_append_text(message, &position, "up=");
+    trace_append_u64(message, &position, uptime_ms);
+    trace_append_text(message, &position, "ms ");
+    trace_append_text(message, &position, phase ? phase : "storage");
+    trace_append_text(message, &position, " ms USBblk=");
+    trace_append_u64(message, &position, io->block_elapsed_ms);
+    trace_append_text(message, &position, "/");
+    trace_append_u64(message, &position, io->block_max_ms);
+    trace_append_text(message, &position, " BOT=");
+    trace_append_u64(message, &position, io->bot_elapsed_ms);
+    trace_append_text(message, &position, "/");
+    trace_append_u64(message, &position, io->bot_commands ?
+                     io->bot_elapsed_ms / io->bot_commands : 0U);
+    trace_append_text(message, &position, "/");
+    trace_append_u64(message, &position, io->bot_min_ms);
+    trace_append_text(message, &position, "/");
+    trace_append_u64(message, &position, io->bot_max_ms);
+    trace_append_text(message, &position, " CBW/data/CSW=");
+    trace_append_u64(message, &position, io->bot_cbw_ms);
+    trace_append_text(message, &position, "/");
+    trace_append_u64(message, &position, io->bot_data_ms);
+    trace_append_text(message, &position, "/");
+    trace_append_u64(message, &position, io->bot_csw_ms);
+    message[position] = '\0';
+    trace_store_wrapped(message, 'I');
+    trace_render();
 }
 
 void x250_boot_trace_result(u32 checkpoint, bool passed,

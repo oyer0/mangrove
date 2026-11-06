@@ -136,6 +136,23 @@ int main(void){
    seed(big);fail_alloc=failure;u64 result=mgfs_write(&node,0,len,data);assert(!live_allocs);assert(result==0||result==len);
   }
  }
+ // A full bounded boot log is one supported MGFS write request, not an
+ // application-level sequence of 4 KiB commits.
+ static unsigned char boot_log[65536],boot_log_readback[65536];
+ for(usize i=0;i<sizeof(boot_log);i++)boot_log[i]=(unsigned char)(i*29U+7U);
+ seed(false);assert(mgfs_write(&node,0,sizeof(boot_log),boot_log)==sizeof(boot_log));
+ unsigned boot_log_write_io_count=io_count;
+ assert(!live_allocs&&mgfs_get_le64(record+32)==sizeof(boot_log));
+ mg_file_lines_state_t boot_log_state;
+ assert(!mgfs_snapshot(&node,(char*)boot_log_readback,sizeof(boot_log_readback),&boot_log_state));
+ assert(boot_log_state.length==sizeof(boot_log));
+ assert(!memcmp(boot_log_readback,boot_log,sizeof(boot_log)));
+ for(unsigned failure=1;failure<=boot_log_write_io_count;failure++){
+  seed(false);fail_io=failure;
+  assert(!mgfs_write(&node,0,sizeof(boot_log),boot_log));
+  assert(!live_allocs);
+  if(committed || next_block>1U)assert(fs.record_lifecycle_uncertain);
+ }
  seed(false);assert(!mgfs_append_lines(&node,"new\n",4,10,0,NULL));assert(mgfs_get_le64(record+32)==8);
  seed(false);assert(!mgfs_append_lines(&node,"new\n",4,10,0,NULL));unsigned calls=io_count;bool uncertain_after_commit=false;
  for(unsigned failure=1;failure<=calls;failure++){

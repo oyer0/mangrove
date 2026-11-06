@@ -1785,5 +1785,10 @@ void kmain_high(BOOT_INFO *source_boot_info)
 #endif
     x250_boot_trace_event(&kernel_boot_info, 22, false,
                           "prepare PID 1 and transfer to Shoot");
+#if X250_BOOT_TRACE
+    x250_boot_trace_timing(timer_uptime_ms(), "Shoot launch begin", 0,
+                           false, 0, NULL);
+    x250_boot_trace_refresh();
+#endif
     start_pid1();
 }

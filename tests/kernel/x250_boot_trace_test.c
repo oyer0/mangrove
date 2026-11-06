@@ -25,6 +25,12 @@ void framebuffer_flush_rect(u32 x, u32 y, u32 width, u32 height)
     trace_test_flush_count++;
 }
 
+u32 inl(u16 port)
+{
+    (void)port;
+    return 0;
+}
+
 static int trace_test_fail(const char *message)
 {
     fprintf(stderr, "x250 boot trace test failed: %s\n", message);
@@ -180,6 +186,51 @@ int main(void)
             "44 [FAIL] USB p=7 s=3 sp=3 id=8087:0a2a cls=00/00/00 bind=failed probe=storage rc=6") != 0)
         return trace_test_fail("descriptor probe failure is not labeled unsupported");
 
+    trace_line_count = 0;
+    trace_line_start = 0;
+    trace_width = 1366U;
+    columns = (trace_width - TRACE_TEXT_MARGIN_X * 2U) /
+              TRACE_DIAG_CELL_WIDTH;
+    x250_boot_trace_timing(12345U, "port probe complete", 7U, true,
+                           10000U, "FAILED");
+    if (trace_line_count != 1U ||
+        __builtin_strcmp(trace_test_line(0U),
+            "47 [INFO] up=12345ms port probe complete p=7 dt=10000ms state=FAILED") != 0 ||
+        __builtin_strlen(trace_test_line(0U)) > columns)
+        return trace_test_fail("timestamped port timing fits diagnostic width");
+
+    trace_line_count = 0;
+    trace_line_start = 0;
+    x250_boot_trace_timing_value(16399U, "boot log data write", "bytes",
+                                 65536U, true, 9955U, "SAVED");
+    if (trace_line_count != 1U ||
+        __builtin_strcmp(trace_test_line(0U),
+            "47 [INFO] up=16399ms boot log data write bytes=65536 dt=9955ms state=SAVED") != 0 ||
+        __builtin_strlen(trace_test_line(0U)) > columns)
+        return trace_test_fail("boot-log byte count and elapsed time fit diagnostic width");
+
+    trace_line_count = 0;
+    trace_line_start = 0;
+    const xhci_storage_trace_snapshot_t io = {
+        .block_read_requests = 2U, .block_read_sectors = 17U,
+        .block_read_min_sectors = 1U, .block_read_max_sectors = 8U,
+        .block_write_requests = 11U, .block_write_sectors = 88U,
+        .block_write_min_sectors = 8U, .block_write_max_sectors = 8U,
+        .block_read_failures = 0U, .block_write_failures = 0U,
+        .block_elapsed_ms = 18900U, .block_max_ms = 300U,
+        .bot_commands = 18U, .bot_read10 = 2U, .bot_write10 = 11U,
+        .bot_other = 5U, .bot_failed = 1U, .bot_data_bytes = 8210U,
+        .bot_elapsed_ms = 18000U, .bot_min_ms = 30U, .bot_max_ms = 2300U,
+        .bot_cbw_ms = 180U, .bot_data_ms = 16000U, .bot_csw_ms = 900U
+    };
+    x250_boot_trace_storage_io(19131U, "boot log write", &io);
+    if (trace_line_count != 2U ||
+        __builtin_strcmp(trace_test_line(0U),
+            "47 [INFO] up=19131ms boot log write USBblk r=2/17s w=11/88s sizeR=1-8 sizeW=8-8 BOT=18 R10=2 W10=11 other=5 iofail=0/0 BOTfail=1") != 0 ||
+        __builtin_strcmp(trace_test_line(1U),
+            "47 [INFO] up=19131ms boot log write ms USBblk=18900/300 BOT=18000/1000/30/2300 CBW/data/CSW=180/16000/900") != 0)
+        return trace_test_fail("boot-log phase reports bounded USB block and BOT counts/timings");
+
     /* Exercise more than the visible panel capacity. The ring must retain
        recent discovery and root-failure evidence instead of silently
        dropping every event after the first forty wrapped rows. */
@@ -187,13 +238,14 @@ int main(void)
     trace_line_start = 0;
     trace_active = false;
     x250_boot_trace_begin();
-    x250_boot_trace_xhci_summary(48U, 48U, 0U, 48U, 0U);
-    for (u32 port = 1U; port <= 100U; port++)
+    trace_width = 1366U;
+    x250_boot_trace_xhci_summary(200U, 200U, 0U, 200U, 0U);
+    for (u32 port = 1U; port <= 200U; port++)
         x250_boot_trace_xhci_port(port, 0x00000c01U, "FAILED", true, 7,
                                   "reset-completion-change-missing");
-    x250_boot_trace_usb_device(48U, 2U, 3U, 0x0781U, 0x5567U,
+    x250_boot_trace_usb_device(200U, 2U, 3U, 0x0781U, 0x5567U,
                                0x08U, 0x06U, 0x50U, 2U, true, NULL, 0);
-    x250_boot_trace_msc_probe(48U, 2U, "inquiry", 9, false, false,
+    x250_boot_trace_msc_probe(200U, 2U, "inquiry", 9, false, false,
                               false, false, false, 0U, 0U, 0U, NULL);
     x250_boot_trace_block_device(0U, "SATA", 512U, 123456U, "ThinkDisk",
                                  0, 1U, 2U, 0U, 0U);
@@ -222,6 +274,27 @@ int main(void)
     }
     if (!retained_usb || !retained_msc || !retained_root)
         return trace_test_fail("visible window keeps USB, MSC, and root evidence");
+
+    /* Successful boot reaches Shoot after callbacks that can push early xHCI
+       timing rows above the visible ring window. The final view must retain
+       those rows from the bounded history. */
+    trace_line_count = 0;
+    trace_line_start = 0;
+    x250_boot_trace_begin();
+    x250_boot_trace_timing(321U, "xHCI total", 0, true, 250U, "READY");
+    for (u32 callback = 0U; callback < 50U; callback++)
+        x250_boot_trace_stage(37U, true, "optional callback");
+    x250_boot_trace_refresh();
+    bool retained_timing = false;
+    visible_start = trace_line_count > TRACE_HISTORY_LINES ?
+        trace_line_count - TRACE_HISTORY_LINES : 0U;
+    for (u32 row = visible_start; row < trace_line_count; row++) {
+        if (__builtin_strcmp(trace_test_line(row),
+                "47 [INFO] up=321ms xHCI total dt=250ms state=READY") == 0)
+            retained_timing = true;
+    }
+    if (!retained_timing)
+        return trace_test_fail("final view retains early xHCI timing");
 
     trace_test_flush_count = 0;
     trace_width = 1366U;
@@ -308,6 +381,99 @@ int main(void)
     }
     if (!first_port || !last_port || trace_test_bad_pixel)
         return trace_test_fail("all disconnected port registers remain visible within display bounds");
+
+    trace_active = false;
+    x250_boot_trace_begin();
+    x250_boot_trace_stage(37U, true, "callback chatter");
+    x250_boot_trace_result(21U, true, "required kernel bring-up", true,
+                           true, 0, "READY", NULL);
+    x250_boot_trace_refresh();
+    if (trace_line_count < 1U ||
+        __builtin_strncmp(trace_test_line(0U),
+                          "21 [PASS] required kernel bring-up",
+                          sizeof("21 [PASS] required kernel bring-up") - 1U) != 0)
+        return trace_test_fail("final bring-up outcome survives persistent trace filtering");
+
+    trace_active = false;
+    x250_boot_trace_begin();
+    trace_append_result(47U, true, "first event", false, false, 0,
+                        "READY", NULL);
+    x250_boot_trace_timing(1234U, "last event", 7U, true, 88U, "FAILED");
+    char exported[X250_BOOT_TRACE_EXPORT_CAPACITY];
+    u32 exported_lines = 0;
+    bool export_complete = false;
+    usize exported_bytes = x250_boot_trace_export(
+        exported, sizeof(exported), &exported_lines, &export_complete);
+    if (exported_bytes >= sizeof(exported))
+        return trace_test_fail("trace export exceeded caller capacity");
+    exported[exported_bytes] = '\0';
+    if (!export_complete || exported_lines != 2U ||
+        __builtin_strncmp(exported,
+            "47 [PASS] first event optional state=READY\n",
+            sizeof("47 [PASS] first event optional state=READY\n") - 1U) != 0 ||
+        exported_bytes <=
+            sizeof("47 [PASS] first event optional state=READY\n") - 1U ||
+        !__builtin_strstr(exported, "47 [INFO] up=1234ms last event p=7 dt=88ms state=FAILED\n")) {
+        fprintf(stderr, "export complete=%u lines=%u bytes=%llu: %s\n",
+                export_complete, exported_lines,
+                (unsigned long long)exported_bytes, exported);
+        return trace_test_fail("persistent export preserves trace order and line boundaries");
+    }
+
+    x250_boot_trace_measurements_begin();
+    x250_boot_trace_measurement_note(
+        X250_BOOT_TRACE_MEASURE_BLOCK_IO_GATE_ACQUIRE, 7U);
+    x250_boot_trace_measurement_note(
+        X250_BOOT_TRACE_MEASURE_BLOCK_IO_GATE_ACQUIRE, 3U);
+    x250_boot_trace_measurement_note(
+        X250_BOOT_TRACE_MEASURE_RECOVERY_PIN_HANDOFF, 4U);
+    x250_boot_trace_measurement_snapshot_t measurements;
+    x250_boot_trace_measurements_end(&measurements);
+    x250_boot_trace_measurement_note(
+        X250_BOOT_TRACE_MEASURE_BLOCK_IO_GATE_ACQUIRE, 99U);
+    if (measurements.kinds[X250_BOOT_TRACE_MEASURE_BLOCK_IO_GATE_ACQUIRE].count != 2U ||
+        measurements.kinds[X250_BOOT_TRACE_MEASURE_BLOCK_IO_GATE_ACQUIRE].elapsed_ms != 10U ||
+        measurements.kinds[X250_BOOT_TRACE_MEASURE_BLOCK_IO_GATE_ACQUIRE].maximum_ms != 7U ||
+        measurements.kinds[X250_BOOT_TRACE_MEASURE_RECOVERY_PIN_HANDOFF].count != 1U ||
+        measurements.kinds[X250_BOOT_TRACE_MEASURE_RECOVERY_PIN_HANDOFF].elapsed_ms != 4U ||
+        measurements.kinds[X250_BOOT_TRACE_MEASURE_BLOCK_IO_GATE_ACQUIRE].elapsed_ms == 109U)
+        return trace_test_fail("wait counters are bounded to their active window");
+
+    x250_boot_trace_measurements_begin();
+    x250_boot_trace_measurement_note(
+        X250_BOOT_TRACE_MEASURE_BLOCK_IO_GATE_ACQUIRE, 5U);
+    x250_boot_trace_measurements_end(NULL);
+    if (__atomic_load_n(&trace_measurements_active, __ATOMIC_ACQUIRE))
+        return trace_test_fail("discarded measurement snapshot closes its window");
+    x250_boot_trace_measurement_note(
+        X250_BOOT_TRACE_MEASURE_BLOCK_IO_GATE_ACQUIRE, 99U);
+    x250_boot_trace_measurements_end(&measurements);
+    if (measurements.kinds[X250_BOOT_TRACE_MEASURE_BLOCK_IO_GATE_ACQUIRE].count != 1U ||
+        measurements.kinds[X250_BOOT_TRACE_MEASURE_BLOCK_IO_GATE_ACQUIRE].elapsed_ms != 5U)
+        return trace_test_fail("failed persistence cannot retain an active measurement window");
+
+    trace_active = false;
+    x250_boot_trace_begin();
+    for (u32 index = 0; index < TRACE_HISTORY_CAPACITY; index++)
+        x250_boot_trace_timing(index, "bounded event", 0U, false, 0U,
+                               "READY");
+    exported_bytes = x250_boot_trace_export(
+        exported, sizeof(exported), &exported_lines, &export_complete);
+    if (!export_complete || exported_lines != TRACE_HISTORY_CAPACITY ||
+        exported_bytes == 0U)
+        return trace_test_fail("history is complete at its configured capacity");
+    x250_boot_trace_timing(TRACE_HISTORY_CAPACITY, "bounded event", 0U,
+                           false, 0U, "READY");
+    exported_bytes = x250_boot_trace_export(
+        exported, sizeof(exported), &exported_lines, &export_complete);
+    if (export_complete || exported_lines != TRACE_HISTORY_CAPACITY ||
+        exported_bytes == 0U)
+        return trace_test_fail("overwritten history is marked incomplete");
+
+    exported_bytes = x250_boot_trace_export(exported, 2U, &exported_lines,
+                                             &export_complete);
+    if (export_complete || exported_lines != 0U || exported_bytes != 0U)
+        return trace_test_fail("short export buffer fails closed without partial lines");
 
     return 0;
 }

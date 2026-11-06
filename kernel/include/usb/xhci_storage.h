@@ -4,6 +4,9 @@
 #include <types.h>
 #include <block.h>
 #include <xhci.h>
+#if X250_BOOT_TRACE
+#include <xhci_storage_trace.h>
+#endif
 
 #ifndef X250_BOOT_TRACE
 #define X250_BOOT_TRACE 0
@@ -61,6 +64,10 @@ bool xhci_storage_init_device(xhci_controller_t *xhc, u8 port_id, u8 slot_id,
                               u8 bulk_in_ep, u8 bulk_out_ep,
                               xhci_storage_probe_result_t *out_result);
 u32 xhci_storage_device_count(void);
+#if X250_BOOT_TRACE
+void xhci_storage_trace_begin(void);
+void xhci_storage_trace_end(xhci_storage_trace_snapshot_t *snapshot);
+#endif
 bool xhci_storage_remove_device(xhci_controller_t *xhc, u8 slot_id);
 bool xhci_storage_device_teardown_pending(xhci_controller_t *xhc,
                                           u8 slot_id);

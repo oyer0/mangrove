@@ -97,10 +97,31 @@ static int mgfs_write_pinned(vfs_node_t *node, u64 offset, u64 size,
     if (size && !buffer) return VFS_ERR_INVALID_PARAM;
     if (!size) return VFS_OK;
     vfs_super_t *sb = node->super;
+#if X250_BOOT_TRACE
+    u64 phase_started_ms = timer_uptime_ms();
+#endif
     int result = mgfs_ordinary_begin(sb, node, NULL, NULL);
+#if X250_BOOT_TRACE
+    x250_boot_trace_measurement_note(
+        X250_BOOT_TRACE_MEASURE_MGFS_ORDINARY_BEGIN,
+        timer_uptime_ms() - phase_started_ms);
+#endif
     if (result != VFS_OK) return result;
+#if X250_BOOT_TRACE
+    phase_started_ms = timer_uptime_ms();
+#endif
     u64 written = mgfs_write_internal_impl(node, offset, size, buffer, false);
+#if X250_BOOT_TRACE
+    x250_boot_trace_measurement_note(X250_BOOT_TRACE_MEASURE_MGFS_MUTATION,
+                                     timer_uptime_ms() - phase_started_ms);
+    phase_started_ms = timer_uptime_ms();
+#endif
     result = mgfs_ordinary_complete(sb, written == size ? VFS_OK : VFS_ERR_IO, out_pin);
+#if X250_BOOT_TRACE
+    x250_boot_trace_measurement_note(
+        X250_BOOT_TRACE_MEASURE_MGFS_ORDINARY_COMPLETE,
+        timer_uptime_ms() - phase_started_ms);
+#endif
     if (result != VFS_ERR_UNCERTAIN) *out_bytes = written;
     return result;
 }
@@ -144,12 +165,34 @@ static int mgfs_new_node_pinned(vfs_node_t *dir, vfs_node_t *prepared,
 {
     *out_pin = 0;
     vfs_super_t *sb = dir->super;
+#if X250_BOOT_TRACE
+    u64 phase_started_ms = timer_uptime_ms();
+#endif
     int result = mgfs_ordinary_begin(sb, dir, NULL, prepared);
+#if X250_BOOT_TRACE
+    x250_boot_trace_measurement_note(
+        X250_BOOT_TRACE_MEASURE_MGFS_ORDINARY_BEGIN,
+        timer_uptime_ms() - phase_started_ms);
+#endif
     if (result != VFS_OK) return result;
+#if X250_BOOT_TRACE
+    phase_started_ms = timer_uptime_ms();
+#endif
     vfs_node_t *node = NULL;
     result = mgfs_create_node_impl(dir, name, directory ? MGFS_RECORD_DIRECTORY : MGFS_RECORD_FILE,
                                     owned, uid, permissions, &node);
-    return mgfs_ordinary_complete(sb, result, out_pin);
+#if X250_BOOT_TRACE
+    x250_boot_trace_measurement_note(X250_BOOT_TRACE_MEASURE_MGFS_MUTATION,
+                                     timer_uptime_ms() - phase_started_ms);
+    phase_started_ms = timer_uptime_ms();
+#endif
+    result = mgfs_ordinary_complete(sb, result, out_pin);
+#if X250_BOOT_TRACE
+    x250_boot_trace_measurement_note(
+        X250_BOOT_TRACE_MEASURE_MGFS_ORDINARY_COMPLETE,
+        timer_uptime_ms() - phase_started_ms);
+#endif
+    return result;
 }
 static int mgfs_create_pinned(vfs_node_t *dir, vfs_node_t *prepared,
                               const char *name, u64 *out_pin)

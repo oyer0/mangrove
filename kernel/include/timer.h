@@ -5,6 +5,10 @@
 #include <idt.h>
 #include <mg/time.h>
 
+#ifndef X250_BOOT_TRACE
+#define X250_BOOT_TRACE 0
+#endif
+
 #define TIMER_FREQUENCY 1000
 
 typedef struct {
@@ -21,6 +25,9 @@ u64 timer_ticks(void);
 u64 timer_uptime_ms(void);
 u64 timer_preemptions(void);
 void timer_monotonic_info(mg_monotonic_info_t *out);
+#if X250_BOOT_TRACE
+u64 timer_monotonic_period_fs(void);
+#endif
 
 /* Initializes an interrupt-independent polling clock after ACPI and the
  * permanent MMIO mapping infrastructure are ready. This clock is for

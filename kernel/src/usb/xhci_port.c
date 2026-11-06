@@ -6,6 +6,7 @@
 #include <xhci_trb.h>
 #include <types.h>
 #include <stddef.h>
+#include <x250_boot_trace.h>
 
 /* ==============================================================================
  * External Dependencies
@@ -108,6 +109,25 @@ static const char *xhci_port_reset_state_name(xhci_port_state_t state)
         default: return "UNKNOWN";
     }
 }
+
+#if X250_BOOT_TRACE
+static const char *xhci_boot_port_state_name(xhci_port_state_t state)
+{
+    switch (state) {
+        case XHCI_PORT_DISCONNECTED: return "DISCONNECTED";
+        case XHCI_PORT_CONNECTED_OBSERVED: return "CONNECTED";
+        case XHCI_PORT_DEBOUNCING: return "DEBOUNCING";
+        case XHCI_PORT_RESET_REQUESTED: return "RESET_REQUESTED";
+        case XHCI_PORT_RESET_IN_PROGRESS: return "RESET_IN_PROGRESS";
+        case XHCI_PORT_RESET_COMPLETED: return "RESET_COMPLETED";
+        case XHCI_PORT_ENABLED: return "ENABLED";
+        case XHCI_PORT_ENUMERATING: return "ENUMERATING";
+        case XHCI_PORT_READY: return "READY";
+        case XHCI_PORT_FAILED: return "FAILED";
+        default: return "UNKNOWN";
+    }
+}
+#endif
 
 static void xhci_port_reset_log(u8 port_id,
                                 xhci_port_state_t state,
@@ -302,6 +322,9 @@ xhci_status_t xhci_probe_ports(xhci_controller_t *xhc) {
 
         /* Check if a device is physically plugged in (Current Connect Status) */
         if (status & XHCI_PORTSC_CCS) {
+#if X250_BOOT_TRACE
+            u64 wait_started_ms = timer_uptime_ms();
+#endif
             xhci_set_port_state(xhc, port, XHCI_PORT_CONNECTED_OBSERVED,
                                 status, "boot-probe");
             xhci_queue_port_change(xhc, port, "boot-probe");
@@ -318,6 +341,13 @@ xhci_status_t xhci_probe_ports(xhci_controller_t *xhc) {
             }
 
             xhci_port_state_t final_state = xhci_get_port_state(xhc, port);
+#if X250_BOOT_TRACE
+            u64 wait_finished_ms = timer_uptime_ms();
+            x250_boot_trace_timing(
+                wait_finished_ms, "port probe complete", port, true,
+                wait_finished_ms - wait_started_ms,
+                xhci_boot_port_state_name(final_state));
+#endif
             /* The setup worker owns the state transition.  Its observation
                deadline is not permission for the bootstrap caller to mark an
                in-flight transfer failed: doing so lets storage initialization

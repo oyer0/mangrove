@@ -8,6 +8,7 @@
 #include <scheduler.h>
 #include <storage/gpt.h>
 #include <timer.h>
+#include <x250_boot_trace.h>
 
 #ifndef NULL
 #define NULL ((void*)0)
@@ -974,13 +975,31 @@ bool vfs_super_operation_lock(vfs_super_t *sb)
     if (!sb || vfs_super_operation_error(sb) != VFS_OK) return false;
     if (sb->serialize_handoff) {
         if (!vfs_super_retain(sb)) return false;
-        if (!mutex_lock(&sb->operation_guard)) {
+#if X250_BOOT_TRACE
+        u64 guard_wait_started_ms = timer_uptime_ms();
+#endif
+        bool guard_acquired = mutex_lock(&sb->operation_guard);
+#if X250_BOOT_TRACE
+        x250_boot_trace_measurement_note(
+            X250_BOOT_TRACE_MEASURE_VFS_OPERATION_GUARD_ACQUIRE,
+            timer_uptime_ms() - guard_wait_started_ms);
+#endif
+        if (!guard_acquired) {
             vfs_super_release(sb);
             return false;
         }
         __atomic_store_n(&sb->operation_guard_owner, thread_current(), __ATOMIC_RELEASE);
     }
-    if (!mutex_lock(&sb->operation_lock)) {
+#if X250_BOOT_TRACE
+    u64 operation_wait_started_ms = timer_uptime_ms();
+#endif
+    bool operation_acquired = mutex_lock(&sb->operation_lock);
+#if X250_BOOT_TRACE
+    x250_boot_trace_measurement_note(
+        X250_BOOT_TRACE_MEASURE_VFS_OPERATION_LOCK_ACQUIRE,
+        timer_uptime_ms() - operation_wait_started_ms);
+#endif
+    if (!operation_acquired) {
         (void)vfs_super_operation_guard_release(sb);
         return false;
     }
@@ -3230,6 +3249,9 @@ static int vfs_operation_finish_pin(vfs_super_t *sb, int result, u64 pin)
     if (result == VFS_ERR_UNCERTAIN)
         __atomic_store_n(&sb->operation_error, result, __ATOMIC_RELEASE);
     if (!pin) return result;
+#if X250_BOOT_TRACE
+    u64 finish_started_ms = timer_uptime_ms();
+#endif
     do {
         finish = vfs_recovery_pin_finish_handoff(pin);
         if (finish == VFS_ERR_BUSY) {
@@ -3240,8 +3262,18 @@ static int vfs_operation_finish_pin(vfs_super_t *sb, int result, u64 pin)
     if (finish != VFS_OK) {
         if (finish == VFS_ERR_BUSY)
             (void)vfs_recovery_pin_mark_unresolved(pin);
+#if X250_BOOT_TRACE
+        x250_boot_trace_measurement_note(
+            X250_BOOT_TRACE_MEASURE_RECOVERY_PIN_HANDOFF,
+            timer_uptime_ms() - finish_started_ms);
+#endif
         return VFS_ERR_UNCERTAIN;
     }
+#if X250_BOOT_TRACE
+    x250_boot_trace_measurement_note(
+        X250_BOOT_TRACE_MEASURE_RECOVERY_PIN_HANDOFF,
+        timer_uptime_ms() - finish_started_ms);
+#endif
     return result;
 }
 

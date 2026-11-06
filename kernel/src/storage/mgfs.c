@@ -7,6 +7,10 @@
 #include <mg/filesystem.h>
 #include <mg/utf8.h>
 #include <string.h>
+#include <x250_boot_trace.h>
+#if X250_BOOT_TRACE
+#include <timer.h>
+#endif
 
 #ifndef NULL
 #define NULL ((void *)0)

@@ -9,6 +9,10 @@
 #include <stddef.h>
 #include <string.h>
 #include <storage/gpt.h>
+#include <x250_boot_trace.h>
+#if X250_BOOT_TRACE
+#include <timer.h>
+#endif
 
 static block_device_t devices[BLOCK_MAX_DEVICES];
 static u32 device_count = 0;
@@ -60,7 +64,16 @@ static bool block_io_acquire(void)
         return true;
     }
     spin_unlock_irqrestore(&block_io_gate.state_lock, flags);
-    if (!mutex_lock(&block_io_gate)) return false;
+#if X250_BOOT_TRACE
+    u64 wait_started_ms = timer_uptime_ms();
+#endif
+    bool acquired = mutex_lock(&block_io_gate);
+#if X250_BOOT_TRACE
+    x250_boot_trace_measurement_note(
+        X250_BOOT_TRACE_MEASURE_BLOCK_IO_GATE_ACQUIRE,
+        timer_uptime_ms() - wait_started_ms);
+#endif
+    if (!acquired) return false;
     flags = spin_lock_irqsave(&block_io_gate.state_lock);
     block_io_depth = 1;
     spin_unlock_irqrestore(&block_io_gate.state_lock, flags);

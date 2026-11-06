@@ -468,6 +468,13 @@ void timer_monotonic_info(mg_monotonic_info_t *out)
     }
 }
 
+#if X250_BOOT_TRACE
+u64 timer_monotonic_period_fs(void)
+{
+    return monotonic_period_fs;
+}
+#endif
+
 u64 timer_preemptions(void)
 {
     return preemption_count_snapshot(&preemptions);

@@ -47,6 +47,19 @@ typedef struct __attribute__((packed)) {
 
 static usb_mass_storage_device_t devices[4];
 static u32 device_count;
+#if X250_BOOT_TRACE
+static xhci_storage_trace_counters_t storage_io_trace;
+
+void xhci_storage_trace_begin(void)
+{
+    xhci_storage_trace_counters_begin(&storage_io_trace);
+}
+
+void xhci_storage_trace_end(xhci_storage_trace_snapshot_t *snapshot)
+{
+    xhci_storage_trace_counters_end(&storage_io_trace, snapshot);
+}
+#endif
 
 static void storage_mark_block_gone(usb_mass_storage_device_t *device)
 {
@@ -393,6 +406,11 @@ out:
 static bool bot_command(usb_mass_storage_device_t *dev, const u8 *cdb, u8 cdb_len,
                         void *data, uintptr_t data_phys, u32 data_len, bool data_in)
 {
+#if X250_BOOT_TRACE
+    bool trace_io = xhci_storage_trace_is_active(&storage_io_trace);
+    u64 command_started_ms = trace_io ? timer_uptime_ms() : 0;
+    u64 cbw_ms = 0, data_ms = 0, csw_ms = 0;
+#endif
     dev->scsi_failure = false;
     usb_cbw_t cbw;
     usb_csw_t csw;
@@ -403,11 +421,23 @@ static bool bot_command(usb_mass_storage_device_t *dev, const u8 *cdb, u8 cdb_le
     if (!cbw_dma || !csw_dma) {
         if (cbw_dma) xhci_dma_free(cbw_dma, sizeof(cbw));
         if (csw_dma) xhci_dma_free(csw_dma, sizeof(csw));
+#if X250_BOOT_TRACE
+        if (trace_io)
+            xhci_storage_trace_note_bot(&storage_io_trace, true, cdb[0],
+                data_len, timer_uptime_ms() - command_started_ms,
+                cbw_ms, data_ms, csw_ms, false);
+#endif
         return false;
     }
     if (!xhci_slot_accepts_io(dev->xhc, dev->slot_id)) {
         xhci_dma_free(cbw_dma, sizeof(cbw));
         xhci_dma_free(csw_dma, sizeof(csw));
+#if X250_BOOT_TRACE
+        if (trace_io)
+            xhci_storage_trace_note_bot(&storage_io_trace, true, cdb[0],
+                data_len, timer_uptime_ms() - command_started_ms,
+                cbw_ms, data_ms, csw_ms, false);
+#endif
         return false;
     }
     memset(&cbw, 0, sizeof(cbw));
@@ -418,21 +448,39 @@ static bool bot_command(usb_mass_storage_device_t *dev, const u8 *cdb, u8 cdb_le
     cbw.cb_length = cdb_len;
     memcpy(cbw.cb, cdb, cdb_len);
     memcpy(cbw_dma, &cbw, sizeof(cbw));
+#if X250_BOOT_TRACE
+    u64 transfer_started_ms = trace_io ? timer_uptime_ms() : 0;
+#endif
     ok = bulk_transfer(dev, dev->bulk_out_dci, cbw_dma, cbw_phys, sizeof(cbw), false, false);
+#if X250_BOOT_TRACE
+    if (trace_io) cbw_ms = timer_uptime_ms() - transfer_started_ms;
+#endif
 #ifdef NETWORK_BOOT_DIAG
     if (!ok) kprint("[USB-BOT] CBW failed tag=%u\n", cbw.tag);
 #endif
     if (ok && data_len) {
+#if X250_BOOT_TRACE
+        transfer_started_ms = trace_io ? timer_uptime_ms() : 0;
+#endif
         ok = bulk_transfer(dev, data_in ? dev->bulk_in_dci : dev->bulk_out_dci,
                            data, data_phys, data_len, data_in, data_in);
+#if X250_BOOT_TRACE
+        if (trace_io) data_ms = timer_uptime_ms() - transfer_started_ms;
+#endif
 #ifdef NETWORK_BOOT_DIAG
         if (!ok) kprint("[USB-BOT] data failed tag=%u in=%u bytes=%u\n",
                         cbw.tag, data_in ? 1U : 0U, data_len);
 #endif
     }
     if (ok) {
+#if X250_BOOT_TRACE
+        transfer_started_ms = trace_io ? timer_uptime_ms() : 0;
+#endif
         ok = bulk_transfer(dev, dev->bulk_in_dci, csw_dma, csw_phys,
                            sizeof(csw), true, false);
+#if X250_BOOT_TRACE
+        if (trace_io) csw_ms = timer_uptime_ms() - transfer_started_ms;
+#endif
 #ifdef NETWORK_BOOT_DIAG
         if (!ok)
             kprint("[USB-BOT] CSW transfer failed tag=%u opcode=%02x\n",
@@ -454,6 +502,12 @@ static bool bot_command(usb_mass_storage_device_t *dev, const u8 *cdb, u8 cdb_le
     }
     xhci_dma_free(cbw_dma, sizeof(cbw));
     xhci_dma_free(csw_dma, sizeof(csw));
+#if X250_BOOT_TRACE
+    if (trace_io)
+        xhci_storage_trace_note_bot(&storage_io_trace, true, cdb[0],
+            data_len, timer_uptime_ms() - command_started_ms,
+            cbw_ms, data_ms, csw_ms, ok);
+#endif
     return ok;
 }
 
@@ -562,6 +616,12 @@ static bool storage_read(block_device_t *block, u64 lba, u32 count, void *buffer
         block->id != dev->block.id || block->sector_size != 512 ||
         lba >= dev->block_count ||
         count > dev->block_count - lba) return false;
+#if X250_BOOT_TRACE
+    bool trace_io = xhci_storage_trace_is_active(&storage_io_trace);
+    u64 io_started_ms = trace_io ? timer_uptime_ms() : 0;
+    xhci_storage_trace_note_block_begin(&storage_io_trace, trace_io, false,
+                                        count);
+#endif
     /* A Normal TRB needs contiguous physical memory and must not cross a
      * 64 KiB boundary.  Heap mappings are not necessarily contiguous, so
      * verify every page before using a larger BOT data transfer. */
@@ -585,7 +645,14 @@ static bool storage_read(block_device_t *block, u64 lba, u32 count, void *buffer
     } else {
         dma = (u8 *)xhci_dma_alloc(4096U, &phys);
     }
-    if (!dma) return false;
+    if (!dma) {
+#if X250_BOOT_TRACE
+        if (trace_io)
+            xhci_storage_trace_note_block_end(&storage_io_trace, true, false,
+                false, timer_uptime_ms() - io_started_ms);
+#endif
+        return false;
+    }
     while (count) {
         if (!__atomic_load_n(&dev->active, __ATOMIC_ACQUIRE)) {
             if (batch_dma.virt) {
@@ -595,6 +662,11 @@ static bool storage_read(block_device_t *block, u64 lba, u32 count, void *buffer
             }
             else xhci_dma_free(dma, 4096U);
             storage_teardown_wakeup(dev);
+#if X250_BOOT_TRACE
+            if (trace_io)
+                xhci_storage_trace_note_block_end(&storage_io_trace, true,
+                    false, false, timer_uptime_ms() - io_started_ms);
+#endif
             return false;
         }
         u16 chunk = count > maximum_sectors ? (u16)maximum_sectors : (u16)count;
@@ -618,6 +690,11 @@ static bool storage_read(block_device_t *block, u64 lba, u32 count, void *buffer
             }
             else xhci_dma_free(dma, 4096U);
             storage_teardown_wakeup(dev);
+#if X250_BOOT_TRACE
+            if (trace_io)
+                xhci_storage_trace_note_block_end(&storage_io_trace, true,
+                    false, false, timer_uptime_ms() - io_started_ms);
+#endif
             return false;
         }
         memcpy(out, dma, (usize)chunk * 512U);
@@ -630,6 +707,11 @@ static bool storage_read(block_device_t *block, u64 lba, u32 count, void *buffer
         else (void)xhci_dma_defer_release(batch_dma.virt, batch_dma.phys, 32768U, true);
     } else xhci_dma_free(dma, 4096U);
     storage_teardown_wakeup(dev);
+#if X250_BOOT_TRACE
+    if (trace_io)
+        xhci_storage_trace_note_block_end(&storage_io_trace, true, false,
+            true, timer_uptime_ms() - io_started_ms);
+#endif
     return true;
 }
 
@@ -646,12 +728,30 @@ static bool storage_write(block_device_t *block, u64 lba, u32 count,
         block->id != dev->block.id || block->sector_size != 512 ||
         lba >= dev->block_count ||
         count > dev->block_count - lba) return false;
+#if X250_BOOT_TRACE
+    bool trace_io = xhci_storage_trace_is_active(&storage_io_trace);
+    u64 io_started_ms = trace_io ? timer_uptime_ms() : 0;
+    xhci_storage_trace_note_block_begin(&storage_io_trace, trace_io, true,
+                                        count);
+#endif
     dma = (u8 *)xhci_dma_alloc(4096U, &phys);
-    if (!dma) return false;
+    if (!dma) {
+#if X250_BOOT_TRACE
+        if (trace_io)
+            xhci_storage_trace_note_block_end(&storage_io_trace, true, true,
+                false, timer_uptime_ms() - io_started_ms);
+#endif
+        return false;
+    }
     while (count) {
         if (!__atomic_load_n(&dev->active, __ATOMIC_ACQUIRE)) {
             xhci_dma_free(dma, 4096U);
             storage_teardown_wakeup(dev);
+#if X250_BOOT_TRACE
+            if (trace_io)
+                xhci_storage_trace_note_block_end(&storage_io_trace, true,
+                    true, false, timer_uptime_ms() - io_started_ms);
+#endif
             return false;
         }
         u16 chunk = count > 8U ? 8U : (u16)count;
@@ -664,6 +764,11 @@ static bool storage_write(block_device_t *block, u64 lba, u32 count,
                                           (u32)bytes, false)) {
             xhci_dma_free(dma, 4096U);
             storage_teardown_wakeup(dev);
+#if X250_BOOT_TRACE
+            if (trace_io)
+                xhci_storage_trace_note_block_end(&storage_io_trace, true,
+                    true, false, timer_uptime_ms() - io_started_ms);
+#endif
             return false;
         }
         input += bytes;
@@ -672,6 +777,11 @@ static bool storage_write(block_device_t *block, u64 lba, u32 count,
     }
     xhci_dma_free(dma, 4096U);
     storage_teardown_wakeup(dev);
+#if X250_BOOT_TRACE
+    if (trace_io)
+        xhci_storage_trace_note_block_end(&storage_io_trace, true, true,
+            true, timer_uptime_ms() - io_started_ms);
+#endif
     return true;
 }
 
@@ -690,10 +800,22 @@ static bool storage_flush(block_device_t *block)
         !__atomic_load_n(&dev->active, __ATOMIC_ACQUIRE) ||
         block->driver_data != dev || block->id != dev->block.id ||
         block->sector_size != 512U) return false;
+#if X250_BOOT_TRACE
+    u64 flush_started_ms = timer_uptime_ms();
+#endif
     if (dev->flush_unsupported) {
         result = dev->write_cache_known && !dev->write_cache_enabled;
         storage_teardown_wakeup(dev);
-        return result && __atomic_load_n(&dev->active, __ATOMIC_ACQUIRE);
+        bool accepted = result &&
+            __atomic_load_n(&dev->active, __ATOMIC_ACQUIRE);
+#if X250_BOOT_TRACE
+        u64 flush_finished_ms = timer_uptime_ms();
+        x250_boot_trace_timing(
+            flush_finished_ms, "USB cache flush", 0, true,
+            flush_finished_ms - flush_started_ms,
+            accepted ? "CACHE_DISABLED" : "FAILED");
+#endif
+        return accepted;
     }
     for (u32 attempt = 0; attempt < 4U; attempt++) {
         bot_sense_t sense;
@@ -721,7 +843,15 @@ static bool storage_flush(block_device_t *block)
             bot_retry_backoff();
     }
     storage_teardown_wakeup(dev);
-    return result && __atomic_load_n(&dev->active, __ATOMIC_ACQUIRE);
+    bool accepted = result && __atomic_load_n(&dev->active, __ATOMIC_ACQUIRE);
+#if X250_BOOT_TRACE
+    u64 flush_finished_ms = timer_uptime_ms();
+    x250_boot_trace_timing(
+        flush_finished_ms, "USB cache flush", 0, true,
+        flush_finished_ms - flush_started_ms,
+        accepted ? "READY" : "FAILED");
+#endif
+    return accepted;
 }
 
 /* MODE SENSE(6)'s four-byte mode-parameter header carries the device
