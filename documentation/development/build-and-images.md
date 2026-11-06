@@ -55,16 +55,98 @@ Run these from the repository root:
 Use the available validation targets above and the guest/runtime network
 commands documented by the current image.
 
-`X250_BOOT_TRACE=1` enables the temporary compact X250 boot overlay and the
+### Opt-in boot diagnostics
+
+`X250_BOOT_TRACE=1` enables the opt-in compact hardware boot overlay and the
 extra firmware storage-discovery report. It retains recent wrapped messages,
 shows up to 40 rows within the actual firmware GOP height, and redraws a
 filtered discovery/failure report after a required bring-up failure. The final
 report includes the GOP dimensions and USB-controller PCI command registers;
 Intel xHCI configuration DWORDs D0/D4/D8/DC are reported read-only to investigate
-companion-controller routing. The loader retains the firmware GOP mode, which
-need not match the panel's native resolution. It is disabled by default. The
-firmware checkpoint halt markers use
-the separate `BOOT_HANDOFF_CHECKPOINT` option; its default `0` does not halt.
+companion-controller routing. For boot-log latency investigation it also reports
+whether a prior log existed and its size, plus USB block-request and BOT command
+counts, sizes, failures, and phase timings separately for file preparation and
+snapshot writing. Footer version 2 also records bounded timing aggregates for
+block-I/O gate and VFS operation-lock acquisitions, recovery-pin handoff, and
+MGFS ordinary-mutation begin/body/complete phases. Each aggregate reports a
+sample count, total elapsed milliseconds, and maximum sample; timings use
+Pith's monotonic millisecond clock. Lock counts are timed acquisition attempts,
+including immediate acquisitions, and do not mean every attempt blocked. The
+phase counters are collected separately for file preparation and payload
+writing. Categories can be nested, so their
+totals must not be added together. USB callback and BOT timings exclude time
+spent before entering those measured callbacks, including any block-gate or
+VFS wait. These measurements are observational and do not change the storage
+path. The loader retains the firmware GOP mode, which need not match the
+panel's native resolution.
+
+On a successful trace-enabled boot, Pith saves the captured kernel log and
+trace to `/sys/logs/boot.log`. Before saving, it moves the preceding
+`boot.log` to `/sys/logs/boot.previous.log`; the next trace-enabled boot
+replaces that one older generation. The record includes a bounded diagnostic
+footer with preparation and payload-write timings, USB block/BOT counters,
+phase aggregates, and CRCs. A valid completion footer means the final footer
+write completed;
+the duration of that final write itself cannot be included in the same write.
+The trace text is frozen after file preparation and before the payload write;
+the footer and host-generated summary add payload completion timings and the
+final save state without recursively rewriting the trace. Later kernel events
+are outside that captured trace boundary.
+If the trace ring overflowed, a write failed, or boot stopped before a valid
+footer was written, extraction reports `INCOMPLETE`. A failure before MGFS is
+mounted cannot be persisted by this mechanism. These records are written only
+by trace-enabled builds; normal builds keep the existing boot-log behavior and
+produce no overlay or diagnostic footer.
+
+The trace retains at most 128 wrapped lines while the on-screen overlay shows
+at most 40. An exported trace is marked incomplete if the ring overflowed or
+the export buffer could not hold every retained line. The host extractor
+reports a valid save footer independently from trace completeness: a completed
+payload can contain an incomplete trace. Footer version 1 remains readable but
+does not contain phase aggregates; newer unsupported footer versions are
+reported as incomplete rather than as absent.
+
+Use the two-boot runner before a physical run to verify the current build and
+the persistence/extraction path under OVMF/KVM:
+
+```sh
+python3 tests/guest/guest_boot_diagnostics_test.py \
+  --image "$BUILD_DIR/Mangrove/MangroveUSB.img" \
+  --build-dir "$BUILD_DIR" --accel kvm \
+  --ovmf-code /path/to/OVMF_CODE.4m.fd \
+  --ovmf-vars /path/to/OVMF_VARS.4m.fd \
+  --output "$RUN/kvm-boot-diagnostics"
+```
+
+The runner boots the disposable image twice, executes a distinct Shoot
+command after each boot, compares the first record byte-for-byte with the
+second boot's `boot.previous.log`, extracts both records, and runs the
+independent `mgfsck` checker after each guest has stopped. It never reads an
+image while QEMU can write it. A passing KVM run qualifies this workflow only;
+it does not establish physical hardware behavior.
+
+After a physical boot, shut down or return to the host and detach the USB from
+any guest before extraction. Select the whole removable device yourself, then
+use the read-only extractor with a new output directory:
+
+```sh
+python3 tools/extract_boot_diagnostics.py \
+  --source /dev/disk/by-id/REPLACE_WITH_OPERATOR_SELECTED_WHOLE_USB_DEVICE \
+  --output "$RUN/evidence/boot-diagnostics" \
+  --mgfsck "$BUILD_DIR/mgfsck"
+```
+
+The source is opened read-only. The extractor validates the primary and backup
+GPT, copies the bounded MGFS root partition into its new output directory,
+runs `mgfsck` independently, and exports `boot.log` and
+`boot.previous.log`, when present, as raw files plus snapshot/trace text and an
+`extraction.json` status report. Inspect and redact exported text before
+attaching it to a qualification report. Extract before a third diagnostic
+boot if both preceding runs must be retained: only the most recent two records
+are kept.
+
+Firmware checkpoint halt markers use the separate `BOOT_HANDOFF_CHECKPOINT`
+option; its default `0` does not halt. The trace is disabled by default.
 
 `make test-ovmf-discovery` exercises the Arch and Debian OVMF path layouts and
 the explicit source override behavior without using host firmware files.

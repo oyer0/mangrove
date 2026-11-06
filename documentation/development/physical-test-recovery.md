@@ -19,9 +19,12 @@ revision rather than replacing the previous record.
 The report records the hardware-profile identifier and document hash, a
 firmware-settings snapshot and hash, Git revision plus tracked/untracked
 working-tree fingerprints, loader/kernel/image sizes and SHA-256 values,
-non-unique boot-medium description, build/diagnostic options, cold/warm boot
-classification, expected actions, required stages, stage observations,
-result-state history, and bounded evidence references. Build artifact hashes
+non-unique boot-medium description, build/diagnostic options, cold/warm/unknown
+boot classification, expected actions, required stages, stage observations,
+result-state history, and bounded evidence references. Use `UNKNOWN` when the
+operator did not establish whether a run was cold or warm; do not infer it from
+the boot path or elapsed time. `update --boot-classification` records a
+corrected classification in a new immutable report revision. Build artifact hashes
 identify those files independently; they do not by themselves prove that the
 loader and kernel embedded in the image match the separately hashed files.
 That relation remains `NOT TESTED` until an independent image-identity report
@@ -193,18 +196,47 @@ Use these stage names to identify the first failure and what followed:
 | `test_workload` | Explicit command or operation and its result |
 | `shutdown_recovery` | Requested shutdown/reboot or return to the recovery system |
 
-If the machine displays useful diagnostics, photograph the full screen or
-write a concise operator note into a file under `$RUN/evidence/`. The current
-kernel does not provide a general persistent physical-boot log; terminal
-output can be replaced during boot. Do not claim that QEMU output, a KVM report,
-or the absence of a panic is a physical observation. Attach existing host
-reports as `AUTOMATED`; attach screen photographs and operator notes as
-`OPERATOR`. The tool records the referenced file's relative path, byte count,
-and SHA-256. Each evidence file is limited to 32 MiB, at most 64 references and
-128 MiB total. It does not copy evidence files or inspect their contents for
-technical correctness, so redact sensitive information before retaining them.
-Keep referenced files inside `$RUN/evidence/`, using fresh destination names
-for any copied reports or notes; the tool will not copy or overwrite them.
+Normal builds do not persist a general physical-boot trace. When persistent
+diagnostics are needed, build with the opt-in `X250_BOOT_TRACE=1` option. Once
+MGFS is mounted, that build stores its captured kernel log and trace under
+`/sys/logs/boot.log`, preserving the preceding trace-enabled run as
+`/sys/logs/boot.previous.log`. The files contain bounded completion metadata
+and CRCs. Footer version 2 also stores monotonic timing aggregates for block
+and VFS lock acquisition, MGFS mutation phases, and recovery-pin handoff.
+Acquisition counts include immediate lock acquisitions and do not mean every
+attempt blocked. These categories may be nested; compare each with the enclosing
+preparation or payload duration rather than summing them. A valid footer proves
+the final completion record was written; the duration of that footer write
+cannot be included in itself. The raw trace is
+captured before the payload write; its footer and extracted summary include
+the later payload timing and final save status. Kernel events after this
+boundary are not in that record. If logging failed, the trace overflowed, or
+boot ended before persistence completed, host extraction reports
+`INCOMPLETE`. A failure before the root MGFS mount cannot be recovered from
+this mechanism. The exact build, two-boot KVM qualification,
+and read-only physical-media extraction procedure are documented in the
+[build and image guide](build-and-images.md#opt-in-boot-diagnostics).
+
+After returning to the host, extract records from the detached whole USB
+device to a new location under `$RUN/evidence/`. The extractor verifies both
+GPT copies, runs `mgfsck` on a copied root partition, and writes the raw
+records, parsed snapshot/trace, and extraction status report. Capture the
+extraction directory's `extraction.json`, `mgfsck.txt`, and relevant trace
+files as `AUTOMATED` evidence. Read and redact logs before attaching them; do
+not include unique device or personal identifiers. Only the latest two trace
+runs are kept, so extract them before a third diagnostic boot if both are
+needed.
+
+If no persistent diagnostic record exists or the image was built without the
+trace option, photograph the full screen or write a concise operator note
+under `$RUN/evidence/`. Do not claim that QEMU output, a KVM report, or the
+absence of a panic is a physical observation. Attach host reports as
+`AUTOMATED` and screen photographs/operator notes as `OPERATOR`. The tool
+records each referenced file's relative path, byte count, and SHA-256. Each
+evidence file is limited to 32 MiB, at most 64 references and 128 MiB total.
+It does not copy evidence files or inspect their contents for technical
+correctness. Keep referenced files inside `$RUN/evidence/`, using fresh
+destination names; the tool will not copy or overwrite them.
 
 If an independent host image-identity report establishes that the loader and
 Pith hashes above match the components embedded in the selected image, attach
