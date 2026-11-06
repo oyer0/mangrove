@@ -377,8 +377,9 @@ def validate_report(report: object, repo: Path | None = None,
         raise ReportError("medium write result requires automated flash-verification evidence")
 
     config = report.get("configuration")
-    if not isinstance(config, dict) or config.get("boot_classification") not in ("COLD", "WARM"):
-        raise ReportError("boot classification must be COLD or WARM")
+    if not isinstance(config, dict) or config.get("boot_classification") not in (
+            "COLD", "WARM", "UNKNOWN"):
+        raise ReportError("boot classification must be COLD, WARM, or UNKNOWN")
     for field in ("build_options", "diagnostic_options"):
         if not isinstance(config.get(field), dict):
             raise ReportError(f"{field} must be a JSON object")
@@ -617,6 +618,9 @@ def _cmd_update(args: argparse.Namespace) -> None:
     if args.embedded_match:
         report["build_artifacts"]["embedded_loader_kernel_match"] = args.embedded_match
         changed = True
+    if args.boot_classification:
+        report["configuration"]["boot_classification"] = args.boot_classification
+        changed = True
     before_evidence = len(report["evidence"])
     _add_evidence(report, args)
     changed |= len(report["evidence"]) != before_evidence
@@ -658,7 +662,8 @@ def _parser() -> argparse.ArgumentParser:
     create.add_argument("--medium-capacity", type=int)
     create.add_argument("--medium-vid-pid", help="optional vendor:product ID; do not include a serial")
     create.add_argument("--medium-verification", default="NOT TESTED", choices=("NOT TESTED", "VERIFIED", "FAILED"))
-    create.add_argument("--boot-classification", required=True, choices=("COLD", "WARM"))
+    create.add_argument("--boot-classification", required=True,
+                        choices=("COLD", "WARM", "UNKNOWN"))
     create.add_argument("--build-option", action="append", default=[], metavar="NAME=VALUE")
     create.add_argument("--diagnostic-option", action="append", default=[], metavar="NAME=VALUE")
     create.add_argument("--expected-action", action="append", default=[])
@@ -679,6 +684,7 @@ def _parser() -> argparse.ArgumentParser:
     update.add_argument("--confirm-physical", action="store_true")
     update.add_argument("--medium-verification", choices=("NOT TESTED", "VERIFIED", "FAILED"))
     update.add_argument("--embedded-match", choices=("NOT TESTED", "VERIFIED", "FAILED"))
+    update.add_argument("--boot-classification", choices=("COLD", "WARM", "UNKNOWN"))
     update.add_argument("--evidence-root")
     update.add_argument("--evidence", action="append", default=[], metavar="KIND=PATH")
     update.add_argument("--evidence-source", choices=EVIDENCE_SOURCES, default="OPERATOR")

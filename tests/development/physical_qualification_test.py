@@ -78,6 +78,12 @@ with tempfile.TemporaryDirectory(prefix="mangrove-physical-report-") as director
     assert base["source_identity"]["revision"] == git(repo, "rev-parse", "HEAD")
     assert base["build_artifacts"]["image"]["sha256"] == hashlib.sha256(
         (repo / "build/MangroveUSB.img").read_bytes()).hexdigest()
+    unknown_boot_classification = copy.deepcopy(base)
+    unknown_boot_classification["configuration"]["boot_classification"] = "UNKNOWN"
+    tool.validate_report(unknown_boot_classification, repo)
+    invalid_boot_classification = copy.deepcopy(base)
+    invalid_boot_classification["configuration"]["boot_classification"] = "UNSURE"
+    rejected(invalid_boot_classification, repo, None, "COLD, WARM, or UNKNOWN")
     ignored_output = repo / "build/physical-tests/ignored-report.json"
     ignored_command = [*command[:-1], str(ignored_output)]
     ignored = subprocess.run(ignored_command, capture_output=True, text=True)
@@ -121,6 +127,7 @@ with tempfile.TemporaryDirectory(prefix="mangrove-physical-report-") as director
     updates = [
         ["--status", "INCOMPLETE", "--stage", "root_mount", "--stage-status", "PASS",
          "--observation", "Synthetic root-mount checkpoint", "--medium-verification", "VERIFIED",
+         "--boot-classification", "UNKNOWN",
          "--evidence", "transcript=flash-transcript.txt",
          "--evidence-source", "AUTOMATED", "--evidence-description",
          "Synthetic flash-usb.sh write verification transcript"],
@@ -142,6 +149,9 @@ with tempfile.TemporaryDirectory(prefix="mangrove-physical-report-") as director
         assert result.returncode == 0, result.stderr + "\n" + json.dumps(
             json.loads(previous.read_text())["stage_results"], sort_keys=True)
         previous = revisions[index]
+        if index == 0:
+            assert json.loads(previous.read_text())["configuration"][
+                "boot_classification"] == "UNKNOWN"
     result = subprocess.run([sys.executable, str(TOOL), "validate", "--repo", str(repo),
         "--report", str(previous), "--evidence-root", str(evidence), "--require-pass"],
         capture_output=True, text=True)
