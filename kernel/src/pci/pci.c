@@ -5,6 +5,7 @@
 #include <stddef.h>
 #include <string.h>
 #include <vmm.h>
+#include <spinlock.h>
 
 #define PCI_CONFIG_ADDRESS 0xCF8
 #define PCI_CONFIG_DATA    0xCFC
@@ -58,6 +59,18 @@ static u32 pci_device_count = 0;
 static u64 next_pci_generation = 1;
 static pci_device_t *scan_output;
 static u32 scan_output_count;
+/* CF8 selects one global address for the following CFC transaction. */
+static spinlock_t pci_config_lock = { .value = 0U };
+
+#if defined(MANGROVE_HOST_TEST)
+extern u32 pci_test_inl(u16 port);
+extern void pci_test_outl(u16 port, u32 value);
+#define PCI_CONFIG_INL(port) pci_test_inl(port)
+#define PCI_CONFIG_OUTL(port, value) pci_test_outl(port, value)
+#else
+#define PCI_CONFIG_INL(port) inl(port)
+#define PCI_CONFIG_OUTL(port, value) outl(port, value)
+#endif
 
 static u32 pci_read32(u8 bus, u8 device, u8 function, u8 offset);
 static u16 pci_read16(u8 bus, u8 device, u8 function, u8 offset);
@@ -151,7 +164,7 @@ static u8 pci_find_capability(const pci_device_t *device, u8 capability_id)
     return 0;
 }
 
-static u32 pci_read32(u8 bus, u8 device, u8 function, u8 offset)
+static u32 pci_read32_unlocked(u8 bus, u8 device, u8 function, u8 offset)
 {
     u32 address =
         (1U << 31) |
@@ -160,16 +173,34 @@ static u32 pci_read32(u8 bus, u8 device, u8 function, u8 offset)
         ((u32)function << 8) |
         (offset & 0xFC);
 
-    outl(PCI_CONFIG_ADDRESS, address);
+    PCI_CONFIG_OUTL(PCI_CONFIG_ADDRESS, address);
 
-    return inl(PCI_CONFIG_DATA);
+    return PCI_CONFIG_INL(PCI_CONFIG_DATA);
+}
+
+static u32 pci_read32(u8 bus, u8 device, u8 function, u8 offset)
+{
+    u64 flags = spin_lock_irqsave(&pci_config_lock);
+    u32 value = pci_read32_unlocked(bus, device, function, offset);
+
+    spin_unlock_irqrestore(&pci_config_lock, flags);
+    return value;
+}
+
+static u16 pci_read16_unlocked(u8 bus, u8 device, u8 function, u8 offset)
+{
+    u32 value = pci_read32_unlocked(bus, device, function, offset);
+
+    return (value >> ((offset & 2) * 8)) & 0xFFFF;
 }
 
 static u16 pci_read16(u8 bus, u8 device, u8 function, u8 offset)
 {
-    u32 value = pci_read32(bus, device, function, offset);
+    u64 flags = spin_lock_irqsave(&pci_config_lock);
+    u16 value = pci_read16_unlocked(bus, device, function, offset);
 
-    return (value >> ((offset & 2) * 8)) & 0xFFFF;
+    spin_unlock_irqrestore(&pci_config_lock, flags);
+    return value;
 }
 
 bool pci_boot_framebuffer_prefetchable(u64 physical)
@@ -210,7 +241,8 @@ static u8 pci_read8(u8 bus, u8 device, u8 function, u8 offset)
     return (value >> ((offset & 3) * 8)) & 0xFF;
 }
 
-static void pci_write32(u8 bus, u8 device, u8 function, u8 offset, u32 value)
+static void pci_write32_unlocked(u8 bus, u8 device, u8 function, u8 offset,
+                                 u32 value)
 {
     u32 address =
         (1U << 31) |
@@ -219,24 +251,43 @@ static void pci_write32(u8 bus, u8 device, u8 function, u8 offset, u32 value)
         ((u32)function << 8) |
         (offset & 0xFC);
 
-    outl(PCI_CONFIG_ADDRESS, address);
-    outl(PCI_CONFIG_DATA, value);
+    PCI_CONFIG_OUTL(PCI_CONFIG_ADDRESS, address);
+    PCI_CONFIG_OUTL(PCI_CONFIG_DATA, value);
+}
+
+static void pci_write32(u8 bus, u8 device, u8 function, u8 offset, u32 value)
+{
+    u64 flags = spin_lock_irqsave(&pci_config_lock);
+
+    pci_write32_unlocked(bus, device, function, offset, value);
+    spin_unlock_irqrestore(&pci_config_lock, flags);
+}
+
+static void pci_write16_unlocked(u8 bus, u8 device, u8 function, u8 offset,
+                                 u16 value)
+{
+    u32 shift = (offset & 2U) * 8U;
+    u32 current = pci_read32_unlocked(bus, device, function, offset);
+    current = (current & ~(0xFFFFU << shift)) | ((u32)value << shift);
+    pci_write32_unlocked(bus, device, function, offset, current);
 }
 
 static void pci_write16(u8 bus, u8 device, u8 function, u8 offset, u16 value)
 {
-    u32 shift = (offset & 2U) * 8U;
-    u32 current = pci_read32(bus, device, function, offset);
-    current = (current & ~(0xFFFFU << shift)) | ((u32)value << shift);
-    pci_write32(bus, device, function, offset, current);
+    u64 flags = spin_lock_irqsave(&pci_config_lock);
+
+    pci_write16_unlocked(bus, device, function, offset, value);
+    spin_unlock_irqrestore(&pci_config_lock, flags);
 }
 
 static void pci_write8(u8 bus, u8 device, u8 function, u8 offset, u8 value)
 {
+    u64 flags = spin_lock_irqsave(&pci_config_lock);
     u32 shift = (offset & 3U) * 8U;
-    u32 current = pci_read32(bus, device, function, offset);
+    u32 current = pci_read32_unlocked(bus, device, function, offset);
     current = (current & ~(0xFFU << shift)) | ((u32)value << shift);
-    pci_write32(bus, device, function, offset, current);
+    pci_write32_unlocked(bus, device, function, offset, current);
+    spin_unlock_irqrestore(&pci_config_lock, flags);
 }
 
 void pci_init(void)
@@ -812,12 +863,18 @@ bool pci_enable_memory_busmaster(const pci_device_t *device)
     const u16 command_bits = (1U << 1) | (1U << 2);
     const u16 intx_disable = 1U << 10;
     u16 command;
+    u64 flags;
 
     if (!device) return false;
-    command = pci_read_config16(device, 0x04);
+    flags = spin_lock_irqsave(&pci_config_lock);
+    command = pci_read16_unlocked(device->bus, device->device,
+                                  device->function, 0x04);
     command = (command | command_bits) & ~intx_disable;
-    pci_write_config16(device, 0x04, command);
-    command = pci_read_config16(device, 0x04);
+    pci_write16_unlocked(device->bus, device->device, device->function,
+                         0x04, command);
+    command = pci_read16_unlocked(device->bus, device->device,
+                                  device->function, 0x04);
+    spin_unlock_irqrestore(&pci_config_lock, flags);
     return (command & command_bits) == command_bits &&
            (command & intx_disable) == 0;
 }

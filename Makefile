@@ -2030,6 +2030,18 @@ test-xhci-pci:
 	$(HOST_TEST_DIR)/mangrove-xhci-pci-routing-test
 	python3 tests/storage/xhci_legacy_handoff_test.py "$(HOST_CC)"
 
+.PHONY: test-pci-config
+test-pci-config:
+	@mkdir -p $(HOST_TEST_DIR)
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -pthread -fno-builtin \
+		-fsanitize=address,undefined -ffunction-sections -fdata-sections \
+		-DMANGROVE_HOST_TEST -Ikernel/include/pci -Ikernel/include -Iinclude \
+		-idirafter libc/include tests/kernel/pci_config_serialization_test.c \
+		kernel/src/pci/pci.c -Wl,--gc-sections \
+		-o $(HOST_TEST_DIR)/mangrove-pci-config-serialization-test
+	ASAN_OPTIONS=detect_leaks=0 \
+		$(HOST_TEST_DIR)/mangrove-pci-config-serialization-test
+
 .PHONY: test-xhci-boot
 test-xhci-boot:
 	python3 tests/storage/xhci_port_admission_test.py "$(HOST_CC)"
@@ -2064,7 +2076,7 @@ test-gpt-image:
 	@test -f "$(GPT_TEST_IMAGE)" || { echo "Build a USB image or set GPT_TEST_IMAGE first" >&2; exit 1; }
 	python3 tests/storage/storage_coherency_test.py "$(HOST_CC)" --gpt-image="$(GPT_TEST_IMAGE)"
 
-test-storage: test-storage-authorization test-xhci-pci test-xhci-boot test-usb-image-capacity test-usb-flash
+test-storage: test-storage-authorization test-xhci-pci test-pci-config test-xhci-boot test-usb-image-capacity test-usb-flash
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -Werror=address-of-packed-member \
 		-Ikernel/include -Ikernel/include/usb -Iinclude \
 		tests/storage/xhci_regs_layout_test.c \
