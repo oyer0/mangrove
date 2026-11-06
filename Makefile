@@ -52,6 +52,7 @@ NATIVE_GUEST_ACCEL ?= kvm
 else
 NATIVE_GUEST_ACCEL ?= tcg
 endif
+BOOT_DIAG_ACCEL ?= $(NATIVE_GUEST_ACCEL)
 QEMU_ACCEL_PREFLIGHT = python3 tests/guest/qemu_accel.py --qemu "$(QEMU)" --accel
 
 BOOT_TOOLS := $(BOOT_CC) $(BOOT_LD)
@@ -921,14 +922,33 @@ test-ovmf-discovery:
 test-startup-presentation:
 	python3 tests/kernel/startup_presentation_test.py "$(HOST_CC)"
 	python3 tests/kernel/init_trace_test.py "$(HOST_CC)"
+	python3 tests/kernel/boot_log_persistence_test.py "$(HOST_CC)"
+
+test-boot-log-capture:
+	python3 tests/kernel/boot_log_diagnostic_capture_test.py "$(HOST_CC)"
+	@mkdir -p $(HOST_TEST_DIR)
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -Ikernel/include -Ikernel/include/usb -Iinclude \
+		tests/kernel/boot_log_diagnostic_footer_test.c \
+		-o $(HOST_TEST_DIR)/mangrove-boot-log-diagnostic-footer-test
+	$(HOST_TEST_DIR)/mangrove-boot-log-diagnostic-footer-test
+	python3 tests/development/extract_boot_diagnostics_test.py
+
+test-guest-boot-diagnostics:
+	python3 tests/guest/guest_boot_diagnostics_test.py \
+		--image "$(BUILD_DIR)/Mangrove/MangroveUSB.img" \
+		--build-dir "$(BUILD_DIR)" --accel "$(BOOT_DIAG_ACCEL)"
 
 test-x250-boot-trace:
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -Wno-unused-function \
 		-ffunction-sections \
-		-fdata-sections -Wl,--gc-sections -Ikernel/include -Iinclude \
+		-fdata-sections -Wl,--gc-sections -Ikernel/include -Ikernel/include/usb -Iinclude \
 		-idirafter libc/include tests/kernel/x250_boot_trace_test.c \
 		-o $(HOST_TEST_DIR)/mangrove-x250-boot-trace-test
 	$(HOST_TEST_DIR)/mangrove-x250-boot-trace-test
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -Ikernel/include -Ikernel/include/usb -Iinclude \
+		tests/storage/xhci_storage_trace_test.c \
+		-o $(HOST_TEST_DIR)/mangrove-xhci-storage-trace-test
+	$(HOST_TEST_DIR)/mangrove-xhci-storage-trace-test
 
 test-rtc-build-policy:
 	python3 tests/kernel/rtc_build_policy_test.py
@@ -2012,7 +2032,8 @@ test-usb-flash: $(MKMGFS) $(BUILD_DIR)/mgfsck
 	python3 tests/storage/flash_usb_test.py --mkmgfs "$(MKMGFS)" --mgfsck "$(BUILD_DIR)/mgfsck"
 	python3 tests/storage/flash_usb_tty_test.py --mkmgfs "$(MKMGFS)" --mgfsck "$(BUILD_DIR)/mgfsck"
 
-.PHONY: test-physical-qualification
+.PHONY: test-physical-qualification test-boot-log-capture \
+	test-guest-boot-diagnostics
 test-physical-qualification:
 	python3 tests/development/physical_qualification_test.py
 
