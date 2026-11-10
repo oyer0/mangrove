@@ -44,7 +44,7 @@ typedef uint64_t u64;typedef uint32_t u32;typedef unsigned char u8;
 #define TERMINAL_MARGIN_Y 0U
 typedef struct {u32 codepoint;u8 foreground,background;unsigned short reserved;} terminal_overlay_cell_t;
 typedef struct {u32 codepoint;u8 fg_color,bg_color;} terminal_cell_t;
-static struct {u32 visible_rows,visible_cols,cursor_phys_row,cursor_col,top_row_idx,live_top_row_idx,history_rows,fg_color,bg_color,pending_scroll_rows;bool history_view_cleared,viewport_redraw_pending,batch_active;} terminal;
+static struct {u32 visible_rows,visible_cols,cursor_phys_row,cursor_col,top_row_idx,live_top_row_idx,history_rows,fg_color,bg_color,pending_scroll_rows,history_view_clear_bg_color;bool history_view_cleared,viewport_redraw_pending,batch_active;} terminal;
 static struct {bool valid;u64 owner_pid;u32 physical_row,extent;} terminal_input;
 static struct {bool active;u64 owner_pid;u32 first_screen_row,rows,columns;terminal_cell_t cells[128*256];} terminal_overlay;
 static struct {u64 glyph_render_count,ram_bytes_shifted;} stats;
@@ -80,7 +80,7 @@ for name in ['terminal_render_screen_row','terminal_render_overlay_row_locked','
              'terminal_input_cursor_for_process']:
     pre+=function(name)
 pre+=r'''
-static void reset(void){terminal.visible_rows=25;terminal.visible_cols=80;terminal.top_row_idx=250;terminal.live_top_row_idx=250;terminal.history_rows=0;terminal.history_view_cleared=false;terminal.viewport_redraw_pending=false;terminal.batch_active=false;terminal.pending_scroll_rows=0;scroll_count=0;terminal_input.valid=false;terminal_overlay.active=false;for(u32 r=0;r<256;r++)terminal_clear_phys_row(r,0);for(u32 r=0;r<25;r++)terminal_render_screen_row(r);}
+static void reset(void){terminal.visible_rows=25;terminal.visible_cols=80;terminal.top_row_idx=250;terminal.live_top_row_idx=250;terminal.history_rows=0;terminal.history_view_cleared=false;terminal.history_view_clear_bg_color=0;terminal.viewport_redraw_pending=false;terminal.batch_active=false;terminal.pending_scroll_rows=0;scroll_count=0;terminal_input.valid=false;terminal_overlay.active=false;for(u32 r=0;r<256;r++)terminal_clear_phys_row(r,0);for(u32 r=0;r<25;r++)terminal_render_screen_row(r);}
 int main(void){
  terminal_overlay_cell_t cells[128*80];for(unsigned i=0;i<128*80;i++)cells[i]=(terminal_overlay_cell_t){'X',7,0,0};
  for(u32 cursor=0;cursor<25;cursor++)for(u32 rows=1;rows<=128;rows++){

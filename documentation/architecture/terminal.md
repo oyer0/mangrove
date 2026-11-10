@@ -275,6 +275,11 @@ The CSI styling and cursor commands currently recognized are:
 | `ESC[bc`, `ESC[dc`, `ESC[uc`, `ESC[ic`, `ESC[rc` | Enable bold, dim, underline, italic, or reverse-video state. Prefix the attribute with `-` to disable it. Attributes are retained per process but are not visually rendered by the current framebuffer renderer. |
 | `ESC[30;12p`, `ESC[30x`, `ESC[12y`, `ESC[p` | Set one-based X/Y position, column, row, or home. Valid out-of-range coordinates clamp to the visible grid; zero, malformed values, and numeric overflow reject the complete command. |
 | `ESC[3U`, `ESC[3D`, `ESC[3L`, `ESC[3R`; `ESC[U`, `ESC[D`, `ESC[L`, `ESC[R` | Move up, down, left, or right by the positive parameter, defaulting to one cell. Motion clamps at the visible screen edge and does not wrap. Uppercase finals keep cursor movement distinct from lowercase styling attributes. |
+| `ESC[se`, `ESC[we` | Erase the active screen or the complete current line. |
+| `ESC[ue`, `ESC[de`, `ESC[le`, `ESC[re` | Erase from the screen start through the cursor, from the cursor through the screen end, or from the cursor through the current line's left or right edge. Directional erases include the cursor cell. |
+| `ESC[Ne` | Erase `N` cells starting at the cursor; an omitted count means one. Counts clamp at the visible screen end. Erasing writes blank cells using the current output background and does not move the cursor or shift content. A visible-screen erase preserves scrollback. |
+| `ESC[Nti`, `ESC[Ntd` | Insert or delete `N` character cells starting at the cursor. `N` defaults to one and clamps at the current line's right edge. |
+| `ESC[Nli`, `ESC[Nld` | Insert or delete `N` lines starting at the cursor. `N` defaults to one and clamps at the bottom of the active screen. Lines shift only within the remaining visible screen area; content shifted past its edge is discarded. |
 | `ESC[hk`, `ESC[sk` | Hide or show the active screen's cursor. |
 | `ESC[bk`, `ESC[uk`, `ESC[vk` | Store block, underline, or vertical-bar cursor shape for the active screen. The framebuffer cursor currently renders the same inverted-cell shape for each value. |
 | `ESC[+k`, `ESC[-k` | Save or restore the position in the calling process's output state. Restoring clamps to current dimensions. |

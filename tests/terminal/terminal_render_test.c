@@ -1949,6 +1949,281 @@ static void test_csi_cursor_invalid_and_process_isolation(void)
     assert(phys_to_live_screen_row(terminal.cursor_phys_row) == 1U);
 }
 
+typedef struct {
+    u32 cells[12];
+    u32 cursor_row;
+    u32 cursor_column;
+} csi_edit_snapshot_t;
+
+static void prepare_csi_edit_screen(void)
+{
+    initialize(52U, 76U);
+    assert(terminal.visible_cols == 4U && terminal.visible_rows == 3U);
+    for (u32 row = 0U; row < 3U; row++) {
+        for (u32 column = 0U; column < 4U; column++) {
+            terminal_cell_t *cell = terminal_csi_live_cell(row, column);
+            assert(cell);
+            cell->codepoint = 'A' + row * 4U + column;
+            cell->fg_color = TERMINAL_COLOR_LIGHT_GRAY;
+            cell->bg_color = TERMINAL_COLOR_BLACK;
+        }
+    }
+    assert(terminal_move_cursor(1U, 1U));
+}
+
+static csi_edit_snapshot_t capture_csi_edit_snapshot(void)
+{
+    csi_edit_snapshot_t snapshot = {0};
+    for (u32 row = 0U; row < 3U; row++)
+        for (u32 column = 0U; column < 4U; column++)
+            snapshot.cells[row * 4U + column] =
+                screen_cell(row, column)->codepoint;
+    snapshot.cursor_row = phys_to_live_screen_row(terminal.cursor_phys_row);
+    snapshot.cursor_column = terminal.cursor_col;
+    return snapshot;
+}
+
+static void assert_csi_edit_snapshots_equal(csi_edit_snapshot_t left,
+                                             csi_edit_snapshot_t right)
+{
+    assert(memcmp(left.cells, right.cells, sizeof(left.cells)) == 0);
+    assert(left.cursor_row == right.cursor_row);
+    assert(left.cursor_column == right.cursor_column);
+}
+
+static void test_csi_erase_edit_split_invariance(void)
+{
+    static const char *const commands[] = {
+        "\x1b[se", "\x1b[we", "\x1b[ue", "\x1b[de",
+        "\x1b[le", "\x1b[re", "\x1b[5e", "\x1b[e",
+        "\x1b[5ti", "\x1b[5td", "\x1b[3li", "\x1b[3ld",
+    };
+
+    for (u32 command_index = 0U;
+         command_index < sizeof(commands) / sizeof(commands[0]);
+         command_index++) {
+        const char *command = commands[command_index];
+        u32 length = (u32)strlen(command);
+        csi_edit_snapshot_t expected;
+
+        prepare_csi_edit_screen();
+        assert(terminal_write_for_process(EDITOR_TEST_PID, command, length) ==
+               (i64)length);
+        expected = capture_csi_edit_snapshot();
+        for (u32 split = 1U; split < length; split++) {
+            prepare_csi_edit_screen();
+            assert(terminal_write_for_process(EDITOR_TEST_PID, command,
+                                              split) == (i64)split);
+            assert(terminal_write_for_process(EDITOR_TEST_PID, command + split,
+                    length - split) == (i64)(length - split));
+            assert_csi_edit_snapshots_equal(capture_csi_edit_snapshot(),
+                                            expected);
+        }
+    }
+}
+
+static void test_csi_erase_edit_semantics(void)
+{
+    static const char style[] = "\x1b[2;4c";
+    static const char position[] = "\x1b[2;2p";
+    static const char erase_above[] = "\x1b[ue";
+    static const char erase_below[] = "\x1b[de";
+    static const char erase_left[] = "\x1b[le";
+    static const char erase_right[] = "\x1b[re";
+    static const char erase_line[] = "\x1b[we";
+    static const char erase_cells[] = "\x1b[99e";
+    static const char insert_cells[] = "\x1b[2ti";
+    static const char delete_cells[] = "\x1b[2td";
+    static const char insert_lines[] = "\x1b[2li";
+    static const char delete_lines[] = "\x1b[2ld";
+    u32 history_rows;
+
+    prepare_csi_edit_screen();
+    history_rows = terminal.history_rows;
+    assert(terminal_write_for_process(EDITOR_TEST_PID, style,
+        sizeof(style) - 1U) == (i64)(sizeof(style) - 1U));
+    assert(terminal_write_for_process(EDITOR_TEST_PID, position,
+        sizeof(position) - 1U) == (i64)(sizeof(position) - 1U));
+    assert(terminal_write_for_process(EDITOR_TEST_PID, erase_above,
+        sizeof(erase_above) - 1U) == (i64)(sizeof(erase_above) - 1U));
+    assert(terminal.cursor_col == 1U &&
+           phys_to_live_screen_row(terminal.cursor_phys_row) == 1U);
+    for (u32 index = 0U; index <= 5U; index++) {
+        terminal_cell_t *cell = screen_cell(index / 4U, index % 4U);
+        assert(cell->codepoint == ' ' &&
+               cell->bg_color == TERMINAL_COLOR_BLUE);
+    }
+    assert(screen_cell(1U, 2U)->codepoint == 'G');
+    assert(terminal.history_rows == history_rows);
+
+    prepare_csi_edit_screen();
+    assert(terminal_write_for_process(EDITOR_TEST_PID, position,
+        sizeof(position) - 1U) == (i64)(sizeof(position) - 1U));
+    assert(terminal_write_for_process(EDITOR_TEST_PID, erase_below,
+        sizeof(erase_below) - 1U) == (i64)(sizeof(erase_below) - 1U));
+    assert(screen_cell(1U, 0U)->codepoint == 'E');
+    for (u32 index = 5U; index < 12U; index++)
+        assert(screen_cell(index / 4U, index % 4U)->codepoint == ' ');
+
+    prepare_csi_edit_screen();
+    assert(terminal_write_for_process(EDITOR_TEST_PID, position,
+        sizeof(position) - 1U) == (i64)(sizeof(position) - 1U));
+    assert(terminal_write_for_process(EDITOR_TEST_PID, erase_right,
+        sizeof(erase_right) - 1U) == (i64)(sizeof(erase_right) - 1U));
+    assert(screen_cell(1U, 0U)->codepoint == 'E');
+    for (u32 column = 1U; column < 4U; column++)
+        assert(screen_cell(1U, column)->codepoint == ' ');
+
+    prepare_csi_edit_screen();
+    assert(terminal_write_for_process(EDITOR_TEST_PID, position,
+        sizeof(position) - 1U) == (i64)(sizeof(position) - 1U));
+    assert(terminal_write_for_process(EDITOR_TEST_PID, erase_line,
+        sizeof(erase_line) - 1U) == (i64)(sizeof(erase_line) - 1U));
+    for (u32 column = 0U; column < 4U; column++)
+        assert(screen_cell(1U, column)->codepoint == ' ');
+    assert(screen_cell(0U, 3U)->codepoint == 'D');
+    assert(screen_cell(2U, 0U)->codepoint == 'I');
+    prepare_csi_edit_screen();
+    assert(terminal_write_for_process(EDITOR_TEST_PID, position,
+        sizeof(position) - 1U) == (i64)(sizeof(position) - 1U));
+    assert(terminal_write_for_process(EDITOR_TEST_PID, erase_left,
+        sizeof(erase_left) - 1U) == (i64)(sizeof(erase_left) - 1U));
+    assert(screen_cell(1U, 0U)->codepoint == ' ');
+    assert(screen_cell(1U, 1U)->codepoint == ' ');
+    assert(screen_cell(1U, 2U)->codepoint == 'G');
+    assert(terminal.cursor_col == 1U &&
+           phys_to_live_screen_row(terminal.cursor_phys_row) == 1U);
+
+    prepare_csi_edit_screen();
+    assert(terminal_move_cursor(0U, 0U));
+    assert(terminal_write_for_process(EDITOR_TEST_PID, erase_cells,
+        sizeof(erase_cells) - 1U) == (i64)(sizeof(erase_cells) - 1U));
+    for (u32 row = 0U; row < 3U; row++)
+        for (u32 column = 0U; column < 4U; column++)
+            assert(screen_cell(row, column)->codepoint == ' ');
+    assert(terminal.cursor_col == 0U &&
+           phys_to_live_screen_row(terminal.cursor_phys_row) == 0U);
+
+    prepare_csi_edit_screen();
+    u32 history_phys = (terminal.live_top_row_idx + TERMINAL_BUFFER_ROWS - 1U) %
+                       TERMINAL_BUFFER_ROWS;
+    terminal_cell_at(history_phys, 0U)->codepoint = 'H';
+    terminal.history_rows = 1U;
+    terminal.top_row_idx = history_phys;
+    assert(terminal_write_for_process(EDITOR_TEST_PID, "\x1b[se", 4U) == 4);
+    assert(terminal_cell_at(history_phys, 0U)->codepoint == 'H');
+    assert(terminal.history_rows == 1U);
+
+    prepare_csi_edit_screen();
+    assert(terminal_alternate_enter_process(EDITOR_TEST_PID));
+    assert(terminal_write_for_process(EDITOR_TEST_PID, "alt", 3U) == 3);
+    assert(terminal_write_for_process(EDITOR_TEST_PID, "\x1b[se", 4U) == 4);
+    assert(screen_cell(0U, 0U)->codepoint == ' ');
+    assert(terminal_alternate_leave_process(EDITOR_TEST_PID));
+    assert(screen_cell(0U, 0U)->codepoint == 'A');
+
+    prepare_csi_edit_screen();
+    assert(terminal_write_for_process(EDITOR_TEST_PID, insert_cells,
+        sizeof(insert_cells) - 1U) == (i64)(sizeof(insert_cells) - 1U));
+    assert(screen_cell(1U, 0U)->codepoint == 'E');
+    assert(screen_cell(1U, 1U)->codepoint == ' ');
+    assert(screen_cell(1U, 2U)->codepoint == ' ');
+    assert(screen_cell(1U, 3U)->codepoint == 'F');
+    assert(terminal.cursor_col == 1U &&
+           phys_to_live_screen_row(terminal.cursor_phys_row) == 1U);
+
+    prepare_csi_edit_screen();
+    assert(terminal_write_for_process(EDITOR_TEST_PID, delete_cells,
+        sizeof(delete_cells) - 1U) == (i64)(sizeof(delete_cells) - 1U));
+    assert(screen_cell(1U, 0U)->codepoint == 'E');
+    assert(screen_cell(1U, 1U)->codepoint == 'H');
+    assert(screen_cell(1U, 2U)->codepoint == ' ');
+    assert(screen_cell(1U, 3U)->codepoint == ' ');
+
+    prepare_csi_edit_screen();
+    assert(terminal_write_for_process(EDITOR_TEST_PID, insert_lines,
+        sizeof(insert_lines) - 1U) == (i64)(sizeof(insert_lines) - 1U));
+    assert(screen_cell(0U, 0U)->codepoint == 'A');
+    for (u32 column = 0U; column < 4U; column++) {
+        assert(screen_cell(1U, column)->codepoint == ' ');
+        assert(screen_cell(2U, column)->codepoint == ' ');
+    }
+    assert(terminal.cursor_col == 1U &&
+           phys_to_live_screen_row(terminal.cursor_phys_row) == 1U);
+
+    prepare_csi_edit_screen();
+    assert(terminal_write_for_process(EDITOR_TEST_PID, delete_lines,
+        sizeof(delete_lines) - 1U) == (i64)(sizeof(delete_lines) - 1U));
+    assert(screen_cell(0U, 0U)->codepoint == 'A');
+    for (u32 column = 0U; column < 4U; column++)
+        assert(screen_cell(1U, column)->codepoint == ' ');
+    assert(screen_cell(2U, 0U)->codepoint == ' ');
+    assert(terminal.cursor_col == 1U &&
+           phys_to_live_screen_row(terminal.cursor_phys_row) == 1U);
+}
+
+static void test_csi_erase_edit_rejection_and_isolation(void)
+{
+    terminal_output_state_t other_state;
+    terminal_csi_extended_t rejected;
+    static const char *const invalid[] = {
+        "\x1b[0e", "\x1b[1;2e", "\x1b[999999999999999999999e",
+        "\x1b[0ti", "\x1b[2xi", "\x1b[0ld", "\x1b[3;4td",
+    };
+
+    prepare_csi_edit_screen();
+    terminal_output_state_init(&other_state);
+    for (u32 index = 0U; index < sizeof(invalid) / sizeof(invalid[0]);
+         index++) {
+        usize length = strlen(invalid[index]);
+        assert(!terminal_csi_extended_parse((const u8 *)invalid[index],
+                                            (u16)length, &rejected));
+    }
+
+    static const char malformed_feed[] = "\x1b[0eX";
+    assert(terminal_write_for_process_state(101U, &test_output_state,
+        malformed_feed, sizeof(malformed_feed) - 1U) ==
+        (i64)(sizeof(malformed_feed) - 1U));
+    assert(screen_cell(0U, 0U)->codepoint == 'A');
+    assert(screen_cell(2U, 3U)->codepoint == 'L');
+
+    prepare_csi_edit_screen();
+    terminal_output_state_init(&other_state);
+    static const char prefix[] = "\x1b[2t";
+    static const char other_suffix[] = "Q";
+    static const char owner_suffix[] = "i";
+    assert(terminal_write_for_process_state(101U, &test_output_state,
+        prefix, sizeof(prefix) - 1U) == (i64)(sizeof(prefix) - 1U));
+    assert(test_output_state.pending_length == sizeof(prefix) - 1U);
+    assert(memcmp(test_output_state.pending, prefix,
+                  sizeof(prefix) - 1U) == 0);
+    assert(terminal_write_for_process_state(102U, &other_state,
+        other_suffix, sizeof(other_suffix) - 1U) ==
+        (i64)(sizeof(other_suffix) - 1U));
+    assert(phys_to_live_screen_row(terminal.cursor_phys_row) == 1U &&
+           terminal.cursor_col == 2U);
+    assert(screen_cell(1U, 1U)->codepoint == 'Q');
+    assert(test_output_state.pending_length == sizeof(prefix) - 1U);
+    assert(memcmp(test_output_state.pending, prefix,
+                  sizeof(prefix) - 1U) == 0);
+    assert(other_state.pending_length == 0U);
+    u8 complete_sequence[sizeof(prefix)];
+    memcpy(complete_sequence, prefix, sizeof(prefix) - 1U);
+    complete_sequence[sizeof(prefix) - 1U] = 'i';
+    terminal_csi_extended_t parsed_command;
+    assert(terminal_csi_extended_parse(complete_sequence,
+        sizeof(complete_sequence), &parsed_command));
+    assert(parsed_command.kind == TERMINAL_CSI_INSERT_CELLS &&
+           parsed_command.count == 2U);
+    assert(terminal_write_for_process_state(101U, &test_output_state,
+        owner_suffix, sizeof(owner_suffix) - 1U) ==
+        (i64)(sizeof(owner_suffix) - 1U));
+    assert(screen_cell(1U, 0U)->codepoint == 'E');
+    assert(screen_cell(1U, 1U)->codepoint == 'Q');
+    assert(screen_cell(1U, 2U)->codepoint == ' ');
+    assert(screen_cell(1U, 3U)->codepoint == ' ');
+}
+
 static void test_clear_sequence_preserves_viewport_cursor(void)
 {
     static const char position[] = "\x1b{at:3,4}";
@@ -3010,6 +3285,12 @@ int main(int argument_count, char **arguments)
         test_csi_cursor_commands_are_write_split_invariant();
     if (run_all || !strcmp(arguments[1], "csi-cursor-invalid"))
         test_csi_cursor_invalid_and_process_isolation();
+    if (run_all || !strcmp(arguments[1], "csi-erase-edit-splits"))
+        test_csi_erase_edit_split_invariance();
+    if (run_all || !strcmp(arguments[1], "csi-erase-edit"))
+        test_csi_erase_edit_semantics();
+    if (run_all || !strcmp(arguments[1], "csi-erase-edit-invalid"))
+        test_csi_erase_edit_rejection_and_isolation();
     if (run_all || !strcmp(arguments[1], "esc-clear-position"))
         test_clear_sequence_preserves_viewport_cursor();
     if (run_all || !strcmp(arguments[1], "clear-retains-history"))

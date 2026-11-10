@@ -48,6 +48,7 @@ typedef struct {
     u32 live_top_row_idx;
     u32 history_rows;
     bool history_view_cleared;
+    u8 history_view_clear_bg_color;
     u32 cursor_phys_row;
     u32 cursor_col;
     u8 fg_color;
@@ -69,6 +70,7 @@ typedef struct {
     u32 live_top_row_idx;   // Physical ring index of the live output origin
     u32 history_rows;       // Valid rows before live_top_row_idx
     bool history_view_cleared; // Presentation-only clear while viewing history
+    u8 history_view_clear_bg_color;
     bool viewport_redraw_pending;
     u32 cursor_phys_row;    // Physical ring buffer index of current cursor row
     u32 cursor_col;         // Current cursor column (0 .. visible_cols - 1)
@@ -405,7 +407,8 @@ static void terminal_render_screen_row(u32 screen_row) {
         u32 codepoint = !cleared_view && cell && cell->codepoint ?
                         cell->codepoint : ' ';
         u32 fg = !cleared_view && cell ? cell->fg_color : terminal.fg_color;
-        u32 bg = !cleared_view && cell ? cell->bg_color : terminal.bg_color;
+        u32 bg = cleared_view ? terminal.history_view_clear_bg_color :
+                 (cell ? cell->bg_color : terminal.bg_color);
 
         draw_codepoint(codepoint, px, py, terminal_color_pixel((u8)fg),
                        terminal_color_pixel((u8)bg));
@@ -538,6 +541,7 @@ static void terminal_scrollback_set_back_locked(u32 rows_back)
     terminal_cursor_hide_locked();
     terminal.top_row_idx = target;
     terminal.history_view_cleared = false;
+    terminal.history_view_clear_bg_color = terminal.bg_color;
     terminal.pending_scroll_rows = 0U;
     terminal.viewport_redraw_pending = false;
     terminal_redraw_locked();
@@ -563,6 +567,7 @@ void terminal_init(BOOT_INFO *BootInfo){
         TERMINAL_STYLE_DEFAULT);
     terminal.fg_color = (u8)default_style.foreground;
     terminal.bg_color = (u8)default_style.background;
+    terminal.history_view_clear_bg_color = terminal.bg_color;
 
     x250_boot_trace_event(BootInfo, 29, false,
                           "09.4.2 read display and font dimensions");
@@ -595,6 +600,7 @@ void terminal_init(BOOT_INFO *BootInfo){
     terminal.live_top_row_idx = 0;
     terminal.history_rows = 0;
     terminal.history_view_cleared = false;
+    terminal.history_view_clear_bg_color = terminal.bg_color;
     terminal.viewport_redraw_pending = false;
     terminal.cursor_phys_row = 0;
     terminal.cursor_col = 0;
@@ -1200,6 +1206,7 @@ static void terminal_clear_locked(void) {
     terminal.live_top_row_idx = 0;
     terminal.history_rows = 0U;
     terminal.history_view_cleared = false;
+    terminal.history_view_clear_bg_color = terminal.bg_color;
     terminal.viewport_redraw_pending = false;
     terminal.cursor_phys_row = 0;
     terminal.cursor_col = 0;
@@ -1241,6 +1248,7 @@ static void terminal_clear_visible_locked(void)
          * Keep every retained cell intact so returning to live or navigating
          * again can reveal the original output. */
         terminal.history_view_cleared = true;
+        terminal.history_view_clear_bg_color = terminal.bg_color;
         framebuffer_fill_rows(0U, terminal.height,
                               terminal_color_pixel(terminal.bg_color));
         terminal.vram_valid = true;
@@ -2144,6 +2152,299 @@ static bool terminal_csi_cursor_apply_locked(u64 process_id,
     }
 }
 
+typedef enum {
+    TERMINAL_CSI_ERASE_SCREEN,
+    TERMINAL_CSI_ERASE_LINE,
+    TERMINAL_CSI_ERASE_ABOVE,
+    TERMINAL_CSI_ERASE_BELOW,
+    TERMINAL_CSI_ERASE_LEFT,
+    TERMINAL_CSI_ERASE_RIGHT,
+    TERMINAL_CSI_ERASE_CELLS,
+    TERMINAL_CSI_INSERT_CELLS,
+    TERMINAL_CSI_DELETE_CELLS,
+    TERMINAL_CSI_INSERT_LINES,
+    TERMINAL_CSI_DELETE_LINES,
+} terminal_csi_extended_kind_t;
+
+typedef struct {
+    terminal_csi_extended_kind_t kind;
+    u32 count;
+} terminal_csi_extended_t;
+
+static bool terminal_csi_positive_number(const u8 *text, u32 length,
+                                         u32 default_value, u32 *out_value)
+{
+    if (!out_value) return false;
+    if (!length) {
+        *out_value = default_value;
+        return true;
+    }
+    return terminal_escape_unsigned(text, length, out_value) && *out_value;
+}
+
+static bool terminal_csi_count_selector(const u8 *body, u32 length,
+                                        u8 selector, u32 *out_count)
+{
+    if (!body || !length || body[length - 1U] != selector || !out_count)
+        return false;
+    return terminal_csi_positive_number(body, length - 1U, 1U, out_count);
+}
+
+static bool terminal_csi_extended_parse(const u8 *sequence, u16 length,
+                                        terminal_csi_extended_t *out_command)
+{
+    const u8 *body;
+    u32 body_length;
+    u8 final;
+    terminal_csi_extended_t command = {0};
+
+    if (!sequence || !out_command || length < 3U ||
+        length > TERMINAL_ESCAPE_SEQUENCE_MAX || sequence[0] != 0x1bU ||
+        sequence[1] != '[') return false;
+    body = sequence + 2U;
+    body_length = length - 3U;
+    final = sequence[length - 1U];
+
+    switch (final) {
+        case 'e':
+            if (body_length == 1U) {
+                switch (body[0]) {
+                    case 's': command.kind = TERMINAL_CSI_ERASE_SCREEN; break;
+                    case 'w': command.kind = TERMINAL_CSI_ERASE_LINE; break;
+                    case 'u': command.kind = TERMINAL_CSI_ERASE_ABOVE; break;
+                    case 'd': command.kind = TERMINAL_CSI_ERASE_BELOW; break;
+                    case 'l': command.kind = TERMINAL_CSI_ERASE_LEFT; break;
+                    case 'r': command.kind = TERMINAL_CSI_ERASE_RIGHT; break;
+                    default: return false;
+                }
+                command.count = 1U;
+            } else {
+                if (!terminal_csi_positive_number(body, body_length, 1U,
+                                                  &command.count))
+                    return false;
+                command.kind = TERMINAL_CSI_ERASE_CELLS;
+            }
+            break;
+        case 'i':
+            if (!terminal_csi_count_selector(body, body_length, 't',
+                                              &command.count)) {
+                if (!terminal_csi_count_selector(body, body_length, 'l',
+                                                  &command.count)) return false;
+                command.kind = TERMINAL_CSI_INSERT_LINES;
+            } else {
+                command.kind = TERMINAL_CSI_INSERT_CELLS;
+            }
+            break;
+        case 'd':
+            if (!terminal_csi_count_selector(body, body_length, 't',
+                                              &command.count)) {
+                if (!terminal_csi_count_selector(body, body_length, 'l',
+                                                  &command.count)) return false;
+                command.kind = TERMINAL_CSI_DELETE_LINES;
+            } else {
+                command.kind = TERMINAL_CSI_DELETE_CELLS;
+            }
+            break;
+        default:
+            return false;
+    }
+    *out_command = command;
+    return true;
+}
+
+static terminal_cell_t *terminal_csi_live_cell(u32 row, u32 column)
+{
+    if (row >= terminal.visible_rows || column >= terminal.visible_cols)
+        return NULL;
+    return terminal_cell_at(live_screen_to_phys_row(row), column);
+}
+
+static void terminal_csi_blank_cell(u32 row, u32 column,
+                                    const terminal_output_state_t *state)
+{
+    terminal_cell_t *cell = terminal_csi_live_cell(row, column);
+    if (!cell || !state) return;
+    cell->codepoint = ' ';
+    cell->fg_color = state->foreground;
+    cell->bg_color = state->background;
+}
+
+static void terminal_csi_render_live_rows(u32 first, u32 last)
+{
+    if (!terminal.alternate_active && !terminal_view_is_live_locked()) return;
+    if (last >= terminal.visible_rows) last = terminal.visible_rows - 1U;
+    for (u32 row = first; row <= last; row++)
+        terminal_render_screen_row(row);
+}
+
+static void terminal_csi_erase_cells_locked(
+    terminal_output_state_t *state, const terminal_csi_extended_t *command)
+{
+    u32 row = phys_to_live_screen_row(terminal.cursor_phys_row);
+    u32 column = terminal.cursor_col;
+    u32 first_index = 0U;
+    u32 last_index = terminal.visible_rows * terminal.visible_cols - 1U;
+    u32 width = terminal.visible_cols;
+    u32 cursor_index;
+
+    if (row >= terminal.visible_rows) row = terminal.visible_rows - 1U;
+    if (column >= width) column = width - 1U;
+    cursor_index = row * width + column;
+    switch (command->kind) {
+        case TERMINAL_CSI_ERASE_SCREEN:
+            if (!terminal.alternate_active &&
+                !terminal_view_is_live_locked()) {
+                terminal_overlay_clear_locked(true);
+                terminal_cursor_hide_locked();
+                terminal.history_view_cleared = true;
+                terminal.history_view_clear_bg_color = state->background;
+                for (u32 screen_row = 0U;
+                     screen_row < terminal.visible_rows; screen_row++)
+                    terminal_render_screen_row(screen_row);
+                terminal_cursor_show_locked();
+                return;
+            }
+            break;
+        case TERMINAL_CSI_ERASE_LINE:
+            first_index = row * width;
+            last_index = first_index + width - 1U;
+            break;
+        case TERMINAL_CSI_ERASE_ABOVE:
+            last_index = cursor_index;
+            break;
+        case TERMINAL_CSI_ERASE_BELOW:
+            first_index = cursor_index;
+            break;
+        case TERMINAL_CSI_ERASE_LEFT:
+            first_index = row * width;
+            last_index = cursor_index;
+            break;
+        case TERMINAL_CSI_ERASE_RIGHT:
+            first_index = cursor_index;
+            last_index = row * width + width - 1U;
+            break;
+        case TERMINAL_CSI_ERASE_CELLS:
+            first_index = cursor_index;
+            if (command->count - 1U <
+                terminal.visible_rows * width - cursor_index)
+                last_index = cursor_index + command->count - 1U;
+            break;
+        default:
+            return;
+    }
+
+    terminal_overlay_clear_locked(true);
+    terminal_cursor_hide_locked();
+    for (u32 index = first_index; index <= last_index; index++)
+        terminal_csi_blank_cell(index / width, index % width, state);
+    terminal_csi_render_live_rows(first_index / width, last_index / width);
+    terminal_cursor_show_locked();
+}
+
+static void terminal_csi_copy_live_row(u32 destination, u32 source)
+{
+    terminal_cell_t *destination_cell = terminal_csi_live_cell(destination, 0U);
+    terminal_cell_t *source_cell = terminal_csi_live_cell(source, 0U);
+    if (!destination_cell || !source_cell) return;
+    memmove(destination_cell, source_cell,
+            terminal.visible_cols * sizeof(terminal_cell_t));
+}
+
+static void terminal_csi_fill_row(u32 row,
+                                  const terminal_output_state_t *state)
+{
+    for (u32 column = 0U; column < terminal.visible_cols; column++)
+        terminal_csi_blank_cell(row, column, state);
+}
+
+static void terminal_csi_edit_locked(
+    terminal_output_state_t *state, const terminal_csi_extended_t *command)
+{
+    u32 row = phys_to_live_screen_row(terminal.cursor_phys_row);
+    u32 column = terminal.cursor_col;
+    u32 count = command->count;
+    bool insert = command->kind == TERMINAL_CSI_INSERT_CELLS ||
+                  command->kind == TERMINAL_CSI_INSERT_LINES;
+    bool lines = command->kind == TERMINAL_CSI_INSERT_LINES ||
+                 command->kind == TERMINAL_CSI_DELETE_LINES;
+
+    if (row >= terminal.visible_rows) row = terminal.visible_rows - 1U;
+    if (column >= terminal.visible_cols) column = terminal.visible_cols - 1U;
+    terminal_overlay_clear_locked(true);
+    terminal_cursor_hide_locked();
+
+    if (!lines) {
+        u32 available = terminal.visible_cols - column;
+        if (count > available) count = available;
+        u32 physical_row = live_screen_to_phys_row(row);
+        terminal_cell_t *first = terminal_cell_at(physical_row, column);
+        if (first && count) {
+            if (insert) {
+                u32 movable = available - count;
+                if (movable)
+                    memmove(first + count, first,
+                            movable * sizeof(terminal_cell_t));
+                for (u32 index = 0U; index < count; index++)
+                    terminal_csi_blank_cell(row, column + index, state);
+            } else {
+                u32 movable = available - count;
+                if (movable)
+                    memmove(first, first + count,
+                            movable * sizeof(terminal_cell_t));
+                for (u32 index = available - count; index < available; index++)
+                    terminal_csi_blank_cell(row, column + index, state);
+            }
+        }
+        terminal_csi_render_live_rows(row, row);
+    } else {
+        u32 bottom = terminal.visible_rows - 1U;
+        u32 available = bottom - row + 1U;
+        if (count > available) count = available;
+        if (insert) {
+            for (u32 offset = available; offset > count; offset--)
+                terminal_csi_copy_live_row(row + offset - 1U,
+                                           row + offset - count - 1U);
+            for (u32 offset = 0U; offset < count; offset++)
+                terminal_csi_fill_row(row + offset, state);
+        } else {
+            for (u32 offset = 0U; offset + count < available; offset++)
+                terminal_csi_copy_live_row(row + offset,
+                                           row + offset + count);
+            for (u32 offset = available - count; offset < available; offset++)
+                terminal_csi_fill_row(row + offset, state);
+        }
+        terminal_csi_render_live_rows(row, bottom);
+    }
+    terminal_cursor_show_locked();
+}
+
+static bool terminal_csi_extended_apply_locked(
+    u64 process_id, terminal_output_state_t *state,
+    const terminal_csi_extended_t *command)
+{
+    if (!state || !command || !terminal_process_controls_locked(process_id))
+        return false;
+    switch (command->kind) {
+        case TERMINAL_CSI_ERASE_SCREEN:
+        case TERMINAL_CSI_ERASE_LINE:
+        case TERMINAL_CSI_ERASE_ABOVE:
+        case TERMINAL_CSI_ERASE_BELOW:
+        case TERMINAL_CSI_ERASE_LEFT:
+        case TERMINAL_CSI_ERASE_RIGHT:
+        case TERMINAL_CSI_ERASE_CELLS:
+            terminal_csi_erase_cells_locked(state, command);
+            return true;
+        case TERMINAL_CSI_INSERT_CELLS:
+        case TERMINAL_CSI_DELETE_CELLS:
+        case TERMINAL_CSI_INSERT_LINES:
+        case TERMINAL_CSI_DELETE_LINES:
+            terminal_csi_edit_locked(state, command);
+            return true;
+        default:
+            return false;
+    }
+}
+
 void terminal_output_state_init(terminal_output_state_t *state)
 {
     terminal_style_t style;
@@ -2324,6 +2625,40 @@ static bool terminal_csi_apply_style_sequence_locked(
 
 static void terminal_output_feed_byte_locked(u64 process_id,
                                              terminal_output_state_t *state,
+                                             u8 byte);
+
+static void terminal_csi_feed_extended_final_locked(
+    u64 process_id, terminal_output_state_t *state, u8 final,
+    bool may_be_parameter)
+{
+    terminal_csi_extended_t command;
+
+    if (state->pending_length >= TERMINAL_ESCAPE_SEQUENCE_MAX) {
+        terminal_output_flush_pending_locked(state);
+        terminal_output_feed_byte_locked(process_id, state, final);
+        return;
+    }
+    state->pending[state->pending_length++] = final;
+    if (terminal_csi_extended_parse(state->pending, state->pending_length,
+                                    &command)) {
+        if (terminal_csi_extended_apply_locked(process_id, state, &command)) {
+            state->pending_length = 0U;
+        } else {
+            terminal_output_flush_pending_locked(state);
+        }
+        return;
+    }
+
+    state->pending_length--;
+    if (may_be_parameter) {
+        state->pending[state->pending_length++] = final;
+    } else {
+        terminal_output_flush_pending_locked(state);
+    }
+}
+
+static void terminal_output_feed_byte_locked(u64 process_id,
+                                             terminal_output_state_t *state,
                                              u8 byte)
 {
     if (!state->pending_length) {
@@ -2355,8 +2690,8 @@ static void terminal_output_feed_byte_locked(u64 process_id,
         bool parameter_byte = (byte >= '0' && byte <= '9') || byte == ';' ||
             byte == '-' || byte == '+' || byte == 'b' || byte == 'd' ||
             byte == 'u' || byte == 'i' || byte == 'r' || byte == 'l' ||
-            byte == 'h' ||
-            byte == 's' || byte == 'v';
+            byte == 'h' || byte == 's' || byte == 'v' || byte == 't' ||
+            byte == 'w';
 
         if (byte == 0x1bU || byte < 0x20U || byte == 0x7fU) {
             terminal_output_flush_pending_locked(state);
@@ -2394,6 +2729,16 @@ static void terminal_output_feed_byte_locked(u64 process_id,
             }
             return;
         }
+        if (byte == 'e') {
+            terminal_csi_feed_extended_final_locked(process_id, state, byte,
+                                                    false);
+            return;
+        }
+        if (byte == 'i' || byte == 'd') {
+            terminal_csi_feed_extended_final_locked(process_id, state, byte,
+                                                    true);
+            return;
+        }
         if (!parameter_byte ||
             state->pending_length >= TERMINAL_ESCAPE_SEQUENCE_MAX) {
             terminal_output_flush_pending_locked(state);
@@ -2401,10 +2746,7 @@ static void terminal_output_feed_byte_locked(u64 process_id,
             return;
         }
         state->pending[state->pending_length++] = byte;
-        /* u/d/r can be either the final cursor-motion letter or a character
-         * attribute before c. Defer those endings until the next byte makes
-         * the intended command decidable. At process finish, a complete
-         * standalone motion is applied. */
+        /* Retain a possible parameter or command prefix across writes. */
         return;
     }
 
@@ -2513,6 +2855,7 @@ static void terminal_save_normal_state_locked(void)
     saved->live_top_row_idx = terminal.live_top_row_idx;
     saved->history_rows = terminal.history_rows;
     saved->history_view_cleared = terminal.history_view_cleared;
+    saved->history_view_clear_bg_color = terminal.history_view_clear_bg_color;
     saved->cursor_phys_row = terminal.cursor_phys_row;
     saved->cursor_col = terminal.cursor_col;
     saved->fg_color = terminal.fg_color;
@@ -2540,6 +2883,7 @@ static bool terminal_restore_normal_state_locked(void)
     terminal.live_top_row_idx = saved.live_top_row_idx;
     terminal.history_rows = saved.history_rows;
     terminal.history_view_cleared = saved.history_view_cleared;
+    terminal.history_view_clear_bg_color = saved.history_view_clear_bg_color;
     terminal.viewport_redraw_pending = false;
     terminal.cursor_phys_row = saved.cursor_phys_row;
     terminal.cursor_col = saved.cursor_col;
@@ -2591,6 +2935,7 @@ static bool terminal_alternate_enter_process_locked(u64 process_id)
     terminal.live_top_row_idx = 0;
     terminal.history_rows = 0U;
     terminal.history_view_cleared = false;
+    terminal.history_view_clear_bg_color = terminal.bg_color;
     terminal.viewport_redraw_pending = false;
     terminal.cursor_phys_row = 0;
     terminal.cursor_col = 0;
