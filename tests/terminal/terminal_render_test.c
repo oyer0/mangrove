@@ -1648,6 +1648,307 @@ static void test_csi_style_rejection_and_split_state(void)
     assert(test_output_state.attributes == 0U);
 }
 
+static void test_csi_cursor_commands(void)
+{
+    initialize(640U, 480U);
+    static const char position[] = "\x1b[30;12p";
+    assert(terminal_write_for_process(EDITOR_TEST_PID, position,
+        sizeof(position) - 1U) == (i64)(sizeof(position) - 1U));
+    assert(terminal.cursor_col == 29U);
+    assert(phys_to_live_screen_row(terminal.cursor_phys_row) == 11U);
+
+    static const char column[] = "\x1b[5x";
+    assert(terminal_write_for_process(EDITOR_TEST_PID, column,
+        sizeof(column) - 1U) == (i64)(sizeof(column) - 1U));
+    assert(terminal.cursor_col == 4U);
+    assert(phys_to_live_screen_row(terminal.cursor_phys_row) == 11U);
+
+    static const char row[] = "\x1b[7y";
+    assert(terminal_write_for_process(EDITOR_TEST_PID, row,
+        sizeof(row) - 1U) == (i64)(sizeof(row) - 1U));
+    assert(terminal.cursor_col == 4U);
+    assert(phys_to_live_screen_row(terminal.cursor_phys_row) == 6U);
+
+    static const char home[] = "\x1b[p";
+    assert(terminal_write_for_process(EDITOR_TEST_PID, home,
+        sizeof(home) - 1U) == (i64)(sizeof(home) - 1U));
+    assert(terminal.cursor_col == 0U);
+    assert(phys_to_live_screen_row(terminal.cursor_phys_row) == 0U);
+
+    static const char movement[] = "\x1b[3R\x1b[2D\x1b[4L\x1b[3U";
+    assert(terminal_write_for_process(EDITOR_TEST_PID, movement,
+        sizeof(movement) - 1U) == (i64)(sizeof(movement) - 1U));
+    assert(terminal.cursor_col == 0U);
+    assert(phys_to_live_screen_row(terminal.cursor_phys_row) == 0U);
+
+    static const char one_cell_each[] =
+        "\x1b[5;5p\x1b[U\x1b[D\x1b[L\x1b[R";
+    assert(terminal_write_for_process(EDITOR_TEST_PID, one_cell_each,
+        sizeof(one_cell_each) - 1U) ==
+        (i64)(sizeof(one_cell_each) - 1U));
+    assert(terminal.cursor_col == 4U);
+    assert(phys_to_live_screen_row(terminal.cursor_phys_row) == 4U);
+
+    initialize(160U, 96U);
+    static const char far_position[] = "\x1b[999;999p";
+    assert(terminal_write_for_process(EDITOR_TEST_PID, far_position,
+        sizeof(far_position) - 1U) == (i64)(sizeof(far_position) - 1U));
+    assert(terminal.cursor_col == terminal.visible_cols - 1U);
+    assert(phys_to_live_screen_row(terminal.cursor_phys_row) ==
+           terminal.visible_rows - 1U);
+
+    static const char up_then_text[] = "\x1b[2UZ";
+    assert(terminal_write_for_process(EDITOR_TEST_PID, up_then_text,
+        sizeof(up_then_text) - 1U) == (i64)(sizeof(up_then_text) - 1U));
+    assert(phys_to_live_screen_row(terminal.cursor_phys_row) ==
+           terminal.visible_rows - 3U);
+    assert(screen_cell(terminal.visible_rows - 3U, terminal.visible_cols - 1U)
+               ->codepoint == 'Z');
+
+    static const char clamp_top_left[] = "\x1b[999U\x1b[999L";
+    assert(terminal_write_for_process(EDITOR_TEST_PID, clamp_top_left,
+        sizeof(clamp_top_left) - 1U) == (i64)(sizeof(clamp_top_left) - 1U));
+    assert(terminal.cursor_col == 0U);
+    assert(phys_to_live_screen_row(terminal.cursor_phys_row) == 0U);
+
+    static const char clamp_bottom_right[] = "\x1b[999D\x1b[999R";
+    assert(terminal_write_for_process(EDITOR_TEST_PID, clamp_bottom_right,
+        sizeof(clamp_bottom_right) - 1U) ==
+        (i64)(sizeof(clamp_bottom_right) - 1U));
+    assert(terminal.cursor_col == terminal.visible_cols - 1U);
+    assert(phys_to_live_screen_row(terminal.cursor_phys_row) ==
+           terminal.visible_rows - 1U);
+
+    static const char standalone_down[] = "\x1b[p\x1b[3D";
+    assert(terminal_write_for_process(EDITOR_TEST_PID, standalone_down,
+        sizeof(standalone_down) - 1U) ==
+        (i64)(sizeof(standalone_down) - 1U));
+    assert(phys_to_live_screen_row(terminal.cursor_phys_row) == 3U);
+}
+
+static void test_csi_cursor_controls_and_saved_position(void)
+{
+    terminal_output_state_t other_state;
+    initialize(160U, 96U);
+    terminal_output_state_init(&other_state);
+
+    static const char set_position[] = "\x1b[4;3p\x1b[+k";
+    assert(terminal_write_for_process_state(101U, &test_output_state,
+        set_position, sizeof(set_position) - 1U) ==
+        (i64)(sizeof(set_position) - 1U));
+    assert(test_output_state.saved_cursor_valid);
+    assert(test_output_state.saved_cursor_column == 3U);
+    assert(test_output_state.saved_cursor_row == 2U);
+
+    static const char shape_hide[] = "\x1b[uk\x1b[hk";
+    assert(terminal_write_for_process_state(101U, &test_output_state,
+        shape_hide, sizeof(shape_hide) - 1U) ==
+        (i64)(sizeof(shape_hide) - 1U));
+    assert(terminal.cursor_shape == TERMINAL_CURSOR_SHAPE_UNDERLINE);
+    assert(!terminal.cursor_enabled);
+
+    static const char other_hide[] = "\x1b[hk";
+    assert(terminal_write_for_process_state(102U, &other_state, other_hide,
+        sizeof(other_hide) - 1U) == (i64)(sizeof(other_hide) - 1U));
+    assert(!terminal.cursor_enabled);
+
+    /* A second process has no saved position and cannot restore the first
+     * process's saved cursor location. */
+    static const char restore_other[] = "\x1b[-k";
+    assert(terminal_write_for_process_state(102U, &other_state, restore_other,
+        sizeof(restore_other) - 1U) ==
+        (i64)(sizeof(restore_other) - 1U));
+    assert(terminal.cursor_col == 3U);
+    assert(phys_to_live_screen_row(terminal.cursor_phys_row) == 2U);
+
+    static const char move_and_restore[] = "\x1b[p\x1b[-k";
+    assert(terminal_write_for_process_state(101U, &test_output_state,
+        move_and_restore, sizeof(move_and_restore) - 1U) ==
+        (i64)(sizeof(move_and_restore) - 1U));
+    assert(terminal.cursor_col == 3U);
+    assert(phys_to_live_screen_row(terminal.cursor_phys_row) == 2U);
+    assert(!terminal.cursor_enabled);
+    assert(terminal.cursor_shape == TERMINAL_CURSOR_SHAPE_UNDERLINE);
+
+    static const char switch_shapes[] = "\x1b[bk\x1b[vk\x1b[sk";
+    assert(terminal_write_for_process_state(101U, &test_output_state,
+        switch_shapes, sizeof(switch_shapes) - 1U) ==
+        (i64)(sizeof(switch_shapes) - 1U));
+    assert(terminal.cursor_shape == TERMINAL_CURSOR_SHAPE_BAR);
+    assert(terminal.cursor_enabled);
+    static const char block_shape[] = "\x1b[bk";
+    assert(terminal_write_for_process_state(101U, &test_output_state,
+        block_shape, sizeof(block_shape) - 1U) ==
+        (i64)(sizeof(block_shape) - 1U));
+    assert(terminal.cursor_shape == TERMINAL_CURSOR_SHAPE_BLOCK);
+    static const char restore_bar[] = "\x1b[vk";
+    assert(terminal_write_for_process_state(101U, &test_output_state,
+        restore_bar, sizeof(restore_bar) - 1U) ==
+        (i64)(sizeof(restore_bar) - 1U));
+    assert(terminal.cursor_shape == TERMINAL_CURSOR_SHAPE_BAR);
+
+    /* Cursor shape belongs to the active screen, while saved positions stay
+     * in each process's output state. The main screen's shape is restored. */
+    static const char underline_shape[] = "\x1b[uk";
+    assert(terminal_write_for_process_state(101U, &test_output_state,
+        underline_shape, sizeof(underline_shape) - 1U) ==
+        (i64)(sizeof(underline_shape) - 1U));
+    assert(terminal_alternate_enter_process(101U));
+    assert(terminal.cursor_shape == TERMINAL_CURSOR_SHAPE_BLOCK);
+    static const char bar_shape[] = "\x1b[vk";
+    assert(terminal_write_for_process_state(101U, &test_output_state,
+        bar_shape, sizeof(bar_shape) - 1U) ==
+        (i64)(sizeof(bar_shape) - 1U));
+    assert(terminal.cursor_shape == TERMINAL_CURSOR_SHAPE_BAR);
+    assert(terminal_alternate_leave_process(101U));
+    assert(terminal.cursor_shape == TERMINAL_CURSOR_SHAPE_UNDERLINE);
+
+    /* Restore clamps the saved coordinates against current dimensions. */
+    terminal.visible_rows = 2U;
+    terminal.visible_cols = 3U;
+    static const char shrink_restore[] = "\x1b[-k";
+    assert(terminal_write_for_process_state(101U, &test_output_state,
+        shrink_restore, sizeof(shrink_restore) - 1U) ==
+        (i64)(sizeof(shrink_restore) - 1U));
+    assert(terminal.cursor_col == 2U);
+    assert(phys_to_live_screen_row(terminal.cursor_phys_row) == 1U);
+}
+
+typedef struct {
+    u32 row;
+    u32 column;
+    u32 saved_row;
+    u32 saved_column;
+    u8 shape;
+    bool enabled;
+    bool visible;
+    bool saved_valid;
+} csi_cursor_snapshot_t;
+
+static void prepare_csi_cursor_split_state(void)
+{
+    initialize(640U, 480U);
+    assert(terminal_move_cursor(10U, 10U));
+    assert(terminal_set_cursor_visible(true));
+    terminal.cursor_shape = TERMINAL_CURSOR_SHAPE_BLOCK;
+    test_output_state.saved_cursor_valid = true;
+    test_output_state.saved_cursor_row = 7U;
+    test_output_state.saved_cursor_column = 8U;
+}
+
+static csi_cursor_snapshot_t capture_csi_cursor_snapshot(void)
+{
+    csi_cursor_snapshot_t snapshot = {
+        .row = phys_to_live_screen_row(terminal.cursor_phys_row),
+        .column = terminal.cursor_col,
+        .saved_row = test_output_state.saved_cursor_row,
+        .saved_column = test_output_state.saved_cursor_column,
+        .shape = terminal.cursor_shape,
+        .enabled = terminal.cursor_enabled,
+        .visible = terminal.cursor_visible,
+        .saved_valid = test_output_state.saved_cursor_valid,
+    };
+    return snapshot;
+}
+
+static void assert_csi_cursor_snapshot_equal(csi_cursor_snapshot_t left,
+                                              csi_cursor_snapshot_t right)
+{
+    assert(left.row == right.row);
+    assert(left.column == right.column);
+    assert(left.saved_row == right.saved_row);
+    assert(left.saved_column == right.saved_column);
+    assert(left.shape == right.shape);
+    assert(left.enabled == right.enabled);
+    assert(left.visible == right.visible);
+    assert(left.saved_valid == right.saved_valid);
+}
+
+static void test_csi_cursor_commands_are_write_split_invariant(void)
+{
+    static const char *const commands[] = {
+        "\x1b[3U", "\x1b[3D", "\x1b[3L", "\x1b[3R",
+        "\x1b[U", "\x1b[D", "\x1b[L", "\x1b[R",
+        "\x1b[30;12p", "\x1b[30x", "\x1b[12y", "\x1b[p",
+        "\x1b[hk", "\x1b[sk", "\x1b[bk", "\x1b[uk", "\x1b[vk",
+        "\x1b[+k", "\x1b[-k",
+    };
+
+    for (u32 command_index = 0U;
+         command_index < sizeof(commands) / sizeof(commands[0]);
+         command_index++) {
+        const char *command = commands[command_index];
+        u32 command_length = (u32)strlen(command);
+        csi_cursor_snapshot_t expected;
+
+        prepare_csi_cursor_split_state();
+        assert(terminal_write_for_process(EDITOR_TEST_PID, command,
+                                          command_length) ==
+               (i64)command_length);
+        expected = capture_csi_cursor_snapshot();
+
+        for (u32 split = 1U; split < command_length; split++) {
+            prepare_csi_cursor_split_state();
+            assert(terminal_write_for_process(EDITOR_TEST_PID, command,
+                                              split) == split);
+            assert(terminal_write_for_process(EDITOR_TEST_PID, command + split,
+                                              command_length - split) ==
+                   (i64)(command_length - split));
+            assert_csi_cursor_snapshot_equal(
+                capture_csi_cursor_snapshot(), expected);
+        }
+    }
+}
+
+static void test_csi_cursor_invalid_and_process_isolation(void)
+{
+    terminal_output_state_t other_state;
+    terminal_csi_cursor_t rejected;
+    initialize(640U, 480U);
+    terminal_output_state_init(&other_state);
+    static const char invalid_position[] = "\x1b[1;2;3p";
+    assert(!terminal_csi_cursor_parse((const u8 *)invalid_position,
+        sizeof(invalid_position) - 1U, &rejected));
+
+    static const char invalid_move[] = "\x1b[0U";
+    assert(!terminal_csi_cursor_parse((const u8 *)invalid_move,
+        sizeof(invalid_move) - 1U, &rejected));
+
+    static const char zero_axis[] = "\x1b[0x";
+    assert(!terminal_csi_cursor_parse((const u8 *)zero_axis,
+        sizeof(zero_axis) - 1U, &rejected));
+
+    static const char overflow[] = "\x1b[999999999999999999999y";
+    assert(!terminal_csi_cursor_parse((const u8 *)overflow,
+        sizeof(overflow) - 1U, &rejected));
+
+    static const char malformed_feed[] = "\x1b[1;2;3p";
+    assert(terminal_write_for_process_state(101U, &test_output_state,
+        malformed_feed, sizeof(malformed_feed) - 1U) ==
+        (i64)(sizeof(malformed_feed) - 1U));
+    assert(test_output_state.pending_length == 0U);
+
+    static const char start_at_row[] = "\x1b[1;5p";
+    assert(terminal_write_for_process_state(101U, &test_output_state,
+        start_at_row, sizeof(start_at_row) - 1U) ==
+        (i64)(sizeof(start_at_row) - 1U));
+    static const char prefix[] = "\x1b[3";
+    static const char other_text[] = "UQ";
+    static const char suffix[] = "U";
+    assert(terminal_write_for_process_state(101U, &test_output_state,
+        prefix, sizeof(prefix) - 1U) == (i64)(sizeof(prefix) - 1U));
+    assert(test_output_state.pending_length == sizeof(prefix) - 1U);
+    assert(terminal_write_for_process_state(102U, &other_state, other_text,
+        sizeof(other_text) - 1U) == (i64)(sizeof(other_text) - 1U));
+    assert(test_output_state.pending_length == sizeof(prefix) - 1U);
+    assert(phys_to_live_screen_row(terminal.cursor_phys_row) == 4U);
+    assert(terminal_write_for_process_state(101U, &test_output_state,
+        suffix, sizeof(suffix) - 1U) == (i64)(sizeof(suffix) - 1U));
+    assert(test_output_state.pending_length == 0U);
+    assert(other_state.pending_length == 0U);
+    assert(phys_to_live_screen_row(terminal.cursor_phys_row) == 1U);
+}
+
 static void test_clear_sequence_preserves_viewport_cursor(void)
 {
     static const char position[] = "\x1b{at:3,4}";
@@ -2701,6 +3002,14 @@ int main(int argument_count, char **arguments)
         test_csi_character_styling();
     if (run_all || !strcmp(arguments[1], "csi-style-state"))
         test_csi_style_rejection_and_split_state();
+    if (run_all || !strcmp(arguments[1], "csi-cursor"))
+        test_csi_cursor_commands();
+    if (run_all || !strcmp(arguments[1], "csi-cursor-state"))
+        test_csi_cursor_controls_and_saved_position();
+    if (run_all || !strcmp(arguments[1], "csi-cursor-splits"))
+        test_csi_cursor_commands_are_write_split_invariant();
+    if (run_all || !strcmp(arguments[1], "csi-cursor-invalid"))
+        test_csi_cursor_invalid_and_process_isolation();
     if (run_all || !strcmp(arguments[1], "esc-clear-position"))
         test_clear_sequence_preserves_viewport_cursor();
     if (run_all || !strcmp(arguments[1], "clear-retains-history"))

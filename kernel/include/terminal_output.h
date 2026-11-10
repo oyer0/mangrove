@@ -21,5 +21,8 @@ typedef struct {
     /* Preserved per process even where the active renderer has no visual
      * implementation for a requested text attribute. */
     u8 attributes;
+    bool saved_cursor_valid;
+    u32 saved_cursor_row;
+    u32 saved_cursor_column;
     bool initialized;
 } terminal_output_state_t;

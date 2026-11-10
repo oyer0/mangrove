@@ -54,6 +54,7 @@ typedef struct {
     u8 bg_color;
     bool cursor_visible;
     bool cursor_enabled;
+    u8 cursor_shape;
     bool vram_valid;
     utf8_decoder_t utf8_decoder;
     bool cursor_blink_pending;
@@ -82,6 +83,7 @@ typedef struct {
 
     bool cursor_visible;
     bool cursor_enabled;
+    u8 cursor_shape;
     bool vram_valid;        // Indicates if VRAM cache is synchronized with ring buffer
     utf8_decoder_t utf8_decoder;
 
@@ -108,6 +110,12 @@ typedef struct {
     u32 columns;
     terminal_cell_t cells[TERMINAL_MAX_OVERLAY_ROWS * TERMINAL_MAX_COLS];
 } terminal_overlay_t;
+
+enum {
+    TERMINAL_CURSOR_SHAPE_BLOCK = 0U,
+    TERMINAL_CURSOR_SHAPE_UNDERLINE,
+    TERMINAL_CURSOR_SHAPE_BAR,
+};
 
 static terminal_t terminal;
 static struct {
@@ -152,6 +160,7 @@ static bool terminal_process_controls_locked(u64 process_id);
 static bool terminal_alternate_enter_process_locked(u64 process_id);
 static bool terminal_alternate_leave_process_locked(u64 process_id);
 static bool terminal_move_cursor_locked(u32 row, u32 column);
+static bool terminal_move_cursor_relative_locked(u32 direction, u32 amount);
 static void terminal_set_cursor_visible_locked(bool visible);
 static bool terminal_clear_current_line_locked(void);
 static bool terminal_clear_current_to_end_locked(void);
@@ -594,6 +603,7 @@ void terminal_init(BOOT_INFO *BootInfo){
     /* Startup output is noninteractive.  Keep the cursor disabled until an
      * input owner explicitly requests it through the terminal interface. */
     terminal.cursor_enabled = false;
+    terminal.cursor_shape = TERMINAL_CURSOR_SHAPE_BLOCK;
     terminal.vram_valid = false;
     terminal.batch_active = false;
     terminal.pending_scroll_rows = 0;
@@ -1955,6 +1965,185 @@ static void terminal_csi_style_apply(terminal_output_state_t *state,
                              (u8)~style->attributes_clear);
 }
 
+typedef enum {
+    TERMINAL_CSI_CURSOR_MOVE,
+    TERMINAL_CSI_CURSOR_POSITION,
+    TERMINAL_CSI_CURSOR_COLUMN,
+    TERMINAL_CSI_CURSOR_ROW,
+    TERMINAL_CSI_CURSOR_HOME,
+    TERMINAL_CSI_CURSOR_HIDE,
+    TERMINAL_CSI_CURSOR_SHOW,
+    TERMINAL_CSI_CURSOR_SHAPE,
+    TERMINAL_CSI_CURSOR_SAVE,
+    TERMINAL_CSI_CURSOR_RESTORE,
+} terminal_csi_cursor_kind_t;
+
+typedef struct {
+    terminal_csi_cursor_kind_t kind;
+    u8 direction;
+    u8 shape;
+    u32 first;
+    u32 second;
+} terminal_csi_cursor_t;
+
+static bool terminal_csi_cursor_parse(const u8 *sequence, u16 length,
+                                      terminal_csi_cursor_t *out_command)
+{
+    u32 body_length;
+    const u8 *body;
+    u8 final;
+    terminal_csi_cursor_t command = {0};
+
+    if (!sequence || !out_command || length < 3U ||
+        length > TERMINAL_ESCAPE_SEQUENCE_MAX || sequence[0] != 0x1bU ||
+        sequence[1] != '[') return false;
+    body = sequence + 2U;
+    body_length = length - 3U;
+    final = sequence[length - 1U];
+    switch (final) {
+        case 'U': case 'D': case 'L': case 'R':
+            command.kind = TERMINAL_CSI_CURSOR_MOVE;
+            command.direction = final;
+            if (!body_length) command.first = 1U;
+            else if (!terminal_escape_unsigned(body, body_length,
+                                               &command.first) ||
+                     !command.first) return false;
+            break;
+        case 'p':
+            if (!body_length) {
+                command.kind = TERMINAL_CSI_CURSOR_HOME;
+                break;
+            }
+            command.kind = TERMINAL_CSI_CURSOR_POSITION;
+            {
+                u32 separator = 0U;
+                while (separator < body_length && body[separator] != ';')
+                    separator++;
+                if (!separator || separator + 1U >= body_length ||
+                    !terminal_escape_unsigned(body, separator,
+                                              &command.first) ||
+                    !command.first ||
+                    !terminal_escape_unsigned(body + separator + 1U,
+                        body_length - separator - 1U, &command.second) ||
+                    !command.second)
+                    return false;
+            }
+            break;
+        case 'x': case 'y':
+            if (!body_length ||
+                !terminal_escape_unsigned(body, body_length,
+                                          &command.first) || !command.first)
+                return false;
+            command.kind = final == 'x' ? TERMINAL_CSI_CURSOR_COLUMN :
+                                          TERMINAL_CSI_CURSOR_ROW;
+            break;
+        case 'k':
+            if (body_length != 1U) return false;
+            switch (body[0]) {
+                case 'h': command.kind = TERMINAL_CSI_CURSOR_HIDE; break;
+                case 's': command.kind = TERMINAL_CSI_CURSOR_SHOW; break;
+                case 'b':
+                    command.kind = TERMINAL_CSI_CURSOR_SHAPE;
+                    command.shape = TERMINAL_CURSOR_SHAPE_BLOCK;
+                    break;
+                case 'u':
+                    command.kind = TERMINAL_CSI_CURSOR_SHAPE;
+                    command.shape = TERMINAL_CURSOR_SHAPE_UNDERLINE;
+                    break;
+                case 'v':
+                    command.kind = TERMINAL_CSI_CURSOR_SHAPE;
+                    command.shape = TERMINAL_CURSOR_SHAPE_BAR;
+                    break;
+                case '+': command.kind = TERMINAL_CSI_CURSOR_SAVE; break;
+                case '-': command.kind = TERMINAL_CSI_CURSOR_RESTORE; break;
+                default: return false;
+            }
+            break;
+        default:
+            return false;
+    }
+    *out_command = command;
+    return true;
+}
+
+static u32 terminal_clamp_one_based(u32 value, u32 extent)
+{
+    if (!extent) return 0U;
+    if (!value || value > extent) return extent - 1U;
+    return value - 1U;
+}
+
+static bool terminal_csi_cursor_apply_locked(u64 process_id,
+                                             terminal_output_state_t *state,
+                                             const terminal_csi_cursor_t *command)
+{
+    u32 row;
+    u32 column;
+
+    if (!state || !command || !terminal_process_controls_locked(process_id))
+        return false;
+    row = phys_to_live_screen_row(terminal.cursor_phys_row);
+    column = terminal.cursor_col;
+    if (row >= terminal.visible_rows)
+        row = terminal.visible_rows ? terminal.visible_rows - 1U : 0U;
+    if (column >= terminal.visible_cols)
+        column = terminal.visible_cols ? terminal.visible_cols - 1U : 0U;
+
+    switch (command->kind) {
+        case TERMINAL_CSI_CURSOR_MOVE:
+            switch (command->direction) {
+                case 'U': return terminal_move_cursor_relative_locked(
+                    TERMINAL_ESCAPE_MOVE_UP, command->first);
+                case 'D': return terminal_move_cursor_relative_locked(
+                    TERMINAL_ESCAPE_MOVE_DOWN, command->first);
+                case 'L': return terminal_move_cursor_relative_locked(
+                    TERMINAL_ESCAPE_MOVE_LEFT, command->first);
+                case 'R': return terminal_move_cursor_relative_locked(
+                    TERMINAL_ESCAPE_MOVE_RIGHT, command->first);
+                default: return false;
+            }
+        case TERMINAL_CSI_CURSOR_POSITION:
+            column = terminal_clamp_one_based(command->first,
+                                               terminal.visible_cols);
+            row = terminal_clamp_one_based(command->second,
+                                            terminal.visible_rows);
+            return terminal_move_cursor_locked(row, column);
+        case TERMINAL_CSI_CURSOR_COLUMN:
+            column = terminal_clamp_one_based(command->first,
+                                               terminal.visible_cols);
+            return terminal_move_cursor_locked(row, column);
+        case TERMINAL_CSI_CURSOR_ROW:
+            row = terminal_clamp_one_based(command->first,
+                                            terminal.visible_rows);
+            return terminal_move_cursor_locked(row, column);
+        case TERMINAL_CSI_CURSOR_HOME:
+            return terminal_move_cursor_locked(0U, 0U);
+        case TERMINAL_CSI_CURSOR_HIDE:
+            terminal_set_cursor_visible_locked(false);
+            return true;
+        case TERMINAL_CSI_CURSOR_SHOW:
+            terminal_set_cursor_visible_locked(true);
+            return true;
+        case TERMINAL_CSI_CURSOR_SHAPE:
+            terminal.cursor_shape = command->shape;
+            return true;
+        case TERMINAL_CSI_CURSOR_SAVE:
+            state->saved_cursor_row = row;
+            state->saved_cursor_column = column;
+            state->saved_cursor_valid = true;
+            return true;
+        case TERMINAL_CSI_CURSOR_RESTORE:
+            if (!state->saved_cursor_valid) return true;
+            row = terminal_clamp_one_based(state->saved_cursor_row + 1U,
+                                            terminal.visible_rows);
+            column = terminal_clamp_one_based(
+                state->saved_cursor_column + 1U, terminal.visible_cols);
+            return terminal_move_cursor_locked(row, column);
+        default:
+            return false;
+    }
+}
+
 void terminal_output_state_init(terminal_output_state_t *state)
 {
     terminal_style_t style;
@@ -1983,8 +2172,7 @@ static void terminal_output_flush_pending_locked(terminal_output_state_t *state)
                                          state->background);
 }
 
-static bool terminal_move_cursor_relative_locked(
-    terminal_escape_kind_t direction, u32 amount)
+static bool terminal_move_cursor_relative_locked(u32 direction, u32 amount)
 {
     u32 row = phys_to_live_screen_row(terminal.cursor_phys_row);
     u32 column;
@@ -2114,6 +2302,15 @@ static void terminal_output_literal_byte_locked(
                                      state->background);
 }
 
+static bool terminal_csi_apply_cursor_sequence_locked(
+    u64 process_id, terminal_output_state_t *state, u16 length)
+{
+    terminal_csi_cursor_t command;
+
+    return terminal_csi_cursor_parse(state->pending, length, &command) &&
+           terminal_csi_cursor_apply_locked(process_id, state, &command);
+}
+
 static bool terminal_csi_apply_style_sequence_locked(
     u64 process_id, terminal_output_state_t *state, u16 length)
 {
@@ -2156,8 +2353,10 @@ static void terminal_output_feed_byte_locked(u64 process_id,
 
     if (state->pending_length >= 2U && state->pending[1] == '[') {
         bool parameter_byte = (byte >= '0' && byte <= '9') || byte == ';' ||
-            byte == '-' || byte == 'b' || byte == 'd' || byte == 'u' ||
-            byte == 'i' || byte == 'r';
+            byte == '-' || byte == '+' || byte == 'b' || byte == 'd' ||
+            byte == 'u' || byte == 'i' || byte == 'r' || byte == 'l' ||
+            byte == 'h' ||
+            byte == 's' || byte == 'v';
 
         if (byte == 0x1bU || byte < 0x20U || byte == 0x7fU) {
             terminal_output_flush_pending_locked(state);
@@ -2179,6 +2378,22 @@ static void terminal_output_feed_byte_locked(u64 process_id,
             }
             return;
         }
+        if (byte == 'k' || byte == 'p' || byte == 'x' || byte == 'y' ||
+            byte == 'U' || byte == 'D' || byte == 'L' || byte == 'R') {
+            if (state->pending_length >= TERMINAL_ESCAPE_SEQUENCE_MAX) {
+                terminal_output_flush_pending_locked(state);
+                terminal_output_feed_byte_locked(process_id, state, byte);
+                return;
+            }
+            state->pending[state->pending_length++] = byte;
+            if (terminal_csi_apply_cursor_sequence_locked(
+                    process_id, state, state->pending_length)) {
+                state->pending_length = 0U;
+            } else {
+                terminal_output_flush_pending_locked(state);
+            }
+            return;
+        }
         if (!parameter_byte ||
             state->pending_length >= TERMINAL_ESCAPE_SEQUENCE_MAX) {
             terminal_output_flush_pending_locked(state);
@@ -2186,6 +2401,10 @@ static void terminal_output_feed_byte_locked(u64 process_id,
             return;
         }
         state->pending[state->pending_length++] = byte;
+        /* u/d/r can be either the final cursor-motion letter or a character
+         * attribute before c. Defer those endings until the next byte makes
+         * the intended command decidable. At process finish, a complete
+         * standalone motion is applied. */
         return;
     }
 
@@ -2300,6 +2519,7 @@ static void terminal_save_normal_state_locked(void)
     saved->bg_color = terminal.bg_color;
     saved->cursor_visible = terminal.cursor_visible;
     saved->cursor_enabled = terminal.cursor_enabled;
+    saved->cursor_shape = terminal.cursor_shape;
     saved->vram_valid = terminal.vram_valid;
     saved->utf8_decoder = terminal.utf8_decoder;
     saved->cursor_blink_pending = cursor_blink_pending;
@@ -2326,6 +2546,7 @@ static bool terminal_restore_normal_state_locked(void)
     terminal.fg_color = saved.fg_color;
     terminal.bg_color = saved.bg_color;
     terminal.cursor_enabled = saved.cursor_enabled;
+    terminal.cursor_shape = saved.cursor_shape;
     terminal.utf8_decoder = saved.utf8_decoder;
     terminal.cursor_visible = false;
     terminal.vram_valid = false;
@@ -2375,6 +2596,7 @@ static bool terminal_alternate_enter_process_locked(u64 process_id)
     terminal.cursor_col = 0;
     terminal.cursor_visible = false;
     terminal.cursor_enabled = true;
+    terminal.cursor_shape = TERMINAL_CURSOR_SHAPE_BLOCK;
     terminal.pending_scroll_rows = 0;
     terminal.vram_valid = false;
     terminal_reset_dirty();

@@ -267,12 +267,17 @@ A C program can emit the same stream with `printf("\x1b{fg:green}...")` or
 `console_write()`; Shoot's `say -e` explicitly translates `\e` in an
 argument to the ESC byte.
 
-The CSI character-styling command currently recognized is:
+The CSI styling and cursor commands currently recognized are:
 
 | Sequence | Effect |
 | --- | --- |
 | `ESC[FG;BGc`, `ESC[FGc`, `ESC[;BGc` | Set numeric foreground and/or background palette indices from 0 through 15. An empty field leaves that color unchanged; `-` restores its default. `ESC[-c`, `ESC[;-c`, and `ESC[-;-c` reset foreground, background, or both while retaining attributes. `ESC[c` resets all styling. |
 | `ESC[bc`, `ESC[dc`, `ESC[uc`, `ESC[ic`, `ESC[rc` | Enable bold, dim, underline, italic, or reverse-video state. Prefix the attribute with `-` to disable it. Attributes are retained per process but are not visually rendered by the current framebuffer renderer. |
+| `ESC[30;12p`, `ESC[30x`, `ESC[12y`, `ESC[p` | Set one-based X/Y position, column, row, or home. Valid out-of-range coordinates clamp to the visible grid; zero, malformed values, and numeric overflow reject the complete command. |
+| `ESC[3U`, `ESC[3D`, `ESC[3L`, `ESC[3R`; `ESC[U`, `ESC[D`, `ESC[L`, `ESC[R` | Move up, down, left, or right by the positive parameter, defaulting to one cell. Motion clamps at the visible screen edge and does not wrap. Uppercase finals keep cursor movement distinct from lowercase styling attributes. |
+| `ESC[hk`, `ESC[sk` | Hide or show the active screen's cursor. |
+| `ESC[bk`, `ESC[uk`, `ESC[vk` | Store block, underline, or vertical-bar cursor shape for the active screen. The framebuffer cursor currently renders the same inverted-cell shape for each value. |
+| `ESC[+k`, `ESC[-k` | Save or restore the position in the calling process's output state. Restoring clamps to current dimensions. |
 
 The legacy command set remains accepted while existing output producers are
 migrated:
@@ -291,13 +296,13 @@ migrated:
 Only the exact forms above are recognized; compatibility aliases and RGB
 colors are not accepted. A candidate sequence is bounded to 128 bytes
 including its introducer and final. The parser validates a complete command
-before applying it and keeps parse/style state per process.
+before applying it and keeps parse/style/saved-position state per process.
 Different processes cannot complete each other's partial sequences. Unknown,
 malformed, oversized, and process-final incomplete sequences are rendered as
 literal text (ESC itself appears as the replacement glyph). A rejected
-command is not applied; buffered bytes are rendered literally. Output writes
-are serialized under the terminal lock; separate process writes may appear
-between one another's completed commands.
+command has no terminal-state side effect. Output writes are serialized under
+the terminal lock; separate process writes may appear between one another's
+completed commands.
 
 Commands use the existing terminal control authorization. A process that does
 not own an active alternate screen cannot write to it or change it. The ESC
