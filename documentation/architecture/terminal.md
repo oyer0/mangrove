@@ -280,6 +280,10 @@ The CSI styling and cursor commands currently recognized are:
 | `ESC[Ne` | Erase `N` cells starting at the cursor; an omitted count means one. Counts clamp at the visible screen end. Erasing writes blank cells using the current output background and does not move the cursor or shift content. A visible-screen erase preserves scrollback. |
 | `ESC[Nti`, `ESC[Ntd` | Insert or delete `N` character cells starting at the cursor. `N` defaults to one and clamps at the current line's right edge. |
 | `ESC[Nli`, `ESC[Nld` | Insert or delete `N` lines starting at the cursor. `N` defaults to one and clamps at the bottom of the active screen. Lines shift only within the remaining visible screen area; content shifted past its edge is discarded. |
+| `ESC[Nus`, `ESC[Nds` | Scroll the active buffer up or down by `N` rows; the omitted count defaults to one and excessive counts clamp to the region height. Scrolling preserves the cursor and does not add rows to scrollback. |
+| `ESC[TOP;BOTTOMs`, `ESC[;s` | Set an inclusive one-based scrolling region or restore the full-screen region. Invalid, reversed, zero, out-of-range, or overflowing bounds reject the command. The region is saved across alternate-screen use; line insertion and deletion are limited to its remaining rows. |
+| `ESC[av`, `ESC[mv` | Enter the owned alternate screen or return to the retained main screen. The alternate screen starts with a full-screen scroll region and wrapping enabled; returning restores both main-screen settings. |
+| `ESC[wv`, `ESC[-wv` | Enable or disable automatic line wrapping on the active screen. With wrapping disabled, printing at the last column replaces that cell rather than advancing to the next row. The setting is restored with the main screen after alternate-screen use. |
 | `ESC[hk`, `ESC[sk` | Hide or show the active screen's cursor. |
 | `ESC[bk`, `ESC[uk`, `ESC[vk` | Store block, underline, or vertical-bar cursor shape for the active screen. The framebuffer cursor currently renders the same inverted-cell shape for each value. |
 | `ESC[+k`, `ESC[-k` | Save or restore the position in the calling process's output state. Restoring clamps to current dimensions. |

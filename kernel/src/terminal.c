@@ -49,6 +49,8 @@ typedef struct {
     u32 history_rows;
     bool history_view_cleared;
     u8 history_view_clear_bg_color;
+    u32 scroll_top;
+    u32 scroll_bottom;
     u32 cursor_phys_row;
     u32 cursor_col;
     u8 fg_color;
@@ -56,6 +58,7 @@ typedef struct {
     bool cursor_visible;
     bool cursor_enabled;
     u8 cursor_shape;
+    bool auto_wrap;
     bool vram_valid;
     utf8_decoder_t utf8_decoder;
     bool cursor_blink_pending;
@@ -71,6 +74,8 @@ typedef struct {
     u32 history_rows;       // Valid rows before live_top_row_idx
     bool history_view_cleared; // Presentation-only clear while viewing history
     u8 history_view_clear_bg_color;
+    u32 scroll_top;
+    u32 scroll_bottom;
     bool viewport_redraw_pending;
     u32 cursor_phys_row;    // Physical ring buffer index of current cursor row
     u32 cursor_col;         // Current cursor column (0 .. visible_cols - 1)
@@ -86,6 +91,7 @@ typedef struct {
     bool cursor_visible;
     bool cursor_enabled;
     u8 cursor_shape;
+    bool auto_wrap;
     bool vram_valid;        // Indicates if VRAM cache is synchronized with ring buffer
     utf8_decoder_t utf8_decoder;
 
@@ -610,6 +616,9 @@ void terminal_init(BOOT_INFO *BootInfo){
      * input owner explicitly requests it through the terminal interface. */
     terminal.cursor_enabled = false;
     terminal.cursor_shape = TERMINAL_CURSOR_SHAPE_BLOCK;
+    terminal.auto_wrap = true;
+    terminal.scroll_top = 0U;
+    terminal.scroll_bottom = terminal.visible_rows - 1U;
     terminal.vram_valid = false;
     terminal.batch_active = false;
     terminal.pending_scroll_rows = 0;
@@ -1037,8 +1046,10 @@ static void terminal_put_codepoint_with_colors_locked(u32 codepoint,
 
     if (codepoint == '\t') {
         bool own_batch = !terminal.batch_active;
-        if (terminal.cursor_col >= terminal.visible_cols)
+        if (terminal.cursor_col >= terminal.visible_cols && terminal.auto_wrap)
             terminal_newline();
+        else if (terminal.cursor_col >= terminal.visible_cols)
+            terminal.cursor_col = terminal.visible_cols - 1U;
         u32 spaces = TERMINAL_TAB_WIDTH -
                      (terminal.cursor_col % TERMINAL_TAB_WIDTH);
         if (own_batch) terminal_begin_batch_locked();
@@ -1049,8 +1060,10 @@ static void terminal_put_codepoint_with_colors_locked(u32 codepoint,
         return;
     }
 
-    if (terminal.cursor_col >= terminal.visible_cols) {
+    if (terminal.cursor_col >= terminal.visible_cols && terminal.auto_wrap) {
         terminal_newline();
+    } else if (terminal.cursor_col >= terminal.visible_cols) {
+        terminal.cursor_col = terminal.visible_cols - 1U;
     }
 
     /* Track in text buffer */
@@ -1072,6 +1085,8 @@ static void terminal_put_codepoint_with_colors_locked(u32 codepoint,
     }
 
     terminal.cursor_col++;
+    if (!terminal.auto_wrap && terminal.cursor_col >= terminal.visible_cols)
+        terminal.cursor_col = terminal.visible_cols - 1U;
 
     /* Flush immediately if not in batch mode */
     if (!terminal.batch_active) {
@@ -2164,11 +2179,21 @@ typedef enum {
     TERMINAL_CSI_DELETE_CELLS,
     TERMINAL_CSI_INSERT_LINES,
     TERMINAL_CSI_DELETE_LINES,
+    TERMINAL_CSI_SCROLL_UP,
+    TERMINAL_CSI_SCROLL_DOWN,
+    TERMINAL_CSI_SCROLL_REGION,
+    TERMINAL_CSI_SCROLL_REGION_RESET,
+    TERMINAL_CSI_ALTERNATE_SCREEN,
+    TERMINAL_CSI_MAIN_SCREEN,
+    TERMINAL_CSI_AUTOWRAP_ENABLE,
+    TERMINAL_CSI_AUTOWRAP_DISABLE,
 } terminal_csi_extended_kind_t;
 
 typedef struct {
     terminal_csi_extended_kind_t kind;
     u32 count;
+    u32 first;
+    u32 second;
 } terminal_csi_extended_t;
 
 static bool terminal_csi_positive_number(const u8 *text, u32 length,
@@ -2244,6 +2269,48 @@ static bool terminal_csi_extended_parse(const u8 *sequence, u16 length,
             } else {
                 command.kind = TERMINAL_CSI_DELETE_CELLS;
             }
+            break;
+        case 's':
+            if (body_length == 1U && body[0] == ';') {
+                command.kind = TERMINAL_CSI_SCROLL_REGION_RESET;
+                break;
+            }
+            if (body_length >= 1U &&
+                (body[body_length - 1U] == 'u' ||
+                 body[body_length - 1U] == 'd')) {
+                u32 direction_length = body_length - 1U;
+                u8 direction = body[body_length - 1U];
+                if (!terminal_csi_positive_number(body, direction_length,
+                        1U, &command.count)) return false;
+                command.kind = direction == 'u' ? TERMINAL_CSI_SCROLL_UP :
+                                                  TERMINAL_CSI_SCROLL_DOWN;
+                break;
+            }
+            {
+                u32 separator = 0U;
+                while (separator < body_length && body[separator] != ';')
+                    separator++;
+                if (!separator || separator + 1U >= body_length ||
+                    !terminal_csi_positive_number(body, separator, 0U,
+                                                  &command.first) ||
+                    !terminal_csi_positive_number(body + separator + 1U,
+                        body_length - separator - 1U, 0U, &command.second) ||
+                    command.first > command.second ||
+                    command.second > terminal.visible_rows)
+                    return false;
+                command.kind = TERMINAL_CSI_SCROLL_REGION;
+            }
+            break;
+        case 'v':
+            if (body_length == 1U && body[0] == 'a')
+                command.kind = TERMINAL_CSI_ALTERNATE_SCREEN;
+            else if (body_length == 1U && body[0] == 'm')
+                command.kind = TERMINAL_CSI_MAIN_SCREEN;
+            else if (body_length == 1U && body[0] == 'w')
+                command.kind = TERMINAL_CSI_AUTOWRAP_ENABLE;
+            else if (body_length == 2U && body[0] == '-' && body[1] == 'w')
+                command.kind = TERMINAL_CSI_AUTOWRAP_DISABLE;
+            else return false;
             break;
         default:
             return false;
@@ -2396,8 +2463,9 @@ static void terminal_csi_edit_locked(
             }
         }
         terminal_csi_render_live_rows(row, row);
-    } else {
-        u32 bottom = terminal.visible_rows - 1U;
+    } else if (row >= terminal.scroll_top && row <= terminal.scroll_bottom) {
+        u32 bottom = terminal.scroll_bottom;
+        u32 end = bottom + 1U;
         u32 available = bottom - row + 1U;
         if (count > available) count = available;
         if (insert) {
@@ -2413,8 +2481,34 @@ static void terminal_csi_edit_locked(
             for (u32 offset = available - count; offset < available; offset++)
                 terminal_csi_fill_row(row + offset, state);
         }
-        terminal_csi_render_live_rows(row, bottom);
+        terminal_csi_render_live_rows(row, end - 1U);
     }
+    terminal_cursor_show_locked();
+}
+
+static void terminal_csi_scroll_locked(
+    terminal_output_state_t *state, const terminal_csi_extended_t *command)
+{
+    u32 top = terminal.scroll_top;
+    u32 bottom = terminal.scroll_bottom;
+    u32 height = bottom - top + 1U;
+    u32 count = command->count > height ? height : command->count;
+
+    terminal_overlay_clear_locked(true);
+    terminal_cursor_hide_locked();
+    if (command->kind == TERMINAL_CSI_SCROLL_UP) {
+        for (u32 offset = 0U; offset + count < height; offset++)
+            terminal_csi_copy_live_row(top + offset, top + offset + count);
+        for (u32 offset = height - count; offset < height; offset++)
+            terminal_csi_fill_row(top + offset, state);
+    } else {
+        for (u32 offset = height; offset > count; offset--)
+            terminal_csi_copy_live_row(top + offset - 1U,
+                                       top + offset - count - 1U);
+        for (u32 offset = 0U; offset < count; offset++)
+            terminal_csi_fill_row(top + offset, state);
+    }
+    terminal_csi_render_live_rows(top, bottom);
     terminal_cursor_show_locked();
 }
 
@@ -2439,6 +2533,40 @@ static bool terminal_csi_extended_apply_locked(
         case TERMINAL_CSI_INSERT_LINES:
         case TERMINAL_CSI_DELETE_LINES:
             terminal_csi_edit_locked(state, command);
+            return true;
+        case TERMINAL_CSI_SCROLL_UP:
+        case TERMINAL_CSI_SCROLL_DOWN:
+            terminal_csi_scroll_locked(state, command);
+            return true;
+        case TERMINAL_CSI_SCROLL_REGION:
+            terminal.scroll_top = command->first - 1U;
+            terminal.scroll_bottom = command->second - 1U;
+            return true;
+        case TERMINAL_CSI_SCROLL_REGION_RESET:
+            terminal.scroll_top = 0U;
+            terminal.scroll_bottom = terminal.visible_rows - 1U;
+            return true;
+        case TERMINAL_CSI_ALTERNATE_SCREEN:
+            if (terminal.alternate_active)
+                return terminal.alternate_owner_pid == process_id;
+            if (!terminal_alternate_enter_process_locked(process_id))
+                return false;
+            terminal_begin_batch_locked();
+            return true;
+        case TERMINAL_CSI_MAIN_SCREEN:
+            if (!terminal.alternate_active) return true;
+            if (!terminal_process_is_owner_locked(process_id) ||
+                !terminal_alternate_leave_process_locked(process_id))
+                return false;
+            terminal_begin_batch_locked();
+            return true;
+        case TERMINAL_CSI_AUTOWRAP_ENABLE:
+            terminal.auto_wrap = true;
+            return true;
+        case TERMINAL_CSI_AUTOWRAP_DISABLE:
+            terminal.auto_wrap = false;
+            if (terminal.cursor_col >= terminal.visible_cols)
+                terminal.cursor_col = terminal.visible_cols - 1U;
             return true;
         default:
             return false;
@@ -2691,7 +2819,7 @@ static void terminal_output_feed_byte_locked(u64 process_id,
             byte == '-' || byte == '+' || byte == 'b' || byte == 'd' ||
             byte == 'u' || byte == 'i' || byte == 'r' || byte == 'l' ||
             byte == 'h' || byte == 's' || byte == 'v' || byte == 't' ||
-            byte == 'w';
+            byte == 'w' || byte == 'a' || byte == 'm';
 
         if (byte == 0x1bU || byte < 0x20U || byte == 0x7fU) {
             terminal_output_flush_pending_locked(state);
@@ -2734,7 +2862,7 @@ static void terminal_output_feed_byte_locked(u64 process_id,
                                                     false);
             return;
         }
-        if (byte == 'i' || byte == 'd') {
+        if (byte == 'i' || byte == 'd' || byte == 's' || byte == 'v') {
             terminal_csi_feed_extended_final_locked(process_id, state, byte,
                                                     true);
             return;
@@ -2856,6 +2984,8 @@ static void terminal_save_normal_state_locked(void)
     saved->history_rows = terminal.history_rows;
     saved->history_view_cleared = terminal.history_view_cleared;
     saved->history_view_clear_bg_color = terminal.history_view_clear_bg_color;
+    saved->scroll_top = terminal.scroll_top;
+    saved->scroll_bottom = terminal.scroll_bottom;
     saved->cursor_phys_row = terminal.cursor_phys_row;
     saved->cursor_col = terminal.cursor_col;
     saved->fg_color = terminal.fg_color;
@@ -2863,6 +2993,7 @@ static void terminal_save_normal_state_locked(void)
     saved->cursor_visible = terminal.cursor_visible;
     saved->cursor_enabled = terminal.cursor_enabled;
     saved->cursor_shape = terminal.cursor_shape;
+    saved->auto_wrap = terminal.auto_wrap;
     saved->vram_valid = terminal.vram_valid;
     saved->utf8_decoder = terminal.utf8_decoder;
     saved->cursor_blink_pending = cursor_blink_pending;
@@ -2884,6 +3015,8 @@ static bool terminal_restore_normal_state_locked(void)
     terminal.history_rows = saved.history_rows;
     terminal.history_view_cleared = saved.history_view_cleared;
     terminal.history_view_clear_bg_color = saved.history_view_clear_bg_color;
+    terminal.scroll_top = saved.scroll_top;
+    terminal.scroll_bottom = saved.scroll_bottom;
     terminal.viewport_redraw_pending = false;
     terminal.cursor_phys_row = saved.cursor_phys_row;
     terminal.cursor_col = saved.cursor_col;
@@ -2891,6 +3024,7 @@ static bool terminal_restore_normal_state_locked(void)
     terminal.bg_color = saved.bg_color;
     terminal.cursor_enabled = saved.cursor_enabled;
     terminal.cursor_shape = saved.cursor_shape;
+    terminal.auto_wrap = saved.auto_wrap;
     terminal.utf8_decoder = saved.utf8_decoder;
     terminal.cursor_visible = false;
     terminal.vram_valid = false;
@@ -2936,12 +3070,15 @@ static bool terminal_alternate_enter_process_locked(u64 process_id)
     terminal.history_rows = 0U;
     terminal.history_view_cleared = false;
     terminal.history_view_clear_bg_color = terminal.bg_color;
+    terminal.scroll_top = 0U;
+    terminal.scroll_bottom = terminal.visible_rows - 1U;
     terminal.viewport_redraw_pending = false;
     terminal.cursor_phys_row = 0;
     terminal.cursor_col = 0;
     terminal.cursor_visible = false;
     terminal.cursor_enabled = true;
     terminal.cursor_shape = TERMINAL_CURSOR_SHAPE_BLOCK;
+    terminal.auto_wrap = true;
     terminal.pending_scroll_rows = 0;
     terminal.vram_valid = false;
     terminal_reset_dirty();

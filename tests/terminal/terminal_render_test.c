@@ -1953,6 +1953,10 @@ typedef struct {
     u32 cells[12];
     u32 cursor_row;
     u32 cursor_column;
+    u32 scroll_top;
+    u32 scroll_bottom;
+    bool alternate;
+    bool auto_wrap;
 } csi_edit_snapshot_t;
 
 static void prepare_csi_edit_screen(void)
@@ -1980,6 +1984,10 @@ static csi_edit_snapshot_t capture_csi_edit_snapshot(void)
                 screen_cell(row, column)->codepoint;
     snapshot.cursor_row = phys_to_live_screen_row(terminal.cursor_phys_row);
     snapshot.cursor_column = terminal.cursor_col;
+    snapshot.scroll_top = terminal.scroll_top;
+    snapshot.scroll_bottom = terminal.scroll_bottom;
+    snapshot.alternate = terminal.alternate_active;
+    snapshot.auto_wrap = terminal.auto_wrap;
     return snapshot;
 }
 
@@ -1989,6 +1997,10 @@ static void assert_csi_edit_snapshots_equal(csi_edit_snapshot_t left,
     assert(memcmp(left.cells, right.cells, sizeof(left.cells)) == 0);
     assert(left.cursor_row == right.cursor_row);
     assert(left.cursor_column == right.cursor_column);
+    assert(left.scroll_top == right.scroll_top);
+    assert(left.scroll_bottom == right.scroll_bottom);
+    assert(left.alternate == right.alternate);
+    assert(left.auto_wrap == right.auto_wrap);
 }
 
 static void test_csi_erase_edit_split_invariance(void)
@@ -1997,6 +2009,7 @@ static void test_csi_erase_edit_split_invariance(void)
         "\x1b[se", "\x1b[we", "\x1b[ue", "\x1b[de",
         "\x1b[le", "\x1b[re", "\x1b[5e", "\x1b[e",
         "\x1b[5ti", "\x1b[5td", "\x1b[3li", "\x1b[3ld",
+        "\x1b[ti", "\x1b[td", "\x1b[li", "\x1b[ld",
     };
 
     for (u32 command_index = 0U;
@@ -2222,6 +2235,173 @@ static void test_csi_erase_edit_rejection_and_isolation(void)
     assert(screen_cell(1U, 1U)->codepoint == 'Q');
     assert(screen_cell(1U, 2U)->codepoint == ' ');
     assert(screen_cell(1U, 3U)->codepoint == ' ');
+}
+
+static void test_csi_scroll_screen_split_invariance(void)
+{
+    static const char *const commands[] = {
+        "\x1b[us", "\x1b[ds", "\x1b[3us", "\x1b[3ds",
+        "\x1b[2;3s", "\x1b[;s", "\x1b[av", "\x1b[mv",
+        "\x1b[wv", "\x1b[-wv",
+    };
+
+    for (u32 command_index = 0U;
+         command_index < sizeof(commands) / sizeof(commands[0]);
+         command_index++) {
+        const char *command = commands[command_index];
+        u32 length = (u32)strlen(command);
+        csi_edit_snapshot_t expected;
+
+        prepare_csi_edit_screen();
+        if (!strcmp(command, "\x1b[;s")) {
+            terminal.scroll_top = 1U;
+            terminal.scroll_bottom = 1U;
+        }
+        if (!strcmp(command, "\x1b[mv"))
+            assert(terminal_alternate_enter_process(EDITOR_TEST_PID));
+        assert(terminal_write_for_process(EDITOR_TEST_PID, command, length) ==
+               (i64)length);
+        expected = capture_csi_edit_snapshot();
+
+        for (u32 split = 1U; split < length; split++) {
+            prepare_csi_edit_screen();
+            if (!strcmp(command, "\x1b[;s")) {
+                terminal.scroll_top = 1U;
+                terminal.scroll_bottom = 1U;
+            }
+            if (!strcmp(command, "\x1b[mv"))
+                assert(terminal_alternate_enter_process(EDITOR_TEST_PID));
+            assert(terminal_write_for_process(EDITOR_TEST_PID, command,
+                                              split) == (i64)split);
+            assert(terminal_write_for_process(EDITOR_TEST_PID, command + split,
+                    length - split) == (i64)(length - split));
+            assert_csi_edit_snapshots_equal(capture_csi_edit_snapshot(),
+                                            expected);
+        }
+    }
+}
+
+static void test_csi_scroll_regions_and_screen_state(void)
+{
+    static const char region[] = "\x1b[2;3s";
+    static const char scroll_up[] = "\x1b[us";
+    static const char scroll_down[] = "\x1b[ds";
+    static const char reset_region[] = "\x1b[;s";
+    static const char enter_alternate[] = "\x1b[av";
+    static const char return_main[] = "\x1b[mv";
+    static const char disable_wrap[] = "\x1b[-wv";
+    static const char enable_wrap[] = "\x1b[wv";
+
+    prepare_csi_edit_screen();
+    u32 history_rows = terminal.history_rows;
+    assert(terminal_write_for_process(EDITOR_TEST_PID, region,
+        sizeof(region) - 1U) == (i64)(sizeof(region) - 1U));
+    assert(terminal.scroll_top == 1U && terminal.scroll_bottom == 2U);
+    assert(terminal_write_for_process(EDITOR_TEST_PID, scroll_up,
+        sizeof(scroll_up) - 1U) == (i64)(sizeof(scroll_up) - 1U));
+    assert(screen_cell(0U, 0U)->codepoint == 'A');
+    assert(screen_cell(1U, 0U)->codepoint == 'I');
+    for (u32 column = 0U; column < 4U; column++)
+        assert(screen_cell(2U, column)->codepoint == ' ');
+    assert(terminal.history_rows == history_rows);
+    assert(terminal.cursor_col == 1U &&
+           phys_to_live_screen_row(terminal.cursor_phys_row) == 1U);
+    assert(terminal_write_for_process(EDITOR_TEST_PID, scroll_down,
+        sizeof(scroll_down) - 1U) == (i64)(sizeof(scroll_down) - 1U));
+    for (u32 column = 0U; column < 4U; column++)
+        assert(screen_cell(1U, column)->codepoint == ' ');
+    assert(screen_cell(2U, 0U)->codepoint == 'I');
+
+    assert(terminal_write_for_process(EDITOR_TEST_PID, reset_region,
+        sizeof(reset_region) - 1U) == (i64)(sizeof(reset_region) - 1U));
+    assert(terminal.scroll_top == 0U && terminal.scroll_bottom == 2U);
+
+    initialize(52U, 400U);
+    static const char long_region[] = "\x1b[5;20s";
+    assert(terminal.visible_rows >= 20U);
+    assert(terminal_write_for_process(EDITOR_TEST_PID, long_region,
+        sizeof(long_region) - 1U) == (i64)(sizeof(long_region) - 1U));
+    assert(terminal.scroll_top == 4U && terminal.scroll_bottom == 19U);
+
+    static const char edit_region[] = "\x1b[1;2s";
+    static const char insert_line[] = "\x1b[li";
+    static const char delete_line[] = "\x1b[ld";
+    prepare_csi_edit_screen();
+    assert(terminal_write_for_process(EDITOR_TEST_PID, edit_region,
+        sizeof(edit_region) - 1U) == (i64)(sizeof(edit_region) - 1U));
+    assert(terminal_move_cursor(0U, 0U));
+    assert(terminal_write_for_process(EDITOR_TEST_PID, insert_line,
+        sizeof(insert_line) - 1U) == (i64)(sizeof(insert_line) - 1U));
+    assert(screen_cell(0U, 0U)->codepoint == ' ');
+    assert(screen_cell(1U, 0U)->codepoint == 'A');
+    assert(screen_cell(2U, 0U)->codepoint == 'I');
+
+    prepare_csi_edit_screen();
+    assert(terminal_write_for_process(EDITOR_TEST_PID, edit_region,
+        sizeof(edit_region) - 1U) == (i64)(sizeof(edit_region) - 1U));
+    assert(terminal_move_cursor(0U, 0U));
+    assert(terminal_write_for_process(EDITOR_TEST_PID, delete_line,
+        sizeof(delete_line) - 1U) == (i64)(sizeof(delete_line) - 1U));
+    assert(screen_cell(0U, 0U)->codepoint == 'E');
+    assert(screen_cell(1U, 0U)->codepoint == ' ');
+    assert(screen_cell(2U, 0U)->codepoint == 'I');
+
+    prepare_csi_edit_screen();
+    assert(terminal_write_for_process(EDITOR_TEST_PID, region,
+        sizeof(region) - 1U) == (i64)(sizeof(region) - 1U));
+    assert(terminal_write_for_process(EDITOR_TEST_PID, disable_wrap,
+        sizeof(disable_wrap) - 1U) == (i64)(sizeof(disable_wrap) - 1U));
+    terminal_clear_locked();
+    assert(terminal_write_for_process(EDITOR_TEST_PID, "ABCD", 4U) == 4);
+    assert(terminal.cursor_col == 3U);
+    assert(terminal_write_for_process(EDITOR_TEST_PID, "X", 1U) == 1);
+    assert(screen_cell(0U, 3U)->codepoint == 'X');
+    assert(screen_cell(1U, 0U)->codepoint == ' ');
+    assert(terminal_write_for_process(EDITOR_TEST_PID, enable_wrap,
+        sizeof(enable_wrap) - 1U) == (i64)(sizeof(enable_wrap) - 1U));
+    assert(terminal_write_for_process(EDITOR_TEST_PID, "YZ", 2U) == 2);
+    assert(screen_cell(0U, 3U)->codepoint == 'Y');
+    assert(screen_cell(1U, 0U)->codepoint == 'Z');
+
+    prepare_csi_edit_screen();
+    assert(terminal_write_for_process(EDITOR_TEST_PID, region,
+        sizeof(region) - 1U) == (i64)(sizeof(region) - 1U));
+    assert(terminal_write_for_process(EDITOR_TEST_PID, disable_wrap,
+        sizeof(disable_wrap) - 1U) == (i64)(sizeof(disable_wrap) - 1U));
+    assert(terminal_write_for_process(EDITOR_TEST_PID, enter_alternate,
+        sizeof(enter_alternate) - 1U) == (i64)(sizeof(enter_alternate) - 1U));
+    assert(terminal.alternate_active && terminal.auto_wrap);
+    assert(terminal.scroll_top == 0U && terminal.scroll_bottom == 2U);
+    terminal_output_state_t other_state;
+    terminal_output_state_init(&other_state);
+    static const char unauthorized_return[] = "\x1b[mv";
+    assert(terminal_write_for_process_state(EDITOR_TEST_PID + 1U, &other_state,
+        unauthorized_return, sizeof(unauthorized_return) - 1U) ==
+        MG_ERR_ACCESS_DENIED);
+    assert(terminal.alternate_active);
+    assert(terminal_write_for_process(EDITOR_TEST_PID, return_main,
+        sizeof(return_main) - 1U) == (i64)(sizeof(return_main) - 1U));
+    assert(!terminal.alternate_active && !terminal.auto_wrap);
+    assert(terminal.scroll_top == 1U && terminal.scroll_bottom == 2U);
+    assert(screen_cell(0U, 0U)->codepoint == 'A');
+}
+
+static void test_csi_scroll_rejection(void)
+{
+    terminal_csi_extended_t rejected;
+    static const char *const invalid[] = {
+        "\x1b[0us", "\x1b[0ds", "\x1b[0;2s", "\x1b[3;2s",
+        "\x1b[2;999s", "\x1b[1;2;3s", "\x1b[1;2us",
+        "\x1b[999999999999999999999;2s", "\x1b[zwv",
+    };
+
+    prepare_csi_edit_screen();
+    for (u32 index = 0U; index < sizeof(invalid) / sizeof(invalid[0]);
+         index++) {
+        usize length = strlen(invalid[index]);
+        assert(!terminal_csi_extended_parse((const u8 *)invalid[index],
+                                            (u16)length, &rejected));
+    }
 }
 
 static void test_clear_sequence_preserves_viewport_cursor(void)
@@ -3291,6 +3471,12 @@ int main(int argument_count, char **arguments)
         test_csi_erase_edit_semantics();
     if (run_all || !strcmp(arguments[1], "csi-erase-edit-invalid"))
         test_csi_erase_edit_rejection_and_isolation();
+    if (run_all || !strcmp(arguments[1], "csi-scroll-screen-splits"))
+        test_csi_scroll_screen_split_invariance();
+    if (run_all || !strcmp(arguments[1], "csi-scroll-screen"))
+        test_csi_scroll_regions_and_screen_state();
+    if (run_all || !strcmp(arguments[1], "csi-scroll-invalid"))
+        test_csi_scroll_rejection();
     if (run_all || !strcmp(arguments[1], "esc-clear-position"))
         test_clear_sequence_preserves_viewport_cursor();
     if (run_all || !strcmp(arguments[1], "clear-retains-history"))
