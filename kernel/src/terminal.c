@@ -1784,6 +1784,177 @@ static bool terminal_escape_parse(const u8 *sequence, u16 length,
     return false;
 }
 
+typedef struct {
+    bool foreground_set;
+    bool background_set;
+    bool foreground_default;
+    bool background_default;
+    u8 foreground;
+    u8 background;
+    u8 attributes_set;
+    u8 attributes_clear;
+    bool reset_all;
+} terminal_csi_style_t;
+
+static bool terminal_csi_style_attribute(const u8 *token, u32 length,
+                                         u8 *out_mask, bool *out_enable)
+{
+    u32 offset = 0U;
+    bool enable = true;
+    u8 mask;
+
+    if (!token || !length || !out_mask || !out_enable) return false;
+    if (token[0] == '-') {
+        enable = false;
+        offset++;
+    }
+    if (offset + 1U != length) return false;
+    switch (token[offset]) {
+        case 'b': mask = TERMINAL_TEXT_ATTR_BOLD; break;
+        case 'd': mask = TERMINAL_TEXT_ATTR_DIM; break;
+        case 'u': mask = TERMINAL_TEXT_ATTR_UNDERLINE; break;
+        case 'i': mask = TERMINAL_TEXT_ATTR_ITALIC; break;
+        case 'r': mask = TERMINAL_TEXT_ATTR_REVERSE; break;
+        default: return false;
+    }
+    *out_mask = mask;
+    *out_enable = enable;
+    return true;
+}
+
+static bool terminal_csi_color_field(const u8 *token, u32 length,
+                                     bool *out_default, u8 *out_color)
+{
+    u32 value = 0U;
+
+    if (!token || !out_default || !out_color) return false;
+    if (length == 1U && token[0] == '-') {
+        *out_default = true;
+        *out_color = 0U;
+        return true;
+    }
+    if (!length) {
+        *out_default = false;
+        *out_color = 0U;
+        return true;
+    }
+    for (u32 index = 0U; index < length; index++) {
+        u32 digit;
+        if (token[index] < '0' || token[index] > '9') return false;
+        digit = token[index] - '0';
+        if (value > (15U - digit) / 10U) return false;
+        value = value * 10U + digit;
+    }
+    if (value > 15U) return false;
+    *out_default = false;
+    *out_color = (u8)value;
+    return true;
+}
+
+/* Parse only the character-style family. The command letter is the final
+ * byte 'c'; all fields are validated before the caller changes process state. */
+static bool terminal_csi_style_parse(const u8 *sequence, u16 length,
+                                     terminal_csi_style_t *out_style)
+{
+    u32 body_length;
+    u32 token_starts[TERMINAL_ESCAPE_SEQUENCE_MAX / 2U + 1U];
+    u32 token_lengths[TERMINAL_ESCAPE_SEQUENCE_MAX / 2U + 1U];
+    u32 token_count = 0U;
+    u32 start = 2U;
+    u32 color_fields = 0U;
+    bool attributes_started = false;
+    terminal_csi_style_t style = {0};
+
+    if (!sequence || !out_style || length < 3U ||
+        length > TERMINAL_ESCAPE_SEQUENCE_MAX || sequence[0] != 0x1bU ||
+        sequence[1] != '[' || sequence[length - 1U] != 'c') return false;
+    body_length = length - 3U;
+    if (!body_length) {
+        style.reset_all = true;
+        *out_style = style;
+        return true;
+    }
+
+    for (u32 offset = 2U; offset <= length - 1U; offset++) {
+        if (offset == length - 1U || sequence[offset] == ';') {
+            if (token_count >= sizeof(token_starts) / sizeof(token_starts[0]))
+                return false;
+            token_starts[token_count] = start;
+            token_lengths[token_count] = offset - start;
+            token_count++;
+            start = offset + 1U;
+        }
+    }
+
+    for (u32 index = 0U; index < token_count; index++) {
+        const u8 *token = sequence + token_starts[index];
+        u32 token_length = token_lengths[index];
+        bool enable = false;
+        u8 attribute = 0U;
+
+        if (terminal_csi_style_attribute(token, token_length,
+                                         &attribute, &enable)) {
+            attributes_started = true;
+            if (enable) style.attributes_set |= attribute;
+            else style.attributes_clear |= attribute;
+            if (style.attributes_set & style.attributes_clear) return false;
+            continue;
+        }
+
+        /* A leading empty field explicitly reserves foreground and makes
+         * the next field background. Otherwise an attribute after a single
+         * color omits the background field (for example 10;b;u). */
+        if (attributes_started || color_fields >= 2U) return false;
+        if (index == 0U) {
+            if (token_length == 0U) {
+                color_fields = 1U;
+                continue;
+            }
+            if (!terminal_csi_color_field(token, token_length,
+                    &style.foreground_default, &style.foreground))
+                return false;
+            style.foreground_set = true;
+            color_fields = 1U;
+            continue;
+        }
+
+        if (token_length == 0U) {
+            color_fields = 2U;
+            continue;
+        }
+        if (!terminal_csi_color_field(token, token_length,
+                &style.background_default, &style.background))
+            return false;
+        style.background_set = true;
+        color_fields = 2U;
+    }
+
+    *out_style = style;
+    return true;
+}
+
+static void terminal_csi_style_apply(terminal_output_state_t *state,
+                                     const terminal_csi_style_t *style)
+{
+    terminal_style_t defaults = terminal_style_for_role(TERMINAL_STYLE_DEFAULT);
+
+    if (!state || !style) return;
+    if (style->reset_all) {
+        state->foreground = (u8)defaults.foreground;
+        state->background = (u8)defaults.background;
+        state->attributes = 0U;
+        return;
+    }
+    if (style->foreground_set)
+        state->foreground = style->foreground_default ?
+            (u8)defaults.foreground : style->foreground;
+    if (style->background_set)
+        state->background = style->background_default ?
+            (u8)defaults.background : style->background;
+    state->attributes = (u8)((state->attributes | style->attributes_set) &
+                             (u8)~style->attributes_clear);
+}
+
 void terminal_output_state_init(terminal_output_state_t *state)
 {
     terminal_style_t style;
@@ -1943,6 +2114,17 @@ static void terminal_output_literal_byte_locked(
                                      state->background);
 }
 
+static bool terminal_csi_apply_style_sequence_locked(
+    u64 process_id, terminal_output_state_t *state, u16 length)
+{
+    terminal_csi_style_t style;
+
+    if (!terminal_csi_style_parse(state->pending, length, &style) ||
+        !terminal_process_controls_locked(process_id)) return false;
+    terminal_csi_style_apply(state, &style);
+    return true;
+}
+
 static void terminal_output_feed_byte_locked(u64 process_id,
                                              terminal_output_state_t *state,
                                              u8 byte)
@@ -1966,11 +2148,47 @@ static void terminal_output_feed_byte_locked(u64 process_id,
         return;
     }
 
-    if (state->pending_length == 1U && byte != '{') {
+    if (state->pending_length == 1U && byte != '{' && byte != '[') {
         terminal_output_flush_pending_locked(state);
         terminal_output_feed_byte_locked(process_id, state, byte);
         return;
     }
+
+    if (state->pending_length >= 2U && state->pending[1] == '[') {
+        bool parameter_byte = (byte >= '0' && byte <= '9') || byte == ';' ||
+            byte == '-' || byte == 'b' || byte == 'd' || byte == 'u' ||
+            byte == 'i' || byte == 'r';
+
+        if (byte == 0x1bU || byte < 0x20U || byte == 0x7fU) {
+            terminal_output_flush_pending_locked(state);
+            terminal_output_feed_byte_locked(process_id, state, byte);
+            return;
+        }
+        if (byte == 'c') {
+            if (state->pending_length >= TERMINAL_ESCAPE_SEQUENCE_MAX) {
+                terminal_output_flush_pending_locked(state);
+                terminal_output_feed_byte_locked(process_id, state, byte);
+                return;
+            }
+            state->pending[state->pending_length++] = byte;
+            if (terminal_csi_apply_style_sequence_locked(process_id, state,
+                    state->pending_length)) {
+                state->pending_length = 0U;
+            } else {
+                terminal_output_flush_pending_locked(state);
+            }
+            return;
+        }
+        if (!parameter_byte ||
+            state->pending_length >= TERMINAL_ESCAPE_SEQUENCE_MAX) {
+            terminal_output_flush_pending_locked(state);
+            terminal_output_feed_byte_locked(process_id, state, byte);
+            return;
+        }
+        state->pending[state->pending_length++] = byte;
+        return;
+    }
+
     if (byte == 0x1bU || byte < 0x20U || byte == 0x7fU ||
         state->pending_length >= TERMINAL_ESCAPE_SEQUENCE_MAX) {
         terminal_output_flush_pending_locked(state);
@@ -1980,7 +2198,6 @@ static void terminal_output_feed_byte_locked(u64 process_id,
 
     state->pending[state->pending_length++] = byte;
     if (state->pending_length == 2U && byte != '{') {
-        terminal_output_flush_pending_locked(state);
         return;
     }
     if (byte == '}') {

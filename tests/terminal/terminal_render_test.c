@@ -1506,6 +1506,148 @@ static void test_native_escape_commands(void)
             assert(screen_cell(row, column)->codepoint == ' ');
 }
 
+static void test_csi_character_styling(void)
+{
+    initialize(160U, 96U);
+    static const char combined[] = "\x1b[2;4;b;ucG";
+    assert(terminal_write_for_process(EDITOR_TEST_PID, combined,
+        sizeof(combined) - 1U) == (i64)(sizeof(combined) - 1U));
+    assert(test_output_state.foreground == TERMINAL_COLOR_GREEN);
+    assert(test_output_state.background == TERMINAL_COLOR_BLUE);
+    assert(test_output_state.attributes ==
+           (TERMINAL_TEXT_ATTR_BOLD | TERMINAL_TEXT_ATTR_UNDERLINE));
+    assert(screen_cell(0U, 0U)->codepoint == 'G');
+    assert(screen_cell(0U, 0U)->fg_color == TERMINAL_COLOR_GREEN);
+    assert(screen_cell(0U, 0U)->bg_color == TERMINAL_COLOR_BLUE);
+
+    static const char bright_and_attributes[] = "\x1b[10;b;icX";
+    assert(terminal_write_for_process(EDITOR_TEST_PID,
+        bright_and_attributes, sizeof(bright_and_attributes) - 1U) ==
+        (i64)(sizeof(bright_and_attributes) - 1U));
+    assert(test_output_state.foreground == TERMINAL_COLOR_BRIGHT_GREEN);
+    assert(test_output_state.background == TERMINAL_COLOR_BLUE);
+    assert(test_output_state.attributes ==
+           (TERMINAL_TEXT_ATTR_BOLD | TERMINAL_TEXT_ATTR_UNDERLINE |
+            TERMINAL_TEXT_ATTR_ITALIC));
+    assert(screen_cell(0U, 1U)->fg_color == TERMINAL_COLOR_BRIGHT_GREEN);
+    assert(screen_cell(0U, 1U)->bg_color == TERMINAL_COLOR_BLUE);
+
+    static const char disable[] = "\x1b[-b;-uc";
+    assert(terminal_write_for_process(EDITOR_TEST_PID, disable,
+        sizeof(disable) - 1U) == (i64)(sizeof(disable) - 1U));
+    assert(test_output_state.attributes == TERMINAL_TEXT_ATTR_ITALIC);
+
+    static const char reset_foreground[] = "\x1b[-c";
+    assert(terminal_write_for_process(EDITOR_TEST_PID, reset_foreground,
+        sizeof(reset_foreground) - 1U) ==
+        (i64)(sizeof(reset_foreground) - 1U));
+    assert(test_output_state.foreground == TERMINAL_COLOR_LIGHT_GRAY);
+    assert(test_output_state.background == TERMINAL_COLOR_BLUE);
+    assert(test_output_state.attributes == TERMINAL_TEXT_ATTR_ITALIC);
+
+    static const char reset_background[] = "\x1b[;-c";
+    assert(terminal_write_for_process(EDITOR_TEST_PID, reset_background,
+        sizeof(reset_background) - 1U) ==
+        (i64)(sizeof(reset_background) - 1U));
+    assert(test_output_state.background == TERMINAL_COLOR_BLACK);
+    assert(test_output_state.attributes == TERMINAL_TEXT_ATTR_ITALIC);
+
+    static const char reset_both[] = "\x1b[-;-c";
+    assert(terminal_write_for_process(EDITOR_TEST_PID, reset_both,
+        sizeof(reset_both) - 1U) == (i64)(sizeof(reset_both) - 1U));
+    assert(test_output_state.foreground == TERMINAL_COLOR_LIGHT_GRAY);
+    assert(test_output_state.background == TERMINAL_COLOR_BLACK);
+    assert(test_output_state.attributes == TERMINAL_TEXT_ATTR_ITALIC);
+
+    static const char reset_all[] = "\x1b[c";
+    assert(terminal_write_for_process(EDITOR_TEST_PID, reset_all,
+        sizeof(reset_all) - 1U) == (i64)(sizeof(reset_all) - 1U));
+    assert(test_output_state.foreground == TERMINAL_COLOR_LIGHT_GRAY);
+    assert(test_output_state.background == TERMINAL_COLOR_BLACK);
+    assert(test_output_state.attributes == 0U);
+
+    /* All five attributes are independent, idempotent bits and are stored
+     * even though the framebuffer glyph renderer currently ignores them. */
+    static const char all_attributes[] = "\x1b[bc\x1b[dc\x1b[uc\x1b[ic\x1b[rc";
+    assert(terminal_write_for_process(EDITOR_TEST_PID, all_attributes,
+        sizeof(all_attributes) - 1U) ==
+        (i64)(sizeof(all_attributes) - 1U));
+    assert(test_output_state.attributes == 0x1fU);
+    static const char clear_attributes[] =
+        "\x1b[-bc\x1b[-dc\x1b[-uc\x1b[-ic\x1b[-rc";
+    assert(terminal_write_for_process(EDITOR_TEST_PID, clear_attributes,
+        sizeof(clear_attributes) - 1U) ==
+        (i64)(sizeof(clear_attributes) - 1U));
+    assert(test_output_state.attributes == 0U);
+
+    static const char split_sequence[] = "\x1b[2;4;b;uc";
+    for (u32 split = 1U; split < sizeof(split_sequence) - 1U; split++) {
+        initialize(160U, 96U);
+        assert(terminal_write_for_process(EDITOR_TEST_PID, split_sequence,
+                                          split) == (i64)split);
+        assert(terminal_write_for_process(EDITOR_TEST_PID,
+            split_sequence + split, sizeof(split_sequence) - 1U - split) ==
+            (i64)(sizeof(split_sequence) - 1U - split));
+        assert(test_output_state.foreground == TERMINAL_COLOR_GREEN);
+        assert(test_output_state.background == TERMINAL_COLOR_BLUE);
+        assert(test_output_state.attributes ==
+               (TERMINAL_TEXT_ATTR_BOLD | TERMINAL_TEXT_ATTR_UNDERLINE));
+    }
+}
+
+static void test_csi_style_rejection_and_split_state(void)
+{
+    terminal_output_state_t other_state;
+    initialize(240U, 128U);
+    terminal_output_state_init(&other_state);
+
+    static const char prefix[] = "\x1b[2;";
+    static const char other[] = "4cR";
+    static const char suffix[] = "4cG";
+    assert(terminal_write_for_process_state(101U, &test_output_state,
+        prefix, sizeof(prefix) - 1U) == (i64)(sizeof(prefix) - 1U));
+    assert(terminal_write_for_process_state(102U, &other_state,
+        other, sizeof(other) - 1U) == (i64)(sizeof(other) - 1U));
+    assert(test_output_state.pending_length == sizeof(prefix) - 1U);
+    assert(test_output_state.foreground == TERMINAL_COLOR_LIGHT_GRAY);
+    assert(other_state.foreground == TERMINAL_COLOR_LIGHT_GRAY);
+    assert(terminal_write_for_process_state(101U, &test_output_state,
+        suffix, sizeof(suffix) - 1U) == (i64)(sizeof(suffix) - 1U));
+    assert(test_output_state.foreground == TERMINAL_COLOR_GREEN);
+    assert(test_output_state.background == TERMINAL_COLOR_BLUE);
+    assert(other_state.foreground == TERMINAL_COLOR_LIGHT_GRAY);
+
+    static const char malformed[] = "\x1b[7;8;9c"; /* third color field */
+    assert(terminal_write_for_process_state(101U, &test_output_state,
+        malformed, sizeof(malformed) - 1U) == (i64)(sizeof(malformed) - 1U));
+    assert(test_output_state.foreground == TERMINAL_COLOR_GREEN);
+    assert(test_output_state.background == TERMINAL_COLOR_BLUE);
+    assert(test_output_state.attributes == 0U);
+
+    static const char overflow[] = "\x1b[999999999999999999999c";
+    assert(terminal_write_for_process_state(101U, &test_output_state,
+        overflow, sizeof(overflow) - 1U) == (i64)(sizeof(overflow) - 1U));
+    assert(test_output_state.foreground == TERMINAL_COLOR_GREEN);
+    assert(test_output_state.background == TERMINAL_COLOR_BLUE);
+    assert(test_output_state.attributes == 0U);
+
+    static const char invalid_attribute[] = "\x1b[2;4;q c";
+    assert(terminal_write_for_process_state(101U, &test_output_state,
+        invalid_attribute, sizeof(invalid_attribute) - 1U) ==
+        (i64)(sizeof(invalid_attribute) - 1U));
+    assert(test_output_state.foreground == TERMINAL_COLOR_GREEN);
+    assert(test_output_state.background == TERMINAL_COLOR_BLUE);
+
+    static const char incomplete[] = "\x1b[10;b;";
+    assert(terminal_write_for_process_state(101U, &test_output_state,
+        incomplete, sizeof(incomplete) - 1U) == (i64)(sizeof(incomplete) - 1U));
+    assert(test_output_state.foreground == TERMINAL_COLOR_GREEN);
+    terminal_output_finish_for_process(101U, &test_output_state);
+    assert(test_output_state.foreground == TERMINAL_COLOR_GREEN);
+    assert(test_output_state.background == TERMINAL_COLOR_BLUE);
+    assert(test_output_state.attributes == 0U);
+}
+
 static void test_clear_sequence_preserves_viewport_cursor(void)
 {
     static const char position[] = "\x1b{at:3,4}";
@@ -2555,6 +2697,10 @@ int main(int argument_count, char **arguments)
         test_escape_sequences_are_literal();
     if (run_all || !strcmp(arguments[1], "esc-controls"))
         test_native_escape_commands();
+    if (run_all || !strcmp(arguments[1], "csi-style"))
+        test_csi_character_styling();
+    if (run_all || !strcmp(arguments[1], "csi-style-state"))
+        test_csi_style_rejection_and_split_state();
     if (run_all || !strcmp(arguments[1], "esc-clear-position"))
         test_clear_sequence_preserves_viewport_cursor();
     if (run_all || !strcmp(arguments[1], "clear-retains-history"))

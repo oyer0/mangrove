@@ -252,19 +252,30 @@ next row). A tab advances with blank cells to the next eight-column stop.
 Wrapping is deferred until the next printable character; while that wrap is
 pending, the visible cursor is drawn on the last cell of the current row.
 Mangrove's byte-oriented console output recognizes its native control stream:
-an actual ASCII ESC byte (`0x1b`) followed by `{`, a canonical command, and
-`}`. This is not ANSI/CSI or VT compatibility. All byte-stream output
-controls use `ESC{...}` and pass through one parser, terminal state, renderer,
-and process-ownership check. The `mg/terminal.h` output convenience functions
-emit these same bytes through stdout; they do not invoke a second output
-control syscall. Ordinary braces are printable text;
+an actual ASCII ESC byte (`0x1b`) followed either by CSI (`[`, parameters,
+and a final command letter) or by the legacy `{command}` form during
+migration. The CSI protocol borrows no compatibility claim from ANSI, ECMA-48,
+VT, or xterm. Both forms pass through one parser, terminal state, renderer,
+and process-ownership check. CSI parser state is per process and retains
+incomplete sequences across writes; command meaning is independent of write
+boundaries. The `mg/terminal.h` output convenience functions emit these bytes
+through stdout; they do not invoke a second output-control syscall. Ordinary
+braces are printable text;
 the source spelling `\e` is not itself a terminal command and is interpreted
 only by a program that explicitly translates it to byte `0x1b`.
 A C program can emit the same stream with `printf("\x1b{fg:green}...")` or
 `console_write()`; Shoot's `say -e` explicitly translates `\e` in an
 argument to the ESC byte.
 
-The recognized command set is deliberately small:
+The CSI character-styling command currently recognized is:
+
+| Sequence | Effect |
+| --- | --- |
+| `ESC[FG;BGc`, `ESC[FGc`, `ESC[;BGc` | Set numeric foreground and/or background palette indices from 0 through 15. An empty field leaves that color unchanged; `-` restores its default. `ESC[-c`, `ESC[;-c`, and `ESC[-;-c` reset foreground, background, or both while retaining attributes. `ESC[c` resets all styling. |
+| `ESC[bc`, `ESC[dc`, `ESC[uc`, `ESC[ic`, `ESC[rc` | Enable bold, dim, underline, italic, or reverse-video state. Prefix the attribute with `-` to disable it. Attributes are retained per process but are not visually rendered by the current framebuffer renderer. |
+
+The legacy command set remains accepted while existing output producers are
+migrated:
 
 | Sequence | Effect |
 | --- | --- |
@@ -277,18 +288,16 @@ The recognized command set is deliberately small:
 | `ESC{cls}`, `ESC{cll}`, `ESC{cleol}` | Clear the visible viewport without moving the logical cursor, clear the current line, or clear from the cursor to the line end. On the live normal screen, `cls` retains the vacated page in the ring; on a historical view it blanks only the presentation. |
 | `ESC{alt}`, `ESC{main}` | Enter the alternate screen or return to the retained main screen. Repeating `alt` by the current owner preserves the alternate screen; repeating `main` when already on main is a no-op. |
 
-Only these exact names and forms are supported. Operation identifiers are at
-most five ASCII characters; color names and numeric arguments are exempt.
-There are no aliases. RGB, bold, underline, and arbitrary device controls are
-not part of this stream. A candidate sequence is bounded to 128 bytes,
-including ESC and its braces. The parser retains incomplete candidates across
-writes from the same process, validates the complete command before applying
-it, and keeps parser and style state per process. Different processes cannot
-complete each other's partial sequences. Unknown, malformed, oversized, and
-process-final incomplete sequences are rendered as literal text (ESC itself
-appears as the replacement glyph). A command that fails validation has no
-terminal side effect. Output writes are serialized under the terminal lock;
-separate process writes may appear between one another's completed writes.
+Only the exact forms above are recognized; compatibility aliases and RGB
+colors are not accepted. A candidate sequence is bounded to 128 bytes
+including its introducer and final. The parser validates a complete command
+before applying it and keeps parse/style state per process.
+Different processes cannot complete each other's partial sequences. Unknown,
+malformed, oversized, and process-final incomplete sequences are rendered as
+literal text (ESC itself appears as the replacement glyph). A rejected
+command is not applied; buffered bytes are rendered literally. Output writes
+are serialized under the terminal lock; separate process writes may appear
+between one another's completed commands.
 
 Commands use the existing terminal control authorization. A process that does
 not own an active alternate screen cannot write to it or change it. The ESC
